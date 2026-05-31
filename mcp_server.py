@@ -16,6 +16,7 @@ mcp = FastMCP(
     instructions="多AI角色共享记忆系统 - 存储、搜索、管理记忆",
     stateless_http=True,
     streamable_http_path="/mcp",
+    json_response=True,
 )
 
 
