@@ -164,7 +164,7 @@ def list_rooms() -> dict:
 DECAY_LAMBDA = 0.05
 DECAY_LAMBDA_FAST = 0.15  # 工作事务等快速衰减的房间
 DECAY_THRESHOLD = 0.15
-MERGE_SIMILARITY = 0.88
+MERGE_SIMILARITY = 0.75
 
 # ── Embedding ──
 EMBEDDING_MODEL = "gemini-embedding-001"
