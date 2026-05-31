@@ -42,14 +42,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
 # ── MCP Server 端点 ──
-# streamable_http_path="/mcp"，所以子应用内部路由是 /mcp
-# 用 Starlette middleware 方式挂载到 FastAPI
-from starlette.middleware import Middleware
-from starlette.routing import Mount as StarletteMount
-
 _mcp_asgi_app = mcp_server.streamable_http_app()
-# 直接把 MCP 应用的路由加入 FastAPI
-app.router.routes.insert(0, StarletteMount("/", app=_mcp_asgi_app))
+
+# ASGI middleware：拦截 /mcp 路径，直接转发给 MCP 应用
+_original_app = app.build_middleware_stack
+def _patched_build():
+    original_asgi = _original_app()
+    async def asgi_wrapper(scope, receive, send):
+        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp"
+            scope["raw_path"] = b"/mcp"
+            await _mcp_asgi_app(scope, receive, send)
+        else:
+            await original_asgi(scope, receive, send)
+    return asgi_wrapper
+app.build_middleware_stack = _patched_build
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
