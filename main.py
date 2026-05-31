@@ -42,8 +42,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
 # ── MCP Server 端点 ──
+# streamable_http_app() 内部路由是 /mcp，所以 mount 到 "/" 让最终路径为 /mcp
+from starlette.routing import Mount
 mcp_app = mcp_server.streamable_http_app()
-app.mount("/mcp", mcp_app)
+app.router.routes.insert(0, Mount("/", app=mcp_app))
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
