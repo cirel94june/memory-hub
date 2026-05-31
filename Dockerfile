@@ -5,4 +5,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN mkdir -p data
 EXPOSE 8888
-CMD ["python", "main.py"]
+CMD ["uvicorn", "main:gateway", "--host", "0.0.0.0", "--port", "8888"]

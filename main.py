@@ -32,35 +32,27 @@ def verify_secret(authorization: str = Header(default="")):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _mcp_session_manager
     await github_store.load_all()
     mems = github_store.get_all_memories()
     print(f"[Memory Hub] Loaded {len(mems)} memories from GitHub")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
     print(f"[Memory Hub] Rooms: {list(ROOMS.keys())}")
-    yield
+
+    # 初始化 MCP session manager（通过 streamable_http_app 触发懒加载）
+    _mcp_inst.streamable_http_app()  # 确保 _session_manager 被创建
+    _mcp_session_manager = _mcp_inst._session_manager
+    async with _mcp_session_manager.run():
+        print("[Memory Hub] MCP server ready at /mcp")
+        yield
 
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
 # ── MCP Server 端点 ──
-_mcp_asgi_app = mcp_server.streamable_http_app()
+# 在 FastAPI 的 lifespan 里初始化 MCP session manager
+from mcp_server import mcp as _mcp_inst
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
-
-class MCPMiddleware:
-    def __init__(self, app):
-        self.app = app
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
-            scope = dict(scope)
-            scope["path"] = "/mcp"
-            scope["raw_path"] = b"/mcp"
-            await _mcp_asgi_app(scope, receive, send)
-        else:
-            await self.app(scope, receive, send)
-
-app.add_middleware(MCPMiddleware)
+_mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -276,6 +268,24 @@ async def api_export(authorization: str = Header(default="")):
 
 # ── 启动 ──
 
+class MCPGateway:
+    """顶层 ASGI 应用：/mcp 走 MCP session manager，其他走 FastAPI"""
+    def __init__(self, fastapi_app):
+        self.fastapi_app = fastapi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
+            if _mcp_session_manager is not None:
+                await _mcp_session_manager.handle_request(scope, receive, send)
+            else:
+                await send({"type": "http.response.start", "status": 503,
+                           "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"MCP not initialized"})
+        else:
+            await self.fastapi_app(scope, receive, send)
+
+gateway = MCPGateway(app)
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8888)
+    uvicorn.run(gateway, host="0.0.0.0", port=8888, lifespan="on")
