@@ -2,10 +2,9 @@ name: Memory Daemon
 
 on:
   schedule:
-    # 每天跑两次：北京时间早上8点和晚上8点
-    - cron: '0 0 * * *'   # UTC 00:00 = 北京时间 08:00
-    - cron: '0 12 * * *'  # UTC 12:00 = 北京时间 20:00
-  workflow_dispatch: {}   # 允许手动触发
+    - cron: '0 0 * * *'
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
 
 jobs:
   maintain:
@@ -20,13 +19,7 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.HUB_SECRET }}" \
             -H "Content-Type: application/json" \
             --max-time 120)
-
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
-
           echo "Status: $HTTP_CODE"
           echo "Result: $BODY"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::warning::Maintenance returned $HTTP_CODE"
-          fi
