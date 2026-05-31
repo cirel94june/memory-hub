@@ -42,10 +42,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
 # ── MCP Server 端点 ──
-# 提取 streamable_http_app 内部的 StreamableHTTPASGIApp 直接挂载
-_mcp_starlette = mcp_server.streamable_http_app()
-_mcp_route = _mcp_starlette.routes[0]  # Route("/mcp", app=StreamableHTTPASGIApp)
-app.routes.insert(0, _mcp_route)
+_mcp_asgi_app = mcp_server.streamable_http_app()
+app.mount("/mcp", _mcp_asgi_app)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
