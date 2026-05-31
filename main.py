@@ -3,6 +3,8 @@ Memory Hub - 主服务入口
 多 AI 角色共享记忆系统
 """
 import json
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Query
@@ -44,7 +46,33 @@ async def lifespan(app: FastAPI):
     _mcp_session_manager = _mcp_inst._session_manager
     async with _mcp_session_manager.run():
         print("[Memory Hub] MCP server ready at /mcp")
-        yield
+
+        # 启动后台 daemon 定时任务
+        daemon_task = asyncio.create_task(_daemon_loop())
+        print("[Memory Hub] Daemon scheduler started (every 12h)")
+        try:
+            yield
+        finally:
+            daemon_task.cancel()
+
+
+async def _daemon_loop():
+    """每12小时自动跑一次记忆整理"""
+    log = logging.getLogger("daemon_scheduler")
+    # 启动后等5分钟再跑第一次（让服务先稳定）
+    await asyncio.sleep(300)
+    while True:
+        try:
+            log.info("Starting scheduled maintenance...")
+            result = await daemon.run_full_maintenance()
+            log.info(f"Scheduled maintenance done: {json.dumps(result)}")
+            print(f"[Daemon] Maintenance complete: merge={result.get('merge',{}).get('merged',0)}, "
+                  f"decay={result.get('decay',{}).get('archived',0)}")
+        except Exception as e:
+            log.error(f"Scheduled maintenance failed: {e}")
+            print(f"[Daemon] Maintenance failed: {e}")
+        # 等12小时
+        await asyncio.sleep(12 * 3600)
 
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
