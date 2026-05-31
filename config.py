@@ -14,6 +14,14 @@ DATA_DIR.mkdir(exist_ok=True)
 HUB_SECRET = os.getenv("HUB_SECRET", "change-me-in-production")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# ── Daemon 小模型配置 ──
+# 模式1 (默认): Gemini 免费 API（GEMINI_API_KEY + GEMINI_MODEL）
+# 模式2: OpenAI 兼容中转站（设 DAEMON_API_KEY + DAEMON_BASE_URL + DAEMON_MODEL）
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+DAEMON_API_KEY = os.getenv("DAEMON_API_KEY", "")
+DAEMON_MODEL = os.getenv("DAEMON_MODEL", "deepseek-chat")
+DAEMON_BASE_URL = os.getenv("DAEMON_BASE_URL", "https://api.dzzi.ai/v1")
+
 # ── AI 角色定义 ──
 AI_ROLES = {
     "claude": {"name": "Claude", "color": "#D4A574"},

@@ -10,30 +10,60 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-from config import GEMINI_API_KEY, MERGE_SIMILARITY, get_room
+from config import (GEMINI_API_KEY, GEMINI_MODEL, MERGE_SIMILARITY, get_room,
+                     DAEMON_MODEL, DAEMON_API_KEY, DAEMON_BASE_URL)
 from embedding import get_embedding, cosine_similarity, unpack_embedding, pack_embedding
 import github_store as store
 
 log = logging.getLogger("daemon")
 
 
-async def _call_gemini_flash(prompt: str) -> str:
-    """调用小模型做整理"""
-    if not GEMINI_API_KEY:
-        return ""
+async def _call_llm(prompt: str) -> str:
+    """调用小模型做整理。优先用中转站（如果配了 DAEMON_API_KEY），否则用 Gemini 免费 API"""
     import httpx
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+    # 模式1: 中转站 / OpenAI 兼容 API
+    if DAEMON_API_KEY:
+        url = f"{DAEMON_BASE_URL}/chat/completions"
+        headers = {"Authorization": f"Bearer {DAEMON_API_KEY}", "Content-Type": "application/json"}
+        body = {
+            "model": DAEMON_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 512,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                resp.raise_for_status()
+                result = resp.json()["choices"][0]["message"]["content"]
+                log.info(f"LLM OK ({DAEMON_MODEL})")
+                return result
+        except Exception as e:
+            log.error(f"Relay LLM error ({DAEMON_MODEL}@{DAEMON_BASE_URL}): {e}")
+            # 中转站失败，尝试 Gemini 兜底
+            if not GEMINI_API_KEY:
+                return ""
+
+    # 模式2: Gemini 免费 API（默认兜底）
+    if not GEMINI_API_KEY:
+        log.warning("No API key configured for daemon LLM")
+        return ""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512},
     }
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=body)
             resp.raise_for_status()
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            result = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            log.info(f"Gemini OK ({GEMINI_MODEL})")
+            return result
     except Exception as e:
-        log.error(f"Gemini Flash error: {e}")
+        log.error(f"Gemini error ({GEMINI_MODEL}): {e}")
         return ""
 
 
@@ -68,7 +98,7 @@ async def merge_similar() -> dict:
 记忆1：{a['content']}
 记忆2：{b['content']}
 只输出合并后的一句话。"""
-            merged = await _call_gemini_flash(prompt)
+            merged = await _call_llm(prompt)
             if not merged:
                 continue
 
@@ -146,7 +176,7 @@ async def compress_diaries() -> dict:
 {texts}
 
 只输出周记内容。"""
-            digest = await _call_gemini_flash(prompt)
+            digest = await _call_llm(prompt)
             if not digest:
                 continue
 
@@ -221,7 +251,7 @@ async def archive_old_work() -> dict:
         prompt = f"""将以下工作记录压缩成一句话的职业经历描述：
 {item['content']}
 只输出一句话。"""
-        summary = await _call_gemini_flash(prompt)
+        summary = await _call_llm(prompt)
         if not summary:
             summary = item["content"][:100]
         summary = summary.strip().strip('"')
@@ -288,7 +318,7 @@ async def tidy_living_room() -> dict:
 }}
 只输出 JSON。"""
 
-    result = await _call_gemini_flash(prompt)
+    result = await _call_llm(prompt)
     tidied = 0
 
     if result:
@@ -307,7 +337,7 @@ async def tidy_living_room() -> dict:
                 if len(mems_to_merge) < 2:
                     continue
                 texts = "\n".join([m["content"] for m in mems_to_merge])
-                merged = await _call_gemini_flash(f"合并以下信息为一句简洁的陈述：\n{texts}\n只输出一句话。")
+                merged = await _call_llm(f"合并以下信息为一句简洁的陈述：\n{texts}\n只输出一句话。")
                 if not merged:
                     continue
                 merged = merged.strip().strip('"')
@@ -390,7 +420,7 @@ async def distill_psychology() -> dict:
 
 只输出章节内容。"""
 
-        chapter = await _call_gemini_flash(prompt)
+        chapter = await _call_llm(prompt)
         if not chapter:
             continue
         chapter = chapter.strip()
