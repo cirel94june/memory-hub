@@ -1,0 +1,25 @@
+name: Memory Daemon
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Memory Maintenance
+        run: |
+          echo "Triggering daemon maintenance..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.HUB_URL }}/api/daemon/maintain" \
+            -H "Authorization: Bearer ${{ secrets.HUB_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --max-time 120)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "Status: $HTTP_CODE"
+          echo "Result: $BODY"
