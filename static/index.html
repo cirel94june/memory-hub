@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Hub</title>
+<style>
+:root {
+  --bg: #fafaf8;
+  --card: #ffffff;
+  --border: #e8e5e0;
+  --text: #2c2c2c;
+  --text2: #888;
+  --accent: #6c9bcf;
+  --accent2: #e8f0fb;
+  --danger: #e07070;
+  --success: #6bc07f;
+  --warning: #e8b84a;
+  --radius: 10px;
+  --shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+}
+
+/* ── 顶栏 ── */
+.header {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.header h1 { font-size: 18px; font-weight: 600; }
+.header-actions { display: flex; gap: 8px; }
+.btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.15s;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
+.btn-primary:hover { opacity: 0.85; }
+.btn-danger { color: var(--danger); border-color: var(--danger); }
+
+/* ── 布局 ── */
+.layout {
+  display: flex;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+  gap: 20px;
+}
+.sidebar {
+  width: 200px;
+  flex-shrink: 0;
+}
+.main {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── 侧栏 ── */
+.nav-group { margin-bottom: 20px; }
+.nav-group h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text2);
+  letter-spacing: 1px;
+  padding: 0 12px;
+  margin-bottom: 6px;
+}
+.nav-item {
+  display: block;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text);
+  text-decoration: none;
+  transition: background 0.15s;
+}
+.nav-item:hover { background: var(--accent2); }
+.nav-item.active { background: var(--accent2); color: var(--accent); font-weight: 500; }
+.nav-count {
+  float: right;
+  font-size: 12px;
+  color: var(--text2);
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+/* ── 搜索 ── */
+.search-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.search-bar input {
+  flex: 1;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 14px;
+  outline: none;
+}
+.search-bar input:focus { border-color: var(--accent); }
+
+/* ── 记忆卡片 ── */
+.memory-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  margin-bottom: 10px;
+  box-shadow: var(--shadow);
+  transition: border-color 0.15s;
+}
+.memory-card:hover { border-color: var(--accent); }
+.memory-content {
+  font-size: 14px;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+.memory-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.tag-room { background: #f0ebe6; color: #8b7355; }
+.tag-layer { background: var(--accent2); color: var(--accent); }
+.tag-ai { padding: 2px 8px; border-radius: 4px; color: white; font-size: 11px; }
+.importance-bar {
+  display: inline-block;
+  width: 50px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  position: relative;
+  vertical-align: middle;
+}
+.importance-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+}
+.decay-warn { color: var(--warning); }
+.memory-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.memory-actions .btn { font-size: 11px; padding: 3px 10px; }
+
+/* ── 统计卡片 ── */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  text-align: center;
+}
+.stat-num { font-size: 24px; font-weight: 600; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--text2); margin-top: 2px; }
+
+/* ── 模态框 ── */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.3);
+  z-index: 200;
+  justify-content: center;
+  align-items: center;
+}
+.modal-overlay.show { display: flex; }
+.modal {
+  background: var(--card);
+  border-radius: 12px;
+  padding: 24px;
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.modal h2 { font-size: 16px; margin-bottom: 16px; }
+.modal label { display: block; font-size: 13px; color: var(--text2); margin: 10px 0 4px; }
+.modal input, .modal select, .modal textarea {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+  font-family: inherit;
+}
+.modal textarea { resize: vertical; min-height: 80px; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+/* ── 空状态 ── */
+.empty {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text2);
+}
+.empty-icon { font-size: 48px; margin-bottom: 12px; }
+
+/* ── 分页 ── */
+.pagination {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ── 响应式 ── */
+@media (max-width: 768px) {
+  .layout { flex-direction: column; padding: 12px; }
+  .sidebar { width: 100%; display: flex; flex-wrap: wrap; gap: 6px; }
+  .nav-group { margin-bottom: 8px; }
+  .nav-group h3 { display: none; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Memory Hub</h1>
+  <div class="header-actions">
+    <button class="btn" onclick="openAddModal()">+ 添加记忆</button>
+    <button class="btn" onclick="exportMemories()">导出 JSON</button>
+    <button class="btn btn-danger" onclick="runDecay()">执行衰减</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar" id="sidebar">
+    <div class="nav-group">
+      <h3>概览</h3>
+      <a class="nav-item active" data-filter="all" onclick="filterBy('all', this)">全部记忆 <span class="nav-count" id="count-all">0</span></a>
+    </div>
+    <div class="nav-group">
+      <h3>房间</h3>
+      <a class="nav-item" data-filter="room:living_room" onclick="filterBy('room:living_room', this)">客厅</a>
+      <a class="nav-item" data-filter="room:study_career" onclick="filterBy('room:study_career', this)">职业生涯</a>
+      <a class="nav-item" data-filter="room:study_psychology" onclick="filterBy('room:study_psychology', this)">心理状态</a>
+      <a class="nav-item" data-filter="room:study_health" onclick="filterBy('room:study_health', this)">身体健康</a>
+      <a class="nav-item" data-filter="room:study_learning" onclick="filterBy('room:study_learning', this)">学习目标</a>
+      <a class="nav-item" data-filter="room:study_relationships" onclick="filterBy('room:study_relationships', this)">人际关系</a>
+      <a class="nav-item" data-filter="room:study_preferences" onclick="filterBy('room:study_preferences', this)">兴趣偏好</a>
+      <a class="nav-item" data-filter="room:game_room" onclick="filterBy('room:game_room', this)">游戏房</a>
+    </div>
+    <div class="nav-group">
+      <h3>AI 私有</h3>
+      <a class="nav-item" data-filter="ai:claude" onclick="filterBy('ai:claude', this)">Claude</a>
+      <a class="nav-item" data-filter="ai:gemini" onclick="filterBy('ai:gemini', this)">Gemini</a>
+      <a class="nav-item" data-filter="ai:gpt" onclick="filterBy('ai:gpt', this)">GPT</a>
+    </div>
+    <div class="nav-group">
+      <h3>状态</h3>
+      <a class="nav-item" data-filter="status:archived" onclick="filterBy('status:archived', this)">已归档</a>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="stats" id="stats"></div>
+
+    <div class="search-bar">
+      <input type="text" id="searchInput" placeholder="搜索记忆..." onkeydown="if(event.key==='Enter')searchMemories()">
+      <button class="btn btn-primary" onclick="searchMemories()">搜索</button>
+    </div>
+
+    <div id="memoryList"></div>
+    <div class="pagination" id="pagination"></div>
+  </div>
+</div>
+
+<!-- 添加/编辑模态框 -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <h2 id="modalTitle">添加记忆</h2>
+    <input type="hidden" id="editId">
+
+    <label>内容</label>
+    <textarea id="mContent" placeholder="要记住的内容..."></textarea>
+
+    <label>层级</label>
+    <select id="mLayer" onchange="onLayerChange()">
+      <option value="shared">共享（所有 AI 可见）</option>
+      <option value="private">私有（指定 AI 专属）</option>
+    </select>
+
+    <div id="ownerRow" style="display:none">
+      <label>所属 AI</label>
+      <select id="mOwner">
+        <option value="claude">Claude</option>
+        <option value="gemini">Gemini</option>
+        <option value="gpt">GPT</option>
+      </select>
+    </div>
+
+    <label>房间</label>
+    <select id="mRoom">
+      <option value="living_room">客厅（核心信息）</option>
+      <option value="study_career">职业生涯</option>
+      <option value="study_psychology">心理状态</option>
+      <option value="study_health">身体健康</option>
+      <option value="study_learning">学习目标</option>
+      <option value="study_relationships">人际关系</option>
+      <option value="study_preferences">兴趣偏好</option>
+      <option value="game_room">游戏房</option>
+    </select>
+
+    <label>重要度</label>
+    <input type="range" id="mImportance" min="0" max="1" step="0.1" value="0.5">
+    <span id="mImpVal">0.5</span>
+
+    <div class="modal-actions">
+      <button class="btn" onclick="closeAddModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveMemory()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // 同域部署时留空
+let TOKEN = localStorage.getItem('hub_token') || '';
+let currentFilter = 'all';
+let currentPage = 1;
+
+// ── 鉴权 ──
+function authHeader() {
+  return { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
+}
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, { headers: authHeader(), ...opts });
+  if (res.status === 401) {
+    TOKEN = prompt('请输入 Memory Hub 密钥:') || '';
+    localStorage.setItem('hub_token', TOKEN);
+    return api(path, opts);
+  }
+  return res.json();
+}
+
+// ── 加载 ──
+async function loadMemories() {
+  let params = `page=${currentPage}&per_page=20`;
+  if (currentFilter.startsWith('room:')) params += `&room=${currentFilter.slice(5)}`;
+  else if (currentFilter.startsWith('ai:')) params += `&owner_ai=${currentFilter.slice(3)}&layer=private`;
+  else if (currentFilter.startsWith('status:')) params += `&status=${currentFilter.slice(7)}`;
+
+  const data = await api(`/api/memory/list?${params}`);
+  document.getElementById('count-all').textContent = data.total;
+  renderMemories(data.items);
+  renderPagination(data.total, data.page, data.per_page);
+}
+
+function renderMemories(items) {
+  const el = document.getElementById('memoryList');
+  if (!items.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>这里还没有记忆</p></div>';
+    return;
+  }
+  el.innerHTML = items.map(m => {
+    const aiColors = { claude: '#D4A574', gemini: '#4285F4', gpt: '#10A37F' };
+    const impPct = Math.round((m.importance || 0.5) * 100);
+    const decay = m.decay_score || 1;
+    const decayWarn = decay < 0.3 ? '<span class="decay-warn"> (即将遗忘)</span>' : '';
+    return `
+      <div class="memory-card" data-id="${m.id}">
+        <div class="memory-content">${escHtml(m.content)}</div>
+        <div class="memory-meta">
+          <span class="tag tag-room">${m.room}</span>
+          <span class="tag tag-layer">${m.layer}</span>
+          ${m.owner_ai ? `<span class="tag tag-ai" style="background:${aiColors[m.owner_ai]||'#888'}">${m.owner_ai}</span>` : ''}
+          <span>重要度: <span class="importance-bar"><span class="importance-fill" style="width:${impPct}%"></span></span> ${m.importance}</span>
+          ${decayWarn}
+          <span>${m.created_at?.slice(0,10) || ''}</span>
+          ${m.source_platform ? `<span>via ${m.source_platform}</span>` : ''}
+        </div>
+        <div class="memory-actions">
+          <button class="btn" onclick="editMemory('${m.id}')">编辑</button>
+          <button class="btn" onclick="archiveMemory('${m.id}')">归档</button>
+          <button class="btn btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderPagination(total, page, perPage) {
+  const pages = Math.ceil(total / perPage);
+  const el = document.getElementById('pagination');
+  if (pages <= 1) { el.innerHTML = ''; return; }
+  let html = '';
+  for (let i = 1; i <= pages; i++) {
+    html += `<button class="btn ${i===page?'btn-primary':''}" onclick="goPage(${i})">${i}</button>`;
+  }
+  el.innerHTML = html;
+}
+
+function goPage(p) { currentPage = p; loadMemories(); }
+
+// ── 过滤 ──
+function filterBy(filter, el) {
+  currentFilter = filter;
+  currentPage = 1;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  if (el) el.classList.add('active');
+  loadMemories();
+}
+
+// ── 搜索 ──
+async function searchMemories() {
+  const q = document.getElementById('searchInput').value.trim();
+  if (!q) { loadMemories(); return; }
+  const data = await api(`/api/memory/recall?q=${encodeURIComponent(q)}&top_k=20`);
+  renderMemories(data.results || []);
+  document.getElementById('pagination').innerHTML = '';
+}
+
+// ── 添加/编辑 ──
+function openAddModal() {
+  document.getElementById('modalTitle').textContent = '添加记忆';
+  document.getElementById('editId').value = '';
+  document.getElementById('mContent').value = '';
+  document.getElementById('mLayer').value = 'shared';
+  document.getElementById('mRoom').value = 'living_room';
+  document.getElementById('mImportance').value = 0.5;
+  document.getElementById('mImpVal').textContent = '0.5';
+  onLayerChange();
+  document.getElementById('addModal').classList.add('show');
+}
+
+function closeAddModal() {
+  document.getElementById('addModal').classList.remove('show');
+}
+
+function onLayerChange() {
+  document.getElementById('ownerRow').style.display =
+    document.getElementById('mLayer').value === 'private' ? 'block' : 'none';
+}
+
+document.getElementById('mImportance').addEventListener('input', e => {
+  document.getElementById('mImpVal').textContent = e.target.value;
+});
+
+async function saveMemory() {
+  const editId = document.getElementById('editId').value;
+  const body = {
+    content: document.getElementById('mContent').value,
+    layer: document.getElementById('mLayer').value,
+    room: document.getElementById('mRoom').value,
+    importance: parseFloat(document.getElementById('mImportance').value),
+  };
+  if (body.layer === 'private') {
+    body.owner_ai = document.getElementById('mOwner').value;
+  }
+
+  if (editId) {
+    await api(`/api/memory/${editId}`, { method: 'PUT', body: JSON.stringify(body) });
+  } else {
+    await api('/api/memory/remember', { method: 'POST', body: JSON.stringify(body) });
+  }
+  closeAddModal();
+  loadMemories();
+}
+
+async function editMemory(id) {
+  const data = await api(`/api/memory/list?status=active&per_page=100`);
+  const m = data.items.find(x => x.id === id);
+  if (!m) return;
+  document.getElementById('modalTitle').textContent = '编辑记忆';
+  document.getElementById('editId').value = id;
+  document.getElementById('mContent').value = m.content;
+  document.getElementById('mLayer').value = m.layer;
+  document.getElementById('mRoom').value = m.room;
+  document.getElementById('mImportance').value = m.importance;
+  document.getElementById('mImpVal').textContent = m.importance;
+  onLayerChange();
+  if (m.owner_ai) document.getElementById('mOwner').value = m.owner_ai;
+  document.getElementById('addModal').classList.add('show');
+}
+
+async function archiveMemory(id) {
+  if (!confirm('确定归档？')) return;
+  await api(`/api/memory/${id}/archive`, { method: 'POST' });
+  loadMemories();
+}
+
+async function deleteMemory(id) {
+  if (!confirm('确定删除？')) return;
+  await api(`/api/memory/${id}`, { method: 'DELETE' });
+  loadMemories();
+}
+
+// ── 导出 ──
+async function exportMemories() {
+  const data = await api('/api/export');
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `memory-hub-export-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+}
+
+// ── 衰减 ──
+async function runDecay() {
+  if (!confirm('执行记忆衰减？不重要的老记忆会被自动归档。')) return;
+  const result = await api('/api/daemon/decay', { method: 'POST' });
+  alert(`衰减完成：归档了 ${result.archived} 条，更新了 ${result.decayed} 条`);
+  loadMemories();
+}
+
+// ── 工具 ──
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── 初始化 ──
+if (!TOKEN) {
+  TOKEN = prompt('请输入 Memory Hub 访问密钥:') || '';
+  localStorage.setItem('hub_token', TOKEN);
+}
+loadMemories();
+</script>
+</body>
+</html>
