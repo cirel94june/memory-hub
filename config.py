@@ -175,4 +175,4 @@ DECAY_THRESHOLD = 0.15
 MERGE_SIMILARITY = 0.75
 
 # ── Embedding ──
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")

@@ -272,13 +272,16 @@ async def api_test_llm(authorization: str = Header(default="")):
     """测试 daemon 小模型是否连通"""
     verify_secret(authorization)
     result = await daemon._call_llm("请回复两个字：正常")
-    from config import DAEMON_API_KEY, DAEMON_MODEL, DAEMON_BASE_URL, GEMINI_API_KEY, GEMINI_MODEL
+    from config import DAEMON_API_KEY, DAEMON_MODEL, DAEMON_BASE_URL, GEMINI_API_KEY, GEMINI_MODEL, EMBEDDING_MODEL
+    from embedding import get_embedding
+    emb = await get_embedding("测试向量化")
     return {
-        "result": result,
-        "mode": "relay" if DAEMON_API_KEY else "gemini",
-        "model": DAEMON_MODEL if DAEMON_API_KEY else GEMINI_MODEL,
-        "has_gemini_key": bool(GEMINI_API_KEY),
-        "has_daemon_key": bool(DAEMON_API_KEY),
+        "llm_result": result,
+        "llm_mode": "relay" if DAEMON_API_KEY else "gemini",
+        "llm_model": DAEMON_MODEL if DAEMON_API_KEY else GEMINI_MODEL,
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_ok": emb is not None,
+        "embedding_dim": len(emb) if emb else 0,
     }
 
 
