@@ -17,6 +17,7 @@ mcp = FastMCP(
     stateless_http=True,
     streamable_http_path="/mcp",
     json_response=True,
+    host="0.0.0.0",  # 禁用 localhost-only DNS rebinding protection
 )
 
 
