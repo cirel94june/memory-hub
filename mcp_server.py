@@ -13,7 +13,7 @@ from config import AI_ROLES, ROOMS, list_rooms
 
 mcp = FastMCP(
     "Memory Hub",
-    description="多AI角色共享记忆系统 - 存储、搜索、管理记忆",
+    instructions="多AI角色共享记忆系统 - 存储、搜索、管理记忆",
     stateless_http=True,
 )
 
