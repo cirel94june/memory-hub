@@ -17,6 +17,7 @@ import memory_ops
 import gateway
 import daemon
 import corridor
+from mcp_server import mcp as mcp_server
 
 
 # ── 鉴权 ──
@@ -39,6 +40,11 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
+
+# ── MCP Server 端点 ──
+mcp_app = mcp_server.streamable_http_app()
+app.mount("/mcp", mcp_app)
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 

@@ -1,46 +1,21 @@
 """
 Memory Hub MCP Server
-让 Claude Code 通过 MCP 工具直接操作 Memory Hub
+远程 MCP 端点，直接调用内存中的函数（不走 HTTP 自调自己）
+通过 mount 到 FastAPI 应用提供 streamable HTTP transport
 """
-import os
 import json
-import httpx
 from mcp.server.fastmcp import FastMCP
 
-HUB_URL = os.getenv("MEMORY_HUB_URL", "https://memory-hub-vry8.onrender.com")
-HUB_SECRET = os.getenv("HUB_SECRET", "")
+import memory_ops
+import corridor as corridor_mod
+import daemon
+from config import AI_ROLES, ROOMS, list_rooms
 
 mcp = FastMCP(
     "Memory Hub",
     description="多AI角色共享记忆系统 - 存储、搜索、管理记忆",
+    stateless_http=True,
 )
-
-def _headers():
-    return {"Authorization": f"Bearer {HUB_SECRET}", "Content-Type": "application/json"}
-
-async def _post(path: str, data: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(f"{HUB_URL}{path}", json=data, headers=_headers())
-        r.raise_for_status()
-        return r.json()
-
-async def _get(path: str, params: dict = None) -> dict:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{HUB_URL}{path}", params=params, headers=_headers())
-        r.raise_for_status()
-        return r.json()
-
-async def _put(path: str, data: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.put(f"{HUB_URL}{path}", json=data, headers=_headers())
-        r.raise_for_status()
-        return r.json()
-
-async def _delete(path: str) -> dict:
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.delete(f"{HUB_URL}{path}", headers=_headers())
-        r.raise_for_status()
-        return r.json()
 
 
 @mcp.tool()
@@ -79,15 +54,11 @@ async def remember(
         source_ai: 来源AI（claude/gemini/gpt）
         category: 分类标签
     """
-    result = await _post("/api/memory/remember", {
-        "content": content,
-        "room": room,
-        "importance": importance,
-        "tags": tags,
-        "source_ai": source_ai,
-        "category": category,
-        "source_platform": "claude_code",
-    })
+    result = await memory_ops.remember(
+        content=content, room=room, importance=importance,
+        tags=tags, source_ai=source_ai, category=category,
+        source_platform="mcp",
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -99,13 +70,13 @@ async def recall(query: str, top_k: int = 5) -> str:
         query: 搜索关键词或自然语言描述
         top_k: 返回数量（默认5）
     """
-    result = await _get("/api/memory/recall", {"q": query, "ai_id": "claude", "top_k": top_k})
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    results = await memory_ops.recall(query=query, ai_id="claude", top_k=top_k)
+    return json.dumps({"results": results}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def list_memories(
-    room: str = None,
+    room: str = "",
     status: str = "active",
     page: int = 1,
     per_page: int = 20,
@@ -113,45 +84,42 @@ async def list_memories(
     """列出记忆。可按房间、状态筛选。
 
     Args:
-        room: 房间ID筛选（可选）
+        room: 房间ID筛选（留空=全部）
         status: 状态筛选：active/archived/decayed
         page: 页码
         per_page: 每页数量
     """
-    params = {"status": status, "page": page, "per_page": per_page}
-    if room:
-        params["room"] = room
-    result = await _get("/api/memory/list", params)
+    result = await memory_ops.list_memories(
+        room=room or None, status=status, page=page, per_page=per_page,
+    )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def update_memory(
     memory_id: str,
-    content: str = None,
-    importance: float = None,
-    room: str = None,
-    tags: list[str] = None,
+    content: str = "",
+    importance: float = -1,
+    room: str = "",
+    tags: list[str] = [],
 ) -> str:
     """更新一条已有记忆。
 
     Args:
         memory_id: 记忆ID
-        content: 新内容（可选）
-        importance: 新重要度（可选）
-        room: 移动到新房间（可选）
-        tags: 新标签（可选）
+        content: 新内容（留空=不改）
+        importance: 新重要度（-1=不改）
+        room: 移动到新房间（留空=不改）
+        tags: 新标签（空列表=不改）
     """
-    data = {"changed_by": "claude"}
-    if content is not None:
-        data["content"] = content
-    if importance is not None:
-        data["importance"] = importance
-    if room is not None:
-        data["room"] = room
-    if tags is not None:
-        data["tags"] = tags
-    result = await _put(f"/api/memory/{memory_id}", data)
+    result = await memory_ops.update_memory(
+        memory_id=memory_id,
+        content=content or None,
+        importance=importance if importance >= 0 else None,
+        room=room or None,
+        tags=tags or None,
+        changed_by="claude",
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -162,7 +130,7 @@ async def archive_memory(memory_id: str) -> str:
     Args:
         memory_id: 记忆ID
     """
-    result = await _post(f"/api/memory/{memory_id}/archive", {})
+    result = await memory_ops.archive_memory(memory_id)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -173,22 +141,21 @@ async def delete_memory(memory_id: str) -> str:
     Args:
         memory_id: 记忆ID
     """
-    result = await _delete(f"/api/memory/{memory_id}")
+    result = await memory_ops.delete_memory(memory_id)
     return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
-async def corridor() -> str:
+async def get_corridor() -> str:
     """获取 Claude 的走廊文档 - AI醒来时读的第一份记忆上下文快照。"""
-    result = await _get("/api/corridor/claude")
-    return result.get("corridor", "（走廊为空）")
+    text = await corridor_mod.get_corridor("claude")
+    return text or "（走廊为空）"
 
 
 @mcp.tool()
 async def living_room() -> str:
     """获取客厅内容 - 核心身份和当前状态。"""
-    result = await _get("/api/memory/living-room")
-    items = result.get("items", [])
+    items = await memory_ops.get_living_room()
     if not items:
         return "（客厅为空）"
     return json.dumps(items, ensure_ascii=False, indent=2)
@@ -197,16 +164,16 @@ async def living_room() -> str:
 @mcp.tool()
 async def maintain() -> str:
     """执行记忆整理：合并相似记忆、压缩日记、衰减遗忘、重建走廊。"""
-    result = await _post("/api/daemon/maintain", {})
+    result = await daemon.run_full_maintenance()
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 async def hub_info() -> str:
     """查看 Memory Hub 的角色和房间配置信息。"""
-    result = await _get("/api/info")
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-if __name__ == "__main__":
-    mcp.run()
+    rooms = list_rooms()
+    data = {
+        "roles": AI_ROLES,
+        "rooms": {k: {"name": v["name"], "icon": v.get("icon", ""), "type": v.get("type", "")} for k, v in rooms.items()},
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2)
