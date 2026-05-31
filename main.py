@@ -276,7 +276,15 @@ class MCPGateway:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
             if _mcp_session_manager is not None:
-                await _mcp_session_manager.handle_request(scope, receive, send)
+                try:
+                    await _mcp_session_manager.handle_request(scope, receive, send)
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    await send({"type": "http.response.start", "status": 500,
+                               "headers": [(b"content-type", b"text/plain")]})
+                    await send({"type": "http.response.body",
+                               "body": f"MCP Error: {e}".encode()})
             else:
                 await send({"type": "http.response.start", "status": 503,
                            "headers": [(b"content-type", b"text/plain")]})
