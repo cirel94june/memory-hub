@@ -15,7 +15,7 @@ jobs:
         run: |
           echo "Triggering daemon maintenance..."
           RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.HUB_URL }}/api/daemon/maintain" \
+            "https://xiaokememory.camdvr.org/api/daemon/maintain" \
             -H "Authorization: Bearer ${{ secrets.HUB_SECRET }}" \
             -H "Content-Type: application/json" \
             --max-time 120)

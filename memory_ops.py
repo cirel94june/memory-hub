@@ -97,7 +97,15 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
 
     if importance is not None:
         mem["importance"] = importance
-    if room is not None:
+    if room is not None and room != mem.get("room"):
+        old_path = store._file_path_for_memory(mem)
+        mem["room"] = room
+        from config import get_room
+        new_room_cfg = get_room(room) or {}
+        if new_room_cfg.get("scope") == "per_ai" and not mem.get("owner_ai"):
+            mem["owner_ai"] = changed_by or "claude"
+        store._dirty_files.add(old_path)
+    elif room is not None:
         mem["room"] = room
     if category is not None:
         mem["category"] = category
