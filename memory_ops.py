@@ -1,16 +1,21 @@
 """
-记忆操作：增删改查 + 向量搜索 + 衰减
+记忆操作：增删改查 + 向量搜索 + 衰减 + 自动合并 + 长文拆分
 基于内存操作，后台异步推送到 GitHub
 """
 import json
 import time
 import math
 import asyncio
+import logging
 from datetime import datetime, timezone
 
-from config import DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD, ROOMS, get_room
+from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
+                    MERGE_SIMILARITY, ROOMS, get_room)
 from embedding import get_embedding, pack_embedding, unpack_embedding, cosine_similarity
 import github_store as store
+import analyzer
+
+logger = logging.getLogger("memory_hub.ops")
 
 
 def _now() -> str:
@@ -22,11 +27,24 @@ def _gen_id() -> str:
 
 
 def _schedule_push():
-    """安排一个延迟推送（避免频繁写 GitHub）"""
     asyncio.get_event_loop().call_later(5.0, lambda: asyncio.ensure_future(store.push_dirty()))
 
 
-# ── 写入记忆 ──
+def _fuzzy_score(query: str, text: str) -> float:
+    if not query or not text:
+        return 0.0
+    query_lower = query.lower()
+    text_lower = text.lower()
+    if query_lower in text_lower:
+        return 1.0
+    words = query_lower.split()
+    if not words:
+        return 0.0
+    matched = sum(1 for w in words if w in text_lower)
+    return matched / len(words)
+
+
+# ── 写入记忆（带自动打标 + 合并检测） ──
 
 async def remember(
     content: str,
@@ -39,8 +57,32 @@ async def remember(
     source_ai: str = "",
     source_platform: str = "",
     tags: list[str] = None,
+    auto_analyze: bool = True,
+    auto_merge: bool = True,
 ) -> dict:
-    """写入一条新记忆"""
+    """写入一条新记忆，自动打标 + 合并检测"""
+
+    # Step 1: 自动打标
+    analysis = None
+    if auto_analyze:
+        analysis = await analyzer.analyze(content)
+        if not tags:
+            tags = analysis.get("tags", [])
+        if not category and analysis.get("suggested_category"):
+            category = analysis["suggested_category"]
+        if emotion_arousal == 0.3 and analysis.get("arousal") is not None:
+            emotion_arousal = analysis["arousal"]
+
+    domain = analysis.get("domain", []) if analysis else []
+    valence = analysis.get("valence", 0.5) if analysis else 0.5
+
+    # Step 2: 合并检测
+    if auto_merge:
+        merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal)
+        if merge_result:
+            return merge_result
+
+    # Step 3: 新建记忆
     mem_id = _gen_id()
     now = _now()
     vec = await get_embedding(content)
@@ -54,6 +96,8 @@ async def remember(
         "owner_ai": owner_ai,
         "importance": importance,
         "emotion_arousal": emotion_arousal,
+        "valence": valence,
+        "domain": json.dumps(domain),
         "decay_score": 1.0,
         "activation_count": 0,
         "last_activated": "",
@@ -70,7 +114,113 @@ async def remember(
 
     store.set_memory(mem)
     _schedule_push()
-    return {"id": mem_id, "status": "created"}
+    return {"id": mem_id, "status": "created", "category": category, "domain": domain}
+
+
+async def _try_merge(content: str, domain: list, tags: list, importance: float,
+                     valence: float, arousal: float) -> dict | None:
+    """查找最相似的已有记忆，如果超过阈值则合并"""
+    query_vec = await get_embedding(content)
+    if not query_vec:
+        return None
+
+    best_mem = None
+    best_score = 0.0
+
+    for mem in store.get_all_memories().values():
+        if mem.get("status") != "active" or not mem.get("embedding"):
+            continue
+
+        mem_vec = unpack_embedding(mem["embedding"])
+        vec_sim = cosine_similarity(query_vec, mem_vec)
+
+        # domain 匹配加分
+        mem_domain = _parse_json_field(mem.get("domain", "[]"))
+        domain_bonus = 0.05 if any(d in mem_domain for d in domain) else 0.0
+
+        score = vec_sim + domain_bonus
+        if score > best_score:
+            best_score = score
+            best_mem = mem
+
+    if not best_mem or best_score < MERGE_SIMILARITY:
+        return None
+
+    # 执行合并
+    merged_content = await analyzer.merge(best_mem["content"], content)
+    now = _now()
+    vec = await get_embedding(merged_content)
+
+    best_mem["content"] = merged_content
+    best_mem["updated_at"] = now
+    best_mem["importance"] = max(float(best_mem.get("importance", 0.5)), importance)
+    best_mem["emotion_arousal"] = (float(best_mem.get("emotion_arousal", 0.3)) + arousal) / 2
+    best_mem["valence"] = (float(best_mem.get("valence", 0.5)) + valence) / 2
+
+    old_tags = set(_parse_json_field(best_mem.get("tags", "[]")))
+    old_tags.update(tags or [])
+    best_mem["tags"] = json.dumps(list(old_tags)[:20])
+
+    old_domain = set(_parse_json_field(best_mem.get("domain", "[]")))
+    old_domain.update(domain)
+    best_mem["domain"] = json.dumps(list(old_domain)[:5])
+
+    if vec:
+        best_mem["embedding"] = pack_embedding(vec)
+
+    history = best_mem.get("history", [])
+    history.append({"v": len(history) + 1, "content": merged_content, "date": now, "by": "auto_merge"})
+    best_mem["history"] = history
+
+    store.set_memory(best_mem)
+    _schedule_push()
+
+    logger.info(f"Merged into {best_mem['id']} (score={best_score:.3f})")
+    return {"id": best_mem["id"], "status": "merged", "score": round(best_score, 3)}
+
+
+# ── 长文拆分（grow） ──
+
+async def grow(
+    content: str,
+    source_ai: str = "",
+    auto_merge: bool = True,
+) -> dict:
+    """把长文本拆分成多条独立记忆，每条独立走合并检测"""
+    items = await analyzer.digest(content)
+    if not items:
+        result = await remember(content, source_ai=source_ai, auto_merge=auto_merge)
+        return {"total": 1, "created": 1, "merged": 0, "items": [result]}
+
+    created = 0
+    merged = 0
+    results = []
+    for item in items:
+        r = await remember(
+            content=item["content"],
+            room=item.get("room", "living_room"),
+            category=item.get("name", ""),
+            importance=item.get("importance", 0.5),
+            emotion_arousal=item.get("arousal", 0.3),
+            source_ai=source_ai,
+            tags=item.get("tags"),
+            auto_analyze=False,
+            auto_merge=auto_merge,
+        )
+        # Set domain/valence from digest result
+        if r.get("status") == "created":
+            mem = store.get_memory(r["id"])
+            if mem:
+                mem["domain"] = json.dumps(item.get("domain", []))
+                mem["valence"] = item.get("valence", 0.5)
+                store.set_memory(mem)
+            created += 1
+        elif r.get("status") == "merged":
+            merged += 1
+        results.append(r)
+
+    _schedule_push()
+    return {"total": len(results), "created": created, "merged": merged, "items": results}
 
 
 # ── 更新记忆 ──
@@ -78,7 +228,6 @@ async def remember(
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
                         owner_ai: str = None, changed_by: str = "") -> dict:
-    """更新已有记忆"""
     mem = store.get_memory(memory_id)
     if not mem:
         return {"id": memory_id, "status": "not_found"}
@@ -100,7 +249,6 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
     if room is not None and room != mem.get("room"):
         old_path = store._file_path_for_memory(mem)
         mem["room"] = room
-        from config import get_room
         new_room_cfg = get_room(room) or {}
         if new_room_cfg.get("scope") == "per_ai" and not mem.get("owner_ai"):
             mem["owner_ai"] = changed_by or "claude"
@@ -119,50 +267,117 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
     return {"id": memory_id, "status": "updated"}
 
 
-# ── 召回记忆（向量搜索） ──
+# ── 召回记忆（多维搜索） ──
+
+def _parse_json_field(val) -> list:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:
+            return []
+    return []
+
 
 async def recall(
     query: str,
     ai_id: str = "",
     top_k: int = 8,
-    threshold: float = 0.35,
+    threshold: float = 0.30,
     include_rooms: list[str] = None,
     exclude_isolated: bool = True,
+    query_domain: list[str] = None,
+    query_valence: float = -1,
+    query_arousal: float = -1,
 ) -> list[dict]:
-    """智能召回记忆"""
+    """多维搜索召回记忆"""
     query_vec = await get_embedding(query)
     if not query_vec:
         return []
 
-    all_mems = store.get_all_memories()
-    isolated_rooms = {k for k, v in ROOMS.items() if v.get("isolated")}
+    # 如果没指定 domain，用 analyzer 快速分析 query
+    if not query_domain:
+        try:
+            q_analysis = await analyzer.analyze(query)
+            query_domain = q_analysis.get("domain", [])
+            if query_valence < 0:
+                query_valence = q_analysis.get("valence", 0.5)
+            if query_arousal < 0:
+                query_arousal = q_analysis.get("arousal", 0.3)
+        except Exception:
+            query_domain = []
 
-    scored = []
+    all_mems = store.get_all_memories()
+    isolated_rooms = {k for k, v in ROOMS.items() if v.get("type") == "isolated"}
+
+    candidates = []
     for mem in all_mems.values():
         if mem.get("status") != "active":
             continue
         if not mem.get("embedding"):
             continue
-
-        # 房间过滤
         room = mem.get("room", "")
         if exclude_isolated and room in isolated_rooms:
             continue
         if include_rooms and room not in include_rooms:
             continue
-
-        # 私有权限
         if mem.get("layer") == "private":
             if not ai_id or mem.get("owner_ai") != ai_id:
                 continue
+        candidates.append(mem)
 
-        # 计算综合评分
+    # Domain 预筛：如果有 domain，优先匹配的排前面
+    scored = []
+    for mem in candidates:
         mem_vec = unpack_embedding(mem["embedding"])
         vec_sim = cosine_similarity(query_vec, mem_vec)
-        importance = float(mem.get("importance", 0.5))
-        decay = float(mem.get("decay_score", 1.0))
-        activation_bonus = min(float(mem.get("activation_count", 0)) / 20.0, 1.0)
-        final = vec_sim * 0.55 + importance * 0.2 + decay * 0.15 + activation_bonus * 0.1
+
+        # Topic score: fuzzy match on category + domain + tags + content
+        mem_domain = _parse_json_field(mem.get("domain", "[]"))
+        mem_tags = _parse_json_field(mem.get("tags", "[]"))
+        cat = mem.get("category", "")
+
+        domain_match = _fuzzy_score(
+            " ".join(query_domain),
+            " ".join(mem_domain)
+        ) if query_domain else 0.0
+        tag_match = _fuzzy_score(query, " ".join(mem_tags))
+        cat_match = _fuzzy_score(query, cat)
+        content_match = _fuzzy_score(query, mem.get("content", "")[:200])
+
+        topic_score = (cat_match * 3 + domain_match * 2.5 + tag_match * 2 + content_match * 1) / 8.5
+
+        # Embedding score (normalized to 0-1)
+        embed_score = max(0, vec_sim)
+
+        # Emotion score
+        if query_valence >= 0 and query_arousal >= 0:
+            mv = float(mem.get("valence", 0.5))
+            ma = float(mem.get("emotion_arousal", 0.3))
+            emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
+        else:
+            emotion_score = 0.5
+
+        # Time score
+        try:
+            created = datetime.fromisoformat(mem["created_at"])
+            days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
+            time_score = math.exp(-0.02 * days)
+        except Exception:
+            time_score = 0.5
+
+        # Importance score
+        importance_score = float(mem.get("importance", 0.5))
+
+        # Combined: embedding dominates but other dims help
+        final = (
+            embed_score * 5.0 +
+            topic_score * 4.0 +
+            emotion_score * 2.0 +
+            time_score * 1.5 +
+            importance_score * 1.0
+        ) / 13.5
 
         if final >= threshold:
             scored.append({
@@ -171,7 +386,10 @@ async def recall(
                 "layer": mem.get("layer", ""),
                 "room": room,
                 "category": mem.get("category", ""),
-                "importance": importance,
+                "domain": mem_domain,
+                "importance": float(mem.get("importance", 0.5)),
+                "valence": float(mem.get("valence", 0.5)),
+                "arousal": float(mem.get("emotion_arousal", 0.3)),
                 "score": round(final, 4),
                 "created_at": mem.get("created_at", ""),
             })
@@ -229,8 +447,6 @@ async def list_memories(
     status: str = "active", page: int = 1, per_page: int = 20,
 ) -> dict:
     all_mems = list(store.get_all_memories().values())
-
-    # 过滤
     filtered = []
     for m in all_mems:
         if layer and m.get("layer") != layer:
@@ -248,7 +464,6 @@ async def list_memories(
     start = (page - 1) * per_page
     items = filtered[start:start + per_page]
 
-    # 导出时去掉 embedding 和 history（前端不需要）
     clean = []
     for m in items:
         c = {k: v for k, v in m.items() if k not in ("embedding", "history")}
@@ -275,7 +490,7 @@ async def delete_memory(memory_id: str) -> dict:
     return {"id": memory_id, "status": "deleted"}
 
 
-# ── 记忆衰减 ──
+# ── 记忆衰减（含情感维度） ──
 
 async def run_decay() -> dict:
     now_dt = datetime.now(timezone.utc)
@@ -296,11 +511,11 @@ async def run_decay() -> dict:
         arousal = float(mem.get("emotion_arousal", 0.3))
         activations = int(mem.get("activation_count", 0))
 
-        # 检查房间是否快速衰减
         room_cfg = get_room(mem.get("room", "")) or {}
         lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
 
-        emotion_weight = 0.7 + (arousal * 0.6)
+        # 高唤醒记忆衰减更慢
+        emotion_weight = 1.0 + (arousal * 0.8)
         new_score = importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight
         new_score = min(new_score, 1.0)
 

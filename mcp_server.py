@@ -26,42 +26,45 @@ async def remember(
     content: str,
     room: str = "living_room",
     importance: float = 0.5,
-    tags: list[str] = [],
     source_ai: str = "claude",
-    category: str = "",
 ) -> str:
-    """存储一条新记忆到 Memory Hub。
+    """存储一条新记忆。系统会自动打标签、自动合并重复内容。
 
     房间选择：
-    - living_room: 核心身份、当前状态（永远注入）
-    - career: 职业生涯
-    - psychology: 心理状态
-    - health: 身体健康
-    - learning: 学习目标
-    - relationships: 人际关系
-    - preferences: 兴趣偏好
+    - living_room: 核心身份（永远注入）
+    - career/psychology/health/learning/relationships/preferences: 各主题共享房间
     - work_tasks: 工作事务（快速衰减）
-    - infra: 基建总览（项目/架构/部署）
-    - infra_changelog: 基建更新日志
-    - diary: 日记本（per_ai私有）
-    - dreams: 梦境/自省（per_ai私有）
-    - relationship: 和用户的关系（per_ai私有）
-    - personality: 自我认知（per_ai私有）
-    - game_room: 游戏房（隔离）
+    - infra/infra_changelog: 基建相关
+    - diary/dreams/relationship/personality: AI私有房间
 
     Args:
         content: 记忆内容
         room: 房间ID
-        importance: 重要度 0-1，越高越不容易被遗忘
-        tags: 标签列表
+        importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
-        category: 分类标签
     """
     result = await memory_ops.remember(
         content=content, room=room, importance=importance,
-        tags=tags, source_ai=source_ai, category=category,
-        source_platform="mcp",
+        source_ai=source_ai, source_platform="mcp",
     )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def grow(
+    content: str,
+    source_ai: str = "claude",
+) -> str:
+    """把一大段混合内容（日记、对话总结等）拆分成多条独立记忆。
+    系统自动拆分主题、分配房间、打标签、合并重复。
+
+    Args:
+        content: 要整理的长文本
+        source_ai: 来源AI
+    """
+    result = await memory_ops.grow(content=content, source_ai=source_ai)
+    summary = f"{result['total']}条|新{result['created']}合{result['merged']}"
+    result["summary"] = summary
     return json.dumps(result, ensure_ascii=False)
 
 

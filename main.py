@@ -177,6 +177,17 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
     return result
 
 
+class GrowRequest(BaseModel):
+    content: str
+    source_ai: str = ""
+
+@app.post("/api/memory/grow")
+async def api_grow(body: GrowRequest, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    result = await memory_ops.grow(content=body.content, source_ai=body.source_ai)
+    return result
+
+
 @app.get("/api/memory/recall")
 async def api_recall(
     q: str, ai_id: str = "", top_k: int = 8,

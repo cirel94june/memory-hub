@@ -364,6 +364,11 @@ body {
 </div>
 
 <script>
+function parseDomain(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') try { return JSON.parse(v); } catch(e) {}
+  return [];
+}
 const API = '';  // 同域部署时留空
 let TOKEN = localStorage.getItem('hub_token') || '';
 let currentFilter = 'all';
@@ -412,12 +417,11 @@ function renderMemories(items) {
         <div class="memory-content">${escHtml(m.content)}</div>
         <div class="memory-meta">
           <span class="tag tag-room">${m.room}</span>
-          <span class="tag tag-layer">${m.layer}</span>
           ${m.owner_ai ? `<span class="tag tag-ai" style="background:${aiColors[m.owner_ai]||'#888'}">${m.owner_ai}</span>` : ''}
-          <span>重要度: <span class="importance-bar"><span class="importance-fill" style="width:${impPct}%"></span></span> ${m.importance}</span>
+          ${(parseDomain(m.domain)||[]).map(d => `<span class="tag" style="background:#e8f4f8;color:#2980b9">${d}</span>`).join('')}
+          <span>重要度:${m.importance} ${m.valence != null ? `V:${(m.valence||0).toFixed(1)}` : ''} ${m.emotion_arousal != null ? `A:${(m.emotion_arousal||0).toFixed(1)}` : ''}</span>
           ${decayWarn}
           <span>${m.created_at?.slice(0,10) || ''}</span>
-          ${m.source_platform ? `<span>via ${m.source_platform}</span>` : ''}
         </div>
         <div class="memory-actions">
           <button class="btn" onclick="editMemory('${m.id}')">编辑</button>
