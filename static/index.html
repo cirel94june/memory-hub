@@ -318,10 +318,29 @@ body {
     <label>内容</label>
     <textarea id="mContent" placeholder="要记住的内容..."></textarea>
 
-    <label>层级</label>
-    <select id="mLayer" onchange="onLayerChange()">
-      <option value="shared">共享（所有 AI 可见）</option>
-      <option value="private">私有（指定 AI 专属）</option>
+    <label>房间</label>
+    <select id="mRoom" onchange="onRoomChange()">
+      <optgroup label="共享房间">
+        <option value="living_room">🏠 客厅（核心信息）</option>
+        <option value="career">💼 职业生涯</option>
+        <option value="psychology">🧠 心理状态</option>
+        <option value="health">❤️ 身体健康</option>
+        <option value="learning">📚 学习目标</option>
+        <option value="relationships">👥 人际关系</option>
+        <option value="preferences">✨ 兴趣偏好</option>
+        <option value="work_tasks">📋 工作事务</option>
+        <option value="infra">🏗️ 基建总览</option>
+        <option value="infra_changelog">📝 基建更新日志</option>
+      </optgroup>
+      <optgroup label="AI 私有房间">
+        <option value="diary">📔 日记本</option>
+        <option value="dreams">🌙 梦境</option>
+        <option value="relationship">💕 和用户的关系</option>
+        <option value="personality">🪞 自我认知</option>
+      </optgroup>
+      <optgroup label="隔离房间">
+        <option value="game_room">🎮 游戏房</option>
+      </optgroup>
     </select>
 
     <div id="ownerRow" style="display:none">
@@ -332,18 +351,6 @@ body {
         <option value="gpt">GPT</option>
       </select>
     </div>
-
-    <label>房间</label>
-    <select id="mRoom">
-      <option value="living_room">客厅（核心信息）</option>
-      <option value="study_career">职业生涯</option>
-      <option value="study_psychology">心理状态</option>
-      <option value="study_health">身体健康</option>
-      <option value="study_learning">学习目标</option>
-      <option value="study_relationships">人际关系</option>
-      <option value="study_preferences">兴趣偏好</option>
-      <option value="game_room">游戏房</option>
-    </select>
 
     <label>重要度</label>
     <input type="range" id="mImportance" min="0" max="1" step="0.1" value="0.5">
@@ -461,7 +468,7 @@ function openAddModal() {
   document.getElementById('mRoom').value = 'living_room';
   document.getElementById('mImportance').value = 0.5;
   document.getElementById('mImpVal').textContent = '0.5';
-  onLayerChange();
+  onRoomChange();
   document.getElementById('addModal').classList.add('show');
 }
 
@@ -469,9 +476,11 @@ function closeAddModal() {
   document.getElementById('addModal').classList.remove('show');
 }
 
-function onLayerChange() {
+const perAiRooms = ['diary', 'dreams', 'relationship', 'personality'];
+function onRoomChange() {
+  const room = document.getElementById('mRoom').value;
   document.getElementById('ownerRow').style.display =
-    document.getElementById('mLayer').value === 'private' ? 'block' : 'none';
+    perAiRooms.includes(room) ? 'block' : 'none';
 }
 
 document.getElementById('mImportance').addEventListener('input', e => {
@@ -480,14 +489,17 @@ document.getElementById('mImportance').addEventListener('input', e => {
 
 async function saveMemory() {
   const editId = document.getElementById('editId').value;
+  const room = document.getElementById('mRoom').value;
   const body = {
     content: document.getElementById('mContent').value,
-    layer: document.getElementById('mLayer').value,
-    room: document.getElementById('mRoom').value,
+    room: room,
     importance: parseFloat(document.getElementById('mImportance').value),
   };
-  if (body.layer === 'private') {
+  if (perAiRooms.includes(room)) {
     body.owner_ai = document.getElementById('mOwner').value;
+    body.layer = 'private';
+  } else {
+    body.layer = 'shared';
   }
 
   if (editId) {
@@ -506,11 +518,10 @@ async function editMemory(id) {
   document.getElementById('modalTitle').textContent = '编辑记忆';
   document.getElementById('editId').value = id;
   document.getElementById('mContent').value = m.content;
-  document.getElementById('mLayer').value = m.layer;
   document.getElementById('mRoom').value = m.room;
   document.getElementById('mImportance').value = m.importance;
   document.getElementById('mImpVal').textContent = m.importance;
-  onLayerChange();
+  onRoomChange();
   if (m.owner_ai) document.getElementById('mOwner').value = m.owner_ai;
   document.getElementById('addModal').classList.add('show');
 }

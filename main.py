@@ -163,6 +163,7 @@ class UpdateRequest(BaseModel):
     room: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[list[str]] = None
+    owner_ai: Optional[str] = None
     changed_by: str = ""
 
 @app.put("/api/memory/{memory_id}")
@@ -171,7 +172,7 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
     result = await memory_ops.update_memory(
         memory_id=memory_id, content=body.content, importance=body.importance,
         room=body.room, category=body.category, tags=body.tags,
-        changed_by=body.changed_by,
+        owner_ai=body.owner_ai, changed_by=body.changed_by,
     )
     return result
 

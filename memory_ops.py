@@ -77,7 +77,7 @@ async def remember(
 
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
-                        changed_by: str = "") -> dict:
+                        owner_ai: str = None, changed_by: str = "") -> dict:
     """更新已有记忆"""
     mem = store.get_memory(memory_id)
     if not mem:
@@ -111,6 +111,8 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
         mem["category"] = category
     if tags is not None:
         mem["tags"] = json.dumps(tags)
+    if owner_ai is not None:
+        mem["owner_ai"] = owner_ai
 
     store.set_memory(mem)
     _schedule_push()
