@@ -11,7 +11,10 @@ HEADERS = {"Authorization": f"Bearer {SECRET}", "Content-Type": "application/jso
 
 
 def api(method, path, body=None):
-    r = getattr(httpx, method)(f"{BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    kwargs = {"headers": HEADERS, "timeout": 30}
+    if body is not None:
+        kwargs["json"] = body
+    r = getattr(httpx, method)(f"{BASE}{path}", **kwargs)
     return r.json()
 
 
