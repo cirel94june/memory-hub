@@ -227,7 +227,7 @@ async def grow(
 
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
-                        owner_ai: str = None, changed_by: str = "") -> dict:
+                        owner_ai: str = None, layer: str = None, changed_by: str = "") -> dict:
     mem = store.get_memory(memory_id)
     if not mem:
         return {"id": memory_id, "status": "not_found"}
@@ -261,6 +261,8 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
         mem["tags"] = json.dumps(tags)
     if owner_ai is not None:
         mem["owner_ai"] = owner_ai
+    if layer is not None:
+        mem["layer"] = layer
 
     store.set_memory(mem)
     _schedule_push()
