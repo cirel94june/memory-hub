@@ -1,16 +1,14 @@
 """
 记忆分析器：自动打标、合并、拆分
-使用 Gemini Flash 免费 API
+使用中转站的小模型（OpenAI 兼容格式）
 """
 import json
 import logging
 import httpx
 
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
 
 logger = logging.getLogger("memory_hub.analyzer")
-
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出结构化的元数据。
 
@@ -94,21 +92,24 @@ valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
 
 
-async def _call_gemini(system_prompt: str, user_content: str, temperature: float = 0.1) -> str:
-    if not GEMINI_API_KEY:
+async def _call_llm(system_prompt: str, user_content: str, temperature: float = 0.1) -> str:
+    """调用中转站小模型（OpenAI 兼容格式）"""
+    if not LLM_API_KEY:
+        logger.warning("LLM_API_KEY not set, skipping LLM call")
         return ""
-    async with httpx.AsyncClient(timeout=30) as client:
+    url = f"{LLM_BASE_URL}/chat/completions"
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            GEMINI_URL,
-            headers={"Authorization": f"Bearer {GEMINI_API_KEY}"},
+            url,
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
             json={
-                "model": GEMINI_MODEL,
+                "model": LLM_MODEL,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 "temperature": temperature,
-                "max_tokens": 2048,
+                "max_tokens": 4096,
             },
         )
         resp.raise_for_status()
@@ -126,7 +127,9 @@ def _parse_json(text: str):
 async def analyze(content: str) -> dict:
     """自动分析内容，返回 domain/valence/arousal/tags/category"""
     try:
-        raw = await _call_gemini(ANALYZE_PROMPT, content)
+        raw = await _call_llm(ANALYZE_PROMPT, content)
+        if not raw:
+            return {"domain": [], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_category": ""}
         result = _parse_json(raw)
         return {
             "domain": result.get("domain", [])[:3],
@@ -141,10 +144,24 @@ async def analyze(content: str) -> dict:
 
 
 async def merge(old_content: str, new_content: str) -> str:
-    """合并新旧记忆内容"""
+    """合并新旧记忆内容。安全校验：合并结果不能比原文短太多。"""
     try:
         prompt = f"=== 旧记忆 ===\n{old_content}\n\n=== 新内容 ===\n{new_content}"
-        return await _call_gemini(MERGE_PROMPT, prompt)
+        merged = await _call_llm(MERGE_PROMPT, prompt)
+        if not merged:
+            logger.warning("Merge LLM returned empty, keeping original")
+            return f"{old_content}\n\n---更新---\n{new_content}"
+
+        # 安全校验：合并结果不能比两段原文中较长的那段还短超过50%
+        max_original = max(len(old_content), len(new_content))
+        if len(merged) < max_original * 0.5:
+            logger.warning(
+                f"Merge result too short ({len(merged)} chars vs original {max_original} chars), "
+                f"rejecting merge to prevent data loss"
+            )
+            return f"{old_content}\n\n---更新---\n{new_content}"
+
+        return merged
     except Exception as e:
         logger.warning(f"Merge failed: {e}")
         return f"{old_content}\n\n---更新---\n{new_content}"
@@ -153,15 +170,20 @@ async def merge(old_content: str, new_content: str) -> str:
 async def digest(content: str) -> list[dict]:
     """把长文本拆分成多条独立记忆"""
     try:
-        raw = await _call_gemini(DIGEST_PROMPT, content, temperature=0.0)
+        raw = await _call_llm(DIGEST_PROMPT, content, temperature=0.0)
+        if not raw:
+            return []
         items = _parse_json(raw)
         if not isinstance(items, list):
             return []
         result = []
         for item in items[:6]:
+            item_content = str(item.get("content", ""))
+            if not item_content or len(item_content) < 10:
+                continue  # 跳过空的或过短的拆分结果
             result.append({
                 "name": str(item.get("name", ""))[:20],
-                "content": str(item.get("content", "")),
+                "content": item_content,
                 "domain": (item.get("domain") or [])[:3],
                 "valence": max(0.0, min(1.0, float(item.get("valence", 0.5)))),
                 "arousal": max(0.0, min(1.0, float(item.get("arousal", 0.3)))),

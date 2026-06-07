@@ -14,13 +14,26 @@ DATA_DIR.mkdir(exist_ok=True)
 HUB_SECRET = os.getenv("HUB_SECRET", "change-me-in-production")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# ── Daemon 小模型配置 ──
-# 模式1 (默认): Gemini 免费 API（GEMINI_API_KEY + GEMINI_MODEL）
-# 模式2: OpenAI 兼容中转站（设 DAEMON_API_KEY + DAEMON_BASE_URL + DAEMON_MODEL）
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-DAEMON_API_KEY = os.getenv("DAEMON_API_KEY", "")
-DAEMON_MODEL = os.getenv("DAEMON_MODEL", "deepseek-chat")
-DAEMON_BASE_URL = os.getenv("DAEMON_BASE_URL", "https://api.dzzi.ai/v1")
+# ── 小模型配置（analyzer / daemon / gateway 统一使用） ──
+# 全部走 OpenAI 兼容格式的中转站，改 .env 即可换模型
+# 推荐便宜快速的模型：deepseek-v4-flash, deepseek-chat, kimi-* 等
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://relay-cache.sharkielab.com/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+
+# 兼容旧配置（如果 .env 里还是旧变量名）
+if not LLM_API_KEY:
+    LLM_API_KEY = os.getenv("DAEMON_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+if os.getenv("DAEMON_BASE_URL"):
+    LLM_BASE_URL = os.getenv("DAEMON_BASE_URL")
+if os.getenv("DAEMON_MODEL"):
+    LLM_MODEL = os.getenv("DAEMON_MODEL")
+
+# 旧变量别名（让还在引用旧名的代码不崩）
+GEMINI_MODEL = LLM_MODEL
+DAEMON_API_KEY = LLM_API_KEY
+DAEMON_MODEL = LLM_MODEL
+DAEMON_BASE_URL = LLM_BASE_URL
 
 # ── AI 角色定义 ──
 AI_ROLES = {

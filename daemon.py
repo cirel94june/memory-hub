@@ -10,8 +10,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-from config import (GEMINI_API_KEY, GEMINI_MODEL, MERGE_SIMILARITY, get_room,
-                     DAEMON_MODEL, DAEMON_API_KEY, DAEMON_BASE_URL)
+from config import (LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, MERGE_SIMILARITY, get_room)
 from embedding import get_embedding, cosine_similarity, unpack_embedding, pack_embedding
 import github_store as store
 
@@ -19,51 +18,30 @@ log = logging.getLogger("daemon")
 
 
 async def _call_llm(prompt: str) -> str:
-    """调用小模型做整理。优先用中转站（如果配了 DAEMON_API_KEY），否则用 Gemini 免费 API"""
+    """调用中转站小模型做整理（OpenAI 兼容格式）"""
     import httpx
 
-    # 模式1: 中转站 / OpenAI 兼容 API
-    if DAEMON_API_KEY:
-        url = f"{DAEMON_BASE_URL}/chat/completions"
-        headers = {"Authorization": f"Bearer {DAEMON_API_KEY}", "Content-Type": "application/json"}
-        body = {
-            "model": DAEMON_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 512,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                result = resp.json()["choices"][0]["message"]["content"]
-                log.info(f"LLM OK ({DAEMON_MODEL})")
-                return result
-        except Exception as e:
-            log.error(f"Relay LLM error ({DAEMON_MODEL}@{DAEMON_BASE_URL}): {e}")
-            # 中转站失败，尝试 Gemini 兜底
-            if not GEMINI_API_KEY:
-                return ""
-
-    # 模式2: Gemini 免费 API（默认兜底）
-    if not GEMINI_API_KEY:
-        log.warning("No API key configured for daemon LLM")
+    if not LLM_API_KEY:
+        log.warning("LLM_API_KEY not set, skipping daemon LLM call")
         return ""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"{LLM_BASE_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512},
+        "model": LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 2048,
     }
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(url, json=body)
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, json=body, headers=headers)
             resp.raise_for_status()
-            result = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            log.info(f"Gemini OK ({GEMINI_MODEL})")
+            result = resp.json()["choices"][0]["message"]["content"]
+            log.info(f"LLM OK ({LLM_MODEL})")
             return result
     except Exception as e:
-        log.error(f"Gemini error ({GEMINI_MODEL}): {e}")
+        log.error(f"LLM error ({LLM_MODEL}@{LLM_BASE_URL}): {e}")
         return ""
 
 

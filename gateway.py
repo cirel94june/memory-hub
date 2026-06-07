@@ -5,28 +5,32 @@ Memory Gateway：小模型预处理层
 """
 import json
 import httpx
-from config import GEMINI_API_KEY, ROOMS
+from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
 
 
-async def _call_gemini_flash(prompt: str) -> str:
-    """调用 Gemini Flash（便宜的小模型）做记忆判断"""
-    if not GEMINI_API_KEY:
+async def _call_llm(prompt: str) -> str:
+    """调用中转站小模型做记忆判断（OpenAI 兼容格式）"""
+    if not LLM_API_KEY:
         return ""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
-    }
+    url = f"{LLM_BASE_URL}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=body)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                },
+            )
             resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"[Gateway] Gemini Flash error: {e}")
+        print(f"[Gateway] LLM error: {e}")
         return ""
 
 
@@ -74,7 +78,7 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
 只输出 JSON，不要其他内容。示例：["study_health", "study_career"]"""
 
     rooms_to_check = []
-    result = await _call_gemini_flash(judge_prompt)
+    result = await _call_llm(judge_prompt)
     if result:
         try:
             # 提取 JSON
@@ -149,7 +153,7 @@ AI回复：{ai_response[:500]}
 如果没有值得记住的，输出 {{"actions": []}}
 只输出 JSON。"""
 
-    result = await _call_gemini_flash(prompt)
+    result = await _call_llm(prompt)
     actions_data = {"actions": []}
 
     if result:

@@ -146,8 +146,12 @@ async def _try_merge(content: str, domain: list, tags: list, importance: float,
     if not best_mem or best_score < MERGE_SIMILARITY:
         return None
 
-    # 执行合并
-    merged_content = await analyzer.merge(best_mem["content"], content)
+    # 执行合并（保留原文用于回滚）
+    original_content = best_mem["content"]
+    merged_content = await analyzer.merge(original_content, content)
+
+    # 双重安全：如果合并结果和原文一模一样（说明 merge 返回了拼接而非真正合并），也接受
+    # 但如果合并结果异常短，analyzer.merge 内部已经会拒绝并返回拼接版本
     now = _now()
     vec = await get_embedding(merged_content)
 
@@ -169,6 +173,8 @@ async def _try_merge(content: str, domain: list, tags: list, importance: float,
         best_mem["embedding"] = pack_embedding(vec)
 
     history = best_mem.get("history", [])
+    # 先备份合并前的原文，再记录合并后的内容
+    history.append({"v": len(history) + 1, "content": original_content, "date": now, "by": "pre_merge_backup"})
     history.append({"v": len(history) + 1, "content": merged_content, "date": now, "by": "auto_merge"})
     best_mem["history"] = history
 

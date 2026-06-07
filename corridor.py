@@ -13,29 +13,10 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from config import GEMINI_API_KEY, AI_ROLES
+from config import AI_ROLES
 import github_store as store
 
 log = logging.getLogger("corridor")
-
-
-async def _call_gemini_flash(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        return ""
-    import httpx
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 800},
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json=body)
-            resp.raise_for_status()
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        log.error(f"Gemini Flash error: {e}")
-        return ""
 
 
 async def build_corridor(ai_id: str) -> str:
