@@ -1,20 +1,20 @@
 """
-向量化引擎：支持多种 embedding 后端
-优先级：EMBEDDING_BASE_URL(自定义) > HuggingFace Inference API > Gemini
+向量化引擎：本地 ONNX embedding（fastembed）
+模型：all-MiniLM-L6-v2，384维，首次运行自动下载 ~25MB
 """
-import os
 import math
 import struct
-import httpx
 
-from config import GEMINI_API_KEY, EMBEDDING_MODEL
+from fastembed import TextEmbedding
 
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
+_model = None
 
-# HuggingFace 免费 Inference API 的模型
-HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+
+def _get_model():
+    global _model
+    if _model is None:
+        _model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _model
 
 
 def pack_embedding(values: list[float]) -> bytes:
@@ -38,78 +38,13 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 async def get_embedding(text: str) -> list[float] | None:
-    """获取文本 embedding，按优先级尝试多种后端"""
-    text = text[:2000]
-
-    # 1. 自定义 OpenAI 兼容 API（如果配了 EMBEDDING_BASE_URL）
-    if EMBEDDING_BASE_URL:
-        result = await _openai_embedding(text)
-        if result:
-            return result
-
-    # 2. HuggingFace Inference API（免费，无需 token 也能用）
-    result = await _hf_embedding(text)
-    if result:
-        return result
-
-    # 3. Gemini（fallback）
-    if GEMINI_API_KEY:
-        result = await _gemini_embedding(text)
-        if result:
-            return result
-
-    return None
-
-
-async def _openai_embedding(text: str) -> list[float] | None:
-    """OpenAI 兼容格式的 embedding API"""
-    url = f"{EMBEDDING_BASE_URL}/embeddings"
-    headers = {"Content-Type": "application/json"}
-    if EMBEDDING_API_KEY:
-        headers["Authorization"] = f"Bearer {EMBEDDING_API_KEY}"
-    body = {"model": EMBEDDING_MODEL, "input": text}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
-    except Exception as e:
-        print(f"[Embedding/OpenAI] error: {e}")
+    """获取文本 embedding（本地 ONNX 推理，无网络依赖）"""
+    if not text or not text.strip():
         return None
-
-
-async def _hf_embedding(text: str) -> list[float] | None:
-    """HuggingFace Inference API（免费）"""
-    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_EMBEDDING_MODEL}"
-    headers = {"Content-Type": "application/json"}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(url, json={"inputs": text}, headers=headers)
-            resp.raise_for_status()
-            result = resp.json()
-            # HF returns [[float, ...]] for single input
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], list):
-                    return result[0]
-                return result
-            return None
+        model = _get_model()
+        embeddings = list(model.embed([text[:2000]]))
+        return embeddings[0].tolist()
     except Exception as e:
-        print(f"[Embedding/HF] error: {e}")
-        return None
-
-
-async def _gemini_embedding(text: str) -> list[float] | None:
-    """Gemini Embedding API"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBEDDING_MODEL}:embedContent?key={GEMINI_API_KEY}"
-    body = {"content": {"parts": [{"text": text}]}}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=body)
-            resp.raise_for_status()
-            return resp.json()["embedding"]["values"]
-    except Exception as e:
-        print(f"[Embedding/Gemini] error: {e}")
+        print(f"[Embedding] error: {e}")
         return None
