@@ -54,34 +54,33 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     if corridor_text:
         parts.append(corridor_text)
 
-    # 3. 用小模型判断需要查哪些书房分区
-    study_rooms = {k: v for k, v in ROOMS.items() if k.startswith("study_")}
-    room_list = "\n".join([f"- {k}: {v['name']}" for k, v in study_rooms.items()])
+    # 3. 用小模型判断需要查哪些房间
+    on_demand_rooms = {k: v for k, v in ROOMS.items()
+                       if v.get("type") == "on_demand" and v.get("scope") == "shared"}
+    room_list = "\n".join([f"- {k}: {v['name']}（{v.get('description','')}）" for k, v in on_demand_rooms.items()])
 
-    # 组装最近对话上下文
     context_text = ""
     if recent_messages:
         context_text = "\n".join([f"{m.get('role','')}: {m.get('content','')[:200]}" for m in recent_messages[-3:]])
 
-    judge_prompt = f"""你是一个记忆路由助手。根据用户的最新消息和最近对话，判断需要查阅哪些记忆分区。
+    judge_prompt = f"""你是一个记忆路由助手。根据用户消息判断需要查哪些记忆房间。
 
-用户最新消息：{user_message}
+用户消息：{user_message}
 
 最近对话：
 {context_text}
 
-可用分区：
+可用房间：
 {room_list}
 - game_room: 游戏房（小游戏、编故事、跑团）
 
-请输出一个 JSON 数组，包含需要查阅的分区 key。如果都不需要就输出空数组。
-只输出 JSON，不要其他内容。示例：["study_health", "study_career"]"""
+输出 JSON 数组，包含需要查的房间 key。不需要就输出空数组。
+只输出 JSON。示例：["psychology", "health"]"""
 
     rooms_to_check = []
     result = await _call_llm(judge_prompt)
     if result:
         try:
-            # 提取 JSON
             result = result.strip()
             if result.startswith("```"):
                 result = result.split("\n", 1)[-1].rsplit("```", 1)[0]
@@ -89,14 +88,13 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         except Exception:
             pass
 
-    # 4. 向量搜索相关记忆
-    search_rooms = rooms_to_check if rooms_to_check else None
+    # 4. 向量搜索相关记忆（不限制房间，让向量搜索自由匹配）
     exclude_isolated = "game_room" not in (rooms_to_check or [])
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
         top_k=6,
-        include_rooms=search_rooms,
+        include_rooms=rooms_to_check if rooms_to_check else None,
         exclude_isolated=exclude_isolated,
     )
     if recalled:
