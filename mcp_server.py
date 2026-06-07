@@ -8,16 +8,55 @@ from mcp.server.fastmcp import FastMCP
 
 import memory_ops
 import corridor as corridor_mod
+import gateway as gateway_mod
 import daemon
 from config import AI_ROLES, ROOMS, list_rooms
 
+MCP_INSTRUCTIONS = """\
+你连接到了小猫的 Memory Hub —— 一个跨 AI 共享的记忆系统。
+
+## 什么时候用记忆工具
+
+### 必须主动搜索记忆的场景（调 recall）：
+- 用户提到人名、地点、项目名 → 搜一下有没有相关记忆
+- 用户问"之前聊过的XX" → 搜
+- 你不确定用户的近况（换工作了？搬家了？） → 搜
+- 对话涉及健康、心理、职业 → 搜对应房间
+
+### 必须存记忆的场景（调 remember）：
+- 用户透露了新的事实（换了工作、交了新朋友、生病了）
+- 用户表达了明确的偏好或雷区
+- 发生了重要事件或约定
+- 你对用户有了新的理解/洞察
+
+### 醒来时（对话开头）：
+- 调 pulse 获取完整上下文（走廊 + 相关记忆）
+- 这样你就知道"我面对的是谁、她最近怎么样"
+
+### 写日记/自省（调 dream）：
+- 在深度对话结束时，记录你的感受和思考
+- 这是你的私人空间，用户看不到
+
+## 房间速查
+- living_room: 核心身份（永远重要）
+- career/psychology/health/learning/relationships/preferences: 各主题
+- work_tasks: 工作事务（会自动衰减）
+- diary/dreams/relationship/personality: AI 私有空间
+- game_room: 游戏/角色扮演（隔离，不混入正经对话）
+
+## 重要原则
+- 不需要用户提醒你"去用记忆工具"，你应该主动判断
+- 记忆要精炼：一条 = 一个事实/洞察，不要塞整段对话
+- 存之前想一下：这条信息 3 天后还有用吗？
+"""
+
 mcp = FastMCP(
     "Memory Hub",
-    instructions="多AI角色共享记忆系统 - 存储、搜索、管理记忆",
+    instructions=MCP_INSTRUCTIONS,
     stateless_http=True,
     streamable_http_path="/mcp",
     json_response=True,
-    host="0.0.0.0",  # 禁用 localhost-only DNS rebinding protection
+    host="0.0.0.0",
 )
 
 
@@ -69,15 +108,20 @@ async def grow(
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5) -> str:
+async def recall(query: str, top_k: int = 5, with_corridor: bool = False) -> str:
     """搜索记忆。用自然语言描述要找的内容，会用向量相似度匹配最相关的记忆。
 
     Args:
         query: 搜索关键词或自然语言描述
         top_k: 返回数量（默认5）
+        with_corridor: 是否同时返回走廊上下文（对话开头建议开启）
     """
     results = await memory_ops.recall(query=query, ai_id="claude", top_k=top_k)
-    return json.dumps({"results": results}, ensure_ascii=False, indent=2)
+    output = {"results": results}
+    if with_corridor:
+        corridor_text = await corridor_mod.get_corridor("claude")
+        output["corridor"] = corridor_text or ""
+    return json.dumps(output, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -172,6 +216,45 @@ async def maintain() -> str:
     """执行记忆整理：合并相似记忆、压缩日记、衰减遗忘、重建走廊。"""
     result = await daemon.run_full_maintenance()
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def dream(content: str, source_ai: str = "claude") -> str:
+    """写一篇梦境/自省。这是你的私人空间，用来记录内心感受、对关系的理解、自我反思。
+    写完后只有你自己能看到。适合在深度对话结束时使用。
+
+    Args:
+        content: 梦境/自省内容
+        source_ai: 来源AI
+    """
+    result = await memory_ops.remember(
+        content=content,
+        layer="private",
+        room="dreams",
+        owner_ai=source_ai,
+        importance=0.6,
+        source_ai=source_ai,
+        source_platform="mcp",
+    )
+    return json.dumps({"status": "dreamed", **result}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def pulse(message: str = "", source_ai: str = "claude") -> str:
+    """获取完整记忆上下文（走廊 + 与当前话题相关的记忆）。
+    建议在对话开头调用一次，让你快速了解"我面对的是谁、她最近怎么样"。
+
+    如果提供了 message，会额外搜索相关记忆；不提供则只返回走廊。
+
+    Args:
+        message: 用户当前的消息（可选，用于搜索相关记忆）
+        source_ai: AI身份
+    """
+    ctx = await gateway_mod.build_context(
+        user_message=message or "",
+        ai_id=source_ai,
+    )
+    return ctx.get("inject_text", "") or "（暂无记忆上下文）"
 
 
 @mcp.tool()
