@@ -16,7 +16,7 @@ from typing import Optional
 from config import HUB_SECRET, AI_ROLES, ROOMS, register_room, list_rooms
 import github_store
 import memory_ops
-import gateway
+import gateway as gateway_mod
 import daemon
 import corridor
 from mcp_server import mcp as mcp_server
@@ -241,7 +241,7 @@ class ContextRequest(BaseModel):
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    return await gateway.build_context(
+    return await gateway_mod.build_context(
         user_message=body.user_message,
         ai_id=body.ai_id,
         recent_messages=body.recent_messages,
@@ -257,7 +257,7 @@ class PostProcessRequest(BaseModel):
 @app.post("/api/gateway/post-process")
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    return await gateway.post_process(
+    return await gateway_mod.post_process(
         user_message=body.user_message,
         ai_response=body.ai_response,
         ai_id=body.ai_id,
@@ -352,8 +352,8 @@ class MCPGateway:
         else:
             await self.fastapi_app(scope, receive, send)
 
-gateway = MCPGateway(app)
+asgi_app = MCPGateway(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(gateway, host="0.0.0.0", port=8888, lifespan="on")
+    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
