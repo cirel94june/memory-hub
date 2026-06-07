@@ -6,298 +6,391 @@
 <title>Memory Hub</title>
 <style>
 :root {
-  --bg: #fafaf8;
-  --card: #ffffff;
-  --border: #e8e5e0;
-  --text: #2c2c2c;
-  --text2: #888;
-  --accent: #6c9bcf;
-  --accent2: #e8f0fb;
-  --danger: #e07070;
-  --success: #6bc07f;
-  --warning: #e8b84a;
-  --radius: 10px;
-  --shadow: 0 1px 4px rgba(0,0,0,0.06);
+  --bg: #f8f5f0;
+  --card: #fffdf9;
+  --border: #e8e0d4;
+  --text: #3a3530;
+  --text2: #9a8e80;
+  --text3: #c4b8a8;
+  --accent: #c4956a;
+  --accent2: #f5ece2;
+  --accent-light: #faf4ed;
+  --danger: #d4756a;
+  --success: #7ab87f;
+  --warning: #d4a84a;
+  --blue: #6a9ec4;
+  --purple: #9a7ec4;
+  --radius: 12px;
+  --shadow: 0 2px 8px rgba(80,60,40,0.06);
+  --shadow-hover: 0 4px 16px rgba(80,60,40,0.1);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-  font-family: -apple-system, 'Segoe UI', sans-serif;
+  font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans', sans-serif;
   background: var(--bg);
   color: var(--text);
-  line-height: 1.6;
+  line-height: 1.65;
 }
 
 /* ── 顶栏 ── */
 .header {
-  background: var(--card);
+  background: linear-gradient(135deg, #f5ece2 0%, #ede4d8 100%);
   border-bottom: 1px solid var(--border);
-  padding: 16px 24px;
+  padding: 18px 28px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   position: sticky;
   top: 0;
   z-index: 100;
+  backdrop-filter: blur(10px);
 }
-.header h1 { font-size: 18px; font-weight: 600; }
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-left h1 { font-size: 19px; font-weight: 700; color: var(--text); letter-spacing: -0.3px; }
+.header-badge {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  background: var(--accent);
+  color: white;
+  font-weight: 500;
+}
 .header-actions { display: flex; gap: 8px; }
 .btn {
-  padding: 6px 14px;
-  border-radius: 6px;
+  padding: 7px 16px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--card);
   cursor: pointer;
   font-size: 13px;
-  transition: all 0.15s;
+  transition: all 0.2s;
+  font-family: inherit;
+  color: var(--text);
 }
-.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn:hover { border-color: var(--accent); color: var(--accent); box-shadow: var(--shadow); }
 .btn-primary { background: var(--accent); color: white; border-color: var(--accent); }
-.btn-primary:hover { opacity: 0.85; }
+.btn-primary:hover { opacity: 0.88; box-shadow: 0 2px 12px rgba(196,149,106,0.3); }
 .btn-danger { color: var(--danger); border-color: var(--danger); }
+.btn-sm { padding: 4px 12px; font-size: 12px; }
 
 /* ── 布局 ── */
 .layout {
   display: flex;
-  max-width: 1200px;
+  max-width: 1280px;
   margin: 0 auto;
-  padding: 20px;
-  gap: 20px;
+  padding: 24px;
+  gap: 24px;
 }
-.sidebar {
-  width: 200px;
-  flex-shrink: 0;
-}
-.main {
-  flex: 1;
-  min-width: 0;
-}
+.sidebar { width: 220px; flex-shrink: 0; }
+.main { flex: 1; min-width: 0; }
 
 /* ── 侧栏 ── */
-.nav-group { margin-bottom: 20px; }
+.nav-group { margin-bottom: 24px; }
 .nav-group h3 {
   font-size: 11px;
   text-transform: uppercase;
-  color: var(--text2);
-  letter-spacing: 1px;
-  padding: 0 12px;
-  margin-bottom: 6px;
+  color: var(--text3);
+  letter-spacing: 1.5px;
+  padding: 0 14px;
+  margin-bottom: 8px;
+  font-weight: 600;
 }
 .nav-item {
-  display: block;
-  padding: 8px 12px;
-  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 14px;
+  border-radius: 8px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13.5px;
   color: var(--text);
   text-decoration: none;
-  transition: background 0.15s;
+  transition: all 0.15s;
 }
 .nav-item:hover { background: var(--accent2); }
-.nav-item.active { background: var(--accent2); color: var(--accent); font-weight: 500; }
+.nav-item.active { background: var(--accent2); color: var(--accent); font-weight: 600; }
+.nav-icon { margin-right: 6px; }
 .nav-count {
-  float: right;
-  font-size: 12px;
-  color: var(--text2);
+  font-size: 11px;
+  color: var(--text3);
   background: var(--bg);
-  padding: 1px 6px;
+  padding: 2px 8px;
   border-radius: 10px;
+  min-width: 20px;
+  text-align: center;
+  font-weight: 500;
+}
+.nav-item.active .nav-count { background: var(--accent); color: white; }
+
+/* ── 统计面板 ── */
+.stats-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+}
+.stats-row {
+  display: flex;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+.stat-item { text-align: center; }
+.stat-num { font-size: 28px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.health-bar {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.health-bar-label { font-size: 12px; color: var(--text2); margin-bottom: 6px; }
+.health-bar-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+}
+.health-bar-fill {
+  height: 100%;
+  transition: width 0.5s;
 }
 
 /* ── 搜索 ── */
 .search-bar {
   display: flex;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 20px;
 }
 .search-bar input {
   flex: 1;
-  padding: 8px 14px;
+  padding: 10px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 14px;
   outline: none;
+  background: var(--card);
+  font-family: inherit;
+  transition: border-color 0.2s;
 }
-.search-bar input:focus { border-color: var(--accent); }
+.search-bar input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(196,149,106,0.1); }
 
 /* ── 记忆卡片 ── */
 .memory-card {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 14px 18px;
-  margin-bottom: 10px;
+  padding: 16px 20px;
+  margin-bottom: 12px;
   box-shadow: var(--shadow);
-  transition: border-color 0.15s;
+  transition: all 0.2s;
+  position: relative;
 }
-.memory-card:hover { border-color: var(--accent); }
+.memory-card:hover { border-color: var(--accent); box-shadow: var(--shadow-hover); }
+.memory-card.truncated { border-left: 3px solid var(--danger); }
+.memory-card.high-importance { border-left: 3px solid var(--accent); }
+
+.memory-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.memory-category {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
 .memory-content {
   font-size: 14px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   word-break: break-word;
+  white-space: pre-line;
+  color: var(--text);
+  line-height: 1.7;
 }
-.memory-meta {
+.memory-content.collapsed {
+  max-height: 120px;
+  overflow: hidden;
+  position: relative;
+}
+.memory-content.collapsed::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: linear-gradient(transparent, var(--card));
+}
+.expand-btn {
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+  border: none;
+  background: none;
+  padding: 4px 0;
+  font-family: inherit;
+}
+.expand-btn:hover { text-decoration: underline; }
+
+.memory-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text2);
+  gap: 6px;
+  margin-bottom: 8px;
 }
 .tag {
   display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
+  padding: 2px 10px;
+  border-radius: 6px;
   font-size: 11px;
+  font-weight: 500;
 }
-.tag-room { background: #f0ebe6; color: #8b7355; }
-.tag-layer { background: var(--accent2); color: var(--accent); }
-.tag-ai { padding: 2px 8px; border-radius: 4px; color: white; font-size: 11px; }
-.importance-bar {
-  display: inline-block;
-  width: 50px;
-  height: 4px;
+.tag-room { background: #f0ebe3; color: #8b7355; }
+.tag-domain { background: #e3eef5; color: #4a7da8; }
+.tag-layer-shared { background: #e8f5e9; color: #558b55; }
+.tag-layer-private { background: #fce4ec; color: #c0625a; }
+.tag-ai {
+  padding: 2px 10px;
+  border-radius: 6px;
+  color: white;
+  font-size: 11px;
+  font-weight: 500;
+}
+.tag-truncated { background: #fdeaea; color: var(--danger); font-weight: 600; }
+
+.memory-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.memory-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text2);
+}
+.importance-dots {
+  display: inline-flex;
+  gap: 2px;
+}
+.importance-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
   background: var(--border);
-  border-radius: 2px;
-  position: relative;
-  vertical-align: middle;
 }
-.importance-fill {
-  height: 100%;
-  border-radius: 2px;
-  background: var(--accent);
-}
-.decay-warn { color: var(--warning); }
+.importance-dot.filled { background: var(--accent); }
+
 .memory-actions {
   display: flex;
   gap: 6px;
-  margin-top: 8px;
+  opacity: 0;
+  transition: opacity 0.2s;
 }
-.memory-actions .btn { font-size: 11px; padding: 3px 10px; }
+.memory-card:hover .memory-actions { opacity: 1; }
 
-/* ── 统计卡片 ── */
-.stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 12px;
-  margin-bottom: 20px;
-}
-.stat-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 14px;
+/* ── 空状态 ── */
+.empty {
   text-align: center;
+  padding: 80px 20px;
+  color: var(--text2);
 }
-.stat-num { font-size: 24px; font-weight: 600; color: var(--accent); }
-.stat-label { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.empty-icon { font-size: 56px; margin-bottom: 16px; opacity: 0.5; }
+.empty p { font-size: 15px; }
+
+/* ── 分页 ── */
+.pagination {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 20px;
+}
 
 /* ── 模态框 ── */
 .modal-overlay {
   display: none;
   position: fixed;
   inset: 0;
-  background: rgba(0,0,0,0.3);
+  background: rgba(60,50,40,0.35);
   z-index: 200;
   justify-content: center;
   align-items: center;
+  backdrop-filter: blur(2px);
 }
 .modal-overlay.show { display: flex; }
 .modal {
   background: var(--card);
-  border-radius: 12px;
-  padding: 24px;
-  width: 480px;
-  max-width: 90vw;
-  max-height: 80vh;
+  border-radius: 16px;
+  padding: 28px;
+  width: 520px;
+  max-width: 92vw;
+  max-height: 85vh;
   overflow-y: auto;
+  box-shadow: 0 20px 60px rgba(60,40,20,0.15);
 }
-.modal h2 { font-size: 16px; margin-bottom: 16px; }
-.modal label { display: block; font-size: 13px; color: var(--text2); margin: 10px 0 4px; }
+.modal h2 { font-size: 17px; margin-bottom: 20px; font-weight: 700; }
+.modal label { display: block; font-size: 13px; color: var(--text2); margin: 12px 0 5px; font-weight: 500; }
 .modal input, .modal select, .modal textarea {
   width: 100%;
-  padding: 8px 12px;
+  padding: 9px 14px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 8px;
   font-size: 14px;
   outline: none;
   font-family: inherit;
+  background: var(--bg);
+  transition: border-color 0.2s;
 }
-.modal textarea { resize: vertical; min-height: 80px; }
-.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
-
-/* ── 空状态 ── */
-.empty {
-  text-align: center;
-  padding: 60px 20px;
-  color: var(--text2);
+.modal input:focus, .modal select:focus, .modal textarea:focus {
+  border-color: var(--accent);
+  background: var(--card);
 }
-.empty-icon { font-size: 48px; margin-bottom: 12px; }
-
-/* ── 分页 ── */
-.pagination {
-  display: flex;
-  justify-content: center;
-  gap: 8px;
-  margin-top: 16px;
-}
+.modal textarea { resize: vertical; min-height: 100px; line-height: 1.6; }
+.modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 
 /* ── 响应式 ── */
 @media (max-width: 768px) {
-  .layout { flex-direction: column; padding: 12px; }
-  .sidebar { width: 100%; display: flex; flex-wrap: wrap; gap: 6px; }
-  .nav-group { margin-bottom: 8px; }
-  .nav-group h3 { display: none; }
-  .stats { grid-template-columns: repeat(2, 1fr); }
+  .layout { flex-direction: column; padding: 12px; gap: 16px; }
+  .sidebar { width: 100%; }
+  .sidebar .nav-group { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+  .sidebar .nav-group h3 { width: 100%; margin-bottom: 4px; }
+  .sidebar .nav-item { padding: 6px 12px; font-size: 12px; }
+  .stats-row { gap: 16px; }
+  .stat-num { font-size: 22px; }
+  .header { padding: 14px 16px; }
+  .header h1 { font-size: 16px; }
+  .memory-actions { opacity: 1; }
 }
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>Memory Hub</h1>
+  <div class="header-left">
+    <h1>Memory Hub</h1>
+    <span class="header-badge" id="headerBadge">0 memories</span>
+  </div>
   <div class="header-actions">
-    <button class="btn" onclick="openAddModal()">+ 添加记忆</button>
-    <button class="btn" onclick="exportMemories()">导出 JSON</button>
-    <button class="btn btn-danger" onclick="runDecay()">执行衰减</button>
+    <button class="btn" onclick="openAddModal()">+ 添加</button>
+    <button class="btn" onclick="runMaintain()">整理</button>
+    <button class="btn" onclick="exportMemories()">导出</button>
   </div>
 </div>
 
 <div class="layout">
-  <div class="sidebar" id="sidebar">
-    <div class="nav-group">
-      <h3>概览</h3>
-      <a class="nav-item active" data-filter="all" onclick="filterBy('all', this)">全部记忆 <span class="nav-count" id="count-all">0</span></a>
-    </div>
-    <div class="nav-group">
-      <h3>房间</h3>
-      <a class="nav-item" data-filter="room:living_room" onclick="filterBy('room:living_room', this)">🏠 客厅</a>
-      <a class="nav-item" data-filter="room:career" onclick="filterBy('room:career', this)">💼 职业生涯</a>
-      <a class="nav-item" data-filter="room:psychology" onclick="filterBy('room:psychology', this)">🧠 心理状态</a>
-      <a class="nav-item" data-filter="room:health" onclick="filterBy('room:health', this)">❤️ 身体健康</a>
-      <a class="nav-item" data-filter="room:learning" onclick="filterBy('room:learning', this)">📚 学习目标</a>
-      <a class="nav-item" data-filter="room:relationships" onclick="filterBy('room:relationships', this)">👥 人际关系</a>
-      <a class="nav-item" data-filter="room:preferences" onclick="filterBy('room:preferences', this)">✨ 兴趣偏好</a>
-      <a class="nav-item" data-filter="room:work_tasks" onclick="filterBy('room:work_tasks', this)">📋 工作事务</a>
-      <a class="nav-item" data-filter="room:infra" onclick="filterBy('room:infra', this)">🏗️ 基建总览</a>
-      <a class="nav-item" data-filter="room:infra_changelog" onclick="filterBy('room:infra_changelog', this)">📝 基建日志</a>
-      <a class="nav-item" data-filter="room:diary" onclick="filterBy('room:diary', this)">📔 日记本</a>
-      <a class="nav-item" data-filter="room:game_room" onclick="filterBy('room:game_room', this)">🎮 游戏房</a>
-    </div>
-    <div class="nav-group">
-      <h3>AI 私有</h3>
-      <a class="nav-item" data-filter="ai:claude" onclick="filterBy('ai:claude', this)">Claude</a>
-      <a class="nav-item" data-filter="ai:gemini" onclick="filterBy('ai:gemini', this)">Gemini</a>
-      <a class="nav-item" data-filter="ai:gpt" onclick="filterBy('ai:gpt', this)">GPT</a>
-    </div>
-    <div class="nav-group">
-      <h3>状态</h3>
-      <a class="nav-item" data-filter="status:archived" onclick="filterBy('status:archived', this)">已归档</a>
-    </div>
-  </div>
+  <div class="sidebar" id="sidebar"></div>
 
   <div class="main">
-    <div class="stats" id="stats"></div>
+    <div class="stats-panel" id="statsPanel"></div>
 
     <div class="search-bar">
       <input type="text" id="searchInput" placeholder="搜索记忆..." onkeydown="if(event.key==='Enter')searchMemories()">
@@ -310,7 +403,7 @@ body {
 </div>
 
 <!-- 添加/编辑模态框 -->
-<div class="modal-overlay" id="addModal">
+<div class="modal-overlay" id="addModal" onclick="if(event.target===this)closeAddModal()">
   <div class="modal">
     <h2 id="modalTitle">添加记忆</h2>
     <input type="hidden" id="editId">
@@ -321,7 +414,7 @@ body {
     <label>房间</label>
     <select id="mRoom" onchange="onRoomChange()">
       <optgroup label="共享房间">
-        <option value="living_room">🏠 客厅（核心信息）</option>
+        <option value="living_room">🏠 客厅</option>
         <option value="career">💼 职业生涯</option>
         <option value="psychology">🧠 心理状态</option>
         <option value="health">❤️ 身体健康</option>
@@ -330,7 +423,7 @@ body {
         <option value="preferences">✨ 兴趣偏好</option>
         <option value="work_tasks">📋 工作事务</option>
         <option value="infra">🏗️ 基建总览</option>
-        <option value="infra_changelog">📝 基建更新日志</option>
+        <option value="infra_changelog">📝 基建日志</option>
       </optgroup>
       <optgroup label="AI 私有房间">
         <option value="diary">📔 日记本</option>
@@ -352,9 +445,8 @@ body {
       </select>
     </div>
 
-    <label>重要度</label>
+    <label>重要度: <span id="mImpVal">0.5</span></label>
     <input type="range" id="mImportance" min="0" max="1" step="0.1" value="0.5">
-    <span id="mImpVal">0.5</span>
 
     <div class="modal-actions">
       <button class="btn" onclick="closeAddModal()">取消</button>
@@ -364,17 +456,34 @@ body {
 </div>
 
 <script>
-function parseDomain(v) {
-  if (Array.isArray(v)) return v;
-  if (typeof v === 'string') try { return JSON.parse(v); } catch(e) {}
-  return [];
-}
-const API = '';  // 同域部署时留空
+const API = '';
 let TOKEN = localStorage.getItem('hub_token') || '';
 let currentFilter = 'all';
 let currentPage = 1;
+let allRoomCounts = {};
+let totalMemories = 0;
 
-// ── 鉴权 ──
+const ROOM_META = {
+  living_room: { icon: '🏠', name: '客厅', group: 'shared' },
+  career: { icon: '💼', name: '职业生涯', group: 'shared' },
+  psychology: { icon: '🧠', name: '心理状态', group: 'shared' },
+  health: { icon: '❤️', name: '身体健康', group: 'shared' },
+  learning: { icon: '📚', name: '学习目标', group: 'shared' },
+  relationships: { icon: '👥', name: '人际关系', group: 'shared' },
+  preferences: { icon: '✨', name: '兴趣偏好', group: 'shared' },
+  work_tasks: { icon: '📋', name: '工作事务', group: 'shared' },
+  infra: { icon: '🏗️', name: '基建总览', group: 'shared' },
+  infra_changelog: { icon: '📝', name: '基建日志', group: 'shared' },
+  diary: { icon: '📔', name: '日记本', group: 'private' },
+  dreams: { icon: '🌙', name: '梦境', group: 'private' },
+  relationship: { icon: '💕', name: '和用户的关系', group: 'private' },
+  personality: { icon: '🪞', name: '自我认知', group: 'private' },
+  game_room: { icon: '🎮', name: '游戏房', group: 'isolated' },
+};
+const AI_COLORS = { claude: '#c4956a', gemini: '#4285F4', gpt: '#10A37F' };
+const PER_AI_ROOMS = ['diary', 'dreams', 'relationship', 'personality'];
+
+// ── Auth ──
 function authHeader() {
   return { 'Authorization': `Bearer ${TOKEN}`, 'Content-Type': 'application/json' };
 }
@@ -388,48 +497,149 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
-// ── 加载 ──
+// ── Load all room counts ──
+async function loadRoomCounts() {
+  const data = await api('/api/memory/list?per_page=1000&status=active');
+  totalMemories = data.total;
+  allRoomCounts = {};
+  let truncatedCount = 0;
+  let noOwnerCount = 0;
+  (data.items || []).forEach(m => {
+    const r = m.room || '(empty)';
+    allRoomCounts[r] = (allRoomCounts[r] || 0) + 1;
+    if (m.content && m.content.length < 40 && m.importance >= 0.8) truncatedCount++;
+    if (!m.owner_ai && m.layer === 'private') noOwnerCount++;
+  });
+  document.getElementById('headerBadge').textContent = `${totalMemories} memories`;
+  renderSidebar();
+  renderStats(truncatedCount, noOwnerCount);
+}
+
+// ── Sidebar ──
+function renderSidebar() {
+  const groups = { shared: [], private: [], isolated: [] };
+  for (const [id, meta] of Object.entries(ROOM_META)) {
+    groups[meta.group].push({ id, ...meta, count: allRoomCounts[id] || 0 });
+  }
+  const labels = { shared: '共享房间', private: 'AI 私有', isolated: '隔离' };
+  let html = `
+    <div class="nav-group">
+      <h3>概览</h3>
+      <a class="nav-item ${currentFilter==='all'?'active':''}" onclick="filterBy('all',this)">
+        <span>📋 全部记忆</span>
+        <span class="nav-count">${totalMemories}</span>
+      </a>
+    </div>`;
+  for (const [group, items] of Object.entries(groups)) {
+    html += `<div class="nav-group"><h3>${labels[group]}</h3>`;
+    for (const item of items) {
+      const f = `room:${item.id}`;
+      html += `
+        <a class="nav-item ${currentFilter===f?'active':''}" onclick="filterBy('${f}',this)">
+          <span><span class="nav-icon">${item.icon}</span>${item.name}</span>
+          ${item.count ? `<span class="nav-count">${item.count}</span>` : ''}
+        </a>`;
+    }
+    html += '</div>';
+  }
+  document.getElementById('sidebar').innerHTML = html;
+}
+
+// ── Stats ──
+function renderStats(truncated, noOwner) {
+  const rooms = Object.entries(allRoomCounts).filter(([k]) => k !== '(empty)');
+  rooms.sort((a,b) => b[1] - a[1]);
+  const topRooms = rooms.slice(0, 5);
+  const colors = ['#c4956a', '#6a9ec4', '#9a7ec4', '#7ab87f', '#d4a84a'];
+
+  let html = `<div class="stats-row">
+    <div class="stat-item"><div class="stat-num">${totalMemories}</div><div class="stat-label">总记忆</div></div>
+    <div class="stat-item"><div class="stat-num">${rooms.length}</div><div class="stat-label">活跃房间</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:${truncated?'var(--danger)':'var(--success)'}">${truncated}</div><div class="stat-label">疑似截断</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:${noOwner?'var(--warning)':'var(--success)'}">${noOwner}</div><div class="stat-label">缺少 owner</div></div>
+  </div>`;
+
+  if (topRooms.length) {
+    html += `<div class="health-bar">
+      <div class="health-bar-label">房间分布：${topRooms.map(([k,v],i) => `<span style="color:${colors[i]}">${(ROOM_META[k]||{}).icon||''} ${(ROOM_META[k]||{}).name||k} (${v})</span>`).join(' · ')}</div>
+      <div class="health-bar-track">
+        ${topRooms.map(([k,v],i) => `<div class="health-bar-fill" style="width:${v/totalMemories*100}%;background:${colors[i]}"></div>`).join('')}
+      </div>
+    </div>`;
+  }
+
+  document.getElementById('statsPanel').innerHTML = html;
+}
+
+// ── Load memories ──
 async function loadMemories() {
   let params = `page=${currentPage}&per_page=20`;
   if (currentFilter.startsWith('room:')) params += `&room=${currentFilter.slice(5)}`;
-  else if (currentFilter.startsWith('ai:')) params += `&owner_ai=${currentFilter.slice(3)}&layer=private`;
   else if (currentFilter.startsWith('status:')) params += `&status=${currentFilter.slice(7)}`;
 
   const data = await api(`/api/memory/list?${params}`);
-  document.getElementById('count-all').textContent = data.total;
   renderMemories(data.items);
   renderPagination(data.total, data.page, data.per_page);
 }
 
+function parseDomain(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') try { return JSON.parse(v); } catch(e) {}
+  return [];
+}
+
 function renderMemories(items) {
   const el = document.getElementById('memoryList');
-  if (!items.length) {
-    el.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>这里还没有记忆</p></div>';
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>这个房间还没有记忆</p></div>';
     return;
   }
   el.innerHTML = items.map(m => {
-    const aiColors = { claude: '#D4A574', gemini: '#4285F4', gpt: '#10A37F' };
-    const impPct = Math.round((m.importance || 0.5) * 100);
-    const decay = m.decay_score || 1;
-    const decayWarn = decay < 0.3 ? '<span class="decay-warn"> (即将遗忘)</span>' : '';
+    const domains = parseDomain(m.domain);
+    const isTruncated = m.content && m.content.length < 40 && m.importance >= 0.8;
+    const isLong = m.content && m.content.length > 200;
+    const impLevel = Math.round((m.importance || 0.5) * 5);
+    const cardClass = isTruncated ? 'truncated' : (m.importance >= 0.9 ? 'high-importance' : '');
+    const category = m.category && m.category.length < 60 ? m.category : '';
+
     return `
-      <div class="memory-card" data-id="${m.id}">
-        <div class="memory-content">${escHtml(m.content)}</div>
-        <div class="memory-meta">
-          <span class="tag tag-room">${m.room}</span>
-          ${m.owner_ai ? `<span class="tag tag-ai" style="background:${aiColors[m.owner_ai]||'#888'}">${m.owner_ai}</span>` : ''}
-          ${(parseDomain(m.domain)||[]).map(d => `<span class="tag" style="background:#e8f4f8;color:#2980b9">${d}</span>`).join('')}
-          <span>重要度:${m.importance} ${m.valence != null ? `V:${(m.valence||0).toFixed(1)}` : ''} ${m.emotion_arousal != null ? `A:${(m.emotion_arousal||0).toFixed(1)}` : ''}</span>
-          ${decayWarn}
-          <span>${m.created_at?.slice(0,10) || ''}</span>
+      <div class="memory-card ${cardClass}" data-id="${m.id}">
+        ${category ? `<div class="memory-header"><span class="memory-category">${escHtml(category)}</span></div>` : ''}
+        <div class="memory-content ${isLong ? 'collapsed' : ''}" id="content-${m.id}">${escHtml(m.content)}</div>
+        ${isLong ? `<button class="expand-btn" onclick="toggleExpand('${m.id}')">展开全部</button>` : ''}
+        <div class="memory-tags">
+          <span class="tag tag-room">${(ROOM_META[m.room]||{}).icon||''} ${(ROOM_META[m.room]||{}).name||m.room}</span>
+          <span class="tag ${m.layer==='private'?'tag-layer-private':'tag-layer-shared'}">${m.layer==='private'?'私有':'共享'}</span>
+          ${m.owner_ai ? `<span class="tag tag-ai" style="background:${AI_COLORS[m.owner_ai]||'#888'}">${m.owner_ai}</span>` : ''}
+          ${domains.map(d => `<span class="tag tag-domain">${d}</span>`).join('')}
+          ${isTruncated ? '<span class="tag tag-truncated">疑似截断</span>' : ''}
         </div>
-        <div class="memory-actions">
-          <button class="btn" onclick="editMemory('${m.id}')">编辑</button>
-          <button class="btn" onclick="archiveMemory('${m.id}')">归档</button>
-          <button class="btn btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
+        <div class="memory-footer">
+          <div class="memory-meta">
+            <span class="importance-dots">${Array.from({length:5},(_,i)=>`<span class="importance-dot ${i<impLevel?'filled':''}"></span>`).join('')}</span>
+            <span>${m.created_at?.slice(0,10) || ''}</span>
+            ${m.decay_score < 0.3 ? '<span style="color:var(--warning)">即将遗忘</span>' : ''}
+          </div>
+          <div class="memory-actions">
+            <button class="btn btn-sm" onclick="editMemory('${m.id}')">编辑</button>
+            <button class="btn btn-sm" onclick="archiveMemory('${m.id}')">归档</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
+          </div>
         </div>
       </div>`;
   }).join('');
+}
+
+function toggleExpand(id) {
+  const el = document.getElementById('content-' + id);
+  const btn = el.nextElementSibling;
+  if (el.classList.contains('collapsed')) {
+    el.classList.remove('collapsed');
+    btn.textContent = '收起';
+  } else {
+    el.classList.add('collapsed');
+    btn.textContent = '展开全部';
+  }
 }
 
 function renderPagination(total, page, perPage) {
@@ -438,14 +648,14 @@ function renderPagination(total, page, perPage) {
   if (pages <= 1) { el.innerHTML = ''; return; }
   let html = '';
   for (let i = 1; i <= pages; i++) {
-    html += `<button class="btn ${i===page?'btn-primary':''}" onclick="goPage(${i})">${i}</button>`;
+    html += `<button class="btn btn-sm ${i===page?'btn-primary':''}" onclick="goPage(${i})">${i}</button>`;
   }
   el.innerHTML = html;
 }
 
 function goPage(p) { currentPage = p; loadMemories(); }
 
-// ── 过滤 ──
+// ── Filter ──
 function filterBy(filter, el) {
   currentFilter = filter;
   currentPage = 1;
@@ -454,7 +664,7 @@ function filterBy(filter, el) {
   loadMemories();
 }
 
-// ── 搜索 ──
+// ── Search ──
 async function searchMemories() {
   const q = document.getElementById('searchInput').value.trim();
   if (!q) { loadMemories(); return; }
@@ -463,12 +673,11 @@ async function searchMemories() {
   document.getElementById('pagination').innerHTML = '';
 }
 
-// ── 添加/编辑 ──
+// ── Add/Edit modal ──
 function openAddModal() {
   document.getElementById('modalTitle').textContent = '添加记忆';
   document.getElementById('editId').value = '';
   document.getElementById('mContent').value = '';
-  document.getElementById('mLayer').value = 'shared';
   document.getElementById('mRoom').value = 'living_room';
   document.getElementById('mImportance').value = 0.5;
   document.getElementById('mImpVal').textContent = '0.5';
@@ -480,11 +689,9 @@ function closeAddModal() {
   document.getElementById('addModal').classList.remove('show');
 }
 
-const perAiRooms = ['diary', 'dreams', 'relationship', 'personality'];
 function onRoomChange() {
   const room = document.getElementById('mRoom').value;
-  document.getElementById('ownerRow').style.display =
-    perAiRooms.includes(room) ? 'block' : 'none';
+  document.getElementById('ownerRow').style.display = PER_AI_ROOMS.includes(room) ? 'block' : 'none';
 }
 
 document.getElementById('mImportance').addEventListener('input', e => {
@@ -499,7 +706,7 @@ async function saveMemory() {
     room: room,
     importance: parseFloat(document.getElementById('mImportance').value),
   };
-  if (perAiRooms.includes(room)) {
+  if (PER_AI_ROOMS.includes(room)) {
     body.owner_ai = document.getElementById('mOwner').value;
     body.layer = 'private';
   } else {
@@ -512,17 +719,18 @@ async function saveMemory() {
     await api('/api/memory/remember', { method: 'POST', body: JSON.stringify(body) });
   }
   closeAddModal();
+  loadRoomCounts();
   loadMemories();
 }
 
 async function editMemory(id) {
-  const data = await api(`/api/memory/list?status=active&per_page=100`);
-  const m = data.items.find(x => x.id === id);
+  const data = await api(`/api/memory/list?per_page=1000&status=active`);
+  const m = (data.items || []).find(x => x.id === id);
   if (!m) return;
   document.getElementById('modalTitle').textContent = '编辑记忆';
   document.getElementById('editId').value = id;
   document.getElementById('mContent').value = m.content;
-  document.getElementById('mRoom').value = m.room;
+  document.getElementById('mRoom').value = m.room || 'living_room';
   document.getElementById('mImportance').value = m.importance;
   document.getElementById('mImpVal').textContent = m.importance;
   onRoomChange();
@@ -531,47 +739,52 @@ async function editMemory(id) {
 }
 
 async function archiveMemory(id) {
-  if (!confirm('确定归档？')) return;
+  if (!confirm('确定归档这条记忆？')) return;
   await api(`/api/memory/${id}/archive`, { method: 'POST' });
+  loadRoomCounts();
   loadMemories();
 }
 
 async function deleteMemory(id) {
-  if (!confirm('确定删除？')) return;
+  if (!confirm('确定永久删除？')) return;
   await api(`/api/memory/${id}`, { method: 'DELETE' });
+  loadRoomCounts();
   loadMemories();
 }
 
-// ── 导出 ──
+// ── Export ──
 async function exportMemories() {
   const data = await api('/api/export');
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `memory-hub-export-${new Date().toISOString().slice(0,10)}.json`;
+  a.download = `memory-hub-${new Date().toISOString().slice(0,10)}.json`;
   a.click();
 }
 
-// ── 衰减 ──
-async function runDecay() {
-  if (!confirm('执行记忆衰减？不重要的老记忆会被自动归档。')) return;
-  const result = await api('/api/daemon/decay', { method: 'POST' });
-  alert(`衰减完成：归档了 ${result.archived} 条，更新了 ${result.decayed} 条`);
+// ── Maintain ──
+async function runMaintain() {
+  if (!confirm('执行记忆整理？（合并相似、压缩日记、衰减遗忘）')) return;
+  const result = await api('/api/daemon/full', { method: 'POST' });
+  alert(`整理完成！\n合并: ${result.merged||0}\n压缩: ${result.compressed||0}\n归档: ${result.archived||0}`);
+  loadRoomCounts();
   loadMemories();
 }
 
-// ── 工具 ──
+// ── Utils ──
 function escHtml(s) {
+  if (!s) return '';
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
 }
 
-// ── 初始化 ──
+// ── Init ──
 if (!TOKEN) {
   TOKEN = prompt('请输入 Memory Hub 访问密钥:') || '';
   localStorage.setItem('hub_token', TOKEN);
 }
+loadRoomCounts();
 loadMemories();
 </script>
 </body>
