@@ -143,6 +143,7 @@ class RememberRequest(BaseModel):
     source_ai: str = ""
     source_platform: str = ""
     tags: list[str] = []
+    event_date: str = ""
 
 @app.post("/api/memory/remember")
 async def api_remember(body: RememberRequest, authorization: str = Header(default="")):
@@ -152,7 +153,28 @@ async def api_remember(body: RememberRequest, authorization: str = Header(defaul
         category=body.category, owner_ai=body.owner_ai,
         importance=body.importance, emotion_arousal=body.emotion_arousal,
         source_ai=body.source_ai, source_platform=body.source_platform,
-        tags=body.tags,
+        tags=body.tags, event_date=body.event_date,
+    )
+    return result
+
+
+class CommentRequest(BaseModel):
+    content: str
+    author: str = "claude"
+    kind: str = "comment"
+    valence: Optional[float] = None
+    arousal: Optional[float] = None
+
+@app.post("/api/memory/{memory_id}/comment")
+async def api_add_comment(memory_id: str, body: CommentRequest, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    result = await memory_ops.add_comment(
+        memory_id=memory_id,
+        content=body.content,
+        author=body.author,
+        kind=body.kind,
+        valence=body.valence,
+        arousal=body.arousal,
     )
     return result
 

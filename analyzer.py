@@ -167,6 +167,68 @@ async def merge(old_content: str, new_content: str) -> str:
         return f"{old_content}\n\n---更新---\n{new_content}"
 
 
+CLASSIFY_RELATION_PROMPT = """你是一个记忆关系分析器。给你一条新记忆和若干旧记忆候选，请判断新记忆和旧记忆的关系。
+
+关系类型：
+- updates: 新记忆是对旧记忆的更新/后续（如"换了工作"更新"在XX公司上班"）
+- contradicts: 新记忆与旧记忆矛盾（以新为准）
+- supplements: 新记忆补充了旧记忆的细节
+- same_topic: 同一主题但各自独立
+- unrelated: 无关
+
+输出纯 JSON：
+{
+  "relations": [
+    {
+      "target_id": "旧记忆ID",
+      "relation": "updates/contradicts/supplements/same_topic/unrelated",
+      "confidence": 0.8,
+      "should_supersede": true,
+      "reason": "简短原因"
+    }
+  ]
+}
+
+规则：
+- should_supersede=true 表示旧记忆已过时，应被新记忆取代
+- updates+should_supersede=true: 旧记忆标记为 superseded
+- contradicts+should_supersede=true: 旧记忆标记为 superseded
+- supplements: 不取代，但建立关联
+- 最多输出 3 条关系
+- 只输出 JSON"""
+
+
+async def classify_relation(new_content: str, candidates: list[dict]) -> dict:
+    """判断新记忆和旧记忆候选的关系"""
+    if not candidates:
+        return {"relations": []}
+    try:
+        candidate_text = "\n".join([
+            f"[{c['id']}] {c['content'][:200]}"
+            for c in candidates[:5]
+        ])
+        prompt = f"=== 新记忆 ===\n{new_content}\n\n=== 旧记忆候选 ===\n{candidate_text}"
+        raw = await _call_llm(CLASSIFY_RELATION_PROMPT, prompt)
+        if not raw:
+            return {"relations": []}
+        result = _parse_json(raw)
+        relations = []
+        for r in result.get("relations", [])[:3]:
+            if r.get("relation") == "unrelated":
+                continue
+            relations.append({
+                "target_id": str(r.get("target_id", "")),
+                "relation": r.get("relation", "same_topic"),
+                "confidence": max(0.0, min(1.0, float(r.get("confidence", 0.5)))),
+                "should_supersede": bool(r.get("should_supersede", False)),
+                "reason": str(r.get("reason", ""))[:100],
+            })
+        return {"relations": relations}
+    except Exception as e:
+        logger.warning(f"Classify relation failed: {e}")
+        return {"relations": []}
+
+
 async def digest(content: str) -> list[dict]:
     """把长文本拆分成多条独立记忆"""
     try:

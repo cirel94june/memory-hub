@@ -57,10 +57,11 @@ async def remember(
     source_ai: str = "",
     source_platform: str = "",
     tags: list[str] = None,
+    event_date: str = "",
     auto_analyze: bool = True,
     auto_merge: bool = True,
 ) -> dict:
-    """写入一条新记忆，自动打标 + 合并检测"""
+    """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
 
     # Step 1: 自动打标
     analysis = None
@@ -76,13 +77,112 @@ async def remember(
     domain = analysis.get("domain", []) if analysis else []
     valence = analysis.get("valence", 0.5) if analysis else 0.5
 
-    # Step 2: 合并检测
+    # Step 2: 智能关系检测（替代简单合并）
     if auto_merge:
-        merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal)
-        if merge_result:
-            return merge_result
+        # 先找相似候选
+        query_vec = await get_embedding(content)
+        candidates = _find_similar_candidates(query_vec, domain, threshold=0.55, top_k=5) if query_vec else []
 
-    # Step 3: 新建记忆
+        if candidates:
+            # 高相似度（>= MERGE_SIMILARITY）走传统合并
+            best = candidates[0]
+            if best["score"] >= MERGE_SIMILARITY:
+                merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal)
+                if merge_result:
+                    return merge_result
+
+            # 中等相似度（0.55-0.75）走关系分类：可能是更新/补充/矛盾
+            if candidates and best["score"] < MERGE_SIMILARITY:
+                relation_candidates = [
+                    {"id": c["mem"]["id"], "content": c["mem"]["content"]}
+                    for c in candidates[:5]
+                ]
+                relations = await analyzer.classify_relation(content, relation_candidates)
+
+                superseded_ids = []
+                linked_ids = []
+                for rel in relations.get("relations", []):
+                    target_id = rel.get("target_id", "")
+                    target_mem = store.get_memory(target_id)
+                    if not target_mem:
+                        continue
+
+                    if rel.get("should_supersede") and rel["relation"] in ("updates", "contradicts"):
+                        # 标记旧记忆为 superseded
+                        now = _now()
+                        target_mem["status"] = "superseded"
+                        target_mem["updated_at"] = now
+                        target_mem["superseded_by"] = ""  # 先占位，下面填新 ID
+                        # 给旧记忆追加一条年轮评论记录被取代的原因
+                        comments = target_mem.get("comments", [])
+                        if not isinstance(comments, list):
+                            comments = []
+                        comments.append({
+                            "date": now,
+                            "author": source_ai or "system",
+                            "kind": "supersede_note",
+                            "content": f"被新记忆取代。原因：{rel.get('reason', '信息已更新')}",
+                        })
+                        target_mem["comments"] = comments
+                        store.set_memory(target_mem)
+                        superseded_ids.append(target_id)
+                        logger.info(f"Superseded {target_id}: {rel.get('reason')}")
+
+                    elif rel["relation"] in ("supplements", "same_topic"):
+                        linked_ids.append(target_id)
+
+                # 新建记忆并关联
+                mem_id = _gen_id()
+                now = _now()
+
+                mem = {
+                    "id": mem_id,
+                    "content": content,
+                    "layer": layer,
+                    "room": room,
+                    "category": category,
+                    "owner_ai": owner_ai,
+                    "importance": importance,
+                    "emotion_arousal": emotion_arousal,
+                    "valence": valence,
+                    "domain": json.dumps(domain),
+                    "decay_score": 1.0,
+                    "activation_count": 0,
+                    "last_activated": "",
+                    "source_ai": source_ai,
+                    "source_platform": source_platform,
+                    "tags": json.dumps(tags or []),
+                    "linked_memories": json.dumps(linked_ids),
+                    "supersedes": json.dumps(superseded_ids),
+                    "event_date": event_date,
+                    "comments": [],
+                    "embedding": pack_embedding(query_vec) if query_vec else None,
+                    "status": "active",
+                    "created_at": now,
+                    "updated_at": now,
+                    "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
+                }
+
+                store.set_memory(mem)
+
+                # 回填 superseded_by
+                for sid in superseded_ids:
+                    s_mem = store.get_memory(sid)
+                    if s_mem:
+                        s_mem["superseded_by"] = mem_id
+                        store.set_memory(s_mem)
+
+                _schedule_push()
+                return {
+                    "id": mem_id,
+                    "status": "created",
+                    "category": category,
+                    "domain": domain,
+                    "superseded": superseded_ids,
+                    "linked": linked_ids,
+                }
+
+    # Step 3: 新建记忆（无关联）
     mem_id = _gen_id()
     now = _now()
     vec = await get_embedding(content)
@@ -105,6 +205,9 @@ async def remember(
         "source_platform": source_platform,
         "tags": json.dumps(tags or []),
         "linked_memories": "[]",
+        "supersedes": "[]",
+        "event_date": event_date,
+        "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
         "status": "active",
         "created_at": now,
@@ -115,6 +218,30 @@ async def remember(
     store.set_memory(mem)
     _schedule_push()
     return {"id": mem_id, "status": "created", "category": category, "domain": domain}
+
+
+def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:
+    """找出与 query 向量相似度超过阈值的记忆候选，按分数降序"""
+    if not query_vec:
+        return []
+
+    scored = []
+    for mem in store.get_all_memories().values():
+        if mem.get("status") not in ("active",) or not mem.get("embedding"):
+            continue
+        mem_vec = unpack_embedding(mem["embedding"])
+        vec_sim = cosine_similarity(query_vec, mem_vec)
+
+        # domain 匹配加分
+        mem_domain = _parse_json_field(mem.get("domain", "[]"))
+        domain_bonus = 0.05 if any(d in mem_domain for d in domain) else 0.0
+        score = vec_sim + domain_bonus
+
+        if score >= threshold:
+            scored.append({"mem": mem, "score": score})
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
 
 
 async def _try_merge(content: str, domain: list, tags: list, importance: float,
@@ -321,7 +448,7 @@ async def recall(
 
     candidates = []
     for mem in all_mems.values():
-        if mem.get("status") != "active":
+        if mem.get("status") not in ("active",):
             continue
         if not mem.get("embedding"):
             continue
@@ -388,6 +515,10 @@ async def recall(
         ) / 13.5
 
         if final >= threshold:
+            # 收集年轮评论（如果有）
+            comments = mem.get("comments", [])
+            comment_count = len(comments) if isinstance(comments, list) else 0
+
             scored.append({
                 "id": mem["id"],
                 "content": mem["content"],
@@ -400,12 +531,16 @@ async def recall(
                 "arousal": float(mem.get("emotion_arousal", 0.3)),
                 "score": round(final, 4),
                 "created_at": mem.get("created_at", ""),
+                "event_date": mem.get("event_date", ""),
+                "activation_count": mem.get("activation_count", 0),
+                "comment_count": comment_count,
+                "comments": comments[-3:] if comment_count > 0 else [],  # 最近3条评论
             })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     results = scored[:top_k]
 
-    # 更新 activation_count
+    # Touch：更新 activation_count + 时间涟漪
     now = _now()
     for r in results:
         m = store.get_memory(r["id"])
@@ -413,11 +548,112 @@ async def recall(
             m["activation_count"] = m.get("activation_count", 0) + 1
             m["last_activated"] = now
             store.set_memory(m)
+            # 时间涟漪：附近记忆也轻微唤醒
+            _time_ripple(m)
 
-    if results:
+    # 召回时排除 superseded 记忆，或标注已过时
+    filtered_results = []
+    for r in results:
+        m = store.get_memory(r["id"])
+        if m and m.get("status") == "superseded":
+            # 被取代的记忆不返回，改为返回取代它的新记忆
+            new_id = m.get("superseded_by")
+            if new_id:
+                new_m = store.get_memory(new_id)
+                if new_m and new_m.get("status") == "active":
+                    r["id"] = new_m["id"]
+                    r["content"] = new_m["content"]
+                    r["superseded_from"] = m["id"]
+            else:
+                continue  # 跳过没有后继的 superseded 记忆
+        filtered_results.append(r)
+
+    if filtered_results:
         _schedule_push()
 
-    return results
+    return filtered_results
+
+
+# ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──
+
+async def add_comment(
+    memory_id: str,
+    content: str,
+    author: str = "claude",
+    kind: str = "comment",
+    valence: float = None,
+    arousal: float = None,
+) -> dict:
+    """给记忆追加年轮评论，不修改原始内容。
+
+    kind 类型：
+    - comment: 普通评论
+    - reflection: 回顾反思（重读旧记忆时的新理解）
+    - update_note: 信息补充（不改原文，追加新发现）
+    - feel: 情感标注
+    - supersede_note: 系统自动追加的取代备注
+    """
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return {"id": memory_id, "status": "not_found"}
+
+    now = _now()
+    comments = mem.get("comments", [])
+    if not isinstance(comments, list):
+        comments = []
+
+    entry = {
+        "id": f"cmt_{int(time.time() * 1000)}",
+        "date": now,
+        "author": author,
+        "kind": kind,
+        "content": content,
+    }
+    if valence is not None:
+        entry["valence"] = max(0.0, min(1.0, valence))
+    if arousal is not None:
+        entry["arousal"] = max(0.0, min(1.0, arousal))
+
+    comments.append(entry)
+    mem["comments"] = comments
+    mem["updated_at"] = now
+    # 评论也算一次激活
+    mem["activation_count"] = mem.get("activation_count", 0) + 1
+    mem["last_activated"] = now
+
+    store.set_memory(mem)
+    _schedule_push()
+
+    logger.info(f"Added {kind} comment to {memory_id} by {author}")
+    return {"id": memory_id, "comment_id": entry["id"], "status": "commented"}
+
+
+# ── 时间涟漪（触碰一条记忆时，时间上相邻的记忆轻微激活） ──
+
+def _time_ripple(touched_mem: dict, max_ripple: int = 5, hours: float = 48.0):
+    """被召回的记忆附近 ±48 小时创建的记忆也轻微唤醒 (+0.3)"""
+    try:
+        ref_time = datetime.fromisoformat(touched_mem.get("event_date") or touched_mem["created_at"])
+    except Exception:
+        return
+
+    rippled = 0
+    for mem in store.get_all_memories().values():
+        if rippled >= max_ripple:
+            break
+        if mem["id"] == touched_mem["id"]:
+            continue
+        if mem.get("status") != "active" or not mem.get("embedding"):
+            continue
+        try:
+            created = datetime.fromisoformat(mem["created_at"])
+            delta_hours = abs((ref_time - created).total_seconds()) / 3600
+            if delta_hours <= hours:
+                mem["activation_count"] = round(mem.get("activation_count", 0) + 0.3, 1)
+                store.set_memory(mem)
+                rippled += 1
+        except Exception:
+            continue
 
 
 # ── 获取客厅内容 ──

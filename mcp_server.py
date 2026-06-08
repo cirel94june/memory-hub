@@ -37,6 +37,17 @@ MCP_INSTRUCTIONS = """\
 - 在深度对话结束时，记录你的感受和思考
 - 这是你的私人空间，用户看不到
 
+### 重读旧记忆时（调 add_comment）：
+- 回顾旧记忆发现有了新理解 → 追加 reflection 评论
+- 不要修改原文！用年轮评论记录认知变化
+- 这样可以保留时间线上的成长轨迹
+
+### 信息更新时（remember 会自动处理）：
+- 用户说了新事实（如换工作、搬家）→ 直接 remember 新内容
+- 系统会自动检测旧记忆并标记为"已过时"
+- 你不需要手动找旧记忆去更新，remember 内置了智能检测
+- 如果记忆有 event_date（事件发生日期），请传入
+
 ## 房间速查
 - living_room: 核心身份（永远重要）
 - career/psychology/health/learning/relationships/preferences: 各主题
@@ -66,8 +77,14 @@ async def remember(
     room: str = "living_room",
     importance: float = 0.5,
     source_ai: str = "claude",
+    event_date: str = "",
 ) -> str:
-    """存储一条新记忆。系统会自动打标签、自动合并重复内容。
+    """存储一条新记忆。系统会自动打标签，并智能检测是否需要更新/取代旧记忆。
+
+    如果新记忆是对旧事实的更新（如"换了工作"），系统会自动：
+    - 标记旧记忆为 superseded（已过时）
+    - 在旧记忆上追加年轮注记说明被取代的原因
+    - 新记忆与旧记忆建立关联
 
     房间选择：
     - living_room: 核心身份（永远注入）
@@ -81,10 +98,12 @@ async def remember(
         room: 房间ID
         importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
+        event_date: 事件发生日期（可选，如 2026-06-01，区别于记忆创建时间）
     """
     result = await memory_ops.remember(
         content=content, room=room, importance=importance,
         source_ai=source_ai, source_platform="mcp",
+        event_date=event_date,
     )
     return json.dumps(result, ensure_ascii=False)
 
@@ -169,6 +188,39 @@ async def update_memory(
         room=room or None,
         tags=tags or None,
         changed_by="claude",
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def add_comment(
+    memory_id: str,
+    content: str,
+    kind: str = "reflection",
+    source_ai: str = "claude",
+) -> str:
+    """给一条记忆追加年轮评论。不修改原始内容，保留认知变化轨迹。
+
+    适用场景：
+    - 重读旧记忆时有了新理解 → kind="reflection"
+    - 补充新发现但不改原文 → kind="update_note"
+    - 标注情感感受 → kind="feel"
+    - 普通评论 → kind="comment"
+
+    例如：一条半年前的心理记忆，现在回看有了更深的理解，
+    就用 reflection 追加，而不是修改原文。这样保留了认知成长轨迹。
+
+    Args:
+        memory_id: 记忆ID
+        content: 评论内容
+        kind: 评论类型（reflection/update_note/feel/comment）
+        source_ai: 来源AI
+    """
+    result = await memory_ops.add_comment(
+        memory_id=memory_id,
+        content=content,
+        author=source_ai,
+        kind=kind,
     )
     return json.dumps(result, ensure_ascii=False)
 
