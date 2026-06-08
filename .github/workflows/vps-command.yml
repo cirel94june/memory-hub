@@ -1,0 +1,22 @@
+name: Run VPS Command
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '要在 VPS 上执行的命令'
+        required: true
+        default: 'cd /opt/memory-hub && systemctl status memory-hub --no-pager'
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute command on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: ${{ inputs.command }}
