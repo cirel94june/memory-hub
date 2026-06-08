@@ -237,4 +237,20 @@ AI回复：{ai_response[:500]}
             )
             executed.append(action)
 
+    # 更新 Persona State（根据对话情绪）
+    try:
+        from persona_state import update_after_conversation
+        # 从提取结果推断对话情绪
+        avg_valence = 0.5
+        avg_arousal = 0.3
+        topics = []
+        for action in executed:
+            if action.get("emotion_arousal"):
+                avg_arousal = (avg_arousal + float(action["emotion_arousal"])) / 2
+            if action.get("category"):
+                topics.append(action["category"])
+        update_after_conversation(ai_id, valence=avg_valence, arousal=avg_arousal, topics=topics)
+    except Exception:
+        pass
+
     return {"actions": executed}

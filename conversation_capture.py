@@ -198,6 +198,12 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         if not content or len(content) < 10:
             continue
 
+        # 附上原始对话片段作为源追溯（最近3轮，截断）
+        source_ctx = "\n".join([
+            f"用户: {e['user'][:100]}\nAI: {e['ai'][:100]}"
+            for e in buffer[-3:]
+        ])[:500]
+
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
@@ -205,6 +211,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform=f"auto_capture:{platform}",
+            source_context=source_ctx,
         )
         memories.append(result)
 

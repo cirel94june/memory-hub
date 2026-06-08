@@ -122,6 +122,7 @@ async def remember(
     source_platform: str = "",
     tags: list[str] = None,
     event_date: str = "",
+    source_context: str = "",
     auto_analyze: bool = True,
     auto_merge: bool = True,
 ) -> dict:
@@ -219,6 +220,7 @@ async def remember(
                     "linked_memories": json.dumps(linked_ids),
                     "supersedes": json.dumps(superseded_ids),
                     "event_date": event_date,
+                    "source_context": source_context,
                     "comments": [],
                     "embedding": pack_embedding(query_vec) if query_vec else None,
                     "status": "active",
@@ -271,6 +273,7 @@ async def remember(
         "linked_memories": "[]",
         "supersedes": "[]",
         "event_date": event_date,
+        "source_context": source_context,
         "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
         "status": "active",

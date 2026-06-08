@@ -481,10 +481,19 @@ async def run_full_maintenance() -> dict:
     results["decay"] = await run_decay()
     log.info(f"  Decay: {results['decay']}")
 
-    # 8. 推送到 GitHub
+    # 8. Persona State 休息（恢复精力）
+    try:
+        from persona_state import rest
+        for ai_id in ["claude", "gemini", "gpt"]:
+            rest(ai_id)
+        log.info("  Persona states rested")
+    except Exception as e:
+        log.warning(f"  Persona rest failed: {e}")
+
+    # 9. 推送到 GitHub
     await store.push_dirty()
 
-    # 8. 重建所有 AI 的走廊
+    # 10. 重建所有 AI 的走廊（含 persona state + unresolved）
     from corridor import rebuild_all_corridors
     await rebuild_all_corridors()
     log.info("Maintenance complete, corridors rebuilt")

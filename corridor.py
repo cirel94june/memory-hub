@@ -91,6 +91,22 @@ async def build_corridor(ai_id: str) -> str:
     if infra:
         sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:100]}" for x in infra))
 
+    # 7. Persona State（AI 当前情绪/精力状态）
+    try:
+        from persona_state import format_for_corridor
+        persona_line = format_for_corridor(ai_id)
+        if persona_line:
+            sections.append(persona_line)
+    except Exception:
+        pass
+
+    # 8. Unresolved 记忆（待办事项提醒）
+    unresolved_mems = [m for m in all_mems.values()
+                       if m.get("resolved") == False and m.get("status") == "active"]
+    if unresolved_mems:
+        lines = [f"· {m['content'][:100]}" for m in unresolved_mems[:3]]
+        sections.append("【待办/未完成】\n" + "\n".join(lines))
+
     corridor_text = "\n\n".join(sections)
 
     # 保存走廊文档到 GitHub
