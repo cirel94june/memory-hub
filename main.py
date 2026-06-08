@@ -287,6 +287,40 @@ async def api_post_process(body: PostProcessRequest, authorization: str = Header
     )
 
 
+# ── 对话自动捕获 ──
+
+import conversation_capture
+
+class ConversationLogRequest(BaseModel):
+    user_message: str
+    ai_response: str
+    ai_id: str = "claude"
+    platform: str = ""
+
+@app.post("/api/capture/log")
+async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
+    """记录一轮对话，缓冲区满时自动提取记忆"""
+    verify_secret(authorization)
+    return await conversation_capture.log_conversation(
+        user_message=body.user_message,
+        ai_response=body.ai_response,
+        ai_id=body.ai_id,
+        platform=body.platform,
+    )
+
+@app.post("/api/capture/extract")
+async def api_force_extract(authorization: str = Header(default="")):
+    """手动触发对话总结（不等缓冲区满）"""
+    verify_secret(authorization)
+    return await conversation_capture.force_extract()
+
+@app.get("/api/capture/status")
+async def api_capture_status(authorization: str = Header(default="")):
+    """查看对话缓冲区状态"""
+    verify_secret(authorization)
+    return await conversation_capture.get_buffer_status()
+
+
 # ── Daemon 操作 ──
 
 @app.post("/api/daemon/decay")

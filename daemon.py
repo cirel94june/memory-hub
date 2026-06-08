@@ -468,11 +468,20 @@ async def run_full_maintenance() -> dict:
     results["psychology"] = await distill_psychology()
     log.info(f"  Psychology: {results['psychology']}")
 
-    # 6. 衰减
+    # 6. 刷新对话捕获缓冲区（确保残留对话不丢）
+    try:
+        from conversation_capture import force_extract
+        capture_result = await force_extract()
+        results["capture_flush"] = capture_result
+        log.info(f"  Capture flush: {capture_result}")
+    except Exception as e:
+        log.warning(f"  Capture flush failed: {e}")
+
+    # 7. 衰减
     results["decay"] = await run_decay()
     log.info(f"  Decay: {results['decay']}")
 
-    # 7. 推送到 GitHub
+    # 8. 推送到 GitHub
     await store.push_dirty()
 
     # 8. 重建所有 AI 的走廊

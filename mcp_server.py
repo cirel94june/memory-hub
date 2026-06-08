@@ -337,3 +337,50 @@ async def hub_info() -> str:
         "rooms": {k: {"name": v["name"], "icon": v.get("icon", ""), "type": v.get("type", "")} for k, v in rooms.items()},
     }
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+# ── 对话自动捕获 ──
+
+import conversation_capture
+
+
+@mcp.tool()
+async def capture_conversation(
+    user_message: str,
+    ai_response: str,
+    source_ai: str = "claude",
+    platform: str = "mcp",
+) -> str:
+    """记录一轮对话到自动捕获缓冲区。
+
+    系统会自动攒对话，每 20 轮触发一次小模型总结，
+    从对话中提取值得记住的事实并自动存成记忆。
+
+    不需要你判断"该不该存" —— 全部丢进来，系统自己筛。
+
+    Args:
+        user_message: 用户说的话
+        ai_response: AI 的回复
+        source_ai: AI 身份
+        platform: 平台标识
+    """
+    result = await conversation_capture.log_conversation(
+        user_message=user_message,
+        ai_response=ai_response,
+        ai_id=source_ai,
+        platform=platform,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def flush_capture(source_ai: str = "claude") -> str:
+    """手动触发对话总结，不等缓冲区攒满。
+
+    适用场景：深度对话结束时，确保重要信息不会因为没攒满 20 条而遗漏。
+
+    Args:
+        source_ai: AI 身份（留空则处理所有缓冲区）
+    """
+    result = await conversation_capture.force_extract(ai_id=source_ai)
+    return json.dumps(result, ensure_ascii=False, indent=2)
