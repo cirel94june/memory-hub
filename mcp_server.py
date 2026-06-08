@@ -226,6 +226,25 @@ async def add_comment(
 
 
 @mcp.tool()
+async def resolve_memory(memory_id: str, resolved: bool = True) -> str:
+    """标记一条记忆为已解决或未解决。
+
+    未解决（resolved=False）的记忆会在 recall 时优先浮现（最多 2 条），
+    确保交代过的事情不会被遗忘。
+
+    适用场景：
+    - 用户说"帮我记着下周要交报告" → remember 后 resolve_memory(id, resolved=False)
+    - 事情完成了 → resolve_memory(id, resolved=True)
+
+    Args:
+        memory_id: 记忆ID
+        resolved: True=已解决（默认），False=未解决/待办
+    """
+    result = await memory_ops.resolve_memory(memory_id, resolved)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
 async def archive_memory(memory_id: str) -> str:
     """归档一条记忆（不删除，标记为archived）。
 

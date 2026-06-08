@@ -44,6 +44,70 @@ def _fuzzy_score(query: str, text: str) -> float:
     return matched / len(words)
 
 
+def _bm25_score(query: str, content: str, avg_len: float = 200.0, k1: float = 1.5, b: float = 0.75) -> float:
+    """简化版 BM25 关键词评分"""
+    if not query or not content:
+        return 0.0
+    query_terms = set(query.lower().split())
+    content_lower = content.lower()
+    doc_len = len(content_lower)
+
+    score = 0.0
+    for term in query_terms:
+        # term frequency
+        tf = content_lower.count(term)
+        if tf == 0:
+            continue
+        # BM25 TF saturation
+        tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * doc_len / avg_len))
+        score += tf_norm
+
+    # normalize by query length
+    return min(1.0, score / max(1, len(query_terms)))
+
+
+def _exact_match_score(query: str, mem: dict) -> float:
+    """精确匹配评分：query 完整出现在 content/tags/category 中"""
+    if not query:
+        return 0.0
+    q = query.lower().strip()
+    fields = [
+        mem.get("content", ""),
+        mem.get("category", ""),
+        " ".join(_parse_json_field(mem.get("tags", "[]"))),
+        " ".join(_parse_json_field(mem.get("domain", "[]"))),
+    ]
+    for field in fields:
+        if q in field.lower():
+            return 1.0
+    # 检查 query 中每个长词（>=2字符）是否出现
+    words = [w for w in q.split() if len(w) >= 2]
+    if not words:
+        return 0.0
+    all_text = " ".join(fields).lower()
+    matched = sum(1 for w in words if w in all_text)
+    return matched / len(words)
+
+
+def _rrf_merge(*rank_lists, k: int = 60) -> list[dict]:
+    """Reciprocal Rank Fusion：多路排序结果融合
+
+    每路给每个 ID 打分 1/(k+rank)，最后按总分排序。
+    k=60 是标准 RRF 参数。
+    """
+    scores = {}  # id -> {"score": float, "data": dict}
+    for rank_list in rank_lists:
+        for rank, item in enumerate(rank_list):
+            mid = item["id"]
+            rrf_score = 1.0 / (k + rank + 1)
+            if mid not in scores:
+                scores[mid] = {"score": 0.0, "data": item}
+            scores[mid]["score"] += rrf_score
+
+    merged = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+    return [item["data"] | {"score": round(item["score"], 6)} for item in merged]
+
+
 # ── 写入记忆（带自动打标 + 合并检测） ──
 
 async def remember(
@@ -419,17 +483,23 @@ async def recall(
     query: str,
     ai_id: str = "",
     top_k: int = 8,
-    threshold: float = 0.30,
+    threshold: float = 0.25,
     include_rooms: list[str] = None,
     exclude_isolated: bool = True,
     query_domain: list[str] = None,
     query_valence: float = -1,
     query_arousal: float = -1,
 ) -> list[dict]:
-    """多维搜索召回记忆"""
+    """混合搜索召回记忆（向量 + 关键词 + 精确匹配，RRF 融合）
+
+    三路并行搜索，Reciprocal Rank Fusion 融合排序：
+    1. 向量路：embedding 余弦相似度（语义匹配）
+    2. 关键词路：BM25 关键词匹配（精确词汇命中）
+    3. 精确路：query 完整出现在内容/标签中（最强信号）
+
+    + unresolved 记忆优先浮现（最多 2 条）
+    """
     query_vec = await get_embedding(query)
-    if not query_vec:
-        return []
 
     # 如果没指定 domain，用 analyzer 快速分析 query
     if not query_domain:
@@ -446,11 +516,10 @@ async def recall(
     all_mems = store.get_all_memories()
     isolated_rooms = {k for k, v in ROOMS.items() if v.get("type") == "isolated"}
 
+    # 过滤候选（公共逻辑）
     candidates = []
     for mem in all_mems.values():
         if mem.get("status") not in ("active",):
-            continue
-        if not mem.get("embedding"):
             continue
         room = mem.get("room", "")
         if exclude_isolated and room in isolated_rooms:
@@ -462,85 +531,105 @@ async def recall(
                 continue
         candidates.append(mem)
 
-    # Domain 预筛：如果有 domain，优先匹配的排前面
-    scored = []
+    def _build_result(mem, score):
+        room = mem.get("room", "")
+        comments = mem.get("comments", [])
+        comment_count = len(comments) if isinstance(comments, list) else 0
+        return {
+            "id": mem["id"],
+            "content": mem["content"],
+            "layer": mem.get("layer", ""),
+            "room": room,
+            "category": mem.get("category", ""),
+            "domain": _parse_json_field(mem.get("domain", "[]")),
+            "importance": float(mem.get("importance", 0.5)),
+            "valence": float(mem.get("valence", 0.5)),
+            "arousal": float(mem.get("emotion_arousal", 0.3)),
+            "score": round(score, 4),
+            "created_at": mem.get("created_at", ""),
+            "event_date": mem.get("event_date", ""),
+            "resolved": mem.get("resolved", None),
+            "activation_count": mem.get("activation_count", 0),
+            "comment_count": comment_count,
+            "comments": comments[-3:] if comment_count > 0 else [],
+        }
+
+    # ── 路径 1：向量搜索（语义匹配）──
+    vec_results = []
+    if query_vec:
+        vec_scored = []
+        for mem in candidates:
+            if not mem.get("embedding"):
+                continue
+            mem_vec = unpack_embedding(mem["embedding"])
+            vec_sim = cosine_similarity(query_vec, mem_vec)
+
+            # 多维加权：向量为主，emotion/time/importance 辅助
+            embed_score = max(0, vec_sim)
+            if query_valence >= 0 and query_arousal >= 0:
+                mv = float(mem.get("valence", 0.5))
+                ma = float(mem.get("emotion_arousal", 0.3))
+                emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
+            else:
+                emotion_score = 0.5
+            try:
+                created = datetime.fromisoformat(mem["created_at"])
+                days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
+                time_score = math.exp(-0.02 * days)
+            except Exception:
+                time_score = 0.5
+            importance_score = float(mem.get("importance", 0.5))
+
+            final = (embed_score * 0.6 + emotion_score * 0.15 +
+                     time_score * 0.1 + importance_score * 0.15)
+            vec_scored.append((mem, final))
+
+        vec_scored.sort(key=lambda x: x[1], reverse=True)
+        vec_results = [_build_result(m, s) for m, s in vec_scored[:50]]
+
+    # ── 路径 2：关键词搜索（BM25）──
+    kw_scored = []
     for mem in candidates:
-        mem_vec = unpack_embedding(mem["embedding"])
-        vec_sim = cosine_similarity(query_vec, mem_vec)
+        searchable = " ".join([
+            mem.get("content", ""),
+            mem.get("category", ""),
+            " ".join(_parse_json_field(mem.get("tags", "[]"))),
+            " ".join(_parse_json_field(mem.get("domain", "[]"))),
+        ])
+        bm25 = _bm25_score(query, searchable)
+        if bm25 > 0.05:
+            kw_scored.append((mem, bm25))
 
-        # Topic score: fuzzy match on category + domain + tags + content
-        mem_domain = _parse_json_field(mem.get("domain", "[]"))
-        mem_tags = _parse_json_field(mem.get("tags", "[]"))
-        cat = mem.get("category", "")
+    kw_scored.sort(key=lambda x: x[1], reverse=True)
+    kw_results = [_build_result(m, s) for m, s in kw_scored[:50]]
 
-        domain_match = _fuzzy_score(
-            " ".join(query_domain),
-            " ".join(mem_domain)
-        ) if query_domain else 0.0
-        tag_match = _fuzzy_score(query, " ".join(mem_tags))
-        cat_match = _fuzzy_score(query, cat)
-        content_match = _fuzzy_score(query, mem.get("content", "")[:200])
+    # ── 路径 3：精确匹配 ──
+    exact_scored = []
+    for mem in candidates:
+        exact = _exact_match_score(query, mem)
+        if exact > 0.3:
+            exact_scored.append((mem, exact))
 
-        topic_score = (cat_match * 3 + domain_match * 2.5 + tag_match * 2 + content_match * 1) / 8.5
+    exact_scored.sort(key=lambda x: x[1], reverse=True)
+    exact_results = [_build_result(m, s) for m, s in exact_scored[:50]]
 
-        # Embedding score (normalized to 0-1)
-        embed_score = max(0, vec_sim)
+    # ── RRF 融合三路结果 ──
+    merged = _rrf_merge(vec_results, kw_results, exact_results)
 
-        # Emotion score
-        if query_valence >= 0 and query_arousal >= 0:
-            mv = float(mem.get("valence", 0.5))
-            ma = float(mem.get("emotion_arousal", 0.3))
-            emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
+    # ── Unresolved 优先浮现（最多 2 条插到最前面）──
+    unresolved = []
+    normal = []
+    for item in merged:
+        mem = store.get_memory(item["id"])
+        if mem and mem.get("resolved") == False and len(unresolved) < 2:
+            item["_unresolved"] = True
+            unresolved.append(item)
         else:
-            emotion_score = 0.5
+            normal.append(item)
 
-        # Time score
-        try:
-            created = datetime.fromisoformat(mem["created_at"])
-            days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
-            time_score = math.exp(-0.02 * days)
-        except Exception:
-            time_score = 0.5
+    results = (unresolved + normal)[:top_k]
 
-        # Importance score
-        importance_score = float(mem.get("importance", 0.5))
-
-        # Combined: embedding dominates but other dims help
-        final = (
-            embed_score * 5.0 +
-            topic_score * 4.0 +
-            emotion_score * 2.0 +
-            time_score * 1.5 +
-            importance_score * 1.0
-        ) / 13.5
-
-        if final >= threshold:
-            # 收集年轮评论（如果有）
-            comments = mem.get("comments", [])
-            comment_count = len(comments) if isinstance(comments, list) else 0
-
-            scored.append({
-                "id": mem["id"],
-                "content": mem["content"],
-                "layer": mem.get("layer", ""),
-                "room": room,
-                "category": mem.get("category", ""),
-                "domain": mem_domain,
-                "importance": float(mem.get("importance", 0.5)),
-                "valence": float(mem.get("valence", 0.5)),
-                "arousal": float(mem.get("emotion_arousal", 0.3)),
-                "score": round(final, 4),
-                "created_at": mem.get("created_at", ""),
-                "event_date": mem.get("event_date", ""),
-                "activation_count": mem.get("activation_count", 0),
-                "comment_count": comment_count,
-                "comments": comments[-3:] if comment_count > 0 else [],  # 最近3条评论
-            })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    results = scored[:top_k]
-
-    # Touch：更新 activation_count + 时间涟漪
+    # ── Touch：更新 activation_count + 时间涟漪 ──
     now = _now()
     for r in results:
         m = store.get_memory(r["id"])
@@ -548,15 +637,13 @@ async def recall(
             m["activation_count"] = m.get("activation_count", 0) + 1
             m["last_activated"] = now
             store.set_memory(m)
-            # 时间涟漪：附近记忆也轻微唤醒
             _time_ripple(m)
 
-    # 召回时排除 superseded 记忆，或标注已过时
+    # ── 替换 superseded 记忆 ──
     filtered_results = []
     for r in results:
         m = store.get_memory(r["id"])
         if m and m.get("status") == "superseded":
-            # 被取代的记忆不返回，改为返回取代它的新记忆
             new_id = m.get("superseded_by")
             if new_id:
                 new_m = store.get_memory(new_id)
@@ -565,7 +652,9 @@ async def recall(
                     r["content"] = new_m["content"]
                     r["superseded_from"] = m["id"]
             else:
-                continue  # 跳过没有后继的 superseded 记忆
+                continue
+        # 清理内部标记
+        r.pop("_unresolved", None)
         filtered_results.append(r)
 
     if filtered_results:
@@ -626,6 +715,21 @@ async def add_comment(
 
     logger.info(f"Added {kind} comment to {memory_id} by {author}")
     return {"id": memory_id, "comment_id": entry["id"], "status": "commented"}
+
+
+# ── 标记记忆为已解决/未解决 ──
+
+async def resolve_memory(memory_id: str, resolved: bool = True) -> dict:
+    """标记一条记忆为已解决（resolved=True）或未解决（resolved=False）。
+    未解决的记忆在 recall 时会优先浮现。"""
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return {"id": memory_id, "status": "not_found"}
+    mem["resolved"] = resolved
+    mem["updated_at"] = _now()
+    store.set_memory(mem)
+    _schedule_push()
+    return {"id": memory_id, "status": "resolved" if resolved else "unresolved"}
 
 
 # ── 时间涟漪（触碰一条记忆时，时间上相邻的记忆轻微激活） ──

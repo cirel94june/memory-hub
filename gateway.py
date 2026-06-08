@@ -88,19 +88,34 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         except Exception:
             pass
 
-    # 4. 向量搜索相关记忆（不限制房间，让向量搜索自由匹配）
+    # 4. 三级记忆过滤（借鉴 Aelios）
+    #    L1: 混合搜索粗筛 → 12 条候选
+    #    L2: 小模型 reranker → 精筛 5 条
+    #    L3: 压缩到 ≤300 字/条（注入时）
     exclude_isolated = "game_room" not in (rooms_to_check or [])
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
-        top_k=6,
+        top_k=12,  # L1: 粗筛 12 条
         include_rooms=rooms_to_check if rooms_to_check else None,
         exclude_isolated=exclude_isolated,
     )
     if recalled:
+        # L2: Reranker — 小模型精筛到 5 条
+        recalled = await _rerank_memories(user_message, recalled, top_k=5)
         recalled_ids = [r["id"] for r in recalled]
         rooms_checked.extend(rooms_to_check or [])
-        lines = [f"- [{r['room']}] {r['content']}" for r in recalled]
+        # L3: 压缩 — 每条 ≤300 字
+        lines = []
+        for r in recalled:
+            content = r["content"]
+            if len(content) > 300:
+                content = content[:280] + "..."
+            room_tag = r["room"]
+            # 未解决的记忆加标记
+            if r.get("resolved") == False:
+                room_tag += "/待办"
+            lines.append(f"- [{room_tag}] {content}")
         parts.append("【相关记忆】\n" + "\n".join(lines))
 
     inject_text = "\n\n".join(parts) if parts else ""
@@ -110,6 +125,47 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         "recalled_ids": recalled_ids,
         "rooms_checked": list(set(rooms_checked)),
     }
+
+
+async def _rerank_memories(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
+    """L2 Reranker：用小模型从候选记忆中精筛最相关的 top_k 条"""
+    if len(candidates) <= top_k:
+        return candidates
+
+    candidate_text = "\n".join([
+        f"[{i}] {c['content'][:150]}"
+        for i, c in enumerate(candidates)
+    ])
+    prompt = f"""从以下记忆候选中，选出与用户消息最相关的 {top_k} 条。
+
+用户消息：{query[:200]}
+
+候选记忆：
+{candidate_text}
+
+输出 JSON 数组，包含最相关的记忆编号（从 0 开始），按相关度降序。
+只输出 JSON。示例：[2, 0, 5, 1, 3]"""
+
+    result = await _call_llm(prompt)
+    if result:
+        try:
+            result = result.strip()
+            if result.startswith("```"):
+                result = result.split("\n", 1)[-1].rsplit("```", 1)[0]
+            indices = json.loads(result)
+            reranked = []
+            seen = set()
+            for idx in indices[:top_k]:
+                if isinstance(idx, int) and 0 <= idx < len(candidates) and idx not in seen:
+                    reranked.append(candidates[idx])
+                    seen.add(idx)
+            if reranked:
+                return reranked
+        except Exception:
+            pass
+
+    # fallback: 直接取前 top_k
+    return candidates[:top_k]
 
 
 async def post_process(user_message: str, ai_response: str, ai_id: str, platform: str = "") -> dict:
