@@ -357,6 +357,49 @@ body {
 .modal textarea { resize: vertical; min-height: 100px; line-height: 1.6; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 
+/* ── 时间线视图 ── */
+.timeline { padding-left: 8px; }
+.timeline-date { margin: 20px 0 10px 0; }
+.timeline-date-label {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  padding: 6px 0;
+  border-bottom: 2px solid var(--accent);
+  display: inline-block;
+}
+.timeline-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding-left: 4px;
+}
+.timeline-time {
+  width: 44px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text2);
+  padding-top: 12px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.timeline-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 14px;
+}
+.timeline-content {
+  flex: 1;
+  min-width: 0;
+}
+.timeline-content .memory-content {
+  font-size: 14px;
+  max-height: none;
+}
+
 /* ── 响应式 ── */
 @media (max-width: 768px) {
   .layout { flex-direction: column; padding: 12px; gap: 16px; }
@@ -380,7 +423,9 @@ body {
     <span class="header-badge" id="headerBadge">0 memories</span>
   </div>
   <div class="header-actions">
+    <button class="btn" id="viewToggle" onclick="toggleTimelineView()">📅 时间线</button>
     <button class="btn" onclick="openAddModal()">+ 添加</button>
+    <button class="btn" onclick="openImportModal()">📥 导入</button>
     <button class="btn" onclick="runMaintain()">整理</button>
     <button class="btn" onclick="exportMemories()">导出</button>
   </div>
@@ -440,6 +485,9 @@ body {
       <label>所属 AI</label>
       <select id="mOwner">
         <option value="claude">Claude</option>
+        <option value="cloudy">小克 (TG)</option>
+        <option value="lucien">Lucien (TG)</option>
+        <option value="jasper">Jasper (TG)</option>
         <option value="gemini">Gemini</option>
         <option value="gpt">GPT</option>
       </select>
@@ -451,6 +499,41 @@ body {
     <div class="modal-actions">
       <button class="btn" onclick="closeAddModal()">取消</button>
       <button class="btn btn-primary" onclick="saveMemory()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 导入对话模态框 -->
+<div class="modal-overlay" id="importModal" onclick="if(event.target===this)closeImportModal()">
+  <div class="modal">
+    <h2>📥 导入对话</h2>
+    <p style="color:var(--text2);font-size:13px;margin-bottom:12px">粘贴对话文本或 JSON，自动提取记忆和用户画像</p>
+
+    <label>对话内容</label>
+    <textarea id="importContent" placeholder="支持格式：&#10;1. JSON: [{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;...&quot;},...]&#10;2. 纯文本: 用户: xxx / AI: xxx&#10;3. Telegram 导出 JSON" style="height:200px"></textarea>
+
+    <label>格式</label>
+    <select id="importFormat">
+      <option value="auto">自动检测</option>
+      <option value="json">JSON</option>
+      <option value="txt">纯文本</option>
+    </select>
+
+    <label>来源 AI</label>
+    <select id="importAi">
+      <option value="claude">Claude</option>
+      <option value="cloudy">小克 (TG)</option>
+      <option value="lucien">Lucien (TG)</option>
+      <option value="jasper">Jasper (TG)</option>
+      <option value="gemini">Gemini</option>
+      <option value="gpt">GPT</option>
+    </select>
+
+    <div id="importResult" style="display:none;margin-top:12px;padding:12px;border-radius:8px;background:var(--accent-light);font-size:13px"></div>
+
+    <div class="modal-actions">
+      <button class="btn" onclick="closeImportModal()">取消</button>
+      <button class="btn btn-primary" id="importBtn" onclick="doImport()">开始导入</button>
     </div>
   </div>
 </div>
@@ -480,7 +563,7 @@ const ROOM_META = {
   personality: { icon: '🪞', name: '自我认知', group: 'private' },
   game_room: { icon: '🎮', name: '游戏房', group: 'isolated' },
 };
-const AI_COLORS = { claude: '#c4956a', gemini: '#4285F4', gpt: '#10A37F' };
+const AI_COLORS = { claude: '#c4956a', gemini: '#4285F4', gpt: '#10A37F', cloudy: '#c4956a', lucien: '#8B5CF6', jasper: '#F59E0B' };
 const PER_AI_ROOMS = ['diary', 'dreams', 'relationship', 'personality'];
 
 // ── Auth ──
@@ -777,6 +860,122 @@ function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// ── Timeline view ──
+let isTimelineView = false;
+
+function toggleTimelineView() {
+  isTimelineView = !isTimelineView;
+  document.getElementById('viewToggle').textContent = isTimelineView ? '📋 列表' : '📅 时间线';
+  if (isTimelineView) {
+    loadTimeline();
+  } else {
+    loadMemories();
+  }
+}
+
+async function loadTimeline() {
+  const data = await api('/api/memory/list?per_page=200&status=active');
+  const items = data.items || [];
+  // Sort by created_at descending
+  items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+  // Group by date
+  const groups = {};
+  items.forEach(m => {
+    const date = (m.created_at || '').slice(0, 10) || 'unknown';
+    if (!groups[date]) groups[date] = [];
+    groups[date].push(m);
+  });
+
+  const el = document.getElementById('memoryList');
+  if (!Object.keys(groups).length) {
+    el.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>还没有记忆</p></div>';
+    document.getElementById('pagination').innerHTML = '';
+    return;
+  }
+
+  let html = '<div class="timeline">';
+  for (const [date, mems] of Object.entries(groups)) {
+    const weekday = ['日','一','二','三','四','五','六'][new Date(date + 'T00:00:00').getDay()] || '';
+    html += `<div class="timeline-date">
+      <div class="timeline-date-label">${date} <span style="color:var(--text3);font-weight:400">周${weekday}</span> <span class="nav-count">${mems.length}条</span></div>
+    </div>`;
+    for (const m of mems) {
+      const time = (m.created_at || '').slice(11, 16) || '';
+      const roomMeta = ROOM_META[m.room] || {};
+      const impLevel = Math.round((m.importance || 0.5) * 5);
+      const sourceTag = m.source_platform ? `<span class="tag" style="background:#e8e0d4">${m.source_platform}</span>` : '';
+      const aiTag = m.source_ai ? `<span class="tag tag-ai" style="background:${AI_COLORS[m.source_ai]||'#888'}">${m.source_ai}</span>` : '';
+      html += `
+        <div class="timeline-item">
+          <div class="timeline-time">${time}</div>
+          <div class="timeline-dot" style="background:${AI_COLORS[m.source_ai||m.owner_ai]||'var(--accent)'}"></div>
+          <div class="timeline-content memory-card" data-id="${m.id}">
+            <div class="memory-content" style="margin-bottom:6px">${escHtml(m.content)}</div>
+            <div class="memory-tags">
+              <span class="tag tag-room">${roomMeta.icon||''} ${roomMeta.name||m.room}</span>
+              ${aiTag}${sourceTag}
+              <span class="importance-dots">${Array.from({length:5},(_,i)=>`<span class="importance-dot ${i<impLevel?'filled':''}"></span>`).join('')}</span>
+            </div>
+            <div class="memory-actions" style="opacity:0.7;margin-top:6px">
+              <button class="btn btn-sm" onclick="editMemory('${m.id}')">编辑</button>
+              <button class="btn btn-sm" onclick="archiveMemory('${m.id}')">归档</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
+            </div>
+          </div>
+        </div>`;
+    }
+  }
+  html += '</div>';
+  el.innerHTML = html;
+  document.getElementById('pagination').innerHTML = '';
+}
+
+// ── Import ──
+function openImportModal() {
+  document.getElementById('importContent').value = '';
+  document.getElementById('importResult').style.display = 'none';
+  document.getElementById('importBtn').disabled = false;
+  document.getElementById('importBtn').textContent = '开始导入';
+  document.getElementById('importModal').classList.add('show');
+}
+function closeImportModal() {
+  document.getElementById('importModal').classList.remove('show');
+}
+
+async function doImport() {
+  const content = document.getElementById('importContent').value.trim();
+  if (!content) { alert('请粘贴对话内容'); return; }
+  const btn = document.getElementById('importBtn');
+  btn.disabled = true;
+  btn.textContent = '导入中...';
+  const resultDiv = document.getElementById('importResult');
+  resultDiv.style.display = 'block';
+  resultDiv.innerHTML = '⏳ 正在解析对话并提取记忆，请稍候...';
+
+  try {
+    const data = await api('/api/import/conversation', {
+      method: 'POST',
+      body: JSON.stringify({
+        content: content,
+        format: document.getElementById('importFormat').value,
+        ai_id: document.getElementById('importAi').value,
+      })
+    });
+    if (data.status === 'success') {
+      resultDiv.innerHTML = `✅ 导入完成！<br>解析消息: ${data.parsed_messages} 条（用户 ${data.user_messages} / AI ${data.ai_messages}）<br>处理分块: ${data.chunks_processed} 块<br><b>提取记忆: ${data.memories_extracted} 条</b>`;
+      loadRoomCounts();
+      if (isTimelineView) loadTimeline(); else loadMemories();
+    } else {
+      resultDiv.innerHTML = `❌ ${data.message || '导入失败'}`;
+    }
+  } catch (e) {
+    resultDiv.innerHTML = `❌ 请求失败: ${e.message}`;
+  }
+  btn.disabled = false;
+  btn.textContent = '开始导入';
 }
 
 // ── Init ──

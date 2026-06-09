@@ -177,34 +177,52 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
         "actions": [{"type": "remember/update/skip", "content": "...", ...}]
     }
     """
-    prompt = f"""你是一个记忆提取助手。分析以下对话，判断是否有值得长期记住的新信息。
+    # 动态构建房间列表
+    room_list = "\n".join([
+        f"  - {k}: {v['name']}（{v.get('description','')}）"
+        for k, v in ROOMS.items()
+    ])
+
+    prompt = f"""你是一个严格的记忆提取助手。分析以下对话，判断是否有值得**长期**记住的新信息。
 
 用户说：{user_message[:500]}
 AI回复：{ai_response[:500]}
 
-请判断：
-1. 有没有关于用户身份/状态的新信息？（如：用户换了工作、心情不好、生病了）
-2. 有没有关于用户偏好的新信息？（如：喜欢/不喜欢什么）
-3. 有没有重要事件？（如：约定、计划、重要日期）
-4. 这是不是在玩游戏/编故事？（如果是，标记为 game 分类）
-5. 不重要的闲聊就跳过
+## 值得记住的（importance ≥ 0.4）：
+- 用户身份/状态变化（换工作、搬家、生病、心情持续低落）
+- 明确表达的偏好或雷区（喜欢X、讨厌Y、对Z过敏）
+- 重要事件或约定（约定周末见面、面试日期、纪念日）
+- 人际关系变化（交了新朋友、和某人吵架了）
+- 对未来的计划或目标
+
+## 绝对不要记的（直接输出空 actions）：
+- 日常问候（早安、晚安、吃了吗）
+- 插科打诨、玩笑、段子、无厘头对话
+- 单纯的情绪表达但没有实质信息（哈哈哈、好无聊、啊啊啊）
+- AI 的回复内容（只提取用户透露的信息）
+- 已知信息的重复（如果只是闲聊没有新信息，就跳过）
+- 模糊的、一次性的感受（今天有点累 ← 不记；持续失眠一周 ← 记）
+
+## 可用房间：
+{room_list}
+  - 私有房间（diary/dreams/relationship/personality）用 layer="private"
 
 输出 JSON 格式：
 {{
   "actions": [
     {{
       "type": "remember",
-      "content": "要记住的内容（用简洁陈述句）",
+      "content": "要记住的内容（用简洁陈述句，不超过50字）",
       "layer": "shared 或 private",
-      "room": "living_room/study_career/study_health/game_room 等",
-      "category": "分类",
-      "importance": 0.1到1.0,
+      "room": "从上面的房间列表选",
+      "category": "简短分类词",
+      "importance": 0.4到1.0,
       "emotion_arousal": 0.1到1.0
     }}
   ]
 }}
 
-如果没有值得记住的，输出 {{"actions": []}}
+大部分对话都不值得记——如果犹豫，就不记。输出 {{"actions": []}}
 只输出 JSON。"""
 
     result = await _call_llm(prompt)
@@ -219,10 +237,14 @@ AI回复：{ai_response[:500]}
         except Exception:
             pass
 
-    # 执行提取到的动作
+    # 执行提取到的动作（importance < 0.3 的直接丢弃）
     executed = []
     for action in actions_data.get("actions", []):
         if action.get("type") == "remember" and action.get("content"):
+            imp = float(action.get("importance", 0.5))
+            if imp < 0.3:
+                print(f"[Gateway] Skipped low-importance ({imp}): {action['content'][:60]}")
+                continue
             owner = ai_id if action.get("layer") == "private" else ""
             await remember(
                 content=action["content"],
@@ -230,7 +252,7 @@ AI回复：{ai_response[:500]}
                 room=action.get("room", "living_room"),
                 category=action.get("category", ""),
                 owner_ai=owner,
-                importance=action.get("importance", 0.5),
+                importance=imp,
                 emotion_arousal=action.get("emotion_arousal", 0.3),
                 source_ai=ai_id,
                 source_platform=platform,

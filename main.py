@@ -373,6 +373,28 @@ async def api_rebuild_corridor(ai_id: str, authorization: str = Header(default="
     return {"ai_id": ai_id, "corridor": text, "status": "rebuilt"}
 
 
+# ── 对话导入（从 JSON/TXT 自动提取记忆 + 用户画像） ──
+
+import conversation_import
+
+class ImportRequest(BaseModel):
+    content: str  # 对话文本或 JSON 字符串
+    format: str = "auto"  # auto / json / txt
+    ai_id: str = "claude"
+    platform: str = "import"
+
+@app.post("/api/import/conversation")
+async def api_import_conversation(body: ImportRequest, authorization: str = Header(default="")):
+    """导入对话记录，自动提取记忆和用户画像"""
+    verify_secret(authorization)
+    return await conversation_import.import_conversation(
+        content=body.content,
+        format=body.format,
+        ai_id=body.ai_id,
+        platform=body.platform,
+    )
+
+
 # ── 导出 ──
 
 @app.get("/api/export")

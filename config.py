@@ -40,6 +40,9 @@ AI_ROLES = {
     "claude": {"name": "Claude", "color": "#D4A574"},
     "gemini": {"name": "Gemini", "color": "#4285F4"},
     "gpt": {"name": "GPT", "color": "#10A37F"},
+    "cloudy": {"name": "小克", "color": "#D4A574", "platform": "telegram"},
+    "lucien": {"name": "Lucien", "color": "#8B5CF6", "platform": "telegram"},
+    "jasper": {"name": "Jasper", "color": "#F59E0B", "platform": "telegram"},
 }
 
 # ── 房间系统（动态，可随时新增） ──
