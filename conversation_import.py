@@ -203,7 +203,8 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
 ## 提取规则（宁缺毋滥）：
 - 只提取用户透露的事实性信息：身份、偏好、重要事件、人际关系、计划
 - 忽略闲聊、玩笑、日常问候、无实质内容的对话
-- 每条记忆 ≤50 字，一条 = 一个独立事实
+- ⚡ 记忆原子化：每条记忆 = 一个独立的原子事实，≤80字
+- 宁可多拆几条，不要把多个事实塞进一条
 - 大部分对话不值得记——这很正常
 
 ## 可用房间：
@@ -215,7 +216,7 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
 输出 JSON 数组（空数组 = 没有值得记的）：
 [
   {{
-    "content": "提炼后的记忆（≤50字）",
+    "content": "一个原子事实（≤80字）",
     "room": "房间ID",
     "importance": 0.4到1.0,
     "event_date": "事件日期或空字符串"

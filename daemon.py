@@ -438,6 +438,144 @@ async def distill_psychology() -> dict:
     return {"distilled": distilled}
 
 
+# ── 6. 过时记忆自动检测 ──
+
+async def detect_stale_memories() -> dict:
+    """扫描活跃记忆，用小模型判断是否已过时。
+
+    检测策略：
+    1. 找出 importance ≥ 0.4 且创建超过 14 天的活跃记忆
+    2. 对每条候选，收集同房间的近期记忆作为"当前状态"参考
+    3. 用小模型判断旧记忆是否与近期记忆矛盾/已被更新
+    4. 过时的 → 标记 status="stale" + 生成更新建议
+    """
+    all_mems = store.get_all_memories()
+    now = datetime.now(timezone.utc)
+    stale_count = 0
+    checked = 0
+
+    # 找候选：重要度 ≥ 0.4、超过 14 天、非 game_room
+    candidates = []
+    for m in all_mems.values():
+        if m.get("status") != "active":
+            continue
+        if m.get("room") in ("game_room", "infra_changelog"):
+            continue
+        if float(m.get("importance", 0)) < 0.4:
+            continue
+        try:
+            created = datetime.fromisoformat(m["created_at"])
+            if (now - created).days < 14:
+                continue
+        except Exception:
+            continue
+        candidates.append(m)
+
+    if not candidates:
+        return {"checked": 0, "stale": 0}
+
+    # 按房间分组近期记忆（14 天内）作参考
+    recent_by_room: dict[str, list[dict]] = {}
+    for m in all_mems.values():
+        if m.get("status") != "active":
+            continue
+        try:
+            created = datetime.fromisoformat(m["created_at"])
+            if (now - created).days <= 14:
+                room = m.get("room", "living_room")
+                if room not in recent_by_room:
+                    recent_by_room[room] = []
+                recent_by_room[room].append(m)
+        except Exception:
+            continue
+
+    # 限制每次检查量（防止 API 爆）
+    import random
+    if len(candidates) > 20:
+        candidates = random.sample(candidates, 20)
+
+    now_str = now.isoformat()
+
+    for old_mem in candidates:
+        room = old_mem.get("room", "living_room")
+        recent = recent_by_room.get(room, [])
+
+        # 如果该房间没有近期记忆，跳过（无法判断是否过时）
+        if not recent:
+            continue
+
+        recent_text = "\n".join([
+            f"- [{r['created_at'][:10]}] {r['content'][:100]}"
+            for r in sorted(recent, key=lambda x: x.get("created_at", ""), reverse=True)[:8]
+        ])
+
+        prompt = f"""你是一个记忆审核助手。请判断以下旧记忆是否已过时。
+
+旧记忆（创建于 {old_mem['created_at'][:10]}）：
+{old_mem['content']}
+
+同领域的近期记忆：
+{recent_text}
+
+判断规则：
+- 如果近期记忆中有内容直接矛盾或更新了旧记忆的信息 → 过时
+- 如果旧记忆描述的状态/事实已被新信息替代 → 过时
+- 如果旧记忆仍然有效、没被新信息覆盖 → 有效
+- 如果不确定 → 有效（宁可保留）
+
+输出 JSON：
+{{
+  "is_stale": true或false,
+  "reason": "简短原因",
+  "suggested_update": "如果过时，建议如何更新（一句话）。如果有效则为空。"
+}}
+只输出 JSON。"""
+
+        result = await _call_llm(prompt)
+        checked += 1
+
+        if not result:
+            continue
+
+        try:
+            result = result.strip()
+            if result.startswith("```"):
+                result = result.split("\n", 1)[-1].rsplit("```", 1)[0]
+            analysis = json.loads(result)
+
+            if analysis.get("is_stale"):
+                # 标记为 stale
+                old_mem["status"] = "stale"
+                old_mem["updated_at"] = now_str
+
+                # 追加评论记录过时原因和更新建议
+                comments = old_mem.get("comments", [])
+                if not isinstance(comments, list):
+                    comments = []
+                comments.append({
+                    "date": now_str,
+                    "author": "daemon",
+                    "kind": "stale_note",
+                    "content": f"⚠️ 可能已过时：{analysis.get('reason', '未知')}",
+                })
+                if analysis.get("suggested_update"):
+                    comments.append({
+                        "date": now_str,
+                        "author": "daemon",
+                        "kind": "update_suggestion",
+                        "content": f"💡 建议更新：{analysis['suggested_update']}",
+                    })
+                old_mem["comments"] = comments
+                store.set_memory(old_mem)
+                stale_count += 1
+                log.info(f"  Stale: [{old_mem['content'][:40]}] - {analysis.get('reason')}")
+
+        except Exception as e:
+            log.warning(f"  Stale check parse error: {e}")
+
+    return {"checked": checked, "stale": stale_count}
+
+
 # ── 主入口：一键执行所有整理 ──
 
 async def run_full_maintenance() -> dict:
@@ -468,7 +606,11 @@ async def run_full_maintenance() -> dict:
     results["psychology"] = await distill_psychology()
     log.info(f"  Psychology: {results['psychology']}")
 
-    # 6. 刷新对话捕获缓冲区（确保残留对话不丢）
+    # 6. 过时记忆检测
+    results["stale"] = await detect_stale_memories()
+    log.info(f"  Stale detection: {results['stale']}")
+
+    # 8. 刷新对话捕获缓冲区（确保残留对话不丢）
     try:
         from conversation_capture import force_extract
         capture_result = await force_extract()
@@ -477,11 +619,11 @@ async def run_full_maintenance() -> dict:
     except Exception as e:
         log.warning(f"  Capture flush failed: {e}")
 
-    # 7. 衰减
+    # 9. 衰减
     results["decay"] = await run_decay()
     log.info(f"  Decay: {results['decay']}")
 
-    # 8. Persona State 休息（恢复精力）
+    # 10. Persona State 休息（恢复精力）
     try:
         from persona_state import rest
         for ai_id in ["claude", "gemini", "gpt"]:
@@ -490,10 +632,10 @@ async def run_full_maintenance() -> dict:
     except Exception as e:
         log.warning(f"  Persona rest failed: {e}")
 
-    # 9. 推送到 GitHub
+    # 11. 推送到 GitHub
     await store.push_dirty()
 
-    # 10. 重建所有 AI 的走廊（含 persona state + unresolved）
+    # 12. 重建所有 AI 的走廊（含 persona state + unresolved）
     from corridor import rebuild_all_corridors
     await rebuild_all_corridors()
     log.info("Maintenance complete, corridors rebuilt")

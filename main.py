@@ -7,7 +7,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -225,6 +225,7 @@ async def api_recall(
 async def api_list(
     layer: str = None, room: str = None, owner_ai: str = None,
     status: str = "active", page: int = 1, per_page: int = 20,
+    source_ai: str = None,
     authorization: str = Header(default=""),
 ):
     verify_secret(authorization)
@@ -393,6 +394,52 @@ async def api_import_conversation(body: ImportRequest, authorization: str = Head
         ai_id=body.ai_id,
         platform=body.platform,
     )
+
+
+# ── 过时记忆检测（手动触发） ──
+
+@app.post("/api/daemon/stale-check")
+async def api_stale_check(authorization: str = Header(default="")):
+    """手动触发过时记忆检测"""
+    verify_secret(authorization)
+    from daemon import detect_stale_memories
+    return await detect_stale_memories()
+
+
+# ── OpenAI 兼容代理（自动记忆注入 + 提取） ──
+
+import proxy as proxy_mod
+
+@app.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    """OpenAI 兼容代理端点
+
+    使用方法：
+    1. 把 base_url 指向 http://172.245.180.158:8888/v1
+    2. 设置请求头：
+       - X-Hub-Secret: 你的 Hub Secret（鉴权）
+       - X-Hub-Target-URL: 真正的 AI API 地址（如 https://api.openai.com/v1）
+       - X-Hub-Target-Key: 真正的 AI API key
+       - X-Hub-AI-ID: Memory Hub 中的身份（如 gemini、gpt）
+    3. 正常发送 OpenAI 格式的请求
+    4. 记忆会自动注入到 system prompt，回复后自动提取记忆
+    """
+    # 验证 Hub Secret
+    hub_secret = request.headers.get("x-hub-secret", "")
+    if hub_secret != HUB_SECRET:
+        # 也兼容 Authorization 头中的 secret（如果没设 x-hub-target-key）
+        auth = request.headers.get("authorization", "").replace("Bearer ", "")
+        if auth != HUB_SECRET and not request.headers.get("x-hub-target-key"):
+            raise HTTPException(status_code=401, detail="Invalid Hub Secret. Set X-Hub-Secret header.")
+
+    body = await request.json()
+    return await proxy_mod.handle_chat_completions(request, body)
+
+
+@app.get("/v1/models")
+async def proxy_models(request: Request):
+    """OpenAI 兼容 models 端点"""
+    return await proxy_mod.handle_models(request)
 
 
 # ── 导出 ──
