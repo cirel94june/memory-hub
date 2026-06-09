@@ -14,10 +14,26 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          envs: HUB_SECRET,LLM_API_KEY
           script: |
             cd /opt/memory-hub
             git pull origin main
+
+            # 同步 GitHub Secrets 到 .env（如果 Secret 有值则更新）
+            touch .env
+            if [ -n "$HUB_SECRET" ]; then
+              sed -i '/^HUB_SECRET=/d' .env
+              echo "HUB_SECRET=$HUB_SECRET" >> .env
+            fi
+            if [ -n "$LLM_API_KEY" ]; then
+              sed -i '/^LLM_API_KEY=/d' .env
+              echo "LLM_API_KEY=$LLM_API_KEY" >> .env
+            fi
+
             # 如果 requirements.txt 有变化，重装依赖
             .venv/bin/pip install -q -r requirements.txt
             systemctl restart memory-hub
             echo "Deployed $(git log --oneline -1)"
+        env:
+          HUB_SECRET: ${{ secrets.HUB_SECRET }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
