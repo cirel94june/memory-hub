@@ -43,17 +43,45 @@ class ProxyConfig(BaseModel):
 def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
     """从请求头提取代理配置
 
-    支持的自定义头：
-    - X-Hub-Target-URL: 目标 AI API 地址（必需，或在 Hub 配置里设默认值）
-    - X-Hub-Target-Key: 目标 AI API key（必需）
+    支持两种模式：
+
+    【简单模式】— 适合 RikkaHub 等不支持自定义头的客户端
+    只需设置 API Key 为 "hub密码:AI身份"，服务端自动用 .env 里的 LLM 配置转发：
+      API Base URL: http://172.245.180.158:8888/v1
+      API Key: xiaoke588887:rikkahub
+
+    【完整模式】— 通过自定义请求头控制一切
+    - X-Hub-Target-URL: 目标 AI API 地址
+    - X-Hub-Target-Key: 目标 AI API key
     - X-Hub-AI-ID: Memory Hub 中的 AI 身份（默认 claude）
     - X-Hub-Platform: 来源平台（默认 proxy）
     - X-Hub-Inject: 是否注入记忆（默认 true）
     - X-Hub-Extract: 是否提取记忆（默认 true）
     """
+    # 检查是否是简单模式：Authorization 里带 "secret:ai_id" 格式
+    auth_raw = headers.get("authorization", "").replace("Bearer ", "").strip()
+    simple_ai_id = ""
+    if ":" in auth_raw and not headers.get("x-hub-target-url"):
+        parts = auth_raw.split(":", 1)
+        if parts[0] == HUB_SECRET:
+            simple_ai_id = parts[1] or "proxy"
+            logger.info(f"[Proxy] Simple mode: ai_id={simple_ai_id}")
+
+    if simple_ai_id:
+        # 简单模式：用服务端 .env 的 LLM 配置
+        return ProxyConfig(
+            target_base_url=LLM_BASE_URL,
+            target_api_key=LLM_API_KEY,
+            ai_id=simple_ai_id,
+            platform="proxy",
+            inject_memory=True,
+            extract_memory=True,
+        )
+
+    # 完整模式：从自定义头读取
     return ProxyConfig(
         target_base_url=headers.get("x-hub-target-url", "") or LLM_BASE_URL,
-        target_api_key=headers.get("x-hub-target-key", "") or headers.get("authorization", "").replace("Bearer ", ""),
+        target_api_key=headers.get("x-hub-target-key", "") or auth_raw,
         ai_id=headers.get("x-hub-ai-id", "claude"),
         platform=headers.get("x-hub-platform", "proxy"),
         inject_memory=headers.get("x-hub-inject", "true").lower() != "false",

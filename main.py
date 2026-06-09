@@ -414,23 +414,35 @@ import proxy as proxy_mod
 async def proxy_chat_completions(request: Request):
     """OpenAI 兼容代理端点
 
-    使用方法：
-    1. 把 base_url 指向 http://172.245.180.158:8888/v1
-    2. 设置请求头：
-       - X-Hub-Secret: 你的 Hub Secret（鉴权）
-       - X-Hub-Target-URL: 真正的 AI API 地址（如 https://api.openai.com/v1）
-       - X-Hub-Target-Key: 真正的 AI API key
-       - X-Hub-AI-ID: Memory Hub 中的身份（如 gemini、gpt）
-    3. 正常发送 OpenAI 格式的请求
-    4. 记忆会自动注入到 system prompt，回复后自动提取记忆
+    使用方法（两种模式）：
+
+    【简单模式】适合 RikkaHub 等只能设 URL + Key 的客户端：
+      API Base URL: http://172.245.180.158:8888/v1
+      API Key: {HUB_SECRET}:{AI身份}   例如 xiaoke588887:rikkahub
+      服务端自动用 .env 里的 LLM_BASE_URL 和 LLM_API_KEY 转发
+
+    【完整模式】通过自定义请求头控制转发目标：
+      X-Hub-Secret: Hub密码
+      X-Hub-Target-URL: 真正的 AI API 地址
+      X-Hub-Target-Key: 真正的 AI API key
+      X-Hub-AI-ID: AI 身份
     """
     # 验证 Hub Secret
     hub_secret = request.headers.get("x-hub-secret", "")
-    if hub_secret != HUB_SECRET:
-        # 也兼容 Authorization 头中的 secret（如果没设 x-hub-target-key）
-        auth = request.headers.get("authorization", "").replace("Bearer ", "")
-        if auth != HUB_SECRET and not request.headers.get("x-hub-target-key"):
-            raise HTTPException(status_code=401, detail="Invalid Hub Secret. Set X-Hub-Secret header.")
+    auth_raw = request.headers.get("authorization", "").replace("Bearer ", "").strip()
+
+    # 简单模式：API Key = "secret:ai_id"
+    is_simple = False
+    if ":" in auth_raw:
+        secret_part = auth_raw.split(":", 1)[0]
+        if secret_part == HUB_SECRET:
+            is_simple = True
+
+    if not is_simple:
+        # 完整模式鉴权
+        if hub_secret != HUB_SECRET:
+            if auth_raw != HUB_SECRET and not request.headers.get("x-hub-target-key"):
+                raise HTTPException(status_code=401, detail="Invalid Hub Secret. Use 'secret:ai_id' as API key, or set X-Hub-Secret header.")
 
     body = await request.json()
     return await proxy_mod.handle_chat_completions(request, body)
