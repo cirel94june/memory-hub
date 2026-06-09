@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # 推荐便宜快速的模型：deepseek-v4-flash, deepseek-chat, kimi-* 等
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://relay-cache.sharkielab.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+LLM_MODEL = os.getenv("LLM_MODEL", "[kiro量低缓]claude-haiku-4-5")
 
 # 兼容旧配置（如果 .env 里还是旧变量名）
 if not LLM_API_KEY:
