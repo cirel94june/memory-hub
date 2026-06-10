@@ -8,6 +8,7 @@ import httpx
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
+import activity_log
 
 
 async def _call_llm(prompt: str) -> str:
@@ -262,13 +263,18 @@ AI回复：{ai_response[:500]}
         except Exception:
             pass
 
-    # 执行提取到的动作（importance < 0.3 的直接丢弃）
+    # 执行提取到的动作（importance < 0.5 的直接丢弃）
     executed = []
     for action in actions_data.get("actions", []):
         if action.get("type") == "remember" and action.get("content"):
             imp = float(action.get("importance", 0.5))
-            if imp < 0.3:
+            if imp < 0.5:
                 print(f"[Gateway] Skipped low-importance ({imp}): {action['content'][:60]}")
+                activity_log.log_activity(
+                    "remember", f"丢弃低重要度({imp}): {action['content'][:60]}",
+                    ai_id=ai_id, success=False,
+                    extra={"importance": imp, "reason": "below_threshold"},
+                )
                 continue
             owner = ai_id if action.get("layer") == "private" else ""
             await remember(
