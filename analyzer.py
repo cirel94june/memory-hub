@@ -199,6 +199,13 @@ async def _call_llm(system_prompt: str, user_content: str, temperature: float = 
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
+            if not content or not content.strip():
+                logger.warning(f"LLM returned empty content, status={resp.status_code}, "
+                             f"finish_reason={data['choices'][0].get('finish_reason')}")
+                activity_log.log_activity(
+                    "error", f"LLM 返回空内容 (finish={data['choices'][0].get('finish_reason')})",
+                    model=model, duration_ms=int((time.time() - t0) * 1000), success=False,
+                )
             return content
 
     except Exception as e:
@@ -211,11 +218,32 @@ async def _call_llm(system_prompt: str, user_content: str, temperature: float = 
 
 
 def _parse_json(text: str):
+    if not text or not text.strip():
+        raise ValueError("LLM returned empty response")
     text = text.strip()
+    # 去掉 markdown code block 包裹
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
+    text = text.strip()
+    # 有些模型会在 JSON 前后加说明文字，尝试提取 JSON 部分
+    if not text.startswith(("{", "[")):
+        # 找第一个 { 或 [
+        for i, c in enumerate(text):
+            if c in ("{", "["):
+                text = text[i:]
+                break
+    if text.endswith(("}", "]")):
+        # 找最后一个 } 或 ]
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] in ("}", "]"):
+                text = text[:i+1]
+                break
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning(f"JSON parse failed, raw text (first 300 chars): {text[:300]}")
+        raise
 
 
 async def analyze(content: str) -> dict:
