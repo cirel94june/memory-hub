@@ -36,8 +36,9 @@ def verify_secret(authorization: str = Header(default="")):
 async def lifespan(app: FastAPI):
     global _mcp_session_manager
     await github_store.load_all()
-    mems = github_store.get_all_memories()
-    print(f"[Memory Hub] Loaded {len(mems)} memories from GitHub")
+    import database
+    mem_count = database.count_memories()
+    print(f"[Memory Hub] SQLite ready: {mem_count} active memories")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
     print(f"[Memory Hub] Rooms: {list(ROOMS.keys())}")
 
