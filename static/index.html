@@ -413,6 +413,71 @@ body {
   .header h1 { font-size: 16px; }
   .memory-actions { opacity: 1; }
 }
+
+/* ── 设置 & 活动日志页面 ── */
+.page-panel { display: none; }
+.page-panel.active { display: block; }
+.settings-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 16px;
+}
+.settings-card h3 { font-size: 15px; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+.settings-card label { font-size: 13px; color: var(--text2); display: block; margin-bottom: 4px; margin-top: 12px; }
+.settings-card input[type="text"],
+.settings-card input[type="password"] {
+  width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+  font-size: 13px; font-family: 'SF Mono', 'Consolas', monospace; background: var(--bg);
+}
+.settings-card input:focus { outline: none; border-color: var(--accent); }
+.settings-actions { margin-top: 16px; display: flex; gap: 8px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.status-dot.ok { background: var(--success); }
+.status-dot.err { background: var(--danger); }
+.status-dot.warn { background: var(--warning); }
+.override-badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 12px;
+  background: var(--warning); color: white; font-weight: 500;
+}
+
+/* Activity log */
+.activity-filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+.activity-filters .btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+.log-entry {
+  display: flex; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 13px; align-items: flex-start; transition: background 0.15s;
+}
+.log-entry:hover { background: var(--accent-light); }
+.log-time { color: var(--text3); white-space: nowrap; font-size: 12px; min-width: 55px; font-family: monospace; }
+.log-action {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap;
+  font-weight: 500; min-width: 52px; text-align: center;
+}
+.log-action.analyze { background: #e3f2fd; color: #1565c0; }
+.log-action.merge { background: #f3e5f5; color: #7b1fa2; }
+.log-action.digest { background: #e8f5e9; color: #2e7d32; }
+.log-action.decay { background: #fff3e0; color: #e65100; }
+.log-action.remember { background: #e0f7fa; color: #00695c; }
+.log-action.recall { background: #fce4ec; color: #c62828; }
+.log-action.error { background: #ffebee; color: #b71c1c; }
+.log-action.config { background: #f5f5f5; color: #424242; }
+.log-action.relation { background: #ede7f6; color: #4527a0; }
+.log-detail { flex: 1; color: var(--text); line-height: 1.5; word-break: break-all; }
+.log-model { color: var(--text3); font-size: 11px; white-space: nowrap; }
+.log-duration { color: var(--text3); font-size: 11px; white-space: nowrap; }
+.log-fail { color: var(--danger); }
+.activity-stats-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-bottom: 20px;
+}
+.activity-stat-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px; text-align: center;
+}
+.activity-stat-card .num { font-size: 24px; font-weight: 700; color: var(--accent); }
+.activity-stat-card .label { font-size: 12px; color: var(--text2); margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -435,15 +500,63 @@ body {
   <div class="sidebar" id="sidebar"></div>
 
   <div class="main">
-    <div class="stats-panel" id="statsPanel"></div>
-
-    <div class="search-bar">
-      <input type="text" id="searchInput" placeholder="搜索记忆..." onkeydown="if(event.key==='Enter')searchMemories()">
-      <button class="btn btn-primary" onclick="searchMemories()">搜索</button>
+    <!-- 记忆页（默认） -->
+    <div class="page-panel active" id="page-memories">
+      <div class="stats-panel" id="statsPanel"></div>
+      <div class="search-bar">
+        <input type="text" id="searchInput" placeholder="搜索记忆..." onkeydown="if(event.key==='Enter')searchMemories()">
+        <button class="btn btn-primary" onclick="searchMemories()">搜索</button>
+      </div>
+      <div id="memoryList"></div>
+      <div class="pagination" id="pagination"></div>
     </div>
 
-    <div id="memoryList"></div>
-    <div class="pagination" id="pagination"></div>
+    <!-- 活动日志页 -->
+    <div class="page-panel" id="page-activity">
+      <h2 style="margin-bottom:16px">📊 小模型活动日志</h2>
+      <div class="activity-stats-grid" id="activityStats"></div>
+      <div class="activity-filters" id="activityFilters">
+        <button class="btn btn-sm active" onclick="filterActivity('',this)">全部</button>
+        <button class="btn btn-sm" onclick="filterActivity('analyze',this)">🔍 分析</button>
+        <button class="btn btn-sm" onclick="filterActivity('merge',this)">🔀 合并</button>
+        <button class="btn btn-sm" onclick="filterActivity('digest',this)">✂️ 拆分</button>
+        <button class="btn btn-sm" onclick="filterActivity('decay',this)">📉 衰减</button>
+        <button class="btn btn-sm" onclick="filterActivity('remember',this)">💾 记忆</button>
+        <button class="btn btn-sm" onclick="filterActivity('recall',this)">🔎 搜索</button>
+        <button class="btn btn-sm" onclick="filterActivity('error',this)">❌ 错误</button>
+        <button class="btn btn-sm" onclick="filterActivity('config',this)">⚙️ 配置</button>
+        <button class="btn btn-sm" style="margin-left:auto" onclick="loadActivityLog()">🔄 刷新</button>
+      </div>
+      <div class="settings-card" style="padding:0;overflow:hidden" id="activityLog">
+        <div style="padding:20px;color:var(--text3);text-align:center">加载中...</div>
+      </div>
+    </div>
+
+    <!-- 模型设置页 -->
+    <div class="page-panel" id="page-settings">
+      <h2 style="margin-bottom:16px">⚙️ 模型设置</h2>
+
+      <div class="settings-card">
+        <h3><span class="status-dot" id="llmStatusDot"></span> 当前模型配置 <span id="overrideBadge"></span></h3>
+        <label>中转站 URL</label>
+        <input type="text" id="settingBaseUrl" placeholder="https://relay.example.com/v1">
+        <label>模型名称</label>
+        <input type="text" id="settingModel" placeholder="claude-haiku-4-5">
+        <label>API Key</label>
+        <input type="password" id="settingApiKey" placeholder="留空 = 使用 .env 默认值">
+        <div class="settings-actions">
+          <button class="btn btn-primary" onclick="saveLLMSettings()">保存并切换</button>
+          <button class="btn" onclick="testLLMSettings()">🧪 测试连通</button>
+          <button class="btn btn-danger" onclick="resetLLMSettings()">↩️ 恢复默认</button>
+        </div>
+        <div id="settingsResult" style="margin-top:12px;font-size:13px;display:none"></div>
+      </div>
+
+      <div class="settings-card">
+        <h3>📋 .env 默认配置（只读）</h3>
+        <div id="defaultConfig" style="font-size:13px;color:var(--text2);font-family:monospace;line-height:1.8"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -625,6 +738,15 @@ function renderSidebar() {
     }
     html += '</div>';
   }
+  // 系统管理
+  html += `<div class="nav-group"><h3>系统</h3>
+    <a class="nav-item ${currentPage==='activity'?'active':''}" onclick="showPage('activity')">
+      <span><span class="nav-icon">📊</span>活动日志</span>
+    </a>
+    <a class="nav-item ${currentPage==='settings'?'active':''}" onclick="showPage('settings')">
+      <span><span class="nav-icon">⚙️</span>模型设置</span>
+    </a>
+  </div>`;
   document.getElementById('sidebar').innerHTML = html;
 }
 
@@ -976,6 +1098,151 @@ async function doImport() {
   }
   btn.disabled = false;
   btn.textContent = '开始导入';
+}
+
+// ── Page navigation ──
+let currentPage = 'memories';
+
+function showPage(page) {
+  currentPage = page;
+  document.querySelectorAll('.page-panel').forEach(p => p.classList.remove('active'));
+  const panel = document.getElementById('page-' + page);
+  if (panel) panel.classList.add('active');
+  renderSidebar();
+  if (page === 'activity') loadActivityLog();
+  if (page === 'settings') loadLLMSettings();
+}
+
+// ── Activity Log ──
+let activityFilter = '';
+
+async function loadActivityLog() {
+  const params = activityFilter ? `action=${activityFilter}&limit=100` : 'limit=100';
+  const [logData, statsData] = await Promise.all([
+    api(`/api/activity/log?${params}`),
+    api('/api/activity/stats'),
+  ]);
+  renderActivityStats(statsData);
+  renderActivityLog(logData.logs || []);
+}
+
+function renderActivityStats(stats) {
+  const h = stats.last_hour || {};
+  const d = stats.last_day || {};
+  const el = document.getElementById('activityStats');
+  el.innerHTML = `
+    <div class="activity-stat-card">
+      <div class="num">${h.total || 0}</div>
+      <div class="label">最近1小时操作</div>
+    </div>
+    <div class="activity-stat-card">
+      <div class="num" style="color:${h.errors?'var(--danger)':'var(--success)'}">${h.errors || 0}</div>
+      <div class="label">最近1小时错误</div>
+    </div>
+    <div class="activity-stat-card">
+      <div class="num">${d.total || 0}</div>
+      <div class="label">最近24h操作</div>
+    </div>
+    <div class="activity-stat-card">
+      <div class="num">${d.tokens_total || 0}</div>
+      <div class="label">24h Token消耗</div>
+    </div>
+  `;
+}
+
+function renderActivityLog(logs) {
+  const el = document.getElementById('activityLog');
+  if (!logs.length) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text3);text-align:center">暂无活动记录</div>';
+    return;
+  }
+  let html = '';
+  for (const log of logs) {
+    const t = (log.ts || '').slice(11, 19);
+    const fail = log.success === false;
+    const dur = log.duration_ms ? `${log.duration_ms}ms` : '';
+    html += `<div class="log-entry${fail?' log-fail':''}">
+      <span class="log-time">${t}</span>
+      <span class="log-action ${log.action}">${log.action}</span>
+      <span class="log-detail">${escHtml(log.detail)}</span>
+      ${log.model ? `<span class="log-model">${log.model.split(']').pop().slice(0,20)}</span>` : ''}
+      ${dur ? `<span class="log-duration">${dur}</span>` : ''}
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+function filterActivity(action, btn) {
+  activityFilter = action;
+  document.querySelectorAll('.activity-filters .btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  loadActivityLog();
+}
+
+// ── Settings ──
+async function loadLLMSettings() {
+  const data = await api('/api/settings/llm');
+  if (!data.current) return;
+  const c = data.current;
+  const d = data.defaults;
+  document.getElementById('settingBaseUrl').value = c.llm_base_url || '';
+  document.getElementById('settingBaseUrl').placeholder = d.llm_base_url;
+  document.getElementById('settingModel').value = c.llm_model || '';
+  document.getElementById('settingModel').placeholder = d.llm_model;
+  document.getElementById('settingApiKey').value = '';
+  document.getElementById('settingApiKey').placeholder = c.llm_api_key_preview || '留空=使用默认';
+
+  const dot = document.getElementById('llmStatusDot');
+  dot.className = 'status-dot ok';
+  const badge = document.getElementById('overrideBadge');
+  badge.innerHTML = data.is_overridden ? '<span class="override-badge">已覆盖</span>' : '';
+
+  document.getElementById('defaultConfig').innerHTML =
+    `LLM_BASE_URL = ${escHtml(d.llm_base_url)}<br>LLM_MODEL = ${escHtml(d.llm_model)}`;
+}
+
+async function saveLLMSettings() {
+  const body = {};
+  const url = document.getElementById('settingBaseUrl').value.trim();
+  const model = document.getElementById('settingModel').value.trim();
+  const key = document.getElementById('settingApiKey').value.trim();
+  if (url) body.llm_base_url = url;
+  if (model) body.llm_model = model;
+  if (key) body.llm_api_key = key;
+  if (!Object.keys(body).length) { showSettingsResult('请至少填写一个字段', false); return; }
+  const res = await api('/api/settings/llm', { method: 'PUT', body: JSON.stringify(body) });
+  if (res.status === 'ok') {
+    showSettingsResult('✅ 配置已更新！建议点"测试连通"确认', true);
+    loadLLMSettings();
+  } else {
+    showSettingsResult('❌ 更新失败', false);
+  }
+}
+
+async function testLLMSettings() {
+  showSettingsResult('🧪 测试中...', true);
+  const res = await api('/api/settings/llm/test', { method: 'POST' });
+  if (res.status === 'ok') {
+    showSettingsResult(`✅ 连通正常！模型回复: "${res.response}" (${res.duration_ms}ms)`, true);
+    document.getElementById('llmStatusDot').className = 'status-dot ok';
+  } else {
+    showSettingsResult(`❌ 连通失败: ${res.error}`, false);
+    document.getElementById('llmStatusDot').className = 'status-dot err';
+  }
+}
+
+async function resetLLMSettings() {
+  if (!confirm('确定要重置为 .env 默认配置吗？')) return;
+  await api('/api/settings/llm/reset', { method: 'POST' });
+  showSettingsResult('✅ 已恢复默认配置', true);
+  loadLLMSettings();
+}
+
+function showSettingsResult(msg, ok) {
+  const el = document.getElementById('settingsResult');
+  el.style.display = 'block';
+  el.style.color = ok ? 'var(--success)' : 'var(--danger)';
+  el.textContent = msg;
 }
 
 // ── Init ──

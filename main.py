@@ -19,6 +19,7 @@ import memory_ops
 import gateway as gateway_mod
 import daemon
 import corridor
+import activity_log
 from mcp_server import mcp as mcp_server
 
 
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     global _mcp_session_manager
     await github_store.load_all()
     import database
+    activity_log.init_activity_table()
     mem_count = database.count_memories()
     print(f"[Memory Hub] SQLite ready: {mem_count} active memories")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
@@ -453,6 +455,108 @@ async def proxy_chat_completions(request: Request):
 async def proxy_models(request: Request):
     """OpenAI 兼容 models 端点"""
     return await proxy_mod.handle_models(request)
+
+
+# ── 模型设置 API ──
+
+import analyzer
+
+class LLMConfigUpdate(BaseModel):
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: str = ""
+
+@app.get("/api/settings/llm")
+async def api_get_llm_settings(authorization: str = Header(default="")):
+    """获取当前 LLM 配置（不返回完整 key）"""
+    verify_secret(authorization)
+    cfg = analyzer.get_llm_config()
+    import config as _cfg
+    return {
+        "current": {
+            "llm_base_url": cfg["llm_base_url"],
+            "llm_model": cfg["llm_model"],
+            "llm_api_key_set": bool(cfg["llm_api_key"]),
+            "llm_api_key_preview": cfg["llm_api_key"][:8] + "..." if len(cfg["llm_api_key"]) > 8 else "***",
+        },
+        "defaults": {
+            "llm_base_url": _cfg.LLM_BASE_URL,
+            "llm_model": _cfg.LLM_MODEL,
+        },
+        "is_overridden": bool(analyzer._runtime_config["llm_base_url"] or
+                              analyzer._runtime_config["llm_model"] or
+                              analyzer._runtime_config["llm_api_key"]),
+    }
+
+@app.put("/api/settings/llm")
+async def api_update_llm_settings(body: LLMConfigUpdate, authorization: str = Header(default="")):
+    """动态更新 LLM 配置（不重启服务）"""
+    verify_secret(authorization)
+    analyzer.set_llm_config(
+        base_url=body.llm_base_url,
+        model=body.llm_model,
+        api_key=body.llm_api_key,
+    )
+    return {"status": "ok", "config": analyzer.get_llm_config()}
+
+@app.post("/api/settings/llm/reset")
+async def api_reset_llm_settings(authorization: str = Header(default="")):
+    """重置 LLM 配置为 .env 默认值"""
+    verify_secret(authorization)
+    analyzer.reset_llm_config()
+    return {"status": "ok", "message": "已重置为默认配置"}
+
+@app.post("/api/settings/llm/test")
+async def api_test_llm_settings(authorization: str = Header(default="")):
+    """测试当前 LLM 配置是否能正常调用"""
+    verify_secret(authorization)
+    import time
+    cfg = analyzer.get_llm_config()
+    t0 = time.time()
+    try:
+        result = await analyzer._call_llm("请回复两个字：正常", "测试", temperature=0.0)
+        duration = int((time.time() - t0) * 1000)
+        activity_log.log_activity(
+            "config", f"LLM 连通测试成功: {result[:50]}",
+            model=cfg["llm_model"], duration_ms=duration,
+        )
+        return {
+            "status": "ok",
+            "response": result[:100],
+            "model": cfg["llm_model"],
+            "base_url": cfg["llm_base_url"],
+            "duration_ms": duration,
+        }
+    except Exception as e:
+        duration = int((time.time() - t0) * 1000)
+        return {
+            "status": "error",
+            "error": str(e)[:300],
+            "model": cfg["llm_model"],
+            "base_url": cfg["llm_base_url"],
+            "duration_ms": duration,
+        }
+
+
+# ── 活动日志 API ──
+
+@app.get("/api/activity/log")
+async def api_activity_log(
+    limit: int = Query(default=50, le=200),
+    action: str = Query(default=""),
+    since: float = Query(default=0),
+    authorization: str = Header(default=""),
+):
+    """获取最近的活动日志"""
+    verify_secret(authorization)
+    logs = activity_log.get_recent(limit=limit, action_filter=action, since_epoch=since)
+    return {"logs": logs, "total": len(logs)}
+
+@app.get("/api/activity/stats")
+async def api_activity_stats(authorization: str = Header(default="")):
+    """获取活动统计"""
+    verify_secret(authorization)
+    return activity_log.get_stats()
 
 
 # ── 导出 ──
