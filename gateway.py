@@ -141,7 +141,12 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
             time_label = _relative_time(r.get("created_at", ""))
             if time_label:
                 room_tag += f"/{time_label}"
-            lines.append(f"- [{room_tag}] {content}")
+            line = f"- [{room_tag}] {content}"
+            src = r.get("source_context", "")
+            if src:
+                preview = src.replace("\n", " ")[:120]
+                line += f"\n  ↳ 当时聊的: {preview}"
+            lines.append(line)
         parts.append("【相关记忆】\n" + "\n".join(lines))
 
     inject_text = "\n\n".join(parts) if parts else ""
@@ -297,6 +302,7 @@ AI回复：{ai_response[:500]}
                 print(f"[Gateway] Skipped low-importance ({imp}): {action['content'][:60]}")
                 continue
             owner = ai_id if action.get("layer") == "private" else ""
+            source_ctx = f"用户: {user_message[:300]}\nAI: {ai_response[:200]}"
             await remember(
                 content=action["content"],
                 layer=action.get("layer", "shared"),
@@ -307,6 +313,7 @@ AI回复：{ai_response[:500]}
                 emotion_arousal=action.get("emotion_arousal", 0.3),
                 source_ai=ai_id,
                 source_platform=platform,
+                source_context=source_ctx,
             )
             executed.append(action)
 

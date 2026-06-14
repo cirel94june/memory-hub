@@ -555,6 +555,7 @@ async def recall(
             "activation_count": mem.get("activation_count", 0),
             "comment_count": comment_count,
             "comments": comments[-3:] if comment_count > 0 else [],
+            "source_context": mem.get("source_context", ""),
         }
 
     # ── 路径 1：向量搜索（语义匹配）──
