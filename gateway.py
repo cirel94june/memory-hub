@@ -4,7 +4,9 @@ Memory Gateway：小模型预处理层
 - 每次对话后自动提取值得记住的信息
 """
 import json
+import math
 import httpx
+from datetime import datetime, timezone
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
@@ -31,6 +33,28 @@ async def _call_llm(prompt: str) -> str:
             return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"[Gateway] LLM error: {e}")
+        return ""
+
+
+def _relative_time(iso_str: str) -> str:
+    if not iso_str:
+        return ""
+    try:
+        created = datetime.fromisoformat(iso_str)
+        hours = (datetime.now(timezone.utc) - created).total_seconds() / 3600
+        if hours < 1:
+            return "刚刚"
+        if hours < 24:
+            return f"{int(hours)}小时前"
+        days = int(hours / 24)
+        if days == 1:
+            return "昨天"
+        if days < 7:
+            return f"{days}天前"
+        if days < 30:
+            return f"{days // 7}周前"
+        return f"{days // 30}月前"
+    except Exception:
         return ""
 
 
@@ -112,9 +136,11 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
             if len(content) > 300:
                 content = content[:280] + "..."
             room_tag = r["room"]
-            # 未解决的记忆加标记
             if r.get("resolved") == False:
                 room_tag += "/待办"
+            time_label = _relative_time(r.get("created_at", ""))
+            if time_label:
+                room_tag += f"/{time_label}"
             lines.append(f"- [{room_tag}] {content}")
         parts.append("【相关记忆】\n" + "\n".join(lines))
 

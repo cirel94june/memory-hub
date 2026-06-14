@@ -578,13 +578,13 @@ async def recall(
             try:
                 created = datetime.fromisoformat(mem["created_at"])
                 days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
-                time_score = math.exp(-0.02 * days)
+                time_score = math.exp(-0.05 * days)
             except Exception:
                 time_score = 0.5
             importance_score = float(mem.get("importance", 0.5))
 
-            final = (embed_score * 0.6 + emotion_score * 0.15 +
-                     time_score * 0.1 + importance_score * 0.15)
+            final = (embed_score * 0.45 + emotion_score * 0.15 +
+                     time_score * 0.25 + importance_score * 0.15)
             vec_scored.append((mem, final))
 
         vec_scored.sort(key=lambda x: x[1], reverse=True)
