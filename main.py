@@ -19,6 +19,7 @@ import memory_ops
 import gateway as gateway_mod
 import daemon
 import corridor
+import ai_profiles
 from mcp_server import mcp as mcp_server
 
 
@@ -36,6 +37,7 @@ def verify_secret(authorization: str = Header(default="")):
 async def lifespan(app: FastAPI):
     global _mcp_session_manager
     await github_store.load_all()
+    await ai_profiles.load_profiles()
     mems = github_store.get_all_memories()
     print(f"[Memory Hub] Loaded {len(mems)} memories from GitHub")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
@@ -242,6 +244,16 @@ async def api_living_room(authorization: str = Header(default="")):
     return {"items": items}
 
 
+@app.get("/api/memory/{memory_id}")
+async def api_get_memory(memory_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    mem = github_store.get_memory(memory_id)
+    if not mem:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    safe = {k: v for k, v in mem.items() if k != "embedding"}
+    return safe
+
+
 @app.post("/api/memory/{memory_id}/archive")
 async def api_archive(memory_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
@@ -294,9 +306,11 @@ import conversation_capture
 
 class ConversationLogRequest(BaseModel):
     user_message: str
-    ai_response: str
+    ai_response: str = ""
     ai_id: str = "claude"
     platform: str = ""
+    chat_id: str = ""
+    chat_type: str = "private"
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
@@ -307,6 +321,8 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         ai_response=body.ai_response,
         ai_id=body.ai_id,
         platform=body.platform,
+        chat_id=body.chat_id,
+        chat_type=body.chat_type,
     )
 
 @app.post("/api/capture/extract")
@@ -320,6 +336,45 @@ async def api_capture_status(authorization: str = Header(default="")):
     """查看对话缓冲区状态"""
     verify_secret(authorization)
     return await conversation_capture.get_buffer_status()
+
+
+# ── 对话历史摘要（供 TG bot 滚动压缩） ──
+
+class SummarizeRequest(BaseModel):
+    messages: list[dict]
+    ai_id: str = "claude"
+    existing_summary: str = ""
+
+@app.post("/api/utils/summarize-history")
+async def api_summarize_history(body: SummarizeRequest, authorization: str = Header(default="")):
+    """把一段对话历史压缩成摘要，用于 bot 端的滚动历史压缩"""
+    verify_secret(authorization)
+    lines = []
+    for m in body.messages:
+        role = "用户" if m.get("role") == "user" else "AI"
+        ts = m.get("timestamp", "")
+        content = str(m.get("content", ""))[:300]
+        lines.append(f"[{ts}] {role}: {content}" if ts else f"{role}: {content}")
+    conversation_text = "\n".join(lines)
+
+    prev = ""
+    if body.existing_summary:
+        prev = f"\n已有的之前的对话摘要：\n{body.existing_summary}\n"
+
+    prompt = f"""把以下对话历史压缩成一段简洁的摘要（中文，200字以内）。
+保留：关键话题、重要事实、有趣的梗/笑话的具体内容、情绪转折、未完成的讨论。
+丢弃：日常寒暄、重复内容、无信息量的闲聊。
+{prev}
+对话记录：
+{conversation_text[:4000]}
+
+直接输出摘要文本，不要加标题或前缀。"""
+
+    from gateway import _call_llm
+    summary = await _call_llm(prompt)
+    if not summary or len(summary.strip()) < 10:
+        return {"summary": "", "ok": False}
+    return {"summary": summary.strip(), "ok": True}
 
 
 # ── Daemon 操作 ──
@@ -452,6 +507,63 @@ async def proxy_chat_completions(request: Request):
 async def proxy_models(request: Request):
     """OpenAI 兼容 models 端点"""
     return await proxy_mod.handle_models(request)
+
+
+# ── AI Profile 管理 ──
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    emoji: Optional[str] = None
+    color: Optional[str] = None
+    platform: Optional[str] = None
+    greeting: Optional[str] = None
+    persona: Optional[str] = None
+    model_url: Optional[str] = None
+    model_key: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+@app.get("/api/ai-profiles")
+async def api_list_profiles(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return ai_profiles.get_all_profiles()
+
+
+@app.get("/api/ai-profiles/{ai_id}")
+async def api_get_profile(ai_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    profile = ai_profiles.get_profile(ai_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"AI '{ai_id}' not found")
+    return profile
+
+
+@app.post("/api/ai-profiles/{ai_id}")
+async def api_create_profile(ai_id: str, body: ProfileUpdate, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        return await ai_profiles.create_profile(ai_id, data)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.put("/api/ai-profiles/{ai_id}")
+async def api_update_profile(ai_id: str, body: ProfileUpdate, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    return await ai_profiles.update_profile(ai_id, updates)
+
+
+@app.delete("/api/ai-profiles/{ai_id}")
+async def api_delete_profile(ai_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    ok = await ai_profiles.delete_profile(ai_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"AI '{ai_id}' not found")
+    return {"status": "deleted", "ai_id": ai_id}
 
 
 # ── 导出 ──

@@ -50,10 +50,12 @@ async def build_corridor(ai_id: str) -> str:
                    and m.get("status") == "active"]
 
     # 5. 最近所有 AI 的重要动态（跨端感知）
+    # 只取互动类和AI私有记忆，排除用户事实（防止AI把用户经历当成自己的）
     recent_all = sorted(
         [m for m in all_mems.values()
          if m.get("status") == "active"
-         and m.get("source_ai") and m.get("source_ai") != ai_id],
+         and m.get("source_ai") and m.get("source_ai") != ai_id
+         and not m.get("content", "").startswith("[用户]")],
         key=lambda x: x.get("updated_at", ""),
         reverse=True,
     )[:5]
@@ -78,18 +80,18 @@ async def build_corridor(ai_id: str) -> str:
         sections.append("【你对自己的认知】\n" + "\n".join(f"· {x}" for x in personality[:3]))
 
     if diary:
-        sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:150]}" for d in diary))
+        sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
 
     if recent_all:
         lines = []
         for m in recent_all:
             src = AI_ROLES.get(m.get("source_ai", ""), {}).get("name", m.get("source_ai", ""))
             plat = m.get("source_platform", "")
-            lines.append(f"· [{src}{(' via '+plat) if plat else ''}] {m['content'][:100]}")
+            lines.append(f"· [{src}{(' via '+plat) if plat else ''}] {m['content'][:200]}")
         sections.append("【其他伙伴最近的动态】\n" + "\n".join(lines))
 
     if infra:
-        sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:100]}" for x in infra))
+        sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:150]}" for x in infra))
 
     # 7. Persona State（AI 当前情绪/精力状态）
     try:
@@ -104,7 +106,7 @@ async def build_corridor(ai_id: str) -> str:
     unresolved_mems = [m for m in all_mems.values()
                        if m.get("resolved") == False and m.get("status") == "active"]
     if unresolved_mems:
-        lines = [f"· {m['content'][:100]}" for m in unresolved_mems[:3]]
+        lines = [f"· {m['content'][:200]}" for m in unresolved_mems[:3]]
         sections.append("【待办/未完成】\n" + "\n".join(lines))
 
     corridor_text = "\n\n".join(sections)
@@ -121,12 +123,17 @@ async def build_corridor(ai_id: str) -> str:
 
 
 async def get_corridor(ai_id: str) -> str:
-    """获取走廊文档（优先从缓存读，没有就现编译）"""
-    # 先看 GitHub 有没有现成的
+    """获取走廊文档（优先从缓存读，超过6小时自动重建）"""
     cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
     if cached and isinstance(cached, dict) and cached.get("text"):
-        return cached["text"]
-    # 没有就现编
+        try:
+            compiled = datetime.fromisoformat(cached.get("compiled_at", ""))
+            age_hours = (datetime.now(timezone.utc) - compiled).total_seconds() / 3600
+            if age_hours <= 6:
+                return cached["text"]
+            log.info(f"Corridor for {ai_id} is {age_hours:.1f}h old, rebuilding")
+        except Exception:
+            pass
     return await build_corridor(ai_id)
 
 

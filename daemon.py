@@ -10,7 +10,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-from config import (LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, MERGE_SIMILARITY, get_room)
+from config import (LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, MERGE_SIMILARITY, get_room, AI_ROLES)
 from embedding import get_embedding, cosine_similarity, unpack_embedding, pack_embedding
 import github_store as store
 
@@ -45,6 +45,24 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
+_REFUSAL_PATTERNS = [
+    "i can't", "i cannot", "i'm not able", "i am not able",
+    "i'm unable", "as an ai", "as a language model",
+    "i don't have the ability", "i'm sorry, but i",
+    "无法假装", "无法扮演", "我不能", "作为AI", "作为一个AI",
+    "作为语言模型", "我没有能力", "抱歉，我无法", "不具备",
+    "我是一个人工智能", "i apologize", "i must decline",
+]
+
+
+def _is_refusal(text: str) -> bool:
+    """检测 LLM 返回的内容是否是拒绝/元叙述而非真实内容"""
+    if not text or len(text.strip()) < 5:
+        return True
+    lower = text.lower().strip()
+    return any(p in lower for p in _REFUSAL_PATTERNS)
+
+
 # ── 1. 合并相似记忆 ──
 
 async def merge_similar() -> dict:
@@ -77,7 +95,7 @@ async def merge_similar() -> dict:
 记忆2：{b['content']}
 只输出合并后的一句话。"""
             merged = await _call_llm(prompt)
-            if not merged:
+            if not merged or _is_refusal(merged):
                 continue
 
             merged = merged.strip().strip('"')
@@ -115,7 +133,7 @@ async def compress_diaries() -> dict:
     now = datetime.now(timezone.utc)
     compressed = 0
 
-    for ai_id in ["claude", "gemini", "gpt"]:
+    for ai_id in AI_ROLES:
         # 找该 AI 超过7天的日记条目
         diary_entries = [
             m for m in all_mems.values()
@@ -155,7 +173,8 @@ async def compress_diaries() -> dict:
 
 只输出周记内容。"""
             digest = await _call_llm(prompt)
-            if not digest:
+            if not digest or _is_refusal(digest):
+                log.warning(f"  Skipped diary compress for {ai_id} week {week_key}: LLM refusal or empty")
                 continue
 
             digest = digest.strip()
@@ -316,7 +335,7 @@ async def tidy_living_room() -> dict:
                     continue
                 texts = "\n".join([m["content"] for m in mems_to_merge])
                 merged = await _call_llm(f"合并以下信息为一句简洁的陈述：\n{texts}\n只输出一句话。")
-                if not merged:
+                if not merged or _is_refusal(merged):
                     continue
                 merged = merged.strip().strip('"')
 
@@ -399,7 +418,8 @@ async def distill_psychology() -> dict:
 只输出章节内容。"""
 
         chapter = await _call_llm(prompt)
-        if not chapter:
+        if not chapter or _is_refusal(chapter):
+            log.warning(f"  Skipped psychology distill for {month}: LLM refusal or empty")
             continue
         chapter = chapter.strip()
 
@@ -626,7 +646,7 @@ async def run_full_maintenance() -> dict:
     # 10. Persona State 休息（恢复精力）
     try:
         from persona_state import rest
-        for ai_id in ["claude", "gemini", "gpt"]:
+        for ai_id in AI_ROLES:
             rest(ai_id)
         log.info("  Persona states rested")
     except Exception as e:

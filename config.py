@@ -190,15 +190,14 @@ DECAY_LAMBDA_FAST = 0.15  # 工作事务等快速衰减的房间
 DECAY_THRESHOLD = 0.15
 MERGE_SIMILARITY = 0.75
 
-# ── 搜索权重 ──
+# ── 搜索权重（recall() 向量路的多维加权）──
 SEARCH_WEIGHTS = {
-    "embedding": 5.0,
-    "topic": 4.0,
-    "emotion": 2.0,
-    "time": 1.5,
-    "importance": 1.0,
+    "embedding": 0.6,
+    "emotion": 0.15,
+    "time": 0.1,
+    "importance": 0.15,
 }
-SEARCH_THRESHOLD = 0.30
+SEARCH_THRESHOLD = 0.25  # RRF 融合后的最低分，低于此分的结果丢弃
 
 # ── Embedding ──
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")

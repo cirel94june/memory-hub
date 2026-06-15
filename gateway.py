@@ -129,12 +129,12 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         recalled = await _rerank_memories(user_message, recalled, top_k=5)
         recalled_ids = [r["id"] for r in recalled]
         rooms_checked.extend(rooms_to_check or [])
-        # L3: 压缩 — 每条 ≤300 字
+        # L3: 压缩 — 每条 ≤400 字，附带原始语境帮助回忆细节
         lines = []
         for r in recalled:
             content = r["content"]
-            if len(content) > 300:
-                content = content[:280] + "..."
+            if len(content) > 400:
+                content = content[:380] + "..."
             room_tag = r["room"]
             if r.get("resolved") == False:
                 room_tag += "/待办"
@@ -151,10 +151,25 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
 
     inject_text = "\n\n".join(parts) if parts else ""
 
+    # 生成简要的记忆活动摘要（供前端展示）
+    recall_summary = ""
+    if recalled:
+        snippets = []
+        for r in recalled[:3]:
+            c = r["content"]
+            # 去掉 [用户]/[互动]/[AI] 前缀
+            for prefix in ["[用户] ", "[互动] ", "[AI] "]:
+                if c.startswith(prefix):
+                    c = c[len(prefix):]
+                    break
+            snippets.append(c[:30].rstrip("，。、") + ("…" if len(c) > 30 else ""))
+        recall_summary = "🔍 " + " | ".join(snippets)
+
     return {
         "inject_text": inject_text,
         "recalled_ids": recalled_ids,
         "rooms_checked": list(set(rooms_checked)),
+        "recall_summary": recall_summary,
     }
 
 
@@ -216,8 +231,8 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
 
     prompt = f"""你是一个**极其严格**的记忆提取助手。分析以下对话，判断是否有值得**长期**记住的新信息。
 
-用户说：{user_message[:500]}
-AI回复：{ai_response[:500]}
+用户说：{user_message[:1500]}
+AI回复：{ai_response[:1500]}
 
 ## 🚨 最重要的规则——忠实提取，禁止脑补：
 记忆必须在对话中有**明确依据**。可以是用户说的，也可以是对话中能直接观察到的。
@@ -251,24 +266,35 @@ AI回复：{ai_response[:500]}
 - 已知信息的重复
 - 模糊的、一次性的感受（今天有点累 ← 不记；持续失眠一周 ← 记）
 - 没有对话依据的推测和脑补
+- **AI 的自我限制/拒绝**（"我是AI不能XX"、"作为语言模型"、"I can't"等元叙述）
+- AI 关于自身能力的讨论、系统配置、调试类对话
 
 ## ⚡ 记忆原子化规则（非常重要）：
 每条记忆必须是一个**独立的原子事实**。一条记忆 = 一个事实点。
 - ✅ "小猫在杭州工作" — 一条
 - ✅ "小猫养了一只叫团子的橘猫" — 一条
 - ❌ "小猫在杭州工作，养了一只橘猫叫团子，最近在学日语" — 应该拆成三条
-每条不超过80字。宁可多拆几条，也不要把多个事实塞进一条里。
+每条不超过200字。可以包含具体细节（梗、笑话、特定事件的关键台词），不要过度抽象。宁可多拆几条，也不要把多个事实塞进一条里。
 
 ## 可用房间：
 {room_list}
   - 私有房间（diary/dreams/relationship/personality）用 layer="private"
+
+## ⚠️ about 字段——关于谁的记忆（防止 AI 混淆身份）：
+每条记忆必须标注 about 字段：
+- "user" = 关于用户的事实（用户的工作、心情、经历、偏好、人际关系）
+- "interaction" = 关于用户和AI之间的互动（一起玩了什么、讨论了什么话题、共同经历）
+- "ai" = AI自己的感悟/自省（极少用，只有AI主动记日记时才是这个）
+绝大多数记忆都应该是 "user" 或 "interaction"。
+**重要**：用户的工作困难、情绪状态、生活事件 = about:"user"，不是AI自己的经历！
 
 输出 JSON 格式：
 {{
   "actions": [
     {{
       "type": "remember",
-      "content": "一个原子事实（≤80字）",
+      "content": "一个原子事实（≤200字，保留具体细节）",
+      "about": "user 或 interaction 或 ai",
       "layer": "shared 或 private",
       "room": "从上面的房间列表选",
       "category": "简短分类词",
@@ -293,20 +319,45 @@ AI回复：{ai_response[:500]}
         except Exception:
             pass
 
-    # 执行提取到的动作（importance < 0.3 的直接丢弃）
+    # 执行提取到的动作（importance < 0.4 的直接丢弃，与 prompt 一致）
     executed = []
+    _refusal_kw = ["i can't", "i cannot", "as an ai", "作为ai", "我是ai", "作为语言模型", "无法扮演"]
+    valid_rooms = set(ROOMS.keys())
+    valid_about = {"user", "interaction", "ai"}
+
     for action in actions_data.get("actions", []):
         if action.get("type") == "remember" and action.get("content"):
-            imp = float(action.get("importance", 0.5))
-            if imp < 0.3:
-                print(f"[Gateway] Skipped low-importance ({imp}): {action['content'][:60]}")
+            content = action["content"].strip()
+            # 内容验证
+            if len(content) < 5:
                 continue
+            if any(kw in content.lower() for kw in _refusal_kw):
+                print(f"[Gateway] Skipped AI refusal: {content[:60]}")
+                continue
+            imp = float(action.get("importance", 0.5))
+            if imp < 0.4:
+                print(f"[Gateway] Skipped low-importance ({imp}): {content[:60]}")
+                continue
+            # 验证 room 和 about
+            room = action.get("room", "living_room")
+            if room not in valid_rooms:
+                room = "living_room"
+            about = action.get("about", "user")
+            if about not in valid_about:
+                about = "user"
             owner = ai_id if action.get("layer") == "private" else ""
-            source_ctx = f"用户: {user_message[:300]}\nAI: {ai_response[:200]}"
+            # 给记忆内容加上 about 前缀，让走廊和搜索时能区分
+            if about == "user" and not content.startswith("[用户]"):
+                content = f"[用户] {content}"
+            elif about == "interaction" and not content.startswith("[互动]"):
+                content = f"[互动] {content}"
+            elif about == "ai" and not content.startswith("[AI]"):
+                content = f"[AI] {content}"
+            source_ctx = f"用户: {user_message[:400]}\nAI: {ai_response[:400]}"
             await remember(
-                content=action["content"],
+                content=content,
                 layer=action.get("layer", "shared"),
-                room=action.get("room", "living_room"),
+                room=room,
                 category=action.get("category", ""),
                 owner_ai=owner,
                 importance=imp,
@@ -333,4 +384,17 @@ AI回复：{ai_response[:500]}
     except Exception:
         pass
 
-    return {"actions": executed}
+    # 生成简要的存储摘要（供前端展示）
+    store_summary = ""
+    if executed:
+        snippets = []
+        for a in executed[:3]:
+            c = a.get("content", "")
+            for prefix in ["[用户] ", "[互动] ", "[AI] "]:
+                if c.startswith(prefix):
+                    c = c[len(prefix):]
+                    break
+            snippets.append(c[:30].rstrip("，。、") + ("…" if len(c) > 30 else ""))
+        store_summary = "💾 " + " | ".join(snippets)
+
+    return {"actions": executed, "store_summary": store_summary}

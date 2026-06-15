@@ -230,6 +230,7 @@ async def handle_chat_completions(request: Request, body: dict):
     is_stream = body.get("stream", False)
 
     # Step 1: 获取记忆并注入
+    recall_summary = ""
     if config.inject_memory and user_message:
         try:
             recent = _extract_recent_messages(messages)
@@ -239,6 +240,7 @@ async def handle_chat_completions(request: Request, body: dict):
                 recent_messages=recent,
             )
             memory_text = context.get("inject_text", "")
+            recall_summary = context.get("recall_summary", "")
             if memory_text:
                 messages = _inject_memory_into_messages(messages, memory_text)
                 logger.info(f"[Proxy] Injected {len(memory_text)} chars of memory for {config.ai_id}")
@@ -283,6 +285,10 @@ async def handle_chat_completions(request: Request, body: dict):
             ai_id=config.ai_id,
             platform=config.platform,
         ))
+
+    # 在响应中附带记忆活动摘要（自定义字段，不影响 OpenAI 兼容性）
+    if recall_summary:
+        response_data["memory_activity"] = {"recall_summary": recall_summary}
 
     return JSONResponse(content=response_data)
 

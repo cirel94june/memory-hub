@@ -10,6 +10,7 @@ import memory_ops
 import corridor as corridor_mod
 import gateway as gateway_mod
 import daemon
+import github_store as store
 from config import AI_ROLES, ROOMS, list_rooms
 
 MCP_INSTRUCTIONS = """\
@@ -127,18 +128,19 @@ async def grow(
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5, with_corridor: bool = False) -> str:
+async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source_ai: str = "claude") -> str:
     """搜索记忆。用自然语言描述要找的内容，会用向量相似度匹配最相关的记忆。
 
     Args:
         query: 搜索关键词或自然语言描述
         top_k: 返回数量（默认5）
         with_corridor: 是否同时返回走廊上下文（对话开头建议开启）
+        source_ai: AI身份（影响私有房间可见性）
     """
-    results = await memory_ops.recall(query=query, ai_id="claude", top_k=top_k)
+    results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k)
     output = {"results": results}
     if with_corridor:
-        corridor_text = await corridor_mod.get_corridor("claude")
+        corridor_text = await corridor_mod.get_corridor(source_ai)
         output["corridor"] = corridor_text or ""
     return json.dumps(output, ensure_ascii=False, indent=2)
 
@@ -264,6 +266,24 @@ async def delete_memory(memory_id: str) -> str:
     """
     result = await memory_ops.delete_memory(memory_id)
     return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_memory_detail(memory_id: str) -> str:
+    """获取一条记忆的完整详情，包括原始对话上下文、全部年轮评论、关联记忆等。
+
+    当你通过 recall 想起了某条记忆但需要更多细节时，用这个工具深入查看。
+    比如用户提到一个梗，recall 返回了概要，你可以用 get_memory_detail 看到
+    当时的原始对话片段，帮你回忆起完整的上下文和细节。
+
+    Args:
+        memory_id: 记忆ID（从 recall 结果中获取）
+    """
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return json.dumps({"error": f"Memory {memory_id} not found"}, ensure_ascii=False)
+    safe = {k: v for k, v in mem.items() if k != "embedding"}
+    return json.dumps(safe, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

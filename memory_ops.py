@@ -10,7 +10,8 @@ import logging
 from datetime import datetime, timezone
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
-                    MERGE_SIMILARITY, ROOMS, get_room)
+                    MERGE_SIMILARITY, ROOMS, get_room,
+                    SEARCH_WEIGHTS, SEARCH_THRESHOLD)
 from embedding import get_embedding, pack_embedding, unpack_embedding, cosine_similarity
 import github_store as store
 import analyzer
@@ -538,6 +539,7 @@ async def recall(
         room = mem.get("room", "")
         comments = mem.get("comments", [])
         comment_count = len(comments) if isinstance(comments, list) else 0
+        source_ctx = mem.get("source_context", "")
         return {
             "id": mem["id"],
             "content": mem["content"],
@@ -555,7 +557,7 @@ async def recall(
             "activation_count": mem.get("activation_count", 0),
             "comment_count": comment_count,
             "comments": comments[-3:] if comment_count > 0 else [],
-            "source_context": mem.get("source_context", ""),
+            "source_context": source_ctx,
         }
 
     # ── 路径 1：向量搜索（语义匹配）──
@@ -619,6 +621,9 @@ async def recall(
 
     # ── RRF 融合三路结果 ──
     merged = _rrf_merge(vec_results, kw_results, exact_results)
+
+    # ── 过滤低分结果 ──
+    merged = [m for m in merged if m.get("score", 0) >= SEARCH_THRESHOLD]
 
     # ── Unresolved 优先浮现（最多 2 条插到最前面）──
     unresolved = []
