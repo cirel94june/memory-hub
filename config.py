@@ -202,8 +202,8 @@ MERGE_SIMILARITY = 0.75
 # ── 搜索权重（recall() 向量路的多维加权）──
 SEARCH_WEIGHTS = {
     "embedding": 0.6,
-    "emotion": 0.15,
-    "time": 0.1,
+    "emotion": 0.1,
+    "time": 0.15,
     "importance": 0.15,
 }
 SEARCH_THRESHOLD = 0.01  # RRF 融合后的最低分（RRF分值范围约0~0.05）

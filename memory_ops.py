@@ -505,17 +505,13 @@ async def recall(
     """
     query_vec = await get_embedding(query)
 
-    # 如果没指定 domain，用 analyzer 快速分析 query
+    # 不再对 query 调 LLM 分析（省 3-5 秒延迟），用简单默认值
     if not query_domain:
-        try:
-            q_analysis = await analyzer.analyze(query)
-            query_domain = q_analysis.get("domain", [])
-            if query_valence < 0:
-                query_valence = q_analysis.get("valence", 0.5)
-            if query_arousal < 0:
-                query_arousal = q_analysis.get("arousal", 0.3)
-        except Exception:
-            query_domain = []
+        query_domain = []
+    if query_valence < 0:
+        query_valence = 0.5
+    if query_arousal < 0:
+        query_arousal = 0.3
 
     all_mems = store.get_all_memories()
     isolated_rooms = {k for k, v in ROOMS.items() if v.get("type") == "isolated"}
@@ -586,8 +582,11 @@ async def recall(
                 time_score = 0.5
             importance_score = float(mem.get("importance") or 0.5)
 
-            final = (embed_score * 0.45 + emotion_score * 0.15 +
-                     time_score * 0.25 + importance_score * 0.15)
+            # 语义相似度太低的直接跳过，避免不相关记忆靠 time/importance 蹭上来
+            if embed_score < 0.4:
+                continue
+            final = (embed_score * 0.6 + emotion_score * 0.1 +
+                     time_score * 0.15 + importance_score * 0.15)
             vec_scored.append((mem, final))
 
         vec_scored.sort(key=lambda x: x[1], reverse=True)

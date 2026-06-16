@@ -148,9 +148,8 @@ async def _forward_request(
     target_url: str,
     target_key: str,
     body: dict,
-    stream: bool = False,
 ) -> httpx.Response:
-    """转发请求到目标 AI API"""
+    """转发请求到目标 AI API（非流式）"""
     headers = {
         "Authorization": f"Bearer {target_key}",
         "Content-Type": "application/json",
@@ -161,9 +160,57 @@ async def _forward_request(
             f"{target_url.rstrip('/')}/chat/completions",
             headers=headers,
             json=body,
-            # 不自动跟踪重定向
         )
         return resp
+
+
+async def _forward_stream(
+    target_url: str,
+    target_key: str,
+    body: dict,
+    on_complete=None,
+):
+    """转发流式请求，透传 SSE 到客户端，同时收集完整回复用于记忆提取"""
+    headers = {
+        "Authorization": f"Bearer {target_key}",
+        "Content-Type": "application/json",
+    }
+    collected_text = []
+
+    async def event_generator():
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream(
+                "POST",
+                f"{target_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=body,
+            ) as resp:
+                if resp.status_code != 200:
+                    error_body = await resp.aread()
+                    yield f"data: {error_body.decode()}\n\n"
+                    return
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    yield f"{line}\n\n"
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            chunk = json.loads(line[6:])
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                collected_text.append(content)
+                        except Exception:
+                            pass
+        if on_complete:
+            full_text = "".join(collected_text)
+            await on_complete(full_text)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def _extract_response_text(response_data: dict) -> str:
@@ -253,11 +300,30 @@ async def handle_chat_completions(request: Request, body: dict):
     forward_body["messages"] = messages
 
     if is_stream:
-        # 流式响应：直接透传，记忆提取在流结束后做
-        # （流式比较复杂，先返回非流式错误提示）
-        # TODO: 支持流式代理
-        forward_body["stream"] = False
+        # 流式：透传 SSE，流结束后后台提取记忆
+        forward_body["stream"] = True
 
+        async def _on_stream_complete(full_text: str):
+            if config.extract_memory and user_message and full_text:
+                await _background_extract(
+                    user_message=user_message,
+                    ai_response=full_text,
+                    ai_id=config.ai_id,
+                    platform=config.platform,
+                )
+
+        try:
+            return await _forward_stream(
+                target_url=config.target_base_url,
+                target_key=config.target_api_key,
+                body=forward_body,
+                on_complete=_on_stream_complete,
+            )
+        except Exception as e:
+            logger.error(f"[Proxy] Stream forward failed: {e}")
+            raise HTTPException(status_code=502, detail=f"Failed to reach target API: {e}")
+
+    # 非流式
     try:
         resp = await _forward_request(
             target_url=config.target_base_url,
@@ -286,7 +352,6 @@ async def handle_chat_completions(request: Request, body: dict):
             platform=config.platform,
         ))
 
-    # 在响应中附带记忆活动摘要（自定义字段，不影响 OpenAI 兼容性）
     if recall_summary:
         response_data["memory_activity"] = {"recall_summary": recall_summary}
 
