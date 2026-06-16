@@ -79,57 +79,16 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     if corridor_text:
         parts.append(corridor_text)
 
-    # 3. 用小模型判断需要查哪些房间
-    on_demand_rooms = {k: v for k, v in ROOMS.items()
-                       if v.get("type") == "on_demand" and v.get("scope") == "shared"}
-    room_list = "\n".join([f"- {k}: {v['name']}（{v.get('description','')}）" for k, v in on_demand_rooms.items()])
-
-    context_text = ""
-    if recent_messages:
-        context_text = "\n".join([f"{m.get('role','')}: {m.get('content','')[:200]}" for m in recent_messages[-3:]])
-
-    judge_prompt = f"""你是一个记忆路由助手。根据用户消息判断需要查哪些记忆房间。
-
-用户消息：{user_message}
-
-最近对话：
-{context_text}
-
-可用房间：
-{room_list}
-- game_room: 游戏房（小游戏、编故事、跑团）
-
-输出 JSON 数组，包含需要查的房间 key。不需要就输出空数组。
-只输出 JSON。示例：["psychology", "health"]"""
-
-    rooms_to_check = []
-    result = await _call_llm(judge_prompt)
-    if result:
-        try:
-            result = result.strip()
-            if result.startswith("```"):
-                result = result.split("\n", 1)[-1].rsplit("```", 1)[0]
-            rooms_to_check = json.loads(result)
-        except Exception:
-            pass
-
-    # 4. 三级记忆过滤（借鉴 Aelios）
-    #    L1: 混合搜索粗筛 → 12 条候选
-    #    L2: 小模型 reranker → 精筛 5 条
-    #    L3: 压缩到 ≤300 字/条（注入时）
-    exclude_isolated = "game_room" not in (rooms_to_check or [])
+    # 直接搜全部房间（RRF + reranker 自然筛选，省掉 LLM room judge 的延迟）
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
-        top_k=12,  # L1: 粗筛 12 条
-        include_rooms=rooms_to_check if rooms_to_check else None,
-        exclude_isolated=exclude_isolated,
+        top_k=12,
+        exclude_isolated=True,
     )
     if recalled:
-        # L2: Reranker — 小模型精筛到 5 条
-        recalled = await _rerank_memories(user_message, recalled, top_k=5)
+        recalled = recalled[:5]
         recalled_ids = [r["id"] for r in recalled]
-        rooms_checked.extend(rooms_to_check or [])
         # L3: 压缩 — 每条 ≤400 字，附带原始语境帮助回忆细节
         lines = []
         for r in recalled:

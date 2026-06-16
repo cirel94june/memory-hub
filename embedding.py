@@ -1,21 +1,16 @@
 """
-向量化引擎：本地 ONNX embedding（fastembed）
-模型：从 config.EMBEDDING_MODEL 读取，默认 BAAI/bge-small-zh-v1.5（中文优化，512维）
+向量化引擎：硅基流动 API embedding
+模型：BAAI/bge-large-zh-v1.5（中文优化，1024维）
 """
 import math
+import os
 import struct
 
-from fastembed import TextEmbedding
-from config import EMBEDDING_MODEL
+import httpx
 
-_model = None
-
-
-def _get_model():
-    global _model
-    if _model is None:
-        _model = TextEmbedding(model_name=EMBEDDING_MODEL)
-    return _model
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
 
 
 def pack_embedding(values: list[float]) -> bytes:
@@ -39,13 +34,22 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 async def get_embedding(text: str) -> list[float] | None:
-    """获取文本 embedding（本地 ONNX 推理，无网络依赖）"""
     if not text or not text.strip():
         return None
+    if not EMBEDDING_API_KEY:
+        print("[Embedding] no API key configured")
+        return None
     try:
-        model = _get_model()
-        embeddings = list(model.embed([text[:2000]]))
-        return embeddings[0].tolist()
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{EMBEDDING_BASE_URL}/embeddings",
+                headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": EMBEDDING_MODEL, "input": text[:2000]},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["data"][0]["embedding"]
     except Exception as e:
         print(f"[Embedding] error: {e}")
         return None

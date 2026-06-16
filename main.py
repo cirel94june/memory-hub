@@ -52,10 +52,31 @@ async def lifespan(app: FastAPI):
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
+
+        # 后台 backfill embeddings（不阻塞请求）
+        backfill_task = asyncio.create_task(_backfill_embeddings(mems))
         try:
             yield
         finally:
             daemon_task.cancel()
+            backfill_task.cancel()
+
+
+async def _backfill_embeddings(mems):
+    """后台填充 embedding（不阻塞 HTTP 请求）"""
+    from embedding import get_embedding, pack_embedding
+    no_emb = [m for m in mems.values() if m.get("status") == "active" and not m.get("embedding")]
+    if not no_emb:
+        return
+    print(f"[Memory Hub] Backfilling embeddings for {len(no_emb)} memories (background)...")
+    for i, mem in enumerate(no_emb):
+        vec = await get_embedding(mem.get("content", ""))
+        if vec:
+            mem["embedding"] = pack_embedding(vec)
+        if (i + 1) % 20 == 0:
+            print(f"[Memory Hub] Embedded {i+1}/{len(no_emb)}")
+        await asyncio.sleep(0.1)
+    print(f"[Memory Hub] Embedding backfill complete")
 
 
 async def _daemon_loop():

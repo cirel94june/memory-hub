@@ -206,7 +206,7 @@ SEARCH_WEIGHTS = {
     "time": 0.1,
     "importance": 0.15,
 }
-SEARCH_THRESHOLD = 0.25  # RRF 融合后的最低分，低于此分的结果丢弃
+SEARCH_THRESHOLD = 0.01  # RRF 融合后的最低分（RRF分值范围约0~0.05）
 
 # ── Embedding ──
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
