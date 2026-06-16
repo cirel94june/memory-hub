@@ -547,9 +547,9 @@ async def recall(
             "room": room,
             "category": mem.get("category", ""),
             "domain": _parse_json_field(mem.get("domain", "[]")),
-            "importance": float(mem.get("importance", 0.5)),
-            "valence": float(mem.get("valence", 0.5)),
-            "arousal": float(mem.get("emotion_arousal", 0.3)),
+            "importance": float(mem.get("importance") or 0.5),
+            "valence": float(mem.get("valence") or 0.5),
+            "arousal": float(mem.get("emotion_arousal") or 0.3),
             "score": round(score, 4),
             "created_at": mem.get("created_at", ""),
             "event_date": mem.get("event_date", ""),
@@ -573,8 +573,8 @@ async def recall(
             # 多维加权：向量为主，emotion/time/importance 辅助
             embed_score = max(0, vec_sim)
             if query_valence >= 0 and query_arousal >= 0:
-                mv = float(mem.get("valence", 0.5))
-                ma = float(mem.get("emotion_arousal", 0.3))
+                mv = float(mem.get("valence") or 0.5)
+                ma = float(mem.get("emotion_arousal") or 0.3)
                 emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
             else:
                 emotion_score = 0.5
@@ -584,7 +584,7 @@ async def recall(
                 time_score = math.exp(-0.05 * days)
             except Exception:
                 time_score = 0.5
-            importance_score = float(mem.get("importance", 0.5))
+            importance_score = float(mem.get("importance") or 0.5)
 
             final = (embed_score * 0.45 + emotion_score * 0.15 +
                      time_score * 0.25 + importance_score * 0.15)
@@ -865,8 +865,8 @@ async def run_decay() -> dict:
         except Exception:
             continue
 
-        importance = float(mem.get("importance", 0.5))
-        arousal = float(mem.get("emotion_arousal", 0.3))
+        importance = float(mem.get("importance") or 0.5)
+        arousal = float(mem.get("emotion_arousal") or 0.3)
         activations = int(mem.get("activation_count", 0))
 
         room_cfg = get_room(mem.get("room", "")) or {}
@@ -883,7 +883,7 @@ async def run_decay() -> dict:
             mem["updated_at"] = _now()
             store.set_memory(mem)
             archived += 1
-        elif abs(new_score - float(mem.get("decay_score", 1.0))) > 0.01:
+        elif abs(new_score - float(mem.get("decay_score") or 1.0)) > 0.01:
             mem["decay_score"] = new_score
             mem["updated_at"] = _now()
             store.set_memory(mem)
