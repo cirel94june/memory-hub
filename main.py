@@ -361,8 +361,8 @@ async def api_summarize_history(body: SummarizeRequest, authorization: str = Hea
     if body.existing_summary:
         prev = f"\n已有的之前的对话摘要：\n{body.existing_summary}\n"
 
-    prompt = f"""把以下对话历史压缩成一段简洁的摘要（中文，200字以内）。
-保留：关键话题、重要事实、有趣的梗/笑话的具体内容、情绪转折、未完成的讨论。
+    prompt = f"""把以下对话历史压缩成一段简洁的摘要（中文，400字以内）。
+保留：关键话题、重要事实、有趣的梗/笑话的具体内容（保留原话和细节）、情绪转折、未完成的讨论。
 丢弃：日常寒暄、重复内容、无信息量的闲聊。
 {prev}
 对话记录：

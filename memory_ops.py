@@ -625,12 +625,13 @@ async def recall(
     # ── 过滤低分结果 ──
     merged = [m for m in merged if m.get("score", 0) >= SEARCH_THRESHOLD]
 
-    # ── Unresolved 优先浮现（最多 2 条插到最前面）──
+    # ── Unresolved 优先浮现（仅当语义相关时，最多 2 条提升到前排）──
     unresolved = []
     normal = []
-    for item in merged:
+    top_threshold = top_k * 2
+    for rank, item in enumerate(merged):
         mem = store.get_memory(item["id"])
-        if mem and mem.get("resolved") == False and len(unresolved) < 2:
+        if mem and mem.get("resolved") == False and len(unresolved) < 2 and rank < top_threshold:
             item["_unresolved"] = True
             unresolved.append(item)
         else:

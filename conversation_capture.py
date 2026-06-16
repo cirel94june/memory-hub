@@ -126,8 +126,12 @@ EXTRACT_OUTPUT_FORMAT = """
 
 房间可选：
   living_room(核心身份), career(职业), psychology(心理), health(健康),
-  learning(学习), relationships(人际), preferences(偏好),
-  work_tasks(工作事务), infra(基建), game_room(游戏/角色扮演)
+  learning(学习), relationships(人际关系), preferences(兴趣偏好),
+  work_tasks(工作事务), infra(基建), social(社交动态/群聊),
+  relationship(和AI的关系), diary(AI日记), personality(AI自我认知),
+  game_room(游戏/角色扮演)
+
+提示：群聊中的梗、外号、暗号、互动细节 → social 房间
 
 只输出 JSON。"""
 

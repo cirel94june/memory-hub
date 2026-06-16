@@ -111,6 +111,15 @@ DEFAULT_ROOMS = {
         "fast_decay": True,  # 衰减更快
     },
 
+    # ── 社交动态 ──
+    "social": {
+        "name": "社交动态",
+        "description": "群聊里的梗、外号、暗号、互动场景、群内角色关系",
+        "type": "on_demand",
+        "scope": "shared",
+        "icon": "🎭",
+    },
+
     # ── 基建房（项目/代码/配置） ──
     "infra": {
         "name": "基建总览",
@@ -200,4 +209,4 @@ SEARCH_WEIGHTS = {
 SEARCH_THRESHOLD = 0.25  # RRF 融合后的最低分，低于此分的结果丢弃
 
 # ── Embedding ──
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")

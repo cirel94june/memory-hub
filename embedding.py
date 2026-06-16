@@ -1,11 +1,12 @@
 """
 向量化引擎：本地 ONNX embedding（fastembed）
-模型：all-MiniLM-L6-v2，384维，首次运行自动下载 ~25MB
+模型：从 config.EMBEDDING_MODEL 读取，默认 BAAI/bge-small-zh-v1.5（中文优化，512维）
 """
 import math
 import struct
 
 from fastembed import TextEmbedding
+from config import EMBEDDING_MODEL
 
 _model = None
 
@@ -13,7 +14,7 @@ _model = None
 def _get_model():
     global _model
     if _model is None:
-        _model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        _model = TextEmbedding(model_name=EMBEDDING_MODEL)
     return _model
 
 

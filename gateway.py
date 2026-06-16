@@ -5,6 +5,7 @@ Memory Gateway：小模型预处理层
 """
 import json
 import math
+import asyncio
 import httpx
 from datetime import datetime, timezone
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS
@@ -396,5 +397,13 @@ AI回复：{ai_response[:1500]}
                     break
             snippets.append(c[:30].rstrip("，。、") + ("…" if len(c) > 30 else ""))
         store_summary = "💾 " + " | ".join(snippets)
+
+    # 有新记忆写入时，异步重建走廊（下次 recall 就能看到最新状态）
+    if executed:
+        try:
+            import corridor as corridor_mod
+            asyncio.create_task(corridor_mod.build_corridor(ai_id))
+        except Exception:
+            pass
 
     return {"actions": executed, "store_summary": store_summary}

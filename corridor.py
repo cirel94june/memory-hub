@@ -103,8 +103,10 @@ async def build_corridor(ai_id: str) -> str:
         pass
 
     # 8. Unresolved 记忆（待办事项提醒）
+    # 排除 auto_capture 来源的 social 记忆（社交互动不是待办）
     unresolved_mems = [m for m in all_mems.values()
-                       if m.get("resolved") == False and m.get("status") == "active"]
+                       if m.get("resolved") == False and m.get("status") == "active"
+                       and not (m.get("room") == "social" and "auto_capture" in (m.get("source_platform") or ""))]
     if unresolved_mems:
         lines = [f"· {m['content'][:200]}" for m in unresolved_mems[:3]]
         sections.append("【待办/未完成】\n" + "\n".join(lines))
@@ -129,7 +131,7 @@ async def get_corridor(ai_id: str) -> str:
         try:
             compiled = datetime.fromisoformat(cached.get("compiled_at", ""))
             age_hours = (datetime.now(timezone.utc) - compiled).total_seconds() / 3600
-            if age_hours <= 6:
+            if age_hours <= 1:
                 return cached["text"]
             log.info(f"Corridor for {ai_id} is {age_hours:.1f}h old, rebuilding")
         except Exception:
