@@ -107,12 +107,24 @@ _mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+import os
+if os.path.isdir("static-app"):
+    app.mount("/app/assets", StaticFiles(directory="static-app/assets"), name="app-assets")
+
 
 # ── 首页 ──
 
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
+
+
+@app.get("/app/{rest_of_path:path}")
+async def frontend_spa(rest_of_path: str):
+    file_path = os.path.join("static-app", rest_of_path)
+    if rest_of_path and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    return FileResponse("static-app/index.html")
 
 
 # ── 元信息 ──
