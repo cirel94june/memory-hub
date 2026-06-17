@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import github_store as store
 
 async def main():
-    await store.init()
+    await store.load_all()
     all_mems = store.get_all_memories()
     fixed = 0
     for mem in all_mems.values():

@@ -6,7 +6,7 @@ import github_store as store
 import analyzer
 
 async def main():
-    await store.init()
+    await store.load_all()
     all_mems = store.get_all_memories()
     fixed = 0
     for mem in all_mems.values():
