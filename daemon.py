@@ -596,6 +596,33 @@ async def detect_stale_memories() -> dict:
     return {"checked": checked, "stale": stale_count}
 
 
+async def _backfill_analysis():
+    """补分析 quick 模式存入的记忆"""
+    all_mems = store.get_all_memories()
+    backfilled = 0
+    for mem in all_mems.values():
+        if not mem.get("_needs_analysis"):
+            continue
+        if mem.get("status") != "active":
+            continue
+        analysis = await analyzer.analyze(mem["content"])
+        if analysis:
+            if not mem.get("category") and analysis.get("suggested_category"):
+                mem["category"] = analysis["suggested_category"]
+            mem["tags"] = json.dumps(analysis.get("tags", []))
+            mem["domain"] = json.dumps(analysis.get("domain", []))
+            mem["valence"] = analysis.get("valence", 0.5)
+            if analysis.get("arousal") is not None:
+                mem["emotion_arousal"] = analysis["arousal"]
+        mem.pop("_needs_analysis", None)
+        store.set_memory(mem)
+        backfilled += 1
+    if backfilled:
+        await store.push_dirty()
+        log.info(f"Backfilled analysis for {backfilled} memories")
+    return backfilled
+
+
 # ── 主入口：一键执行所有整理 ──
 
 async def run_full_maintenance() -> dict:
@@ -651,6 +678,10 @@ async def run_full_maintenance() -> dict:
         log.info("  Persona states rested")
     except Exception as e:
         log.warning(f"  Persona rest failed: {e}")
+
+    # 10.5 补分析 quick 模式存入的记忆
+    results["backfill_analysis"] = await _backfill_analysis()
+    log.info(f"  Backfill analysis: {results['backfill_analysis']}")
 
     # 11. 推送到 GitHub
     await store.push_dirty()

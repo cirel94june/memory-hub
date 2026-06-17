@@ -126,8 +126,46 @@ async def remember(
     source_context: str = "",
     auto_analyze: bool = True,
     auto_merge: bool = True,
+    quick: bool = False,
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
+
+    if quick:
+        mem_id = _gen_id()
+        now = _now()
+        vec = await get_embedding(content)
+        mem = {
+            "id": mem_id,
+            "content": content,
+            "layer": layer,
+            "room": room,
+            "category": category or "",
+            "owner_ai": owner_ai,
+            "importance": importance,
+            "emotion_arousal": emotion_arousal,
+            "valence": 0.5,
+            "domain": "[]",
+            "decay_score": 1.0,
+            "activation_count": 0,
+            "last_activated": "",
+            "source_ai": source_ai,
+            "source_platform": source_platform,
+            "tags": json.dumps(tags or []),
+            "linked_memories": "[]",
+            "supersedes": "[]",
+            "event_date": event_date,
+            "source_context": source_context,
+            "comments": [],
+            "embedding": pack_embedding(vec) if vec else None,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
+            "_needs_analysis": True,
+        }
+        store.set_memory(mem)
+        _schedule_push()
+        return {"id": mem_id, "status": "created_quick"}
 
     # Step 1: 自动打标
     analysis = None
@@ -493,6 +531,7 @@ async def recall(
     query_domain: list[str] = None,
     query_valence: float = -1,
     query_arousal: float = -1,
+    compact: bool = False,
 ) -> list[dict]:
     """混合搜索召回记忆（向量 + 关键词 + 精确匹配，RRF 融合）
 
@@ -668,6 +707,18 @@ async def recall(
 
     if filtered_results:
         _schedule_push()
+
+    if compact:
+        filtered_results = [
+            {
+                "id": r["id"],
+                "content": r["content"],
+                "room": r.get("room", ""),
+                "score": r.get("score", 0),
+                "created_at": r.get("created_at", ""),
+            }
+            for r in filtered_results
+        ]
 
     return filtered_results
 

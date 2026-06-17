@@ -120,7 +120,7 @@ EXTRACT_OUTPUT_FORMAT = """
     "room": "最合适的房间ID",
     "importance": 0.4到1.0,
     "event_date": "事件日期（如 2026-06-08，推算不出就留空）",
-    "resolved": null或false（如果是待办/未完成的事就 false）
+    "resolved": null 或 false。⚠️ 极少使用 false！只有用户明确说了"要做某事""还没做完""待办""记得提醒我"时才设为 false。群聊梗、知识、互动记录、情绪、观点 → 一律 null。90%以上的记忆应该是 null。
   }
 ]
 
@@ -353,5 +353,62 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         logger.info(f"Auto-captured {len(memories)} memories from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
     else:
         logger.info(f"No memories worth keeping from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
+
+    return memories
+
+
+async def extract_from_messages(
+    messages: list[dict],
+    ai_id: str = "claude",
+    chat_type: str = "private",
+    quick: bool = True,
+) -> list[dict]:
+    """从一组消息中提取记忆。
+
+    messages 格式：[{"role": "user"/"assistant", "content": "..."}, ...]
+    quick=True 时走 remember(quick=True)，不阻塞。
+    """
+    import memory_ops
+
+    lines = []
+    for msg in messages[-30:]:
+        role = "用户" if msg.get("role") == "user" else "AI"
+        content = msg.get("content", "")[:300]
+        lines.append(f"{role}: {content}")
+
+    conversation_text = "\n".join(lines)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prompt = f"今天日期：{today}\n来源：MCP 前端对话，共 {len(messages)} 条消息：\n\n{conversation_text}"
+
+    extract_prompt = _get_extract_prompt(chat_type)
+    raw = await _call_llm(extract_prompt + "\n\n" + prompt)
+    if not raw:
+        return []
+
+    try:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            items = []
+    except Exception:
+        return []
+
+    memories = []
+    for item in items[:10]:
+        content = str(item.get("content", "")).strip()
+        if not content or len(content) < 10:
+            continue
+        result = await memory_ops.remember(
+            content=content,
+            room=item.get("room", "living_room"),
+            importance=max(0.1, min(1.0, float(item.get("importance", 0.5)))),
+            event_date=item.get("event_date", ""),
+            source_ai=ai_id,
+            source_platform="mcp_extract",
+            quick=quick,
+        )
+        memories.append(result)
 
     return memories

@@ -128,7 +128,7 @@ async def grow(
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source_ai: str = "claude") -> str:
+async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source_ai: str = "claude", compact: bool = False) -> str:
     """搜索记忆。用自然语言描述要找的内容，会用向量相似度匹配最相关的记忆。
 
     Args:
@@ -136,8 +136,9 @@ async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source
         top_k: 返回数量（默认5）
         with_corridor: 是否同时返回走廊上下文（对话开头建议开启）
         source_ai: AI身份（影响私有房间可见性）
+        compact: 精简模式。为 true 时只返回 id/content/room/score/created_at，减少上下文消耗。适合 MCP 调用场景。
     """
-    results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k)
+    results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k, compact=compact)
     output = {"results": results}
     if with_corridor:
         corridor_text = await corridor_mod.get_corridor(source_ai)
@@ -404,3 +405,102 @@ async def flush_capture(source_ai: str = "claude") -> str:
     """
     result = await conversation_capture.force_extract(ai_id=source_ai)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def smart_context(
+    ai_id: str,
+    user_message: str = "",
+    has_base_context: bool = False,
+    max_chars: int = 3000,
+) -> str:
+    """获取智能上下文——根据 AI 前端的能力返回最合适的记忆注入。
+
+    Args:
+        ai_id: AI 标识（如 claude / lucien / jasper）
+        user_message: 当前用户消息（可选，用于召回相关记忆）
+        has_base_context: 该 AI 是否已有基础上下文（如 claude.ai 的 userMemories）。
+            True = 只返回增量信息（最近变化 + 待办 + 相关记忆），更短更精准。
+            False = 返回完整走廊 + recall，适合 TG bot 或无上下文的前端。
+        max_chars: 返回文本的最大字符数（默认 3000）
+
+    使用场景：
+    - claude.ai 小克：smart_context(ai_id="claude", user_message="...", has_base_context=True)
+    - TG bot / API 小克：smart_context(ai_id="claude", user_message="...", has_base_context=False)
+    """
+    from smart_context import get_smart_context
+    result = await get_smart_context(ai_id, user_message, has_base_context, max_chars)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def batch_ops(
+    action: str,
+    filter_rules: dict,
+    value: str = "",
+) -> str:
+    """批量操作记忆。
+
+    action 支持：
+    - "reset_activation": 重置 activation_count（value 为目标数值，默认 10）
+    - "reclassify": 重新生成 category（无需 value）
+    - "bulk_resolve": 设置 resolved 状态（value 为 "true" / "null"）
+    - "bulk_archive": 批量归档（无需 value）
+
+    filter_rules 支持的键：
+    - "room": 按房间过滤
+    - "activation_count_gt": activation_count 大于此值
+    - "category_length_gt": category 长度大于此值
+    - "source_platform_contains": source_platform 包含此字符串
+    - "resolved": 按 resolved 过滤（true/false/null）
+    - "importance_lt": importance 小于此值
+
+    示例：
+    - 重置虚高 activation：action="reset_activation", filter={"activation_count_gt": 50}, value="10"
+    - 清理误标待办：action="bulk_resolve", filter={"room": "social", "resolved": false}, value="null"
+    - 修复迁移 category：action="reclassify", filter={"category_length_gt": 20}
+
+    Args:
+        action: 操作类型
+        filter_rules: 过滤条件
+        value: 操作值（部分 action 需要）
+    """
+    from batch_ops import batch_operation
+
+    parsed_value = None
+    if value:
+        if value.lower() in ("null", "none"):
+            parsed_value = None
+        elif value.lower() == "true":
+            parsed_value = True
+        elif value.lower() == "false":
+            parsed_value = False
+        else:
+            try:
+                parsed_value = int(value)
+            except ValueError:
+                parsed_value = value
+
+    result = await batch_operation(action, filter_rules, parsed_value)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def extract_from_messages(
+    messages: list[dict],
+    ai_id: str = "claude",
+    chat_type: str = "private",
+) -> str:
+    """从对话消息中自动提取值得长期记住的信息并存储。
+
+    适合在对话结束时调用，把整段对话交给系统自动提取记忆。
+    比手动 remember 更方便——系统会判断哪些值得记、哪些不值得。
+
+    Args:
+        messages: 对话消息数组，格式 [{"role": "user"/"assistant", "content": "..."}]
+        ai_id: 调用方的 AI 标识
+        chat_type: "private" / "private_group" / "public_group"，影响提取策略
+    """
+    from conversation_capture import extract_from_messages as _extract
+    results = await _extract(messages, ai_id, chat_type, quick=True)
+    return json.dumps(results, ensure_ascii=False, indent=2)
