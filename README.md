@@ -270,8 +270,6 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 | Phase 4.97 | AI 身份统一（cloudy→claude 别名）+ 移除 reranker + DeepSeek V4 Flash + 垃圾清理 | ✅ |
 | Phase 4.98 | 修复向量维度 bug（384→1024）+ 重建 embedding 索引 | ✅ |
 | Phase 4.99 | TG bot 防双回复（去重修复 + 单 worker）+ 确认 post_process 已移除 | ✅ |
-| Phase 4.99 | TG bot 防双回复（去重修复）+ 移除重复 post_process（防双重提取浪费 API） | ✅ |
-| Phase 4.99 | TG bot 去重修复（防双回复）+ 移除重复 post_process 调用 | ✅ |
 | **Phase 5** | **记忆高级功能（相似聚类/脱水压缩/日记再消化）** | **🔲 下一步** |
 | Phase 5.5 | 情感特性（心语、礼物、梦境叙事） | 🔲 远期 |
 
