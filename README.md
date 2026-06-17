@@ -268,6 +268,7 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 | Phase 4.9 | 记忆身份标注（about 字段 + 防 AI 混淆）+ AI Profile 动态化 | ✅ |
 | Phase 4.95 | Embedding 切硅基流动 API + Gateway 性能优化（>20s→2.5s）+ VPS 清理（70%→25%） | ✅ |
 | Phase 4.97 | AI 身份统一（cloudy→claude 别名）+ 移除 reranker + DeepSeek V4 Flash + 垃圾清理 | ✅ |
+| Phase 4.98 | 修复向量维度 bug（384→1024）+ 重建 embedding 索引 | ✅ |
 | **Phase 5** | **记忆高级功能（相似聚类/脱水压缩/日记再消化）** | **🔲 下一步** |
 | Phase 5.5 | 情感特性（心语、礼物、梦境叙事） | 🔲 远期 |
 
