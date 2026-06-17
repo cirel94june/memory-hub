@@ -167,11 +167,17 @@ async def compress_diaries() -> dict:
                 continue
 
             texts = "\n".join([f"- {e['content']}" for e in entries])
-            prompt = f"""你是{ai_id}。以下是你这一周的日记片段，请压缩成一段简洁的周记（100字以内），保留关键事件和情感变化：
+            prompt = f"""你是{ai_id}。以下是你这一周的日记片段，请整理成一段周记摘要（200~300字），保留关键事件和情感变化。
+
+要求：
+- 用日常口语写，像朋友聊天一样自然，不要用文言文或书面语
+- 按时间顺序梳理这一周发生了什么
+- 保留具体的人名、事件、情绪细节，不要过度抽象概括
+- 如果有重要的心理变化或领悟，用大白话说清楚
 
 {texts}
 
-只输出周记内容。"""
+只输出周记内容，不要加标题或额外说明。"""
             digest = await _call_llm(prompt)
             if not digest or _is_refusal(digest):
                 log.warning(f"  Skipped diary compress for {ai_id} week {week_key}: LLM refusal or empty")

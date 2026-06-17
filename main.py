@@ -19,7 +19,7 @@ import memory_ops
 import gateway as gateway_mod
 import daemon
 import corridor
-import ai_profiles
+import activity_log
 from mcp_server import mcp as mcp_server
 
 
@@ -37,9 +37,10 @@ def verify_secret(authorization: str = Header(default="")):
 async def lifespan(app: FastAPI):
     global _mcp_session_manager
     await github_store.load_all()
-    await ai_profiles.load_profiles()
-    mems = github_store.get_all_memories()
-    print(f"[Memory Hub] Loaded {len(mems)} memories from GitHub")
+    import database
+    activity_log.init_activity_table()
+    mem_count = database.count_memories()
+    print(f"[Memory Hub] SQLite ready: {mem_count} active memories")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
     print(f"[Memory Hub] Rooms: {list(ROOMS.keys())}")
 
@@ -52,31 +53,10 @@ async def lifespan(app: FastAPI):
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
-
-        # 后台 backfill embeddings（不阻塞请求）
-        backfill_task = asyncio.create_task(_backfill_embeddings(mems))
         try:
             yield
         finally:
             daemon_task.cancel()
-            backfill_task.cancel()
-
-
-async def _backfill_embeddings(mems):
-    """后台填充 embedding（不阻塞 HTTP 请求）"""
-    from embedding import get_embedding, pack_embedding
-    no_emb = [m for m in mems.values() if m.get("status") == "active" and not m.get("embedding")]
-    if not no_emb:
-        return
-    print(f"[Memory Hub] Backfilling embeddings for {len(no_emb)} memories (background)...")
-    for i, mem in enumerate(no_emb):
-        vec = await get_embedding(mem.get("content", ""))
-        if vec:
-            mem["embedding"] = pack_embedding(vec)
-        if (i + 1) % 20 == 0:
-            print(f"[Memory Hub] Embedded {i+1}/{len(no_emb)}")
-        await asyncio.sleep(0.1)
-    print(f"[Memory Hub] Embedding backfill complete")
 
 
 async def _daemon_loop():
@@ -107,24 +87,12 @@ _mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-import os
-if os.path.isdir("static-app"):
-    app.mount("/app/assets", StaticFiles(directory="static-app/assets"), name="app-assets")
-
 
 # ── 首页 ──
 
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
-
-
-@app.get("/app/{rest_of_path:path}")
-async def frontend_spa(rest_of_path: str):
-    file_path = os.path.join("static-app", rest_of_path)
-    if rest_of_path and os.path.isfile(file_path):
-        return FileResponse(file_path)
-    return FileResponse("static-app/index.html")
 
 
 # ── 元信息 ──
@@ -277,16 +245,6 @@ async def api_living_room(authorization: str = Header(default="")):
     return {"items": items}
 
 
-@app.get("/api/memory/{memory_id}")
-async def api_get_memory(memory_id: str, authorization: str = Header(default="")):
-    verify_secret(authorization)
-    mem = github_store.get_memory(memory_id)
-    if not mem:
-        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-    safe = {k: v for k, v in mem.items() if k != "embedding"}
-    return safe
-
-
 @app.post("/api/memory/{memory_id}/archive")
 async def api_archive(memory_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
@@ -339,11 +297,9 @@ import conversation_capture
 
 class ConversationLogRequest(BaseModel):
     user_message: str
-    ai_response: str = ""
+    ai_response: str
     ai_id: str = "claude"
     platform: str = ""
-    chat_id: str = ""
-    chat_type: str = "private"
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
@@ -354,8 +310,6 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         ai_response=body.ai_response,
         ai_id=body.ai_id,
         platform=body.platform,
-        chat_id=body.chat_id,
-        chat_type=body.chat_type,
     )
 
 @app.post("/api/capture/extract")
@@ -369,45 +323,6 @@ async def api_capture_status(authorization: str = Header(default="")):
     """查看对话缓冲区状态"""
     verify_secret(authorization)
     return await conversation_capture.get_buffer_status()
-
-
-# ── 对话历史摘要（供 TG bot 滚动压缩） ──
-
-class SummarizeRequest(BaseModel):
-    messages: list[dict]
-    ai_id: str = "claude"
-    existing_summary: str = ""
-
-@app.post("/api/utils/summarize-history")
-async def api_summarize_history(body: SummarizeRequest, authorization: str = Header(default="")):
-    """把一段对话历史压缩成摘要，用于 bot 端的滚动历史压缩"""
-    verify_secret(authorization)
-    lines = []
-    for m in body.messages:
-        role = "用户" if m.get("role") == "user" else "AI"
-        ts = m.get("timestamp", "")
-        content = str(m.get("content", ""))[:300]
-        lines.append(f"[{ts}] {role}: {content}" if ts else f"{role}: {content}")
-    conversation_text = "\n".join(lines)
-
-    prev = ""
-    if body.existing_summary:
-        prev = f"\n已有的之前的对话摘要：\n{body.existing_summary}\n"
-
-    prompt = f"""把以下对话历史压缩成一段简洁的摘要（中文，400字以内）。
-保留：关键话题、重要事实、有趣的梗/笑话的具体内容（保留原话和细节）、情绪转折、未完成的讨论。
-丢弃：日常寒暄、重复内容、无信息量的闲聊。
-{prev}
-对话记录：
-{conversation_text[:4000]}
-
-直接输出摘要文本，不要加标题或前缀。"""
-
-    from gateway import _call_llm
-    summary = await _call_llm(prompt)
-    if not summary or len(summary.strip()) < 10:
-        return {"summary": "", "ok": False}
-    return {"summary": summary.strip(), "ok": True}
 
 
 # ── Daemon 操作 ──
@@ -542,61 +457,106 @@ async def proxy_models(request: Request):
     return await proxy_mod.handle_models(request)
 
 
-# ── AI Profile 管理 ──
+# ── 模型设置 API ──
 
-class ProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    emoji: Optional[str] = None
-    color: Optional[str] = None
-    platform: Optional[str] = None
-    greeting: Optional[str] = None
-    persona: Optional[str] = None
-    model_url: Optional[str] = None
-    model_key: Optional[str] = None
-    model_name: Optional[str] = None
+import analyzer
 
+class LLMConfigUpdate(BaseModel):
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: str = ""
 
-@app.get("/api/ai-profiles")
-async def api_list_profiles(authorization: str = Header(default="")):
+@app.get("/api/settings/llm")
+async def api_get_llm_settings(authorization: str = Header(default="")):
+    """获取当前 LLM 配置（不返回完整 key）"""
     verify_secret(authorization)
-    return ai_profiles.get_all_profiles()
+    cfg = analyzer.get_llm_config()
+    import config as _cfg
+    return {
+        "current": {
+            "llm_base_url": cfg["llm_base_url"],
+            "llm_model": cfg["llm_model"],
+            "llm_api_key_set": bool(cfg["llm_api_key"]),
+            "llm_api_key_preview": cfg["llm_api_key"][:8] + "..." if len(cfg["llm_api_key"]) > 8 else "***",
+        },
+        "defaults": {
+            "llm_base_url": _cfg.LLM_BASE_URL,
+            "llm_model": _cfg.LLM_MODEL,
+        },
+        "is_overridden": bool(analyzer._runtime_config["llm_base_url"] or
+                              analyzer._runtime_config["llm_model"] or
+                              analyzer._runtime_config["llm_api_key"]),
+    }
 
-
-@app.get("/api/ai-profiles/{ai_id}")
-async def api_get_profile(ai_id: str, authorization: str = Header(default="")):
+@app.put("/api/settings/llm")
+async def api_update_llm_settings(body: LLMConfigUpdate, authorization: str = Header(default="")):
+    """动态更新 LLM 配置（不重启服务）"""
     verify_secret(authorization)
-    profile = ai_profiles.get_profile(ai_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail=f"AI '{ai_id}' not found")
-    return profile
+    analyzer.set_llm_config(
+        base_url=body.llm_base_url,
+        model=body.llm_model,
+        api_key=body.llm_api_key,
+    )
+    return {"status": "ok", "config": analyzer.get_llm_config()}
 
-
-@app.post("/api/ai-profiles/{ai_id}")
-async def api_create_profile(ai_id: str, body: ProfileUpdate, authorization: str = Header(default="")):
+@app.post("/api/settings/llm/reset")
+async def api_reset_llm_settings(authorization: str = Header(default="")):
+    """重置 LLM 配置为 .env 默认值"""
     verify_secret(authorization)
-    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    analyzer.reset_llm_config()
+    return {"status": "ok", "message": "已重置为默认配置"}
+
+@app.post("/api/settings/llm/test")
+async def api_test_llm_settings(authorization: str = Header(default="")):
+    """测试当前 LLM 配置是否能正常调用"""
+    verify_secret(authorization)
+    import time
+    cfg = analyzer.get_llm_config()
+    t0 = time.time()
     try:
-        return await ai_profiles.create_profile(ai_id, data)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
+        result = await analyzer._call_llm("请回复两个字：正常", "测试", temperature=0.0)
+        duration = int((time.time() - t0) * 1000)
+        activity_log.log_activity(
+            "config", f"LLM 连通测试成功: {result[:50]}",
+            model=cfg["llm_model"], duration_ms=duration,
+        )
+        return {
+            "status": "ok",
+            "response": result[:100],
+            "model": cfg["llm_model"],
+            "base_url": cfg["llm_base_url"],
+            "duration_ms": duration,
+        }
+    except Exception as e:
+        duration = int((time.time() - t0) * 1000)
+        return {
+            "status": "error",
+            "error": str(e)[:300],
+            "model": cfg["llm_model"],
+            "base_url": cfg["llm_base_url"],
+            "duration_ms": duration,
+        }
 
 
-@app.put("/api/ai-profiles/{ai_id}")
-async def api_update_profile(ai_id: str, body: ProfileUpdate, authorization: str = Header(default="")):
+# ── 活动日志 API ──
+
+@app.get("/api/activity/log")
+async def api_activity_log(
+    limit: int = Query(default=50, le=200),
+    action: str = Query(default=""),
+    since: float = Query(default=0),
+    authorization: str = Header(default=""),
+):
+    """获取最近的活动日志"""
     verify_secret(authorization)
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not updates:
-        raise HTTPException(status_code=400, detail="No fields to update")
-    return await ai_profiles.update_profile(ai_id, updates)
+    logs = activity_log.get_recent(limit=limit, action_filter=action, since_epoch=since)
+    return {"logs": logs, "total": len(logs)}
 
-
-@app.delete("/api/ai-profiles/{ai_id}")
-async def api_delete_profile(ai_id: str, authorization: str = Header(default="")):
+@app.get("/api/activity/stats")
+async def api_activity_stats(authorization: str = Header(default="")):
+    """获取活动统计"""
     verify_secret(authorization)
-    ok = await ai_profiles.delete_profile(ai_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail=f"AI '{ai_id}' not found")
-    return {"status": "deleted", "ai_id": ai_id}
+    return activity_log.get_stats()
 
 
 # ── 导出 ──

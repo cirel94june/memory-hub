@@ -194,9 +194,11 @@ def list_rooms() -> dict:
 
 
 # ── 记忆衰减参数 ──
-DECAY_LAMBDA = 0.05
-DECAY_LAMBDA_FAST = 0.15  # 工作事务等快速衰减的房间
-DECAY_THRESHOLD = 0.15
+# λ越大衰减越快。importance=0.5 未激活记忆：
+#   λ=0.08 → ~25天归档；λ=0.05 → ~60天归档
+DECAY_LAMBDA = 0.08
+DECAY_LAMBDA_FAST = 0.20  # 工作事务等快速衰减的房间
+DECAY_THRESHOLD = 0.18    # 稍微提高归档阈值
 MERGE_SIMILARITY = 0.75
 
 # ── 搜索权重（recall() 向量路的多维加权）──
