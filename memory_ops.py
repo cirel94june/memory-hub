@@ -543,6 +543,7 @@ async def recall(
     + unresolved 记忆优先浮现（最多 2 条）
     """
     query_vec = await get_embedding(query)
+    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
 
     # 不再对 query 调 LLM 分析（省 3-5 秒延迟），用简单默认值
     if not query_domain:
