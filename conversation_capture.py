@@ -25,14 +25,17 @@ logger = logging.getLogger("memory_hub.capture")
 _conversation_buffers: dict[str, list[dict]] = {}
 # 每个缓冲区的聊天类型
 _buffer_chat_types: dict[str, str] = {}
+# 每个缓冲区上次提取的时间（节流用）
+_last_extract_time: dict[str, float] = {}
 
 # 按聊天类型的触发阈值
 CHUNK_SIZES = {
-    "private": 20,
-    "private_group": 25,
+    "private": 30,
+    "private_group": 40,
     "public_group": 80,
 }
 MAX_BUFFER_SIZE = 150
+EXTRACT_COOLDOWN = 600  # 同一个 chat 提取后冷却10分钟
 
 # ── 基础提取 prompt（私聊 + 通用） ──
 EXTRACT_PROMPT_BASE = """你是一个**极其严格**的记忆提取专家。从以下对话记录中，提取值得**长期**记住的信息。
@@ -241,6 +244,11 @@ async def log_conversation(
     chunk_size = CHUNK_SIZES.get(chat_type, 30)
 
     if buffer_size >= chunk_size:
+        now_ts = time.time()
+        last_ts = _last_extract_time.get(key, 0)
+        if now_ts - last_ts < EXTRACT_COOLDOWN:
+            return {"status": "buffered", "buffer_size": buffer_size, "cooldown": True}
+        _last_extract_time[key] = now_ts
         extracted = await _extract_and_remember(key)
         return {"status": "extracted", "memories": extracted, "buffer_size": 0}
 
@@ -370,6 +378,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             source_ai=ai_id,
             source_platform=f"auto_capture:{platform}:{chat_type}",
             source_context=source_ctx,
+            quick=True,
         )
         memories.append(result)
 
