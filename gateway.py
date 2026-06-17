@@ -64,6 +64,8 @@ AI_ALIASES = {"cloudy": "claude"}
 
 AI_ALIASES = {"cloudy": "claude"}
 
+AI_ALIASES = {"cloudy": "claude"}
+
 async def build_context(user_message: str, ai_id: str, recent_messages: list[dict] = None) -> dict:
     """
     核心功能：在 AI 回复之前，自动组装要注入的记忆 context。
@@ -75,6 +77,7 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         "rooms_checked": ["检查了哪些房间"]
     }
     """
+    ai_id = AI_ALIASES.get(ai_id, ai_id)
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     parts = []
@@ -190,6 +193,7 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
         "actions": [{"type": "remember/update/skip", "content": "...", ...}]
     }
     """
+    ai_id = AI_ALIASES.get(ai_id, ai_id)
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     # 动态构建房间列表
