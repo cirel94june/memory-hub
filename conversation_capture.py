@@ -69,7 +69,25 @@ EXTRACT_PROMPT_BASE = """你是一个**极其严格**的记忆提取专家。从
 - 技术调试过程、代码讨论（除非用户说了"我在做XX项目"这类身份信息）
 - 没有实质信息的情绪表达（哈哈、无聊、啊啊啊）
 - 没有对话依据的推测和脑补
-- AI 的自我限制/拒绝（"我是AI不能XX"、"作为语言模型"等）"""
+- AI 的自我限制/拒绝（"我是AI不能XX"、"作为语言模型"等）
+
+## ⚠️ 身份归属（防止 AI 混淆身份，非常重要）：
+每条记忆必须标注 about 字段：
+- "user" = 关于用户的事实（用户的工作、心情、经历、偏好、人际关系）——绝大多数记忆都是这个
+- "interaction" = 关于用户和AI之间的互动（一起玩了什么、讨论了什么、共同经历）
+- "ai" = AI自己的感悟/自省（极少用，只有AI主动记日记时才是这个）
+
+**关键防混淆规则**：
+- 用户的工作困难、情绪状态、生活事件 = about:"user"，不是AI自己的经历！
+- 用户提到的外号/称呼，必须在 content 里写清楚是谁的外号（"用户叫小克大蟑螂"而不是"外号是大蟑螂"）
+- 用户的职业/角色/头衔 = about:"user"，AI 不要把用户的职业当成自己的
+- 群聊中如果有多个AI，不要把其他AI的事当成自己的
+
+## ⚠️ 时态和状态变化（防止过时信息污染）：
+- 用户说"我以前做过XX" → content 必须写"用户**曾经**做过XX"，不是"用户做XX"
+- 用户说"我现在不做XX了" → 这是一个**状态变化**，content 写"用户已经不再做XX"
+- 用户纠正AI的错误认知（"我不是XX"、"你记错了"）→ 这是**高优先级**记忆，importance ≥ 0.8
+- 区分"提到过"和"正在做"：用户聊到某个职业不代表那是用户的职业"""
 
 # ── 小群专用追加 prompt（强调梗和互动细节） ──
 EXTRACT_PROMPT_PRIVATE_GROUP = """
@@ -117,6 +135,7 @@ EXTRACT_OUTPUT_FORMAT = """
 [
   {
     "content": "一个原子事实（≤200字，保留具体细节如台词、梗、笑点）",
+    "about": "user 或 interaction 或 ai",
     "room": "最合适的房间ID",
     "importance": 0.4到1.0,
     "event_date": "事件日期（如 2026-06-08，推算不出就留空）",
@@ -320,10 +339,22 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     max_items = {"private": 8, "private_group": 12, "public_group": 5}.get(chat_type, 8)
     memories = []
 
+    valid_about = {"user", "interaction", "ai"}
     for item in items[:max_items]:
         content = str(item.get("content", "")).strip()
         if not content or len(content) < 10:
             continue
+
+        # about 前缀（防身份混淆）
+        about = item.get("about", "user")
+        if about not in valid_about:
+            about = "user"
+        if about == "user" and not content.startswith("[用户]"):
+            content = f"[用户] {content}"
+        elif about == "interaction" and not content.startswith("[互动]"):
+            content = f"[互动] {content}"
+        elif about == "ai" and not content.startswith("[AI]"):
+            content = f"[AI] {content}"
 
         # 附上原始对话片段作为源追溯
         source_ctx = "\n".join([
@@ -400,6 +431,16 @@ async def extract_from_messages(
         content = str(item.get("content", "")).strip()
         if not content or len(content) < 10:
             continue
+        # about 前缀
+        about = item.get("about", "user")
+        if about not in ("user", "interaction", "ai"):
+            about = "user"
+        if about == "user" and not content.startswith("[用户]"):
+            content = f"[用户] {content}"
+        elif about == "interaction" and not content.startswith("[互动]"):
+            content = f"[互动] {content}"
+        elif about == "ai" and not content.startswith("[AI]"):
+            content = f"[AI] {content}"
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
