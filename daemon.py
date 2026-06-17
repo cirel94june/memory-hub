@@ -623,6 +623,87 @@ async def _backfill_analysis():
     return backfilled
 
 
+async def _auto_fix_about_prefix():
+    """自动给缺少 [用户]/[互动]/[AI] 前缀的记忆补上前缀"""
+    all_mems = store.get_all_memories()
+    prefixes = ("[用户]", "[互动]", "[AI]")
+    fixed = 0
+    for mem in all_mems.values():
+        if mem.get("status") != "active":
+            continue
+        content = mem.get("content", "")
+        if any(content.startswith(p) for p in prefixes):
+            continue
+        # 简单规则判断（不调 LLM，省钱）
+        room = mem.get("room", "")
+        if room in ("diary", "dreams", "personality"):
+            prefix = "[AI]"
+        elif room in ("relationship", "game_room"):
+            prefix = "[互动]"
+        else:
+            prefix = "[用户]"
+        mem["content"] = f"{prefix} {content}"
+        store.set_memory(mem)
+        fixed += 1
+    if fixed:
+        await store.push_dirty()
+        log.info(f"Auto-fixed about prefix for {fixed} memories")
+    return fixed
+
+
+async def _detect_contradictions():
+    """检测可能矛盾的记忆对（同房间、高相似度但内容相反）"""
+    from embedding import cosine_similarity, unpack_embedding
+    all_mems = store.get_all_memories()
+    active = [m for m in all_mems.values()
+              if m.get("status") == "active" and m.get("embedding")]
+
+    contradiction_pairs = []
+    checked = set()
+
+    for i, m1 in enumerate(active):
+        vec1 = unpack_embedding(m1["embedding"])
+        for m2 in active[i+1:]:
+            if m1["id"] >= m2["id"]:
+                pair_key = (m2["id"], m1["id"])
+            else:
+                pair_key = (m1["id"], m2["id"])
+            if pair_key in checked:
+                continue
+            checked.add(pair_key)
+
+            if m1.get("room") != m2.get("room"):
+                continue
+
+            vec2 = unpack_embedding(m2["embedding"])
+            sim = cosine_similarity(vec1, vec2)
+
+            if sim >= 0.75:
+                # 高相似 → 可能重复，归档较旧的
+                older = m1 if m1.get("created_at", "") < m2.get("created_at", "") else m2
+                newer = m2 if older is m1 else m1
+                older["status"] = "archived"
+                comments = older.get("comments", [])
+                if not isinstance(comments, list):
+                    comments = []
+                from memory_ops import _now
+                comments.append({
+                    "date": _now(),
+                    "author": "daemon",
+                    "kind": "supersede_note",
+                    "content": f"自动去重：与 {newer['id']} 高度相似(sim={sim:.2f})，归档较旧条目",
+                })
+                older["comments"] = comments
+                store.set_memory(older)
+                contradiction_pairs.append((older["id"], newer["id"], sim))
+
+    if contradiction_pairs:
+        await store.push_dirty()
+        log.info(f"Auto-dedup: archived {len(contradiction_pairs)} duplicate memories")
+
+    return {"deduped": len(contradiction_pairs), "pairs": [(a, b, f"{s:.2f}") for a, b, s in contradiction_pairs[:10]]}
+
+
 # ── 主入口：一键执行所有整理 ──
 
 async def run_full_maintenance() -> dict:
@@ -682,6 +763,14 @@ async def run_full_maintenance() -> dict:
     # 10.5 补分析 quick 模式存入的记忆
     results["backfill_analysis"] = await _backfill_analysis()
     log.info(f"  Backfill analysis: {results['backfill_analysis']}")
+
+    # 10.6 自动补 about 前缀
+    results["fix_about"] = await _auto_fix_about_prefix()
+    log.info(f"  Fix about prefix: {results['fix_about']}")
+
+    # 10.7 自动去重（高相似度记忆归档较旧的）
+    results["dedup"] = await _detect_contradictions()
+    log.info(f"  Dedup: {results['dedup']}")
 
     # 11. 推送到 GitHub
     await store.push_dirty()
