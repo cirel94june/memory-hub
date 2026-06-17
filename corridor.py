@@ -25,6 +25,7 @@ async def build_corridor(ai_id: str) -> str:
     返回一段自然语言文本，AI 读了就能"醒来"。
     """
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
+    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     all_mems = store.get_all_memories()
 
     # 1. 客厅要点（你是谁）
@@ -127,6 +128,7 @@ async def build_corridor(ai_id: str) -> str:
 
 async def get_corridor(ai_id: str) -> str:
     """获取走廊文档（优先从缓存读，超过6小时自动重建）"""
+    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
     if cached and isinstance(cached, dict) and cached.get("text"):
