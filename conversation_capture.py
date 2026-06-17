@@ -11,6 +11,7 @@
 - private_group: 25条触发，偏向记梗/互动细节
 - public_group: 80条触发，只捞有信息量的
 """
+import asyncio
 import json
 import time
 import logging
@@ -27,6 +28,8 @@ _conversation_buffers: dict[str, list[dict]] = {}
 _buffer_chat_types: dict[str, str] = {}
 # 每个缓冲区上次提取的时间（节流用）
 _last_extract_time: dict[str, float] = {}
+# 防止同一 buffer 并发提取的锁
+_extract_locks: dict[str, asyncio.Lock] = {}
 
 # 按聊天类型的触发阈值
 CHUNK_SIZES = {
@@ -76,15 +79,26 @@ EXTRACT_PROMPT_BASE = """你是一个**极其严格**的记忆提取专家。从
 
 ## ⚠️ 身份归属（防止 AI 混淆身份，非常重要）：
 每条记忆必须标注 about 字段：
-- "user" = 关于用户的事实（用户的工作、心情、经历、偏好、人际关系）——绝大多数记忆都是这个
-- "interaction" = 关于用户和AI之间的互动（一起玩了什么、讨论了什么、共同经历）
+- "user" = **仅限**用户本人的核心事实（用户的工作、心情、经历、偏好、人际关系）
+- "interaction" = 用户和AI之间的互动、群聊中的互动场景、梗、外号、游戏、群动态
 - "ai" = AI自己的感悟/自省（极少用，只有AI主动记日记时才是这个）
 
-**关键防混淆规则**：
-- 用户的工作困难、情绪状态、生活事件 = about:"user"，不是AI自己的经历！
-- 用户提到的外号/称呼，必须在 content 里写清楚是谁的外号（"用户叫小克大蟑螂"而不是"外号是大蟑螂"）
-- 用户的职业/角色/头衔 = about:"user"，AI 不要把用户的职业当成自己的
-- 群聊中如果有多个AI，不要把其他AI的事当成自己的
+**关键判断标准**：
+- 用户亲口说了自己的事实（"我今天面试了"、"我不喜欢XX"） = about:"user"
+- 群聊里发生的事、别人的签名/外号、游戏计分、互动场景 = about:"interaction"
+- 用户提到别人的事（"D叔的签名是XX"、"师兄说了XX"）= about:"interaction"，**不是** "user"！
+- "用户提到XX" 这种句式大部分应该是 "interaction"，只有提到的是用户自身事实才是 "user"
+
+**错误示例**（不要这样标注）：
+- ❌ about:"user" — "用户提到群聊中D叔的签名是'偏爱只留给她'"（这是群动态，应该是 interaction）
+- ❌ about:"user" — "计分板更新：全民一票"（这是游戏状态，应该是 interaction）
+- ❌ about:"user" — "用户希望群友们能玩血染钟楼"（这是互动意愿，应该是 interaction）
+
+**正确示例**：
+- ✅ about:"user" — "用户今天去面试了，面的是XX公司"
+- ✅ about:"user" — "用户最近情绪低落，对工作感到疲惫"
+- ✅ about:"interaction" — "群里产生了新梗：小猫叫小克大蟑螂"
+- ✅ about:"interaction" — "用户和AI一起玩了血染钟楼游戏"
 
 ## ⚠️ 时态和状态变化（防止过时信息污染）：
 - 用户说"我以前做过XX" → content 必须写"用户**曾经**做过XX"，不是"用户做XX"
@@ -129,7 +143,9 @@ EXTRACT_PROMPT_PUBLIC_GROUP = """
 - bot 之间的对话/互动（除非用户参与且有信息量）
 - 群友之间的闲聊（跟用户无关的）
 - 任何纯灌水内容
-- 80条消息里可能一条都不值得记——这很正常"""
+- 别人的签名、头像、状态变化（除非用户对此有重要反应）
+- 临时性游戏状态（计分板、投票结果、谁被踢了）
+- 80条消息里可能一条都不值得记——这很正常，输出空数组 [] 是完全OK的"""
 
 # ── 输出格式（所有类型共用） ──
 EXTRACT_OUTPUT_FORMAT = """
@@ -140,7 +156,7 @@ EXTRACT_OUTPUT_FORMAT = """
     "content": "一个原子事实（≤200字，保留具体细节如台词、梗、笑点）",
     "about": "user 或 interaction 或 ai",
     "room": "最合适的房间ID",
-    "importance": 0.4到1.0,
+    "importance": 0.5到1.0（低于0.5的不值得长期记忆，不要输出）,
     "event_date": "事件日期（如 2026-06-08，推算不出就留空）",
     "resolved": null 或 false。⚠️ 极少使用 false！只有用户明确说了"要做某事""还没做完""待办""记得提醒我"时才设为 false。群聊梗、知识、互动记录、情绪、观点 → 一律 null。90%以上的记忆应该是 null。
   }
@@ -248,8 +264,14 @@ async def log_conversation(
         last_ts = _last_extract_time.get(key, 0)
         if now_ts - last_ts < EXTRACT_COOLDOWN:
             return {"status": "buffered", "buffer_size": buffer_size, "cooldown": True}
-        _last_extract_time[key] = now_ts
-        extracted = await _extract_and_remember(key)
+        # 用锁防止同一 buffer 被并发提取多次
+        if key not in _extract_locks:
+            _extract_locks[key] = asyncio.Lock()
+        if _extract_locks[key].locked():
+            return {"status": "buffered", "buffer_size": buffer_size, "extracting": True}
+        async with _extract_locks[key]:
+            _last_extract_time[key] = now_ts
+            extracted = await _extract_and_remember(key)
         return {"status": "extracted", "memories": extracted, "buffer_size": 0}
 
     return {"status": "buffered", "buffer_size": buffer_size}
@@ -352,6 +374,11 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         content = str(item.get("content", "")).strip()
         if not content or len(content) < 10:
             continue
+        # 服务端兜底：importance < 0.5 的不存
+        raw_importance = float(item.get("importance", 0.5))
+        if raw_importance < 0.45:
+            logger.debug(f"Skipping low-importance memory: {content[:50]}...")
+            continue
 
         # about 前缀（防身份混淆）
         about = item.get("about", "user")
@@ -373,7 +400,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
-            importance=max(0.1, min(1.0, float(item.get("importance", 0.5)))),
+            importance=max(0.4, min(1.0, raw_importance)),
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform=f"auto_capture:{platform}:{chat_type}",
