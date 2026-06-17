@@ -7,6 +7,7 @@ SQLite 数据库引擎（替代内存 dict + GitHub 存储）
 """
 import json
 import struct
+import os
 import sqlite3
 import logging
 from pathlib import Path
@@ -22,8 +23,8 @@ DB_PATH: Path = DATA_DIR / "memories.db"
 # ── 模块级连接 ──
 _conn: sqlite3.Connection | None = None
 
-# 384-dim float32 embedding
-EMBEDDING_DIM = 384
+# embedding 维度：从环境变量读取，默认 1024（bge-large-zh-v1.5）
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
 
 
 # ════════════════════════════════════════════
