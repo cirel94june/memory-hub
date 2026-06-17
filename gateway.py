@@ -78,8 +78,6 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     }
     """
     ai_id = AI_ALIASES.get(ai_id, ai_id)
-    ai_id = AI_ALIASES.get(ai_id, ai_id)
-    ai_id = AI_ALIASES.get(ai_id, ai_id)
     parts = []
     recalled_ids = []
     rooms_checked = ["living_room"]
@@ -193,8 +191,6 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
         "actions": [{"type": "remember/update/skip", "content": "...", ...}]
     }
     """
-    ai_id = AI_ALIASES.get(ai_id, ai_id)
-    ai_id = AI_ALIASES.get(ai_id, ai_id)
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     # 动态构建房间列表
     room_list = "\n".join([
