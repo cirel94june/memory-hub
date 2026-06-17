@@ -337,6 +337,7 @@ AI回复：{ai_response[:1500]}
                 source_ai=ai_id,
                 source_platform=platform,
                 source_context=source_ctx,
+                quick=True,
             )
             executed.append(action)
 
