@@ -1080,7 +1080,7 @@ async def spa_catchall(path: str = ""):
     """SPA 路由 fallback：所有 /app/* 请求返回 index.html，由 React Router 处理"""
     spa_index = os.path.join(_SPA_DIR, "index.html")
     if os.path.exists(spa_index):
-        return FileResponse(spa_index)
+        return FileResponse(spa_index, headers={"Cache-Control": "no-cache"})
     return JSONResponse({"error": "Frontend not built. Run: cd frontend && npm run build"}, status_code=404)
 
 

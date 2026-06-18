@@ -272,9 +272,10 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 | Phase 4.98 | 修复向量维度 bug（384→1024）+ 重建 embedding 索引 | ✅ |
 | Phase 4.99 | TG bot 防双回复（去重修复 + 单 worker）+ 确认 post_process 已移除 | ✅ |
 | Phase 4.995 | 提取 prompt 防身份混淆（ceci/燕燕区分 + 禁止泛指AI + 自洽性规则 + 群聊共享key防三重提取） | ✅ |
+| Phase 4.997 | remember() quick参数修复 + AI别名存储归一化(cloudy→claude) + 历史年轮去重(190条) + 情感arousal prompt重写(创伤0.3→0.7-0.85) | ✅ |
 | **Phase 5** | **记忆高级功能（相似聚类/脱水压缩/日记再消化）** | **🔲 下一步** |
 | Phase 5.5 | 情感特性（心语、礼物、梦境叙事） | 🔲 远期 |
-| **Phase 6** | **前端可观测性升级（参考 OmbreBrain-folio，详见下方子计划）** | **🔲 规划中** |
+| **Phase 6** | **前端可观测性升级（参考 OmbreBrain-folio，详见下方子计划）** | **🔄 P0+P1 已完成** |
 
 ### Phase 6 子计划：前端可观测性 + 可视化升级
 
@@ -284,8 +285,8 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 
 | 子阶段 | 内容 | 预估 | 状态 |
 |--------|------|------|------|
-| P0 | **后端 API 补充**：`/api/memory/{id}/detail`（完整记忆+source_context+supersede链）、`/api/memory/timeline`（按日分组+热度）、`/api/memory/graph`（nodes+edges）、`/api/memory/emotion-map`（valence/arousal散点）、`/api/memory/decay-scores`（衰减分+预计归档）、`/api/breath-debug?q=`（搜索打分分解） | 2-3h | 🔲 |
-| P1 | **记忆详情模态框**：点击记忆卡片展开→正文+元数据+原始对话(source_context)+关联记忆(同tag/supersede链)+生命力指标(activation_count/衰减分)+历史年轮(history) | 1-2h | 🔲 |
+| P0 | **后端 API 补充**：memory detail/timeline/graph/emotion-map/decay-scores/breath-debug 六个端点 | 2-3h | ✅ |
+| P1 | **记忆详情模态框**：点击记忆卡片展开→正文+元数据+原始对话+关联记忆+生命力指标+历史年轮，手机全屏 | 1-2h | ✅ |
 | P2 | **时间线视图** `/app/timeline`：天卡片+热度节点+月份分隔+空白日折叠+迷你时间轴导航，参考 OmbreBrain 的 timeline 设计 | 3-4h | 🔲 |
 | P3 | **观测台** `/app/observatory`：情感罗盘（2D valence×arousal 散点图，四象限标注，按room/AI/时间筛选）+ 衰减仪表盘（健康/衰减中/即将归档 三色柱状图 + 预警列表） | 3-4h | 🔲 |
 | P4 | **记忆星图** `/app/graph`：力导向图（Web Worker + Barnes-Hut 四叉树优化），节点=记忆（大小=importance，颜色=room），边=共享标签/同日/supersede链，SVG渲染+拖拽缩放+搜索高亮 | 4-6h | 🔲 |
