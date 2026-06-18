@@ -104,6 +104,9 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
             if len(content) > 400:
                 content = content[:380] + "..."
             room_tag = r["room"]
+            src_ai = r.get("source_ai", "")
+            if src_ai and src_ai != ai_id:
+                room_tag += f"/来自{src_ai}"
             if r.get("resolved") == False:
                 room_tag += "/待办"
             time_label = _relative_time(r.get("created_at", ""))

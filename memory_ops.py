@@ -567,6 +567,8 @@ async def recall(
             "activation_count": mem.get("activation_count", 0),
             "comment_count": comment_count,
             "comments": comments[-3:] if comment_count > 0 else [],
+            "source_ai": mem.get("source_ai", ""),
+            "source_context": mem.get("source_context", ""),
         }
 
     def _passes_private_filter(mem):
