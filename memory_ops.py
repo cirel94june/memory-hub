@@ -144,6 +144,11 @@ async def remember(
     quick: bool = False,
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
+    # 归一化 AI 别名（cloudy → claude）
+    from config import AI_ALIASES
+    source_ai = AI_ALIASES.get(source_ai, source_ai)
+    owner_ai = AI_ALIASES.get(owner_ai, owner_ai)
+
     if quick:
         auto_merge = False
 
