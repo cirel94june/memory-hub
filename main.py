@@ -87,6 +87,12 @@ _mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ── React SPA 前端 (/app/) ──
+import os
+_SPA_DIR = os.path.join(os.path.dirname(__file__), "static-app")
+if os.path.isdir(os.path.join(_SPA_DIR, "assets")):
+    app.mount("/app/assets", StaticFiles(directory=os.path.join(_SPA_DIR, "assets")), name="spa-assets")
+
 
 # ── 首页 ──
 
@@ -559,6 +565,407 @@ async def api_activity_stats(authorization: str = Header(default="")):
     return activity_log.get_stats()
 
 
+
+# ── Phase 6 P0: 前端可观测性 API ──
+
+@app.get("/api/memory/{memory_id}/detail")
+async def api_memory_detail(memory_id: str, authorization: str = Header(default="")):
+    """完整记忆详情：正文 + source_context + history + supersede 链 + 关联记忆"""
+    verify_secret(authorization)
+    import database as db
+
+    mem = db.get_memory(memory_id)
+    if not mem:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    mem.pop("embedding", None)
+
+    for key in ("domain", "tags", "linked_memories", "supersedes"):
+        val = mem.get(key)
+        if isinstance(val, str):
+            try:
+                mem[key] = json.loads(val)
+            except Exception:
+                mem[key] = []
+
+    supersede_chain = []
+    supersedes_ids = mem.get("supersedes") or []
+    if isinstance(supersedes_ids, str):
+        try:
+            supersedes_ids = json.loads(supersedes_ids)
+        except Exception:
+            supersedes_ids = []
+    for sid in supersedes_ids:
+        old = db.get_memory(sid)
+        if old:
+            supersede_chain.append({
+                "id": old["id"],
+                "content": old["content"],
+                "status": old.get("status", ""),
+                "created_at": old.get("created_at", ""),
+                "direction": "superseded_by_current",
+            })
+    if mem.get("superseded_by"):
+        new = db.get_memory(mem["superseded_by"])
+        if new:
+            supersede_chain.append({
+                "id": new["id"],
+                "content": new["content"],
+                "status": new.get("status", ""),
+                "created_at": new.get("created_at", ""),
+                "direction": "supersedes_current",
+            })
+
+    tags = mem.get("tags") or []
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    related = []
+    if tags:
+        tag_set = set(tags)
+        for other in db.iter_memories(status="active"):
+            if other["id"] == memory_id:
+                continue
+            other_tags = other.get("tags")
+            if isinstance(other_tags, str):
+                try:
+                    other_tags = json.loads(other_tags)
+                except Exception:
+                    other_tags = []
+            if not other_tags:
+                continue
+            shared = tag_set & set(other_tags)
+            if len(shared) >= 2:
+                related.append({
+                    "id": other["id"],
+                    "content": other["content"][:100],
+                    "room": other.get("room", ""),
+                    "shared_tags": list(shared),
+                    "shared_count": len(shared),
+                })
+        related.sort(key=lambda x: x["shared_count"], reverse=True)
+        related = related[:8]
+
+    from datetime import datetime, timezone
+    import math
+    from config import DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD, ROOMS
+    try:
+        created = datetime.fromisoformat(mem["created_at"])
+        days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
+    except Exception:
+        days = 0
+    importance = float(mem.get("importance") or 0.5)
+    arousal = float(mem.get("emotion_arousal") or 0.3)
+    activations = int(float(mem.get("activation_count") or 0))
+    room_cfg = ROOMS.get(mem.get("room", ""), {})
+    lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+    emotion_weight = 1.0 + (arousal * 0.8)
+    current_decay = min(1.0, importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight)
+
+    return {
+        "memory": mem,
+        "supersede_chain": supersede_chain,
+        "related_memories": related,
+        "decay": {
+            "current_score": round(current_decay, 4),
+            "threshold": DECAY_THRESHOLD,
+            "days_alive": round(days, 1),
+            "will_archive": current_decay < DECAY_THRESHOLD and mem.get("room") != "living_room",
+        },
+    }
+
+
+@app.get("/api/memory/timeline")
+async def api_memory_timeline(
+    days: int = Query(default=90, le=365),
+    authorization: str = Header(default=""),
+):
+    """按日期分组的记忆摘要 + 每日计数/热度"""
+    verify_secret(authorization)
+    import database as db
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
+    all_mems = db.query_memories(status="active", order_by="created_at DESC")
+
+    by_date = {}
+    for m in all_mems:
+        created = m.get("created_at", "")[:10]
+        if not created or created < cutoff:
+            continue
+        if created not in by_date:
+            by_date[created] = []
+        by_date[created].append({
+            "id": m["id"],
+            "content": m["content"][:80],
+            "room": m.get("room", ""),
+            "importance": float(m.get("importance") or 0.5),
+            "source_ai": m.get("source_ai", ""),
+        })
+
+    timeline = []
+    for date_str in sorted(by_date.keys(), reverse=True):
+        items = by_date[date_str]
+        avg_importance = sum(x["importance"] for x in items) / len(items) if items else 0
+        timeline.append({
+            "date": date_str,
+            "count": len(items),
+            "heat": round(min(1.0, len(items) / 10.0 + avg_importance * 0.3), 2),
+            "memories": items[:6],
+        })
+
+    return {"timeline": timeline, "total_days": len(timeline), "date_range": days}
+
+
+@app.get("/api/memory/graph")
+async def api_memory_graph(authorization: str = Header(default="")):
+    """记忆星图数据：nodes + edges（共 tag / 同日 / supersede）"""
+    verify_secret(authorization)
+    import database as db
+
+    all_mems = db.query_memories(status="active", order_by="importance DESC")
+
+    nodes = []
+    date_groups = {}
+    tag_index = {}
+
+    for m in all_mems:
+        mid = m["id"]
+        tags_raw = m.get("tags")
+        if isinstance(tags_raw, str):
+            try:
+                tags_raw = json.loads(tags_raw)
+            except Exception:
+                tags_raw = []
+        tags = tags_raw or []
+
+        nodes.append({
+            "id": mid,
+            "content": m["content"][:60],
+            "room": m.get("room", ""),
+            "importance": float(m.get("importance") or 0.5),
+            "tags": tags[:5],
+            "created_at": m.get("created_at", "")[:10],
+        })
+
+        date_key = m.get("created_at", "")[:10]
+        if date_key:
+            date_groups.setdefault(date_key, []).append(mid)
+
+        for tag in tags:
+            tag_index.setdefault(tag, []).append(mid)
+
+    edges = []
+    edge_set = set()
+
+    for tag, mids in tag_index.items():
+        if len(mids) > 20:
+            continue
+        for i in range(len(mids)):
+            for j in range(i + 1, len(mids)):
+                pair = tuple(sorted([mids[i], mids[j]]))
+                if pair not in edge_set:
+                    edge_set.add(pair)
+                    edges.append({"source": pair[0], "target": pair[1], "type": "shared_tag", "label": tag})
+
+    for date_key, mids in date_groups.items():
+        if len(mids) > 15:
+            continue
+        for i in range(len(mids)):
+            for j in range(i + 1, len(mids)):
+                pair = tuple(sorted([mids[i], mids[j]]))
+                if pair not in edge_set:
+                    edge_set.add(pair)
+                    edges.append({"source": pair[0], "target": pair[1], "type": "same_day"})
+
+    for m in all_mems:
+        supersedes = m.get("supersedes")
+        if isinstance(supersedes, str):
+            try:
+                supersedes = json.loads(supersedes)
+            except Exception:
+                supersedes = []
+        if supersedes:
+            for sid in supersedes:
+                pair = tuple(sorted([m["id"], sid]))
+                if pair not in edge_set:
+                    edge_set.add(pair)
+                    edges.append({"source": m["id"], "target": sid, "type": "supersede"})
+
+    return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
+
+
+@app.get("/api/memory/emotion-map")
+async def api_memory_emotion_map(authorization: str = Header(default="")):
+    """所有记忆的 valence/arousal 散点数据"""
+    verify_secret(authorization)
+    import database as db
+
+    all_mems = db.query_memories(status="active")
+    points = []
+    for m in all_mems:
+        valence = float(m.get("valence") or 0.5)
+        arousal = float(m.get("emotion_arousal") or 0.3)
+        points.append({
+            "id": m["id"],
+            "content": m["content"][:60],
+            "valence": round(valence, 3),
+            "arousal": round(arousal, 3),
+            "room": m.get("room", ""),
+            "importance": float(m.get("importance") or 0.5),
+            "source_ai": m.get("source_ai", ""),
+            "created_at": m.get("created_at", "")[:10],
+        })
+
+    return {"points": points, "count": len(points)}
+
+
+@app.get("/api/memory/decay-scores")
+async def api_memory_decay_scores(authorization: str = Header(default="")):
+    """每条记忆的当前衰减分数 + 健康状态"""
+    verify_secret(authorization)
+    import database as db
+    from datetime import datetime, timezone
+    import math
+    from config import DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD, ROOMS
+
+    now_dt = datetime.now(timezone.utc)
+    results = []
+
+    for m in db.iter_memories(status="active"):
+        try:
+            created = datetime.fromisoformat(m["created_at"])
+            days = (now_dt - created).total_seconds() / 86400
+        except Exception:
+            days = 0
+
+        importance = float(m.get("importance") or 0.5)
+        arousal = float(m.get("emotion_arousal") or 0.3)
+        activations = int(float(m.get("activation_count") or 0))
+        room_cfg = ROOMS.get(m.get("room", ""), {})
+        lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+        emotion_weight = 1.0 + (arousal * 0.8)
+        score = min(1.0, importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight)
+
+        if score >= 0.6:
+            health = "healthy"
+        elif score >= DECAY_THRESHOLD:
+            health = "decaying"
+        else:
+            health = "critical"
+
+        results.append({
+            "id": m["id"],
+            "content": m["content"][:60],
+            "room": m.get("room", ""),
+            "decay_score": round(score, 4),
+            "health": health,
+            "days_alive": round(days, 1),
+            "activation_count": activations,
+            "last_activated": m.get("last_activated", ""),
+            "importance": importance,
+        })
+
+    results.sort(key=lambda x: x["decay_score"])
+    return {
+        "memories": results,
+        "summary": {
+            "total": len(results),
+            "healthy": sum(1 for r in results if r["health"] == "healthy"),
+            "decaying": sum(1 for r in results if r["health"] == "decaying"),
+            "critical": sum(1 for r in results if r["health"] == "critical"),
+            "threshold": DECAY_THRESHOLD,
+        },
+    }
+
+
+@app.get("/api/breath-debug")
+async def api_breath_debug(
+    q: str = Query(..., min_length=1),
+    authorization: str = Header(default=""),
+):
+    """搜索打分分解：向量分/BM25分/精确分/时间衰减/RRF合并分"""
+    verify_secret(authorization)
+    import database as db
+    from embedding import get_embedding
+    from memory_ops import _distance_to_cosine, _bm25_score, _exact_match_score, _safe_float, _rrf_merge
+    from datetime import datetime, timezone
+    import math
+
+    query_vec = await get_embedding(q)
+
+    vec_raw = db.vector_search(query_vec, top_k=30, status="active") if query_vec else []
+    vec_details = {}
+    for mem in vec_raw:
+        distance = mem.pop("distance", 0.0)
+        vec_sim = _distance_to_cosine(distance)
+        try:
+            created = datetime.fromisoformat(mem["created_at"])
+            days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
+            time_score = math.exp(-0.02 * days)
+        except Exception:
+            days, time_score = 0, 0.5
+        importance = _safe_float(mem.get("importance"), 0.5)
+        final = vec_sim * 0.6 + 0.5 * 0.15 + time_score * 0.1 + importance * 0.15
+        vec_details[mem["id"]] = {
+            "vec_sim": round(vec_sim, 4),
+            "time_score": round(time_score, 4),
+            "importance": round(importance, 4),
+            "vec_final": round(final, 4),
+            "days": round(days, 1),
+        }
+
+    bm25_raw = db.fts_search(q, top_k=30, status="active")
+    bm25_details = {}
+    for mem in bm25_raw:
+        rank = mem.pop("rank", 0.0)
+        bm25 = min(1.0, abs(rank) / 10.0) if rank else 0.0
+        bm25_details[mem["id"]] = {"bm25": round(bm25, 4), "raw_rank": round(rank, 4)}
+
+    all_ids = set(vec_details.keys()) | set(bm25_details.keys())
+    exact_details = {}
+    for mid in all_ids:
+        mem = db.get_memory(mid)
+        if mem:
+            exact = _exact_match_score(q, mem)
+            if exact > 0:
+                exact_details[mid] = {"exact": round(exact, 4)}
+
+    candidates = {}
+    for mid in all_ids:
+        mem = db.get_memory(mid)
+        if not mem:
+            continue
+        candidates[mid] = {
+            "id": mid,
+            "content": mem["content"][:80],
+            "room": mem.get("room", ""),
+            "scores": {
+                "vector": vec_details.get(mid, {}),
+                "bm25": bm25_details.get(mid, {}),
+                "exact": exact_details.get(mid, {}),
+            },
+        }
+
+    vec_list = [{"id": mid, "score": d["vec_final"]} for mid, d in sorted(vec_details.items(), key=lambda x: x[1]["vec_final"], reverse=True)]
+    bm25_list = [{"id": mid, "score": d["bm25"]} for mid, d in sorted(bm25_details.items(), key=lambda x: x[1]["bm25"], reverse=True)]
+    exact_list = [{"id": mid, "score": d["exact"]} for mid, d in sorted(exact_details.items(), key=lambda x: x[1]["exact"], reverse=True)]
+
+    rrf_merged = _rrf_merge(vec_list, bm25_list, exact_list)
+
+    results = []
+    for i, item in enumerate(rrf_merged[:15]):
+        mid = item["id"]
+        entry = candidates.get(mid, {"id": mid, "content": "?", "room": "", "scores": {}})
+        entry["rrf_rank"] = i + 1
+        entry["rrf_score"] = round(item["score"], 4)
+        results.append(entry)
+
+    return {"query": q, "results": results, "paths": {"vector": len(vec_details), "bm25": len(bm25_details), "exact": len(exact_details)}}
+
+
 # ── 导出 ──
 
 @app.get("/api/export")
@@ -566,6 +973,17 @@ async def api_export(authorization: str = Header(default="")):
     verify_secret(authorization)
     data = await memory_ops.export_all()
     return JSONResponse(content=data)
+
+
+# ── React SPA catch-all（必须在所有 API 路由之后）──
+
+@app.get("/app/{path:path}")
+async def spa_catchall(path: str = ""):
+    """SPA 路由 fallback：所有 /app/* 请求返回 index.html，由 React Router 处理"""
+    spa_index = os.path.join(_SPA_DIR, "index.html")
+    if os.path.exists(spa_index):
+        return FileResponse(spa_index)
+    return JSONResponse({"error": "Frontend not built. Run: cd frontend && npm run build"}, status_code=404)
 
 
 # ── 启动 ──
