@@ -112,20 +112,6 @@ function CalendarHeatmap({ onSelectDay }) {
         ))}
         <span style={{ fontSize: 9, color: "var(--text-muted)" }}>多</span>
       </div>
-      {detailId && (
-        <MemoryDetailModal
-          memoryId={detailId}
-          onClose={() => setDetailId(null)}
-          onNavigate={(target) => {
-            if (target.startsWith("memory:")) {
-              setDetailId(target.slice(7));
-            } else {
-              setDetailId(null);
-              navigate(target);
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -188,20 +174,6 @@ function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
             </div>
           ))}
         </div>
-      )}
-      {detailId && (
-        <MemoryDetailModal
-          memoryId={detailId}
-          onClose={() => setDetailId(null)}
-          onNavigate={(target) => {
-            if (target.startsWith("memory:")) {
-              setDetailId(target.slice(7));
-            } else {
-              setDetailId(null);
-              navigate(target);
-            }
-          }}
-        />
       )}
     </div>
   );
@@ -329,8 +301,8 @@ export default function MemoriesPage() {
           </div>
           <div style={{
             fontSize: 13, lineHeight: 1.5, color: "var(--text-primary)",
-            display: expanded === m.id ? "block" : "-webkit-box",
-            WebkitLineClamp: expanded === m.id ? "unset" : 2,
+            display: "-webkit-box",
+            WebkitLineClamp: 3,
             WebkitBoxOrient: "vertical", overflow: "hidden",
           }}>
             <Markdown components={{
@@ -345,25 +317,6 @@ export default function MemoriesPage() {
           <Trash2 size={14} />
         </button>
       </div>
-      {expanded === m.id && (
-        <div style={{ marginTop: "var(--space-sm)", fontSize: 11, color: "var(--text-muted)" }}>
-          ID: {m.id} · 重要度: {m.importance} · 来源: {m.source_ai || "unknown"}
-        </div>
-      )}
-      {detailId && (
-        <MemoryDetailModal
-          memoryId={detailId}
-          onClose={() => setDetailId(null)}
-          onNavigate={(target) => {
-            if (target.startsWith("memory:")) {
-              setDetailId(target.slice(7));
-            } else {
-              setDetailId(null);
-              navigate(target);
-            }
-          }}
-        />
-      )}
     </div>
   );
 
@@ -471,6 +424,7 @@ export default function MemoriesPage() {
           <button className="btn btn-ghost" onClick={() => setPage(page + 1)} disabled={page * 20 >= total}>下一页</button>
         </div>
       )}
+
       {detailId && (
         <MemoryDetailModal
           memoryId={detailId}
