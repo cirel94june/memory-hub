@@ -53,6 +53,8 @@ async def lifespan(app: FastAPI):
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
+        from ai_profiles import load_profiles
+        await load_profiles()
         try:
             yield
         finally:
@@ -564,6 +566,78 @@ async def api_activity_stats(authorization: str = Header(default="")):
     verify_secret(authorization)
     return activity_log.get_stats()
 
+
+
+
+# ── AI Profile API + get_llm_config_for_ai ──
+
+@app.get("/api/ai-profiles")
+async def api_list_profiles(authorization: str = Header(default="")):
+    """获取所有 AI 档案"""
+    verify_secret(authorization)
+    from ai_profiles import get_all_profiles
+    from config import AI_ROLES, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
+    all_p = get_all_profiles()
+    profiles = []
+    for ai_id, role in AI_ROLES.items():
+        p = all_p.get(ai_id, {})
+        profiles.append({
+            "ai_id": ai_id,
+            "name": p.get("name") or role.get("name", ai_id),
+            "emoji": p.get("emoji") or role.get("emoji", ""),
+            "color": p.get("color") or role.get("color", "#888"),
+            "platform": p.get("platform", ""),
+            "greeting": p.get("greeting", ""),
+            "persona": p.get("persona", ""),
+            "llm_base_url": p.get("model_url", ""),
+            "llm_model": p.get("model_name", ""),
+            "llm_api_key_set": bool(p.get("model_key")),
+        })
+    return {"profiles": profiles}
+
+
+@app.get("/api/ai-profiles/{ai_id}/memories")
+async def api_ai_memories(ai_id: str, limit: int = Query(default=30, le=100), authorization: str = Header(default="")):
+    """获取某 AI 的相关记忆"""
+    verify_secret(authorization)
+    import database as db
+    owned = db.query_memories(owner_ai=ai_id, status="active", order_by="updated_at DESC", limit=limit)
+    sourced = db.query_memories(source_ai=ai_id, status="active", order_by="updated_at DESC", limit=limit)
+    seen = set()
+    combined = []
+    for m in owned + sourced:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            combined.append({
+                "id": m["id"],
+                "content": m["content"][:120],
+                "room": m.get("room", ""),
+                "importance": float(m.get("importance") or 0.5),
+                "created_at": m.get("created_at", ""),
+                "owner_ai": m.get("owner_ai", ""),
+                "source_ai": m.get("source_ai", ""),
+            })
+    combined.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return {"memories": combined[:limit], "total": len(combined)}
+
+
+@app.put("/api/ai-profiles/{ai_id}")
+async def api_update_profile(ai_id: str, request: Request, authorization: str = Header(default="")):
+    """更新 AI 档案"""
+    verify_secret(authorization)
+    from ai_profiles import update_profile
+    body = await request.json()
+    field_map = {"llm_base_url": "model_url", "llm_model": "model_name", "llm_api_key": "model_key"}
+    allowed_fields = {"name", "emoji", "color", "platform", "greeting", "persona", "llm_base_url", "llm_model", "llm_api_key"}
+    updates = {}
+    for k, v in body.items():
+        if k in allowed_fields:
+            storage_key = field_map.get(k, k)
+            if k == "llm_api_key" and not v:
+                continue
+            updates[storage_key] = v
+    result = await update_profile(ai_id, updates)
+    return {"status": "ok", "profile": result}
 
 
 # ── Phase 6 P0: 前端可观测性 API ──

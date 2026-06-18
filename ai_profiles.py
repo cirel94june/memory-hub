@@ -119,3 +119,14 @@ async def delete_profile(ai_id: str) -> bool:
     await save_profiles()
     log.info(f"Deleted AI profile: {ai_id}")
     return True
+
+
+def get_llm_config_for_ai(ai_id: str) -> dict:
+    """获取某 AI 的模型配置，fallback 到全局默认"""
+    from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
+    profile = _profiles.get(ai_id, {})
+    return {
+        "base_url": profile.get("model_url") or LLM_BASE_URL,
+        "model": profile.get("model_name") or LLM_MODEL,
+        "api_key": profile.get("model_key") or LLM_API_KEY,
+    }
