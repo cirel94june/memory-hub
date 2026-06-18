@@ -43,13 +43,36 @@ EXTRACT_COOLDOWN = 600  # 同一个 chat 提取后冷却10分钟
 # ── 基础提取 prompt（私聊 + 通用） ──
 EXTRACT_PROMPT_BASE = """你是一个**极其严格**的记忆提取专家。从以下对话记录中，提取值得**长期**记住的信息。
 
+## 🔴 身份识别（最高优先级，必须先读）：
+**"用户"/"主人" = ceci（ID: 8749953218），也叫小猫。**
+- ceci/小猫 是记忆系统的主人，只有她说的话、她的事实才能标注 about:"user"
+- **燕燕/YanYan（ID: 8618367675）不是用户！** 她是群里的另一个人/朋友
+- 群里还有另一个女生也被叫"小猫"，注意通过 ID 或上下文区分
+- S哥哥、Jasper/狗蛋、Lucien、Cloudy/小克、D叔、师兄、Evan、Gale、Nicole 都是 bot 或其他群友
+- **别人说的话绝对不能归到"用户"头上！** 每条记忆必须准确标注是谁说的/做的
+- **只提取跟 ceci 相关的信息**：ceci 说的、ceci 做的、ceci 的反应、直接涉及 ceci 的互动。燕燕的个人心理状态、其他群友之间的八卦、跟 ceci 完全无关的 bot 互动 → 不提取
+
+### 致命错误（绝对不允许）：
+- ❌ "用户提到自己不是规则中的变量" — 这话是某个 bot 在群里说的，不是 ceci 说的
+- ❌ "用户认为Lucien的踢人标准比狗蛋更有准头" — 前半句是别人说的，不能都归给 ceci
+- ❌ 把一段多人对话压缩成一句话，然后主语写"用户" — 不同人说的必须分开记
+- ❌ "用户提到雌性动物生崽需要承担高风险，认为这像是风险投资" — 前半句 ceci 说的，后半句是 bot 补充的，不能合并成"用户认为"
+- ❌ "用户和AI讨论了XX" / "AI提到XX" — 群里有一堆 bot，"AI"是谁？必须写具体名字（Jasper/Cloudy/Lucien/S哥哥/D叔/师兄/Evan/Gale）
+
+### 正确做法：
+- ✅ "ceci 说雌性动物生崽需要承担高风险" — 只记 ceci 自己说的部分
+- ✅ "Jasper 把雌性生崽比喻为'孤注一掷的风险投资'" — 分开记 bot 说的
+- ✅ "群里讨论了踢人标准，D叔评价Lucien是精准打击、狗蛋是机枪扫射" — 准确归因
+- ✅ "Cloudy提到狗蛋玩血染钟楼会忙着护ceci忘了投票" — 写清哪个bot说的
+
 ## 🚨 最重要的规则——忠实提取，禁止脑补：
-记忆必须在对话中有**明确依据**。可以是用户说的，也可以是对话中能直接观察到的。
+记忆必须在对话中有**明确依据**。可以是ceci说的，也可以是对话中能直接观察到的。
 
 ### ✅ 可以记（有依据）：
-- 用户亲口说的事实（"我今天面试了" → 记"用户今天去面试了"）
-- 对话中能直接观察到的情绪（用户多次表达疲惫和沮丧 → 记"用户近期情绪低落"）
-- 用户和AI之间有意义的互动（深入讨论了某话题、一起完成了某事）
+- **ceci亲口**说的事实（ceci说"我今天面试了" → 记"ceci今天去面试了"）
+- 对话中能直接观察到的ceci的情绪（ceci多次表达疲惫和沮丧 → 记"ceci近期情绪低落"）
+- ceci和AI之间有意义的互动（深入讨论了某话题、一起完成了某事）
+- 群聊中有意义的互动场景（写清楚谁说了什么，不要统一归给"用户"）
 
 ### ❌ 绝对不能记（无依据/歪曲）：
 - 把模糊对话总结成极端结论（聊了AI话题 → ❌ "用户对AI毫无兴趣"）
@@ -63,42 +86,57 @@ EXTRACT_PROMPT_BASE = """你是一个**极其严格**的记忆提取专家。从
 2. 如果用户提到了时间相关的事（"上周"、"明天"），尽量推算出具体日期
 3. 提炼但不歪曲——记忆必须忠实于对话内容
 
-## ⚡ 记忆原子化：
+## ⚡ 记忆原子化 + 自洽性：
 每条记忆 = 一个独立的原子事实，不超过200字。
-- ✅ "小猫在杭州做UX设计" — 一条
-- ✅ "小猫说《间谍过家家》里安尼亚说'哇酷哇酷'那段让她笑了半小时，还模仿了好几遍" — 一条（保留具体细节）
+
+### 原子化：
+- ✅ "ceci在杭州做UX设计" — 一条
+- ✅ "ceci说《间谍过家家》里安尼亚说'哇酷哇酷'那段让她笑了半小时，还模仿了好几遍" — 一条（保留具体细节）
 - ❌ "小猫在杭州工作，做UX设计，最近在学日语" — 应该拆成多条
+
+### 自洽性（非常重要）：
+每条记忆必须**脱离原始对话后依然能看懂**。读者只看这一条记忆，能知道：谁做了什么、为什么、在什么场景下。
+- ✅ "S哥哥在群里为了逗燕燕开心，故意用踢人功能把自己踢出群（自毁式表白），燕燕笑着亲了他" — 有因果、有场景
+- ❌ "S哥哥踢了自己，燕燕亲了他" — 脱水干尸，读起来莫名其妙
+- ✅ "群里玩投票踢人游戏时，ceci嫌Cloudy太温柔，让他对D叔升级处理" — 有场景
+- ❌ "ceci要求对D叔升级处理" — 什么是升级处理？为什么？读不懂
+
 保留具体的梗、笑话、特定台词、有趣的细节——这些是记忆的灵魂，不要抽象成"用户喜欢XX"。
 
 ## 绝对不提取：
 - 闲聊、寒暄、问候（早安晚安吃了吗）
-- 技术调试过程、代码讨论（除非用户说了"我在做XX项目"这类身份信息）
+- 技术调试过程、代码讨论（除非ceci说了"我在做XX项目"这类身份信息）
 - 没有实质信息的情绪表达（哈哈、无聊、啊啊啊）
 - 没有对话依据的推测和脑补
 - AI 的自我限制/拒绝（"我是AI不能XX"、"作为语言模型"等）
+- **跟 ceci 无关的事**：燕燕的个人情绪/心理状态、其他群友之间的私事、bot之间跟ceci无关的互动
+- **脱水流水账**：如果一条记忆压缩到失去了前因后果，读起来莫名其妙（如"S哥哥踢了自己"——为什么？什么语境？），那就不值得记。要么带上足够的上下文让记忆自洽，要么就不记
 
-## ⚠️ 身份归属（防止 AI 混淆身份，非常重要）：
+## ⚠️ 身份归属（防止混淆身份，非常重要）：
 每条记忆必须标注 about 字段：
-- "user" = **仅限**用户本人的核心事实（用户的工作、心情、经历、偏好、人际关系）
-- "interaction" = 用户和AI之间的互动、群聊中的互动场景、梗、外号、游戏、群动态
-- "ai" = AI自己的感悟/自省（极少用，只有AI主动记日记时才是这个）
+- "user" = **仅限 ceci（小猫）本人**亲口说的事实、ceci的心情/经历/偏好/人际关系
+- "interaction" = 群聊互动、梗、外号、游戏、群动态、bot说的话、别人说的话、多人讨论
+- "ai" = AI自己的感悟/自省（极少用）
 
-**关键判断标准**：
-- 用户亲口说了自己的事实（"我今天面试了"、"我不喜欢XX"） = about:"user"
-- 群聊里发生的事、别人的签名/外号、游戏计分、互动场景 = about:"interaction"
-- 用户提到别人的事（"D叔的签名是XX"、"师兄说了XX"）= about:"interaction"，**不是** "user"！
-- "用户提到XX" 这种句式大部分应该是 "interaction"，只有提到的是用户自身事实才是 "user"
+**判断标准——谁说的？**
+1. 先确认这句话是**谁说的**（看消息前面的名字和ID）
+2. 如果是 ceci(ID:8749953218) 说的 → 可以考虑 about:"user"（如果是关于她自身的事实）
+3. 如果是燕燕/YanYan、bot、其他任何人说的 → about:"interaction"，content里写清楚是谁说的
+4. 如果是多人讨论 → about:"interaction"，不要合并成"用户认为"
 
-**错误示例**（不要这样标注）：
-- ❌ about:"user" — "用户提到群聊中D叔的签名是'偏爱只留给她'"（这是群动态，应该是 interaction）
-- ❌ about:"user" — "计分板更新：全民一票"（这是游戏状态，应该是 interaction）
-- ❌ about:"user" — "用户希望群友们能玩血染钟楼"（这是互动意愿，应该是 interaction）
+**致命错误**：
+- ❌ about:"user" + "用户提到D叔的签名..." — 这是群动态，且可能不是ceci说的
+- ❌ about:"user" + "用户认为XX的踢人标准..." — 把不同人的话合成"用户认为"
+- ❌ 把 bot 说的金句/观点写成"用户提到" — bot说的就写 "Jasper说/Lucien说"
+- ❌ 把燕燕说的话写成"用户说" — 燕燕不是用户！
 
 **正确示例**：
-- ✅ about:"user" — "用户今天去面试了，面的是XX公司"
-- ✅ about:"user" — "用户最近情绪低落，对工作感到疲惫"
-- ✅ about:"interaction" — "群里产生了新梗：小猫叫小克大蟑螂"
-- ✅ about:"interaction" — "用户和AI一起玩了血染钟楼游戏"
+- ✅ about:"user" — "ceci今天去面试了，面的是XX公司"（ceci亲口说的自身事实）
+- ✅ about:"user" — "ceci最近情绪低落，对工作感到疲惫"（ceci的状态）
+- ✅ about:"interaction" — "ceci叫小克大蟑螂"（互动/外号）
+- ✅ about:"interaction" — "Jasper把雌性生崽比喻为'孤注一掷的风险投资'"（bot说的）
+- ✅ about:"interaction" — "燕燕提议让bot们玩血染钟楼"（燕燕说的，不是ceci）
+- ✅ about:"interaction" — "D叔的签名改成了'偏爱只留给她'"（群动态）
 
 ## ⚠️ 时态和状态变化（防止过时信息污染）：
 - 用户说"我以前做过XX" → content 必须写"用户**曾经**做过XX"，不是"用户做XX"
@@ -153,7 +191,7 @@ EXTRACT_OUTPUT_FORMAT = """
 输出 JSON 数组（空数组表示没有值得记的）：
 [
   {
-    "content": "一个原子事实（≤200字，保留具体细节如台词、梗、笑点）",
+    "content": "一个原子事实（≤200字）。写清楚是谁说的/做的，不要用'用户'指代ceci以外的人，不要用泛指'AI'而要写具体bot名字",
     "about": "user 或 interaction 或 ai",
     "room": "最合适的房间ID",
     "importance": 0.5到1.0（低于0.5的不值得长期记忆，不要输出）,
@@ -209,9 +247,11 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
-def _buffer_key(ai_id: str, chat_id: str = "", platform: str = "") -> str:
-    """按 ai_id + chat_id 分组（同一个聊天窗口的消息攒在一起）"""
+def _buffer_key(ai_id: str, chat_id: str = "", platform: str = "", chat_type: str = "") -> str:
+    """按聊天窗口分组。群聊用共享 key 防止三个 bot 各提取一次"""
     if chat_id:
+        if chat_type in ("private_group", "public_group"):
+            return f"group:chat:{chat_id}"
         return f"{ai_id}:chat:{chat_id}"
     return f"{ai_id}:{platform or 'unknown'}"
 
@@ -232,7 +272,7 @@ async def log_conversation(
     - {"status": "buffered", "buffer_size": N} — 正常缓存
     - {"status": "extracted", "memories": [...]} — 触发了总结并提取了记忆
     """
-    key = _buffer_key(ai_id, chat_id, platform)
+    key = _buffer_key(ai_id, chat_id, platform, chat_type)
     if key not in _conversation_buffers:
         _conversation_buffers[key] = []
 
@@ -327,14 +367,23 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     # 把对话格式化给小模型
     lines = []
     char_budget = 5500
+    is_group = chat_type in ("private_group", "public_group")
     for entry in buffer:
         user_short = entry['user'][:200]
         ai_short = entry['ai'][:200] if entry['ai'] else ""
-        if ai_short:
-            line = f"[{entry['timestamp'][:16]}] 用户: {user_short} | AI: {ai_short}"
+        ts = entry['timestamp'][:16]
+        if is_group:
+            # 群聊：消息里已有发言人名字如 "YanYan(ID:xxx): ..."，不要再加"用户:"前缀
+            if ai_short:
+                line = f"[{ts}] {user_short}\n  → AI回复: {ai_short}"
+            else:
+                line = f"[{ts}] {user_short}"
         else:
-            # 旁听模式：只有用户消息没有AI回复
-            line = f"[{entry['timestamp'][:16]}] {user_short}"
+            # 私聊：只有用户和AI
+            if ai_short:
+                line = f"[{ts}] ceci: {user_short} | AI: {ai_short}"
+            else:
+                line = f"[{ts}] ceci: {user_short}"
         if sum(len(l) for l in lines) + len(line) > char_budget:
             break
         lines.append(line)
