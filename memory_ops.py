@@ -141,8 +141,11 @@ async def remember(
     source_context: str = "",
     auto_analyze: bool = True,
     auto_merge: bool = True,
+    quick: bool = False,
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
+    if quick:
+        auto_merge = False
 
     # Step 1: 自动打标
     analysis = None
@@ -407,6 +410,7 @@ async def grow(
     content: str,
     source_ai: str = "",
     auto_merge: bool = True,
+    quick: bool = False,
 ) -> dict:
     """把长文本拆分成多条独立记忆，每条独立走合并检测"""
     items = await analyzer.digest(content)
