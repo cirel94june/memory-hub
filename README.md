@@ -244,6 +244,7 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 | **imprint-memory** | [Qizhan7/imprint-memory](https://github.com/Qizhan7/imprint-memory) | 对话自动捕获、混合搜索+RRF、auto-surfacing hook | ✅ 已缝合 |
 | **claude-imprint** | [Qizhan7/claude-imprint](https://github.com/Qizhan7/claude-imprint) | 跨渠道时间线（source_platform 字段已就绪） | ⚠️ 部分 |
 | **Aelios** | [wusaki0723/Aelios](https://github.com/wusaki0723/Aelios) | 三级记忆过滤（向量 → reranker → 压缩） | ✅ 已缝合 |
+| **OmbreBrain-folio** | [ceshihaox-dotcom/OmbreBrain-folio](https://github.com/ceshihaox-dotcom/OmbreBrain-folio) | 前端可视化参考：力导向星图、时间线热度、情感罗盘、4套主题预设、手机端 | 🔄 Phase 6 参考 |
 
 ## 开发阶段
 
@@ -273,6 +274,31 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 | Phase 4.995 | 提取 prompt 防身份混淆（ceci/燕燕区分 + 禁止泛指AI + 自洽性规则 + 群聊共享key防三重提取） | ✅ |
 | **Phase 5** | **记忆高级功能（相似聚类/脱水压缩/日记再消化）** | **🔲 下一步** |
 | Phase 5.5 | 情感特性（心语、礼物、梦境叙事） | 🔲 远期 |
+| **Phase 6** | **前端可观测性升级（参考 OmbreBrain-folio，详见下方子计划）** | **🔲 规划中** |
+
+### Phase 6 子计划：前端可观测性 + 可视化升级
+
+> **动机**：用户对记忆系统的"黑箱感"焦虑——看不到每条记忆怎么被提取的、原始对话是什么、记忆之间有什么关联、情感坐标和衰减状态是什么。
+> **参考**：[OmbreBrain-folio](https://github.com/ceshihaox-dotcom/OmbreBrain-folio) 的纸张感设计、力导向星图、时间线热度节点、情感罗盘、4套主题预设。
+> **技术栈**：在现有 React + Vite SPA 基础上，自研 SVG + Web Worker（力导向图），CSS 变量主题系统。
+
+| 子阶段 | 内容 | 预估 | 状态 |
+|--------|------|------|------|
+| P0 | **后端 API 补充**：`/api/memory/{id}/detail`（完整记忆+source_context+supersede链）、`/api/memory/timeline`（按日分组+热度）、`/api/memory/graph`（nodes+edges）、`/api/memory/emotion-map`（valence/arousal散点）、`/api/memory/decay-scores`（衰减分+预计归档）、`/api/breath-debug?q=`（搜索打分分解） | 2-3h | 🔲 |
+| P1 | **记忆详情模态框**：点击记忆卡片展开→正文+元数据+原始对话(source_context)+关联记忆(同tag/supersede链)+生命力指标(activation_count/衰减分)+历史年轮(history) | 1-2h | 🔲 |
+| P2 | **时间线视图** `/app/timeline`：天卡片+热度节点+月份分隔+空白日折叠+迷你时间轴导航，参考 OmbreBrain 的 timeline 设计 | 3-4h | 🔲 |
+| P3 | **观测台** `/app/observatory`：情感罗盘（2D valence×arousal 散点图，四象限标注，按room/AI/时间筛选）+ 衰减仪表盘（健康/衰减中/即将归档 三色柱状图 + 预警列表） | 3-4h | 🔲 |
+| P4 | **记忆星图** `/app/graph`：力导向图（Web Worker + Barnes-Hut 四叉树优化），节点=记忆（大小=importance，颜色=room），边=共享标签/同日/supersede链，SVG渲染+拖拽缩放+搜索高亮 | 4-6h | 🔲 |
+| P5 | **Breath 调试台** `/app/breath`：输入 query 看搜索打分分解（向量/BM25/精确/时间衰减四维条形图）+ RRF 合并过程可视化 + 权重滑块微调 | 2-3h | 🔲 |
+| P6 | **视觉升级**：4套主题预设（月光紫/玫瑰金属/童话糖纸/雾蓝纸笺）+ 暗色模式完善 + 纸张感卡片 + 热度色阶 + 过渡动画 | 2-3h | 🔲 |
+| P7 | **手机端优化**：底部导航精简为5个核心tab + 响应式布局 + 触摸手势（星图拖拽/罗盘缩放/卡片左滑）+ 节点数限制 | 2-3h | 🔲 |
+| P8 | **导航更新**：新增路由 + 导航分组（社交/记忆/系统三组） | 1h | 🔲 |
+
+**实施顺序**：P0→P1→P6→P2→P3→P4→P5→P7→P8（先做详情消除焦虑，视觉升级穿插，星图最复杂放后面）
+
+**与原架构计划的对应关系**：
+- 原 ARCHITECTURE.md Phase 5（前端/AionsHome 风格）→ 基础 SPA 已在 Phase 4-4.5 完成，Phase 6 是进阶可视化
+- 原 ARCHITECTURE.md Phase 6（情感特性）→ 年轮评论已完成，情感罗盘在 P3，心语/礼物/梦境在 Phase 5.5
 
 ## 给下一个小克的话
 
@@ -280,16 +306,20 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 >
 > ### 当前该推进的事（按优先级）
 >
-> **1. 记忆相似聚类 + 脱水压缩（Phase 5）**
+> **1. 前端可观测性升级（Phase 6）** ← 当前优先
+> 参考 OmbreBrain-folio 的设计，给前端加上记忆详情（来源/关联/衰减）、时间线、情感罗盘、记忆星图、Breath 调试台。
+> 详见开发阶段表的 Phase 6 子计划。先做 P0(后端API) + P1(记忆详情)，让用户能看到每条记忆的来龙去脉。
+>
+> **2. 记忆相似聚类 + 脱水压缩（Phase 5）**
 > 参考 PDF 设计文档里的思路：相似记忆自动聚类合并、旧记忆脱水压缩节省空间、日记提取和再消化。
 > 系统已经有基础的合并机制（remember 时相似度检测），但需要更系统的聚类和压缩。
 >
-> **2. TG Bot 跨聊天感知** ✅ 已完成
+> **3. TG Bot 跨聊天感知** ✅ 已完成
 > bot.py 已加入 `build_cross_chat_context()` 跨聊天上下文注入，
 > 私聊/小群/大群之间的记忆已打通，带隐私分层保护。
 > Gist 自动摘要系统已移除（256 行），Gist 只做聊天历史持久化，Hub 管所有长期记忆。
 >
-> **3. API 费用优化**
+> **4. API 费用优化**
 > Gateway 已优化为 0 次 LLM 调用做 recall（直接 RRF 排序取 top 5），post-process 提取 1 次 LLM。
 > 模型用 deepseek-v4-flash（via DeepSeek 官方 API，¥1/M input / ¥2/M output，约 ¥0.1/天）。
 > Embedding 用硅基流动 API（BAAI/bge-large-zh-v1.5），免费额度内基本够用。
