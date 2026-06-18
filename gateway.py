@@ -8,7 +8,7 @@ import math
 import asyncio
 import httpx
 from datetime import datetime, timezone
-from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS
+from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS, AI_ALIASES
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
 
@@ -60,11 +60,6 @@ def _relative_time(iso_str: str) -> str:
 
 
 # cloudy(TG) 和 claude(MCP/Web) 是同一个小克，共享私有房间和走廊
-AI_ALIASES = {"cloudy": "claude"}
-
-AI_ALIASES = {"cloudy": "claude"}
-
-AI_ALIASES = {"cloudy": "claude"}
 
 async def build_context(user_message: str, ai_id: str, recent_messages: list[dict] = None) -> dict:
     """

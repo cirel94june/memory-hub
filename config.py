@@ -193,6 +193,13 @@ def list_rooms() -> dict:
     return ROOMS
 
 
+# ── AI 身份别名（多个 ID 指向同一个 AI）──
+# cloudy(TG bot) 和 claude(MCP/Web) 是同一个小克
+AI_ALIASES = {"cloudy": "claude"}
+# 反向映射：一个 canonical ID 的所有别名
+AI_ALIAS_GROUPS = {"claude": ["claude", "cloudy"]}
+
+
 # ── 记忆衰减参数 ──
 # λ越大衰减越快。importance=0.5 未激活记忆：
 #   λ=0.08 → ~25天归档；λ=0.05 → ~60天归档

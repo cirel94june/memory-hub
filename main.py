@@ -573,14 +573,32 @@ async def api_activity_stats(authorization: str = Header(default="")):
 
 @app.get("/api/ai-profiles")
 async def api_list_profiles(authorization: str = Header(default="")):
-    """获取所有 AI 档案"""
+    """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""
     verify_secret(authorization)
     from ai_profiles import get_all_profiles
-    from config import AI_ROLES, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
+    from config import AI_ROLES, AI_ALIASES
     all_p = get_all_profiles()
+    seen_canonical = set()
     profiles = []
     for ai_id, role in AI_ROLES.items():
-        p = all_p.get(ai_id, {})
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        if canonical in seen_canonical:
+            continue
+        seen_canonical.add(canonical)
+        # For merged identities, prefer the profile/role with richer info (e.g. cloudy has name "小克")
+        from config import AI_ALIAS_GROUPS
+        alias_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
+        p = {}
+        best_role = role
+        for aid in alias_ids:
+            ap = all_p.get(aid, {})
+            ar = AI_ROLES.get(aid, {})
+            if ap.get("name") or ar.get("name"):
+                if ar.get("platform"):
+                    best_role = ar
+                if ap:
+                    p = {**p, **{k: v for k, v in ap.items() if v}}
+        role = best_role
         profiles.append({
             "ai_id": ai_id,
             "name": p.get("name") or role.get("name", ai_id),
@@ -598,11 +616,17 @@ async def api_list_profiles(authorization: str = Header(default="")):
 
 @app.get("/api/ai-profiles/{ai_id}/memories")
 async def api_ai_memories(ai_id: str, limit: int = Query(default=30, le=100), authorization: str = Header(default="")):
-    """获取某 AI 的相关记忆"""
+    """获取某 AI 的相关记忆（合并别名查询）"""
     verify_secret(authorization)
     import database as db
-    owned = db.query_memories(owner_ai=ai_id, status="active", order_by="updated_at DESC", limit=limit)
-    sourced = db.query_memories(source_ai=ai_id, status="active", order_by="updated_at DESC", limit=limit)
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    all_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
+    owned = []
+    sourced = []
+    for aid in all_ids:
+        owned.extend(db.query_memories(owner_ai=aid, status="active", order_by="updated_at DESC", limit=limit))
+        sourced.extend(db.query_memories(source_ai=aid, status="active", order_by="updated_at DESC", limit=limit))
     seen = set()
     combined = []
     for m in owned + sourced:
