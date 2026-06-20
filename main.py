@@ -271,6 +271,8 @@ class ContextRequest(BaseModel):
     user_message: str
     ai_id: str
     recent_messages: list[dict] = []
+    chat_id: str = ""
+    chat_type: str = ""
 
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
@@ -279,6 +281,7 @@ async def api_build_context(body: ContextRequest, authorization: str = Header(de
         user_message=body.user_message,
         ai_id=body.ai_id,
         recent_messages=body.recent_messages,
+        chat_id=body.chat_id,
     )
 
 
@@ -287,16 +290,31 @@ class PostProcessRequest(BaseModel):
     ai_response: str
     ai_id: str
     platform: str = ""
+    chat_id: str = ""
+    chat_type: str = ""
+    reply_reason: str = ""
 
 @app.post("/api/gateway/post-process")
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    return await gateway_mod.post_process(
+    result = await gateway_mod.post_process(
         user_message=body.user_message,
         ai_response=body.ai_response,
         ai_id=body.ai_id,
         platform=body.platform,
     )
+    if body.chat_id:
+        try:
+            from chat_digest import generate_and_save
+            await generate_and_save(
+                user_message=body.user_message, ai_response=body.ai_response,
+                ai_id=body.ai_id, chat_id=body.chat_id,
+                chat_type=body.chat_type or "private",
+                reply_reason=body.reply_reason,
+            )
+        except Exception:
+            pass
+    return result
 
 
 # ── 对话自动捕获 ──
@@ -308,6 +326,8 @@ class ConversationLogRequest(BaseModel):
     ai_response: str
     ai_id: str = "claude"
     platform: str = ""
+    chat_id: str = ""
+    chat_type: str = "private"
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
@@ -318,6 +338,8 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         ai_response=body.ai_response,
         ai_id=body.ai_id,
         platform=body.platform,
+        chat_id=body.chat_id,
+        chat_type=body.chat_type,
     )
 
 @app.post("/api/capture/extract")
