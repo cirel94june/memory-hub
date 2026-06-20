@@ -142,6 +142,7 @@ async def remember(
     auto_analyze: bool = True,
     auto_merge: bool = True,
     quick: bool = False,
+    force_create: bool = False,
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
     # 归一化 AI 别名（cloudy → claude）
@@ -178,6 +179,8 @@ async def remember(
     valence = analysis.get("valence", 0.5) if analysis else 0.5
 
     # Step 2: 智能关系检测（替代简单合并）
+    if force_create:
+        auto_merge = False
     if auto_merge:
         # 先找相似候选
         query_vec = await get_embedding(content)
@@ -187,7 +190,7 @@ async def remember(
             # 高相似度（>= MERGE_SIMILARITY）走传统合并
             best = candidates[0]
             if best["score"] >= MERGE_SIMILARITY:
-                merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal)
+                merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal, target_room=room)
                 if merge_result:
                     return merge_result
 
@@ -348,7 +351,7 @@ def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, t
 
 
 async def _try_merge(content: str, domain: list, tags: list, importance: float,
-                     valence: float, arousal: float) -> dict | None:
+                     valence: float, arousal: float, target_room: str = "") -> dict | None:
     """查找最相似的已有记忆，如果超过阈值则合并。
     Uses database.vector_search() instead of iterating all memories.
     """
@@ -364,6 +367,10 @@ async def _try_merge(content: str, domain: list, tags: list, importance: float,
     for mem in raw:
         distance = mem.pop("distance", 0.0)
         vec_sim = _distance_to_cosine(distance)
+
+        # 跨房间不合并
+        if target_room and mem.get("room", "") != target_room:
+            continue
 
         # domain 匹配加分
         mem_domain = _parse_json_field(mem.get("domain", "[]"))
@@ -417,7 +424,7 @@ async def _try_merge(content: str, domain: list, tags: list, importance: float,
     store.set_memory(best_mem)
 
     logger.info(f"Merged into {best_mem['id']} (score={best_score:.3f})")
-    return {"id": best_mem["id"], "status": "merged", "score": round(best_score, 3)}
+    return {"id": best_mem["id"], "status": "merged_into_existing", "merged_into": best_mem["id"], "score": round(best_score, 3)}
 
 
 # ── 长文拆分（grow） ──
@@ -457,7 +464,7 @@ async def grow(
                 mem["valence"] = item.get("valence", 0.5)
                 store.set_memory(mem)
             created += 1
-        elif r.get("status") == "merged":
+        elif r.get("status") in ("merged", "merged_into_existing"):
             merged += 1
         results.append(r)
 

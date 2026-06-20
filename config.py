@@ -206,7 +206,7 @@ AI_ALIAS_GROUPS = {"claude": ["claude", "cloudy"]}
 DECAY_LAMBDA = 0.12
 DECAY_LAMBDA_FAST = 0.20  # 工作事务等快速衰减的房间
 DECAY_THRESHOLD = 0.18    # 稍微提高归档阈值
-MERGE_SIMILARITY = 0.75
+MERGE_SIMILARITY = 0.85
 
 # ── 搜索权重（recall() 向量路的多维加权）──
 SEARCH_WEIGHTS = {

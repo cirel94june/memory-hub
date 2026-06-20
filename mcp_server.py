@@ -79,6 +79,7 @@ async def remember(
     importance: float = 0.5,
     source_ai: str = "claude",
     event_date: str = "",
+    force_create: bool = False,
 ) -> str:
     """存储一条新记忆。系统会自动打标签，并智能检测是否需要更新/取代旧记忆。
 
@@ -100,11 +101,12 @@ async def remember(
         importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
         event_date: 事件发生日期（可选，如 2026-06-01，区别于记忆创建时间）
+        force_create: 强制新建，跳过自动合并检测。当你确定这条记忆必须独立存在时使用
     """
     result = await memory_ops.remember(
         content=content, room=room, importance=importance,
         source_ai=source_ai, source_platform="mcp",
-        event_date=event_date,
+        event_date=event_date, force_create=force_create,
     )
     return json.dumps(result, ensure_ascii=False)
 
@@ -138,7 +140,12 @@ async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source
         source_ai: AI身份（影响私有房间可见性）
         compact: 精简模式。为 true 时只返回 id/content/room/score/created_at，减少上下文消耗。适合 MCP 调用场景。
     """
-    results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k, compact=compact)
+    results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k)
+    if compact:
+        results = [
+            {k: item[k] for k in ("id", "content", "room", "score", "created_at") if k in item}
+            for item in results
+        ]
     output = {"results": results}
     if with_corridor:
         corridor_text = await corridor_mod.get_corridor(source_ai)
