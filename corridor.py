@@ -25,8 +25,6 @@ async def build_corridor(ai_id: str) -> str:
     返回一段自然语言文本，AI 读了就能"醒来"。
     """
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     all_mems = store.get_all_memories()
 
     # 1. 客厅要点（你是谁）
@@ -53,15 +51,24 @@ async def build_corridor(ai_id: str) -> str:
                    and m.get("status") == "active"]
 
     # 5. 最近所有 AI 的重要动态（跨端感知）
-    # 只取互动类和AI私有记忆，排除用户事实（防止AI把用户经历当成自己的）
-    recent_all = sorted(
+    # 排除用户事实，按话题去重（同一话题只保留最新一条）
+    _raw_recent = sorted(
         [m for m in all_mems.values()
          if m.get("status") == "active"
          and m.get("source_ai") and m.get("source_ai") != ai_id
          and not m.get("content", "").startswith("[用户]")],
         key=lambda x: x.get("updated_at", ""),
         reverse=True,
-    )[:5]
+    )
+    recent_all = []
+    _seen_snippets = set()
+    for m in _raw_recent:
+        snippet = m["content"][:40]
+        if snippet not in _seen_snippets:
+            _seen_snippets.add(snippet)
+            recent_all.append(m)
+        if len(recent_all) >= 5:
+            break
 
     # 6. 基建状态（如果有）
     infra = [m["content"] for m in all_mems.values()
@@ -90,8 +97,8 @@ async def build_corridor(ai_id: str) -> str:
         for m in recent_all:
             src = AI_ROLES.get(m.get("source_ai", ""), {}).get("name", m.get("source_ai", ""))
             plat = m.get("source_platform", "")
-            lines.append(f"· [{src}{(' via '+plat) if plat else ''}] {m['content'][:200]}")
-        sections.append("【其他伙伴最近的动态】\n" + "\n".join(lines))
+            lines.append(f"· {src}的记忆{(' ('+plat+')') if plat else ''}：{m['content'][:200]}")
+        sections.append("【其他伙伴最近的动态（这些是别人的经历，不是你自己的）】\n" + "\n".join(lines))
 
     if infra:
         sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:150]}" for x in infra))
@@ -129,8 +136,6 @@ async def build_corridor(ai_id: str) -> str:
 
 async def get_corridor(ai_id: str) -> str:
     """获取走廊文档（优先从缓存读，超过6小时自动重建）"""
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
     cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
     if cached and isinstance(cached, dict) and cached.get("text"):

@@ -38,6 +38,8 @@ class ProxyConfig(BaseModel):
     platform: str = "proxy"     # 来源平台标识
     inject_memory: bool = True  # 是否注入记忆
     extract_memory: bool = True # 是否自动提取记忆
+    chat_id: str = ""           # 聊天窗口ID（跨窗口感知用）
+    chat_type: str = ""         # private / private_group / public_group
 
 
 def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
@@ -86,6 +88,8 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
         platform=headers.get("x-hub-platform", "proxy"),
         inject_memory=headers.get("x-hub-inject", "true").lower() != "false",
         extract_memory=headers.get("x-hub-extract", "true").lower() != "false",
+        chat_id=headers.get("x-hub-chat-id", ""),
+        chat_type=headers.get("x-hub-chat-type", ""),
     )
 
 
@@ -285,6 +289,7 @@ async def handle_chat_completions(request: Request, body: dict):
                 user_message=user_message,
                 ai_id=config.ai_id,
                 recent_messages=recent,
+                chat_id=config.chat_id,
             )
             memory_text = context.get("inject_text", "")
             recall_summary = context.get("recall_summary", "")
@@ -311,6 +316,16 @@ async def handle_chat_completions(request: Request, body: dict):
                     ai_id=config.ai_id,
                     platform=config.platform,
                 )
+            if config.chat_id and user_message and full_text:
+                try:
+                    from chat_digest import generate_and_save
+                    await generate_and_save(
+                        user_message=user_message, ai_response=full_text,
+                        ai_id=config.ai_id, chat_id=config.chat_id,
+                        chat_type=config.chat_type or "private",
+                    )
+                except Exception as e:
+                    logger.warning(f"[Proxy] Chat digest failed: {e}")
 
         try:
             return await _forward_stream(
@@ -342,7 +357,7 @@ async def handle_chat_completions(request: Request, body: dict):
 
     response_data = resp.json()
 
-    # Step 3: 后台提取记忆
+    # Step 3: 后台提取记忆 + 跨窗口摘要
     ai_response = await _extract_response_text(response_data)
     if config.extract_memory and user_message and ai_response:
         asyncio.create_task(_background_extract(
@@ -351,6 +366,18 @@ async def handle_chat_completions(request: Request, body: dict):
             ai_id=config.ai_id,
             platform=config.platform,
         ))
+    if config.chat_id and user_message and ai_response:
+        async def _bg_digest():
+            try:
+                from chat_digest import generate_and_save
+                await generate_and_save(
+                    user_message=user_message, ai_response=ai_response,
+                    ai_id=config.ai_id, chat_id=config.chat_id,
+                    chat_type=config.chat_type or "private",
+                )
+            except Exception as e:
+                logger.warning(f"[Proxy] Chat digest failed: {e}")
+        asyncio.create_task(_bg_digest())
 
     if recall_summary:
         response_data["memory_activity"] = {"recall_summary": recall_summary}

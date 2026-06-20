@@ -61,7 +61,7 @@ def _relative_time(iso_str: str) -> str:
 
 # cloudy(TG) 和 claude(MCP/Web) 是同一个小克，共享私有房间和走廊
 
-async def build_context(user_message: str, ai_id: str, recent_messages: list[dict] = None) -> dict:
+async def build_context(user_message: str, ai_id: str, recent_messages: list[dict] = None, chat_id: str = "") -> dict:
     """
     核心功能：在 AI 回复之前，自动组装要注入的记忆 context。
 
@@ -81,6 +81,17 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     corridor_text = await get_corridor(ai_id)
     if corridor_text:
         parts.append(corridor_text)
+
+    # 1.5. 跨窗口摘要（让当前聊天知道其他窗口最近聊了什么）
+    if chat_id:
+        try:
+            from chat_digest import get_recent_digests
+            digests = get_recent_digests(ai_id, exclude_chat_id=chat_id, limit=3)
+            if digests:
+                lines = [f"· {d['summary']}" for d in digests]
+                parts.append("【其他聊天窗口最近在聊】\n" + "\n".join(lines))
+        except Exception:
+            pass
 
     # 直接搜全部房间（RRF + reranker 自然筛选，省掉 LLM room judge 的延迟）
     recalled = await recall(
