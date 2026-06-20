@@ -151,6 +151,17 @@ async def remember(
 
     if quick:
         auto_merge = False
+        # 轻量去重：只查 embedding 相似度，不调 LLM
+        try:
+            qv = await get_embedding(content)
+            if qv:
+                similar = _find_similar_candidates(qv, [], threshold=0.85, top_k=1)
+                if similar and similar[0]["score"] >= 0.85:
+                    existing = similar[0]["mem"]
+                    logger.info(f"Quick dedup: skipped (sim={similar[0]['score']:.2f}) with {existing['id']}")
+                    return {"id": existing["id"], "status": "dedup_skipped", "similarity": similar[0]["score"]}
+        except Exception as e:
+            logger.warning(f"Quick dedup check failed: {e}")
 
     # Step 1: 自动打标
     analysis = None
@@ -904,6 +915,11 @@ async def run_decay() -> dict:
 
         room_cfg = get_room(mem.get("room", "")) or {}
         lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+
+        # 从未被召回的自动记忆加速衰减
+        is_auto = "auto_capture" in (mem.get("source_platform") or "")
+        if is_auto and activations == 0 and days > 3:
+            lam *= 2.0
 
         # 高唤醒记忆衰减更慢
         emotion_weight = 1.0 + (arousal * 0.8)
