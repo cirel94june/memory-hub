@@ -50,25 +50,14 @@ async def build_corridor(ai_id: str) -> str:
                    if m.get("room") == "personality" and m.get("owner_ai") == ai_id
                    and m.get("status") == "active"]
 
-    # 5. 最近所有 AI 的重要动态（跨端感知）
-    # 排除用户事实，按话题去重（同一话题只保留最新一条）
-    _raw_recent = sorted(
-        [m for m in all_mems.values()
-         if m.get("status") == "active"
-         and m.get("source_ai") and m.get("source_ai") != ai_id
-         and not m.get("content", "").startswith("[用户]")],
-        key=lambda x: x.get("updated_at", ""),
-        reverse=True,
-    )
-    recent_all = []
-    _seen_snippets = set()
-    for m in _raw_recent:
-        snippet = m["content"][:40]
-        if snippet not in _seen_snippets:
-            _seen_snippets.add(snippet)
-            recent_all.append(m)
-        if len(recent_all) >= 5:
-            break
+    # 5. 跨窗口摘要（通过 chat_digest 提供，不注入其他AI的完整记忆）
+    # AI 在群聊中已亲眼看到发生的事，不需要再注入别人的记忆副本
+    cross_window_digests = []
+    try:
+        from chat_digest import get_recent_digests
+        cross_window_digests = get_recent_digests(ai_id, limit=3)
+    except Exception:
+        pass
 
     # 6. 基建状态（如果有）
     infra = [m["content"] for m in all_mems.values()
@@ -92,13 +81,9 @@ async def build_corridor(ai_id: str) -> str:
     if diary:
         sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
 
-    if recent_all:
-        lines = []
-        for m in recent_all:
-            src = AI_ROLES.get(m.get("source_ai", ""), {}).get("name", m.get("source_ai", ""))
-            plat = m.get("source_platform", "")
-            lines.append(f"· {src}的记忆{(' ('+plat+')') if plat else ''}：{m['content'][:200]}")
-        sections.append("【其他伙伴最近的动态（这些是别人的经历，不是你自己的）】\n" + "\n".join(lines))
+    if cross_window_digests:
+        lines = [f"· {d['summary']}" for d in cross_window_digests]
+        sections.append("【你在其他聊天窗口最近聊了】\n" + "\n".join(lines))
 
     if infra:
         sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:150]}" for x in infra))

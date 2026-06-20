@@ -71,6 +71,7 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
 
     if simple_ai_id:
         # 简单模式：用服务端 .env 的 LLM 配置
+        # 自动生成 chat_id（简单模式的客户端无法传自定义头）
         return ProxyConfig(
             target_base_url=LLM_BASE_URL,
             target_api_key=LLM_API_KEY,
@@ -78,6 +79,8 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
             platform="proxy",
             inject_memory=True,
             extract_memory=True,
+            chat_id=f"proxy:{simple_ai_id}",
+            chat_type="private",
         )
 
     # 完整模式：从自定义头读取
@@ -226,7 +229,8 @@ async def _extract_response_text(response_data: dict) -> str:
     return ""
 
 
-async def _background_extract(user_message: str, ai_response: str, ai_id: str, platform: str):
+async def _background_extract(user_message: str, ai_response: str, ai_id: str, platform: str,
+                               chat_id: str = "", chat_type: str = ""):
     """后台异步提取记忆"""
     try:
         await gateway_mod.post_process(
@@ -244,6 +248,8 @@ async def _background_extract(user_message: str, ai_response: str, ai_id: str, p
             ai_response=ai_response[:2000],
             ai_id=ai_id,
             platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type or "private",
         )
     except Exception as e:
         logger.error(f"Proxy extract capture error: {e}")
@@ -315,6 +321,8 @@ async def handle_chat_completions(request: Request, body: dict):
                     ai_response=full_text,
                     ai_id=config.ai_id,
                     platform=config.platform,
+                    chat_id=config.chat_id,
+                    chat_type=config.chat_type,
                 )
             if config.chat_id and user_message and full_text:
                 try:
@@ -365,6 +373,8 @@ async def handle_chat_completions(request: Request, body: dict):
             ai_response=ai_response,
             ai_id=config.ai_id,
             platform=config.platform,
+            chat_id=config.chat_id,
+            chat_type=config.chat_type,
         ))
     if config.chat_id and user_message and ai_response:
         async def _bg_digest():
