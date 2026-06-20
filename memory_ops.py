@@ -476,7 +476,7 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
     now = _now()
     mem["updated_at"] = now
 
-    if content is not None:
+    if content is not None and content != mem.get("content"):
         mem["content"] = content
         vec = await get_embedding(content)
         if vec:
