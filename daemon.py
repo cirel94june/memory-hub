@@ -778,6 +778,14 @@ async def run_full_maintenance() -> dict:
     results["dedup"] = await _detect_contradictions()
     log.info(f"  Dedup: {results['dedup']}")
 
+    # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
+    try:
+        from dream import generate_dreams
+        results["dreams"] = await generate_dreams()
+        log.info(f"  Dreams: {results['dreams']}")
+    except Exception as e:
+        log.warning(f"  Dreams failed: {e}")
+
     # 11. 推送到 GitHub
     await store.push_dirty()
 
