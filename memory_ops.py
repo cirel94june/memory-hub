@@ -165,6 +165,7 @@ async def remember(
             logger.warning(f"Quick dedup check failed: {e}")
 
     # Step 1: 自动打标
+    original_category = category
     analysis = None
     if auto_analyze:
         analysis = await analyzer.analyze(content)
@@ -276,7 +277,7 @@ async def remember(
                         s_mem["superseded_by"] = mem_id
                         store.set_memory(s_mem)
 
-                return {
+                result = {
                     "id": mem_id,
                     "status": "created",
                     "category": category,
@@ -284,6 +285,9 @@ async def remember(
                     "superseded": superseded_ids,
                     "linked": linked_ids,
                 }
+                if original_category and original_category != category:
+                    result["original_category"] = original_category
+                return result
 
     # Step 3: 新建记忆（无关联）
     mem_id = _gen_id()
@@ -320,7 +324,10 @@ async def remember(
     }
 
     store.set_memory(mem)
-    return {"id": mem_id, "status": "created", "category": category, "domain": domain}
+    result = {"id": mem_id, "status": "created", "category": category, "domain": domain, "linked": [], "superseded": []}
+    if original_category and original_category != category:
+        result["original_category"] = original_category
+    return result
 
 
 def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:
@@ -423,8 +430,16 @@ async def _try_merge(content: str, domain: list, tags: list, importance: float,
 
     store.set_memory(best_mem)
 
+    final_tags = _parse_json_field(best_mem.get("tags", "[]"))
     logger.info(f"Merged into {best_mem['id']} (score={best_score:.3f})")
-    return {"id": best_mem["id"], "status": "merged_into_existing", "merged_into": best_mem["id"], "score": round(best_score, 3)}
+    return {
+        "id": best_mem["id"],
+        "status": "merged_into_existing",
+        "merged_into": best_mem["id"],
+        "score": round(best_score, 3),
+        "final_importance": best_mem["importance"],
+        "merged_tags_count": len(final_tags),
+    }
 
 
 # ── 长文拆分（grow） ──
@@ -577,6 +592,7 @@ async def recall(
             except Exception:
                 comments = []
         comment_count = len(comments) if isinstance(comments, list) else 0
+        linked = _parse_json_field(mem.get("linked_memories", "[]"))
         return {
             "id": mem["id"],
             "content": mem["content"],
@@ -594,6 +610,7 @@ async def recall(
             "activation_count": mem.get("activation_count", 0),
             "comment_count": comment_count,
             "comments": comments[-3:] if comment_count > 0 else [],
+            "linked_memories": linked,
             "source_ai": mem.get("source_ai", ""),
             "source_context": mem.get("source_context", ""),
         }
@@ -732,6 +749,9 @@ async def recall(
                 continue
         # 清理内部标记
         r.pop("_unresolved", None)
+        # RRF 分数区间约 0~0.05，映射为可读置信度
+        s = r.get("score", 0)
+        r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
         filtered_results.append(r)
 
     return filtered_results
@@ -959,3 +979,72 @@ async def export_all() -> dict:
         memories.append(clean)
     memories.sort(key=lambda x: x.get("created_at", ""))
     return {"exported_at": _now(), "count": len(memories), "memories": memories}
+
+
+# ── 按标签搜索 ──
+
+async def search_by_tags(
+    tags: list[str],
+    mode: str = "any",
+    room: str = "",
+    status: str = "active",
+    limit: int = 20,
+) -> list[dict]:
+    """按标签搜索记忆。mode="any" 匹配任一标签，mode="all" 要求全部匹配。"""
+    results = []
+    search_lower = [t.lower() for t in tags]
+
+    for mem in database.iter_memories(status=status):
+        if room and mem.get("room") != room:
+            continue
+        mem_tags = [t.lower() for t in _parse_json_field(mem.get("tags", "[]"))]
+        if mode == "all":
+            if all(any(st in mt for mt in mem_tags) for st in search_lower):
+                results.append(mem)
+        else:
+            if any(any(st in mt for mt in mem_tags) for st in search_lower):
+                results.append(mem)
+        if len(results) >= limit:
+            break
+
+    return [
+        {"id": m["id"], "content": m["content"], "room": m.get("room", ""),
+         "category": m.get("category", ""), "tags": _parse_json_field(m.get("tags", "[]")),
+         "importance": _safe_float(m.get("importance"), 0.5),
+         "created_at": m.get("created_at", "")}
+        for m in results
+    ]
+
+
+# ── 批量存储 ──
+
+async def batch_remember(
+    memories: list[dict],
+    source_ai: str = "",
+) -> dict:
+    """批量存储多条记忆，共享分析流程。"""
+    created = 0
+    merged = 0
+    skipped = 0
+    results = []
+    for item in memories:
+        r = await remember(
+            content=item["content"],
+            room=item.get("room", "living_room"),
+            category=item.get("category", ""),
+            importance=item.get("importance", 0.5),
+            source_ai=source_ai or item.get("source_ai", ""),
+            source_platform="mcp",
+            tags=item.get("tags"),
+            event_date=item.get("event_date", ""),
+            force_create=item.get("force_create", False),
+        )
+        status = r.get("status", "")
+        if status == "created":
+            created += 1
+        elif status in ("merged", "merged_into_existing"):
+            merged += 1
+        elif status == "dedup_skipped":
+            skipped += 1
+        results.append(r)
+    return {"total": len(results), "created": created, "merged": merged, "skipped": skipped, "items": results}

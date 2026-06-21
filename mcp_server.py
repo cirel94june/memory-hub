@@ -76,6 +76,7 @@ mcp = FastMCP(
 async def remember(
     content: str,
     room: str = "living_room",
+    category: str = "",
     importance: float = 0.5,
     source_ai: str = "claude",
     event_date: str = "",
@@ -98,13 +99,14 @@ async def remember(
     Args:
         content: 记忆内容
         room: 房间ID
+        category: 分类标签（留空则由系统自动分类。如果你传了，系统不会覆盖）
         importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
         event_date: 事件发生日期（可选，如 2026-06-01，区别于记忆创建时间）
         force_create: 强制新建，跳过自动合并检测。当你确定这条记忆必须独立存在时使用
     """
     result = await memory_ops.remember(
-        content=content, room=room, importance=importance,
+        content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, source_platform="mcp",
         event_date=event_date, force_create=force_create,
     )
@@ -511,3 +513,58 @@ async def extract_from_messages(
     from conversation_capture import extract_from_messages as _extract
     results = await _extract(messages, ai_id, chat_type, quick=True)
     return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_by_tags(
+    tags: list[str],
+    mode: str = "any",
+    room: str = "",
+    limit: int = 20,
+) -> str:
+    """按标签搜索记忆。比 recall 更精确——直接匹配标签字段，不走语义模糊搜索。
+
+    适用场景：
+    - 找所有tag含"母亲"的记忆 → tags=["母亲"]
+    - 找同时有"NPD"和"创伤"标签的 → tags=["NPD", "创伤"], mode="all"
+    - 审计某个房间的标签分布 → room="psychology", tags=["创伤"]
+
+    Args:
+        tags: 要搜索的标签列表（子串匹配，大小写不敏感）
+        mode: "any"=匹配任一标签（默认），"all"=要求全部匹配
+        room: 限定房间（留空=全部）
+        limit: 最多返回条数
+    """
+    results = await memory_ops.search_by_tags(tags=tags, mode=mode, room=room, limit=limit)
+    return json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def batch_remember(
+    memories: list[dict],
+    source_ai: str = "claude",
+) -> str:
+    """批量存储多条记忆，一次调用完成。
+
+    每条记忆支持的字段：
+    - content (必填): 记忆内容
+    - room: 房间ID（默认 living_room）
+    - category: 分类标签
+    - importance: 重要度 0-1
+    - tags: 标签列表
+    - event_date: 事件日期
+    - force_create: 强制新建，跳过合并
+
+    示例：memories=[
+        {"content": "xxx", "room": "psychology", "importance": 0.8},
+        {"content": "yyy", "room": "career", "force_create": true}
+    ]
+
+    Args:
+        memories: 记忆列表，每条是一个dict
+        source_ai: 来源AI
+    """
+    result = await memory_ops.batch_remember(memories=memories, source_ai=source_ai)
+    summary = f"{result['total']}条|新{result['created']}合{result['merged']}跳{result['skipped']}"
+    result["summary"] = summary
+    return json.dumps(result, ensure_ascii=False, indent=2)
