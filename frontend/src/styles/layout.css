@@ -19,7 +19,7 @@
   background: var(--bg-sidebar);
   backdrop-filter: blur(var(--glass-blur));
   -webkit-backdrop-filter: blur(var(--glass-blur));
-  border-right: 1px solid var(--glass-border);
+  border-right: 0.5px solid var(--glass-border);
   flex-shrink: 0;
   overflow-y: auto;
   transition: transform var(--transition-normal);
@@ -34,8 +34,10 @@
 }
 .sidebar-brand h1 {
   font-size: 18px;
-  font-weight: 700;
-  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+  font-weight: 600;
+  font-family: var(--serif);
+  font-style: italic;
+  background: linear-gradient(135deg, var(--accent), var(--primary-dark));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
@@ -48,9 +50,10 @@
   border-radius: var(--radius-md);
   color: var(--text-secondary);
   text-decoration: none;
-  font-size: 14px;
+  font-family: var(--sans);
+  font-size: 13px;
   font-weight: 500;
-  transition: all var(--transition-fast);
+  transition: all 0.22s var(--ease-pop);
   cursor: pointer;
 }
 .nav-item:hover {
@@ -58,12 +61,12 @@
   color: var(--text-primary);
 }
 .nav-item.active {
-  background: var(--primary-light);
-  color: var(--primary-dark);
+  background: var(--accent-a10, rgba(110, 79, 154, 0.10));
+  color: var(--accent);
 }
 [data-theme="dark"] .nav-item.active {
-  background: rgba(var(--primary-h), 40%, 40%, 0.25);
-  color: var(--primary-light);
+  background: var(--accent-a15, rgba(167, 139, 208, 0.15));
+  color: var(--accent);
 }
 .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; }
 

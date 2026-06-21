@@ -1,49 +1,109 @@
 import { createContext, useContext, useState, useEffect, useCallback } from "react";
 
 const ThemeContext = createContext(null);
-
 const STORAGE_KEY = "mh-theme";
+
+function hexToRgba(hex, alpha) {
+  const m = String(hex || "").replace("#", "");
+  if (m.length !== 6) return `rgba(110,79,154,${alpha})`;
+  const r = parseInt(m.slice(0, 2), 16);
+  const g = parseInt(m.slice(2, 4), 16);
+  const b = parseInt(m.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function shiftHex(hex, delta) {
+  const m = String(hex || "").replace("#", "");
+  if (m.length !== 6) return hex;
+  const clamp = (v) => Math.max(0, Math.min(255, v));
+  const r = clamp(parseInt(m.slice(0, 2), 16) + delta);
+  const g = clamp(parseInt(m.slice(2, 4), 16) + delta);
+  const b = clamp(parseInt(m.slice(4, 6), 16) + delta);
+  const h = (n) => n.toString(16).padStart(2, "0");
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
 
 export const PRESETS = {
   moonlight: {
-    name: "月光紫",
-    desc: "温柔薰衣草，夜空下的安宁",
-    primaryH: 260, primaryS: 60, primaryL: 65, glassBlur: 16,
-    preview: { bg: "#f5f0ff", card: "#ece5ff", accent: "#9b7fd4" },
-    previewDark: { bg: "#1a1625", card: "#28234a", accent: "#b49be8" },
+    name: "月光紫", desc: "冷紫 · 略带粉气",
+    accent: "#6e4f9a", rose: "#d291b3", gold: "#d4a85f",
+    bg: "#f4f3f7", paper: "#ffffff", ink: "#1a1922",
   },
   rose: {
-    name: "玫瑰金属",
-    desc: "暖粉蜜色，复古优雅",
-    primaryH: 340, primaryS: 50, primaryL: 62, glassBlur: 14,
-    preview: { bg: "#fff5f5", card: "#ffe8ec", accent: "#c97088" },
-    previewDark: { bg: "#1f1518", card: "#2d1f25", accent: "#d4879a" },
+    name: "玫瑰金属", desc: "浅玫粉 · 玫瑰金",
+    accent: "#5a3a52", rose: "#c98a85", gold: "#b87a6a",
+    bg: "#f4e4e1", paper: "#faeeea", ink: "#3a2530",
   },
   candy: {
-    name: "童话糖纸",
-    desc: "暖橘蜜桃，甜甜的少女心",
-    primaryH: 25, primaryS: 70, primaryL: 60, glassBlur: 12,
-    preview: { bg: "#fff8f0", card: "#fff0e0", accent: "#d4914a" },
-    previewDark: { bg: "#1d1815", card: "#2a2220", accent: "#e0a060" },
+    name: "童话糖纸", desc: "奶油底 · 粉紫 · 天青",
+    accent: "#c7bce6", rose: "#eec9ea", gold: "#b0e8f9",
+    bg: "#fffeec", paper: "#ffffff", ink: "#4e416f",
   },
   misty: {
-    name: "雾蓝纸笺",
-    desc: "静谧蓝灰，信纸般的质感",
-    primaryH: 210, primaryS: 40, primaryL: 58, glassBlur: 18,
-    preview: { bg: "#f0f4f8", card: "#e4eaf0", accent: "#6889a8" },
-    previewDark: { bg: "#151a1f", card: "#1e252d", accent: "#7a9ab8" },
+    name: "雾蓝纸笺", desc: "烟蓝 · 浅紫 · 深蓝",
+    accent: "#8696bc", rose: "#d3bdd4", gold: "#646b9c",
+    bg: "#f4f3f7", paper: "#ffffff", ink: "#3d4a6b",
   },
 };
+
+const DARK_COLORS = {
+  accent: "#a78bd0", rose: "#e0a3c4", gold: "#a78bd0",
+  bg: "#14131c", paper: "#1d1c27", ink: "#ece9f2",
+};
+
+function applyColors(root, c, isDark) {
+  root.style.setProperty("--accent", c.accent);
+  root.style.setProperty("--rose", c.rose);
+  root.style.setProperty("--gold", c.gold);
+
+  // backward compat aliases
+  root.style.setProperty("--primary", c.accent);
+  root.style.setProperty("--primary-light", hexToRgba(c.accent, 0.15));
+  root.style.setProperty("--primary-dark", shiftHex(c.accent, -40));
+
+  // backgrounds
+  root.style.setProperty("--bg-base", c.bg);
+  root.style.setProperty("--bg-card", isDark ? hexToRgba(c.paper, 0.72) : hexToRgba(c.paper, 0.85));
+  root.style.setProperty("--bg-sidebar", isDark ? hexToRgba(c.paper, 0.6) : hexToRgba(c.paper, 0.7));
+  root.style.setProperty("--bg-input", isDark ? hexToRgba(c.paper, 0.5) : hexToRgba(c.paper, 0.8));
+  root.style.setProperty("--bg-hover", isDark ? hexToRgba(c.ink, 0.06) : hexToRgba(c.ink, 0.04));
+
+  // text hierarchy from ink
+  root.style.setProperty("--text-primary", c.ink);
+  root.style.setProperty("--text-secondary", isDark ? shiftHex(c.ink, -60) : shiftHex(c.ink, 80));
+  root.style.setProperty("--text-muted", isDark ? shiftHex(c.ink, -120) : shiftHex(c.ink, 140));
+  root.style.setProperty("--text-on-primary", "#fff");
+
+  // glass
+  root.style.setProperty("--glass-border", isDark
+    ? hexToRgba(c.ink, 0.08) : hexToRgba(c.ink, 0.06));
+  root.style.setProperty("--glass-shadow", isDark
+    ? `0 8px 32px ${hexToRgba("#000", 0.25)}` : `0 2px 8px ${hexToRgba(c.ink, 0.04)}`);
+
+  // accent alpha variants (for glows, highlights)
+  [0.06, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40].forEach((a) => {
+    const suffix = String(Math.round(a * 100)).padStart(2, "0");
+    root.style.setProperty(`--accent-a${suffix}`, hexToRgba(c.accent, a));
+  });
+
+  // rose alpha variants
+  [0.08, 0.12, 0.25, 0.45].forEach((a) => {
+    const suffix = String(Math.round(a * 100)).padStart(2, "0");
+    root.style.setProperty(`--rose-a${suffix}`, hexToRgba(c.rose, a));
+  });
+
+  // meta theme-color
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = c.bg;
+}
 
 const defaultSettings = {
   mode: "light",
   preset: "moonlight",
-  primaryH: 260,
-  primaryS: 60,
-  primaryL: 65,
   glassBlur: 16,
   bgImage: "",
   bgImageOpacity: 0.3,
+  custom: null,
 };
 
 export function ThemeProvider({ children }) {
@@ -58,11 +118,18 @@ export function ThemeProvider({ children }) {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.setAttribute("data-theme", settings.mode);
+    const isDark = settings.mode === "dark";
+    root.setAttribute("data-theme", isDark ? "dark" : "light");
     root.setAttribute("data-preset", settings.preset || "custom");
-    root.style.setProperty("--primary-h", settings.primaryH);
-    root.style.setProperty("--primary-s", settings.primaryS + "%");
-    root.style.setProperty("--primary-l", settings.primaryL + "%");
+
+    const colors = isDark
+      ? DARK_COLORS
+      : settings.preset === "custom" && settings.custom
+        ? settings.custom
+        : (PRESETS[settings.preset] || PRESETS.moonlight);
+
+    applyColors(root, colors, isDark);
+
     root.style.setProperty("--glass-blur", settings.glassBlur + "px");
 
     if (settings.bgImage) {
@@ -76,30 +143,16 @@ export function ThemeProvider({ children }) {
   }, [settings]);
 
   const update = useCallback((patch) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      if ("primaryH" in patch || "primaryS" in patch || "primaryL" in patch || "glassBlur" in patch) {
-        const matchedPreset = Object.entries(PRESETS).find(([, p]) =>
-          p.primaryH === next.primaryH && p.primaryS === next.primaryS &&
-          p.primaryL === next.primaryL && p.glassBlur === next.glassBlur
-        );
-        next.preset = matchedPreset ? matchedPreset[0] : "custom";
-      }
-      return next;
-    });
+    setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
   const applyPreset = useCallback((name) => {
-    const p = PRESETS[name];
-    if (!p) return;
-    setSettings((prev) => ({
-      ...prev,
-      preset: name,
-      primaryH: p.primaryH,
-      primaryS: p.primaryS,
-      primaryL: p.primaryL,
-      glassBlur: p.glassBlur,
-    }));
+    if (!PRESETS[name]) return;
+    setSettings((prev) => ({ ...prev, preset: name }));
+  }, []);
+
+  const applyCustomColors = useCallback((colors) => {
+    setSettings((prev) => ({ ...prev, preset: "custom", custom: colors }));
   }, []);
 
   const toggleMode = useCallback(() => {
@@ -111,7 +164,7 @@ export function ThemeProvider({ children }) {
   }, []);
 
   return (
-    <ThemeContext.Provider value={{ settings, update, toggleMode, resetTheme, applyPreset }}>
+    <ThemeContext.Provider value={{ settings, update, toggleMode, resetTheme, applyPreset, applyCustomColors, DARK_COLORS }}>
       {children}
     </ThemeContext.Provider>
   );
