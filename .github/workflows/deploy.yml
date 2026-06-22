@@ -33,12 +33,19 @@ jobs:
             # 如果 requirements.txt 有变化，重装依赖
             .venv/bin/pip install -q -r requirements.txt
 
-            # 前端构建（如果 frontend/ 目录存在）
+            # 前端构建
             if [ -d "frontend" ] && [ -f "frontend/package.json" ]; then
-              cd frontend
-              npm install --prefer-offline --no-audit --no-fund 2>&1 | tail -3
-              npm run build 2>&1 | tail -5
-              cd ..
+              if command -v node >/dev/null 2>&1; then
+                echo "Node $(node --version), npm $(npm --version)"
+                cd frontend
+                npm install --prefer-offline --no-audit --no-fund
+                npm run build
+                cd ..
+                echo "Frontend build done"
+              else
+                echo "WARNING: Node.js not installed, skipping frontend build"
+                echo "Install with: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs"
+              fi
             fi
 
             find /opt/memory-hub -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
