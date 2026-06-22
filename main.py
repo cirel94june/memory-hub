@@ -800,6 +800,8 @@ async def api_memory_detail(memory_id: str, authorization: str = Header(default=
 @app.get("/api/memory/timeline")
 async def api_memory_timeline(
     days: int = Query(default=90, le=365),
+    room: str = Query(default=None),
+    source_ai: str = Query(default=None),
     authorization: str = Header(default=""),
 ):
     """按日期分组的记忆摘要 + 每日计数/热度"""
@@ -815,28 +817,80 @@ async def api_memory_timeline(
         created = m.get("created_at", "")[:10]
         if not created or created < cutoff:
             continue
+        if room and m.get("room") != room:
+            continue
+        if source_ai and m.get("source_ai") != source_ai:
+            continue
         if created not in by_date:
             by_date[created] = []
         by_date[created].append({
             "id": m["id"],
-            "content": m["content"][:80],
+            "content": m["content"][:120],
             "room": m.get("room", ""),
             "importance": float(m.get("importance") or 0.5),
             "source_ai": m.get("source_ai", ""),
+            "created_at": m.get("created_at", ""),
+            "tags": m.get("tags", []),
+            "emotion_valence": float(m.get("emotion_valence") or 0.5),
         })
 
     timeline = []
     for date_str in sorted(by_date.keys(), reverse=True):
         items = by_date[date_str]
         avg_importance = sum(x["importance"] for x in items) / len(items) if items else 0
+        rooms = {}
+        for x in items:
+            r = x["room"]
+            rooms[r] = rooms.get(r, 0) + 1
         timeline.append({
             "date": date_str,
             "count": len(items),
             "heat": round(min(1.0, len(items) / 10.0 + avg_importance * 0.3), 2),
-            "memories": items[:6],
+            "rooms": rooms,
+            "memories": sorted(items, key=lambda x: x["created_at"]),
         })
 
     return {"timeline": timeline, "total_days": len(timeline), "date_range": days}
+
+
+@app.get("/api/memory/by-date")
+async def api_memory_by_date(
+    date: str = Query(...),
+    authorization: str = Header(default=""),
+):
+    """获取某一天的全部记忆（完整内容）"""
+    verify_secret(authorization)
+    import database as db
+
+    all_mems = db.query_memories(status="active", order_by="created_at ASC")
+    items = []
+    for m in all_mems:
+        created = m.get("created_at", "")[:10]
+        if created == date:
+            items.append(m)
+    return {"date": date, "items": items, "count": len(items)}
+
+
+@app.get("/api/memory/calendar")
+async def api_memory_calendar(
+    months: int = Query(default=6, le=12),
+    authorization: str = Header(default=""),
+):
+    """日历热图数据：每天记忆条数"""
+    verify_secret(authorization)
+    import database as db
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=months * 31)).isoformat()[:10]
+    all_mems = db.query_memories(status="active", order_by="created_at DESC")
+
+    counts = {}
+    for m in all_mems:
+        created = m.get("created_at", "")[:10]
+        if not created or created < cutoff:
+            continue
+        counts[created] = counts.get(created, 0) + 1
+    return {"counts": counts, "months": months}
 
 
 @app.get("/api/memory/graph")
