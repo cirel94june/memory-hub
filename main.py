@@ -823,6 +823,15 @@ async def api_memory_timeline(
             continue
         if created not in by_date:
             by_date[created] = []
+        raw_tags = m.get("tags", [])
+        if isinstance(raw_tags, str):
+            try:
+                import json as _json
+                raw_tags = _json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+        if not isinstance(raw_tags, list):
+            raw_tags = []
         by_date[created].append({
             "id": m["id"],
             "content": m["content"][:120],
@@ -830,7 +839,7 @@ async def api_memory_timeline(
             "importance": float(m.get("importance") or 0.5),
             "source_ai": m.get("source_ai", ""),
             "created_at": m.get("created_at", ""),
-            "tags": m.get("tags", []),
+            "tags": raw_tags,
             "emotion_valence": float(m.get("emotion_valence") or 0.5),
         })
 

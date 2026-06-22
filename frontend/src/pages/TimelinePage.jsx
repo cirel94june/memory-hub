@@ -216,10 +216,10 @@ function DayCard({ day, isExpanded, onToggle, onSelectMemory, isToday }) {
                     strong: ({ children }) => <strong style={{ color: "var(--primary-dark)" }}>{children}</strong>,
                   }}>{m.content}</Markdown>
                 </div>
-                {m.tags && m.tags.length > 0 && (
+                {Array.isArray(m.tags) && m.tags.length > 0 && (
                   <div style={{ display: "flex", gap: 4, marginTop: 3, flexWrap: "wrap" }}>
-                    {m.tags.slice(0, 3).map((t) => (
-                      <span key={t} className="chip" style={{ fontSize: 9, padding: "0 4px" }}>{t}</span>
+                    {m.tags.slice(0, 3).map((t, i) => (
+                      <span key={i} className="chip" style={{ fontSize: 9, padding: "0 4px" }}>{t}</span>
                     ))}
                   </div>
                 )}
@@ -276,6 +276,7 @@ const AI_FILTER_LABELS = { "": "全部", ...AI_LABELS };
 export default function TimelinePage() {
   const [timeline, setTimeline] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [expanded, setExpanded] = useState(new Set());
   const [detailId, setDetailId] = useState(null);
   const [days, setDays] = useState(90);
@@ -287,18 +288,22 @@ export default function TimelinePage() {
 
   const load = () => {
     setLoading(true);
+    setError(null);
     const params = new URLSearchParams({ days });
     if (roomFilter) params.set("room", roomFilter);
     if (aiFilter) params.set("source_ai", aiFilter);
     fetch(`/api/memory/timeline?${params}`, { headers: authHeaders })
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`API ${r.status}`);
+        return r.json();
+      })
       .then((d) => {
         setTimeline(d.timeline || []);
         if (d.timeline && d.timeline.length > 0) {
           setExpanded(new Set([d.timeline[0].date]));
         }
       })
-      .catch(() => {})
+      .catch((e) => setError(e.message || "加载失败"))
       .finally(() => setLoading(false));
   };
 
@@ -431,6 +436,19 @@ export default function TimelinePage() {
       {loading && (
         <div style={{ textAlign: "center", padding: "var(--space-xl)", color: "var(--text-muted)" }}>
           <div style={{ animation: "pulse 1.5s ease infinite" }}>加载时间线...</div>
+        </div>
+      )}
+
+      {/* Error */}
+      {error && (
+        <div className="glass" style={{
+          padding: "var(--space-md)", marginBottom: "var(--space-md)",
+          color: "var(--text-primary)", fontSize: 13,
+          borderLeft: "3px solid #d4756a",
+        }}>
+          加载出错：{error}
+          <button className="btn btn-ghost" onClick={load}
+            style={{ marginLeft: 12, fontSize: 12 }}>重试</button>
         </div>
       )}
 
