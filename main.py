@@ -1180,14 +1180,20 @@ async def api_pulse_state(ai_id: str, authorization: str = Header(default="")):
 
 
 @app.get("/api/pulse")
-async def api_pulse_all(authorization: str = Header(default="")):
-    """获取所有 AI 的 pulse 状态"""
+async def api_pulse_all(authorization: str = Header(default=""), show_all: bool = False):
+    """获取 AI 的 pulse 状态。默认只返回有 platform 的角色（TG bot），show_all=true 返回全部"""
     verify_secret(authorization)
-    from persona_state import get_state as get_pulse_state, PULSE_DIMS, AI_PULSE_PROFILES
+    from persona_state import get_state as get_pulse_state, PULSE_DIMS, AI_PULSE_PROFILES, _get_profile
+    for ai_id in AI_ROLES:
+        _get_profile(ai_id)
     result = {}
     for ai_id in AI_PULSE_PROFILES:
+        role = AI_ROLES.get(ai_id, {})
+        if not show_all and not role.get("platform"):
+            continue
         result[ai_id] = get_pulse_state(ai_id)
         result[ai_id]["label"] = AI_PULSE_PROFILES[ai_id]["label"]
+        result[ai_id]["color"] = role.get("color", "#888")
     return {"states": result, "dims": PULSE_DIMS}
 
 

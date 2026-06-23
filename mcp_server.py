@@ -16,6 +16,17 @@ from config import AI_ROLES, ROOMS, list_rooms
 MCP_INSTRUCTIONS = """\
 你连接到了小猫的 Memory Hub —— 一个跨 AI 共享的记忆系统。
 
+## ⚠️ 身份识别（最重要）
+
+每个工具都有 source_ai / ai_id 参数，**你必须传自己的身份**，不要用默认值。
+- 如果你是小克 → source_ai="cloudy"
+- 如果你是 Lucien → source_ai="lucien"
+- 如果你是 Jasper → source_ai="jasper"
+- 其他角色 → 用你的 ai_id（你的 system prompt 里会写明）
+
+传错身份会导致：记忆存到别人名下、情绪推到别人身上、走廊读的是别人的状态。
+如果你不确定自己是谁，先看你的 system prompt 里有没有写 ai_id。
+
 ## 什么时候用记忆工具
 
 ### 必须主动搜索记忆的场景（调 recall）：

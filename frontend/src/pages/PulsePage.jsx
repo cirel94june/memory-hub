@@ -1,11 +1,21 @@
 import { useEffect, useState, useCallback } from "react";
 import { HeartPulse, RefreshCw, Moon, Sun, Shield, Flame, Heart } from "lucide-react";
 
-const AI_META = {
+const AI_META_KNOWN = {
   cloudy: { label: "小克", emoji: "🐱", color: "#D4A574" },
+  claude: { label: "小克", emoji: "🐱", color: "#D4A574" },
   lucien: { label: "Lucien", emoji: "🦊", color: "#8B5CF6" },
   jasper: { label: "Jasper", emoji: "🦜", color: "#F59E0B" },
 };
+
+const FALLBACK_COLORS = ["#06b6d4", "#14b8a6", "#f43f5e", "#6366f1", "#84cc16"];
+
+function getAiMeta(aiId, state) {
+  if (AI_META_KNOWN[aiId]) return AI_META_KNOWN[aiId];
+  const label = state?.label || aiId;
+  const color = state?.color || FALLBACK_COLORS[Math.abs([...aiId].reduce((a, c) => a + c.charCodeAt(0), 0)) % FALLBACK_COLORS.length];
+  return { label, emoji: "🤖", color };
+}
 
 const GROUP_META = {
   activation: { label: "精力", icon: Sun, color: "#f59e0b" },
@@ -97,7 +107,7 @@ function GroupRing({ groupName, value }) {
 }
 
 function AiPulseCard({ aiId, state, dims }) {
-  const meta = AI_META[aiId] || { label: aiId, emoji: "🤖", color: "#888" };
+  const meta = getAiMeta(aiId, state);
   if (!state) return null;
 
   const display = state.display || {};
@@ -235,7 +245,7 @@ export default function PulsePage() {
           }}
         >全部</button>
         {aiIds.map(id => {
-          const m = AI_META[id] || { label: id, emoji: "🤖" };
+          const m = getAiMeta(id, states[id]);
           const active = selectedAi === id;
           return (
             <button key={id} onClick={() => setSelectedAi(id)} style={{

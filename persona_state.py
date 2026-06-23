@@ -69,6 +69,15 @@ AI_PULSE_PROFILES = {
 
 DEFAULT_PROFILE_KEY = "cloudy"
 
+def _make_default_profile(label: str) -> dict:
+    """为没有专属 profile 的新角色生成默认配置"""
+    base = AI_PULSE_PROFILES[DEFAULT_PROFILE_KEY]
+    return {
+        "label": label,
+        "defaults": dict(base["defaults"]),
+        "phase": dict(base["phase"]),
+    }
+
 # ── 全局参数 ──
 CAP = 0.08
 HALF_LIFE_HOURS = 3.0
@@ -83,7 +92,16 @@ _lock = threading.Lock()
 
 
 def _get_profile(ai_id: str) -> dict:
-    return AI_PULSE_PROFILES.get(ai_id, AI_PULSE_PROFILES[DEFAULT_PROFILE_KEY])
+    if ai_id in AI_PULSE_PROFILES:
+        return AI_PULSE_PROFILES[ai_id]
+    try:
+        from config import AI_ROLES
+        name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
+    except Exception:
+        name = ai_id
+    profile = _make_default_profile(name)
+    AI_PULSE_PROFILES[ai_id] = profile
+    return profile
 
 
 def _neutral_for(dim: str) -> float:
