@@ -25,10 +25,29 @@ export function AIProvider({ children }) {
 
   useEffect(() => { load(); }, [load]);
 
+  const [aliases, setAliases] = useState({});
+
+  const loadAliases = useCallback(() => {
+    const secret = localStorage.getItem("mh-secret") || "";
+    fetch("/api/ai-aliases", { headers: { Authorization: `Bearer ${secret}` } })
+      .then((r) => r.json())
+      .then((d) => { if (d.aliases) setAliases(d.aliases); })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { loadAliases(); }, [loadAliases]);
+
   const getAI = useCallback((id) => {
     if (!id) return null;
-    return profiles.find((p) => p.ai_id === id) || { ai_id: id, name: id, emoji: "🤖", color: "#888" };
-  }, [profiles]);
+    const direct = profiles.find((p) => p.ai_id === id);
+    if (direct) return direct;
+    const canonical = aliases[id];
+    if (canonical) {
+      const aliased = profiles.find((p) => p.ai_id === canonical);
+      if (aliased) return aliased;
+    }
+    return { ai_id: id, name: id, emoji: "🤖", color: "#888" };
+  }, [profiles, aliases]);
 
   const aiLabel = useCallback((id) => {
     const p = getAI(id);

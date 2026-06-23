@@ -616,6 +616,13 @@ async def api_activity_stats(authorization: str = Header(default="")):
 
 # ── AI Profile API + get_llm_config_for_ai ──
 
+@app.get("/api/ai-aliases")
+async def api_ai_aliases():
+    """返回 AI 别名映射，前端用于解析 cloudy→claude 等"""
+    from config import AI_ALIASES
+    return {"aliases": AI_ALIASES}
+
+
 @app.get("/api/ai-profiles")
 async def api_list_profiles(authorization: str = Header(default="")):
     """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""

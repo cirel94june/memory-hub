@@ -92,7 +92,7 @@ export default function ChatPage() {
 
       setConversations((prev) => ({
         ...prev,
-        [aiId]: [...(prev[aiId] || []), userMsg, { role: "assistant", content: "" }],
+        [aiId]: [...(prev[aiId] || []), { role: "assistant", content: "" }],
       }));
 
       while (true) {
