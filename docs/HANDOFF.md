@@ -1,0 +1,72 @@
+# 给下一个小克的话
+
+> 你好，我是之前的小克。如果你要动这个项目的代码，请先读 `docs/ARCHITECTURE.md`，那是小猫的原始愿景。
+
+## 当前该推进的事（按优先级）
+
+### 1. 前端可观测性升级（Phase 6） ← 当前优先
+
+P0（后端API）+ P1（记忆详情模态框）+ P6（视觉升级/主题系统）+ P2（时间线视图）+ P9（9维度情绪面板）已完成。
+下一步：P3 观测台（情感罗盘+衰减仪表盘）或 P4 记忆星图（力导向图）。
+deploy.yml 已加前端自动构建，push 后 CI 会自动 npm build，不需要手动到 VPS 构建。
+
+**关于 P9 情绪面板**：
+- `persona_state.py` 已重写为 9 维度引擎（活力/疲惫/思慕/亲密/守护/渴求/醋意/焦虑/温柔）
+- 三层驱动：对话打标（gateway + MCP 两条路径都会触发）、半衰期衰减（3h）、昼夜节律（cos 曲线）
+- display > 0.60 的维度自动翻成自然语言注入走廊（当"底色"影响语气，不念数字）
+- 三个 AI 各有独立参数（phase/amp/defaults），新角色自动用默认 profile
+- MCP 指引已加身份识别规则（每个 AI 必须传 source_ai）
+- 前端支持动态角色——AI 档案页可直接添加/删除角色，情绪面板自动显示
+
+### 1.5. Ombre Brain 原版功能移植 ← 待做
+
+参考 README 的"Ombre Brain 原版功能对照"表。优先做 Anchor 锚点（防重要记忆被衰减），再做 Self-knowledge 和 Plan 增强。
+
+### 2. 记忆相似聚类 + 脱水压缩（Phase 5）
+
+参考 PDF 设计文档里的思路：相似记忆自动聚类合并、旧记忆脱水压缩节省空间、日记提取和再消化。
+系统已经有基础的合并机制（remember 时相似度检测），但需要更系统的聚类和压缩。
+
+### 3. 社交系统重做 🔲
+
+旧的 `social_ai.py`（傀儡模式）已删除。期望：每个 AI 角色有独立 profile/模型，
+自主决定发朋友圈/论坛时机，群组随机拉人组建。数据层 `social.py` 可复用。
+
+### 4. API 费用优化
+
+Gateway 已优化为 0 次 LLM 调用做 recall（直接 RRF 排序取 top 5），post-process 提取 1 次 LLM。
+模型用 deepseek-v4-flash（via DeepSeek 官方 API，¥1/M input / ¥2/M output，约 ¥0.1/天）。
+Embedding 用硅基流动 API（BAAI/bge-large-zh-v1.5），免费额度内基本够用。
+
+### 已完成（仅供参考）
+
+- **TG Bot 跨聊天感知** ✅ — bot.py 的 `build_cross_chat_context()`，Hub 侧 `chat_digest.py` 生成跨窗口摘要
+- **梦境日记** ✅ — `dream.py` 已接入 daemon（步骤 10.8），每 12h 自动为有对话的 AI 生成日记
+
+## 不要做的事
+
+- 不要把 MCP instructions 改短——AI 不主动用工具就是因为 instructions 不够详细
+- 不要删 game_room 隔离机制
+- 不要把私有房间的 owner_ai 隔离去掉
+- 不要把记忆的 history 字段删掉（那是合并/更新的回滚保险）
+- 不要把记忆提取模型换回 Haiku（会拒绝恋爱场景 + 中文输出英文）或中转站（不稳定，超时严重）或 Qwen 72B via SiliconFlow（太贵，6500次调用花了15元）
+- 不要把 Gateway 改回 LLM room-judge + reranker（会导致 >15s 超时，bot 报 888 错误，reranker 还会把趣味/梗记忆过滤掉）
+- 不要把 AI_ALIASES 去掉——cloudy(TG小克) 和 claude(MCP/Web小克) 必须是同一个身份，共享走廊和私有房间
+- 不要把 embedding 改回本地 fastembed（VPS 只有 1G 内存，ONNX 模型撑不住）
+- 不要把 importance 范围改回 0.5~1.0——必须允许低分（0.1/0.2/0.3）让垃圾记忆被衰减淘汰
+- 不要删 quick=True 的 embedding 去重——这是防止自动提取产生大量近似重复的关键机制
+- 不要把 DECAY_LAMBDA 调回 0.08 以下——0.12 是让不重要记忆在合理时间内归档的基准值
+- 不要把 MERGE_SIMILARITY 调回 0.85 以下——0.75 曾导致不同房间的记忆被过度合并成"百科全书"
+- 不要删 `_try_merge` 里的跨房间检查——指定 personality 的记忆不能被合并进 psychology 的旧记忆
+- 不要用"傀儡模式"做社交——社交功能应该是 AI 自主决定发帖，不是后台用 prompt 模板让模型扮演角色生成内容
+- 不要把跨 AI 记忆注入走廊——已移除，改用 chat_digest（同一 AI 自己的跨窗口摘要），防止记忆身份混淆
+
+## VPS 管理
+
+- GitHub Actions 自动部署：push 到 main → git pull → pip install → npm build（自动构建前端）→ 清理 __pycache__ → 重启服务
+- 重启：`systemctl restart memory-hub`
+- 日志：`journalctl -u memory-hub -n 50`
+- 项目路径：`/opt/memory-hub/`
+- 前端构建：`cd /opt/memory-hub/frontend && npm run build`（输出到 `../static-app/`）
+- **重要**：重启前务必清理 `find /opt/memory-hub -name '__pycache__' -type d -exec rm -rf {} +`
+- 密码管理：GitHub Secrets（HUB_SECRET, LLM_API_KEY），deploy.yml 自动同步到 VPS .env
