@@ -1,11 +1,8 @@
 import { useState, useEffect } from "react";
-import { Save, Wifi, RefreshCw, FlaskConical, Bot, Key, Globe, Database } from "lucide-react";
+import { Save, Wifi, RefreshCw, FlaskConical, Bot, Key, Database } from "lucide-react";
 
 export default function SettingsPage() {
   const [secret, setSecret] = useState(() => localStorage.getItem("mh-secret") || "");
-  const [targetUrl, setTargetUrl] = useState(() => localStorage.getItem("mh-target-url") || "");
-  const [targetKey, setTargetKey] = useState(() => localStorage.getItem("mh-target-key") || "");
-  const [aiId, setAiId] = useState(() => localStorage.getItem("mh-ai-id") || "cloudy");
   const [saved, setSaved] = useState(false);
   const [llm, setLlm] = useState(null);
   const [llmModel, setLlmModel] = useState("");
@@ -26,9 +23,6 @@ export default function SettingsPage() {
 
   const save = () => {
     localStorage.setItem("mh-secret", secret);
-    localStorage.setItem("mh-target-url", targetUrl);
-    localStorage.setItem("mh-target-key", targetKey);
-    localStorage.setItem("mh-ai-id", aiId);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
@@ -96,21 +90,15 @@ export default function SettingsPage() {
             <Wifi size={14} /> 测试连接
           </button>
         </div>
-      </Section>
-
-      <Section icon={<Globe size={16} />} title="中转站配置（对话用）">
-        <Field label="中转站 URL" value={targetUrl} onChange={setTargetUrl} placeholder="https://relay-cache.sharkielab.com/v1" />
-        <Field label="中转站 API Key" value={targetKey} onChange={setTargetKey} type="password" placeholder="sk-..." />
-        <Field label="AI 身份" value={aiId} onChange={setAiId} placeholder="cloudy" />
-        <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
-          对话页用这些配置通过代理调用中转站。AI 身份决定谁的走廊和记忆被注入。
+        <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: "var(--space-sm)" }}>
+          对话页会自动使用每个 AI 在档案页配置的模型和中转站。去 <a href="/app/ai-profiles" style={{ color: "var(--primary)" }}>AI 档案</a> 配置。
         </p>
-        <button className="btn btn-primary" onClick={save} style={{ marginTop: "var(--space-sm)" }}>
-          <Save size={14} /> {saved ? "✅ 已保存" : "保存"}
-        </button>
       </Section>
 
       <Section icon={<Bot size={16} />} title="小模型（提取 / 分析）">
+        <p style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: "var(--space-sm)" }}>
+          用于记忆提取、打标、合并分析的后台模型，在 VPS .env 中配置。
+        </p>
         {llm ? (
           <>
             <InfoRow label="当前模型" value={llm.model} />
@@ -148,6 +136,9 @@ export default function SettingsPage() {
       </Section>
 
       <Section icon={<Database size={16} />} title="Embedding 模型">
+        <p style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: "var(--space-sm)" }}>
+          用于记忆向量搜索，在 VPS .env 中配置。
+        </p>
         {embInfo ? (
           <>
             <InfoRow label="模型" value={embInfo.model} />

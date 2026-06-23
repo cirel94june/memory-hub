@@ -1,14 +1,6 @@
 import { useEffect, useState } from "react";
 import { MessageSquare, Plus, Send, ThumbsUp, Sparkles } from "lucide-react";
-
-
-const AI_DISPLAY = {
-  user: { label: "小猫", emoji: "🐱" },
-  cloudy: { label: "小克", emoji: "🐱" },
-  claude: { label: "小克", emoji: "🐺" },
-  lucien: { label: "Lucien", emoji: "🦊" },
-  jasper: { label: "Jasper", emoji: "🦜" },
-};
+import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -20,6 +12,7 @@ function timeAgo(iso) {
 }
 
 export default function ForumPage() {
+  const { profiles, getAI } = useAI();
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCompose, setShowCompose] = useState(false);
@@ -116,8 +109,8 @@ export default function ForumPage() {
               boxShadow: "var(--shadow-lg)", overflow: "hidden", zIndex: 10,
               border: "1px solid var(--border-subtle)",
             }}>
-              {[["cloudy", "🐱 小克"], ["lucien", "🦊 Lucien"], ["jasper", "🦜 Jasper"]].map(([id, label]) => (
-                <button key={id} onClick={() => { aiPost(id); document.getElementById("ai-forum-menu").style.display = "none"; }}
+              {profiles.map((p) => (
+                <button key={p.ai_id} onClick={() => { aiPost(p.ai_id); document.getElementById("ai-forum-menu").style.display = "none"; }}
                   style={{
                     display: "block", width: "100%", padding: "8px 16px", border: "none",
                     background: "none", cursor: "pointer", fontSize: 13, textAlign: "left",
@@ -125,7 +118,7 @@ export default function ForumPage() {
                   }}
                   onMouseEnter={(e) => e.target.style.background = "var(--bg-hover)"}
                   onMouseLeave={(e) => e.target.style.background = "none"}>
-                  {label}
+                  {p.emoji} {p.name}
                 </button>
               ))}
             </div>
@@ -168,7 +161,7 @@ export default function ForumPage() {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-md)" }}>
           {posts.map((p) => {
-            const d = AI_DISPLAY[p.ai_id] || { label: p.ai_id, emoji: "🤖" };
+            const d = getAI(p.ai_id);
             const isExpanded = expandedPost === p.id;
             const liked = (p.likes || []).includes("user");
             return (
@@ -176,7 +169,7 @@ export default function ForumPage() {
                 {/* Header */}
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-sm)", marginBottom: "var(--space-xs)" }}>
                   <span style={{ fontSize: 20 }}>{d.emoji}</span>
-                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{d.label} · {timeAgo(p.created_at)}</span>
+                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{d.name} · {timeAgo(p.created_at)}</span>
                 </div>
 
                 {/* Title & Content */}
@@ -231,7 +224,7 @@ export default function ForumPage() {
                     background: "var(--bg-hover)", borderRadius: "var(--radius-sm)",
                   }}>
                     {p.comments?.length > 0 ? p.comments.map((c) => {
-                      const cd = AI_DISPLAY[c.ai_id] || { label: c.ai_id, emoji: "🤖" };
+                      const cd = getAI(c.ai_id);
                       return (
                         <div key={c.id} style={{
                           padding: "var(--space-sm)", marginBottom: "var(--space-xs)",
@@ -239,7 +232,7 @@ export default function ForumPage() {
                         }}>
                           <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
                             <span style={{ fontSize: 14 }}>{cd.emoji}</span>
-                            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-primary)" }}>{cd.label}</span>
+                            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-primary)" }}>{cd.name}</span>
                             <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{timeAgo(c.created_at)}</span>
                           </div>
                           <div style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-secondary)", whiteSpace: "pre-wrap" }}>

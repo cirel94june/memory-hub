@@ -3,6 +3,7 @@ import { useSearchParams, useNavigate } from "react-router-dom";
 import { Search, Trash2, Calendar, ChevronLeft, ChevronRight, ArrowLeft, User } from "lucide-react";
 import Markdown from "react-markdown";
 import MemoryDetailModal from "../components/MemoryDetailModal";
+import { useAI } from "../contexts/AIContext";
 
 const ROOMS = ["", "psychology", "personality", "health", "career", "relationships", "relationship",
   "game_room", "living_room", "preferences", "infra", "infra_changelog", "diary", "work_tasks", "social"];
@@ -10,9 +11,6 @@ const ROOM_LABELS = { "": "全部", psychology: "心理", personality: "性格",
   career: "职业", relationships: "关系", relationship: "亲密", game_room: "游戏室",
   living_room: "客厅", preferences: "偏好", infra: "基建", infra_changelog: "更新日志",
   diary: "日记", work_tasks: "工作", social: "社交" };
-
-const AI_LABELS = { claude: "小克", lucien: "Lucien", jasper: "Jasper", import: "导入" };
-const AI_EMOJI = { claude: "🐱", lucien: "🦊", jasper: "🦜", import: "📥" };
 
 const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
 
@@ -117,6 +115,7 @@ function CalendarHeatmap({ onSelectDay }) {
 }
 
 function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
+  const { getAI } = useAI();
   const [aiStats, setAiStats] = useState(null);
 
   useEffect(() => {
@@ -126,8 +125,9 @@ function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
       .catch(() => {});
   }, [aiId]);
 
-  const label = AI_LABELS[aiId] || aiId;
-  const emoji = AI_EMOJI[aiId] || "🤖";
+  const ai = getAI(aiId);
+  const label = ai.name;
+  const emoji = ai.emoji;
   const maxCount = aiStats ? Math.max(1, ...aiStats.rooms.map((r) => r.count)) : 1;
 
   return (
@@ -180,6 +180,7 @@ function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
 }
 
 export default function MemoriesPage() {
+  const { getAI } = useAI();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const aiFilter = searchParams.get("ai") || "";
@@ -277,7 +278,8 @@ export default function MemoriesPage() {
 
   const displayMemories = dayFilter !== null ? (dayMemories || []) : memories;
   const displayLabel = dayFilter ? `${dayFilter} 的记忆` : null;
-  const aiLabel = AI_LABELS[aiFilter] || aiFilter;
+  const aiInfo = getAI(aiFilter);
+  const aiLabel = aiInfo?.name || aiFilter;
 
   const renderCard = (m) => (
     <div key={m.id} className="glass" style={{ padding: "var(--space-md)", cursor: "pointer" }}
@@ -294,7 +296,7 @@ export default function MemoriesPage() {
                 fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-sm)",
                 background: "var(--bg-hover)", color: "var(--text-secondary)", cursor: "pointer",
               }} onClick={(e) => { e.stopPropagation(); navigate(`/memories?ai=${encodeURIComponent(m.source_ai)}`); }}>
-                {AI_EMOJI[m.source_ai] || "🤖"} {m.source_ai}
+                {getAI(m.source_ai).emoji} {getAI(m.source_ai).name}
               </span>
             )}
             {m.importance >= 0.8 && <span style={{ fontSize: 11 }}>⭐</span>}
@@ -344,7 +346,7 @@ export default function MemoriesPage() {
           )}
           <h2 style={{ fontSize: 20, fontWeight: 700 }}>
             {aiFilter ? (
-              <>{AI_EMOJI[aiFilter] || "🤖"} {aiLabel} · {ROOM_LABELS[room] || room}</>
+              <>{aiInfo?.emoji || "🤖"} {aiLabel} · {ROOM_LABELS[room] || room}</>
             ) : (
               <>记忆库</>
             )}

@@ -1,72 +1,76 @@
 import { useState, useRef, useEffect } from "react";
 import { Send, Loader2, ChevronDown } from "lucide-react";
-
-const AI_LIST = [
-  { id: "cloudy", label: "小克", emoji: "🐱", greeting: "喵~ 小猫来了吗？想聊什么？", color: "var(--primary)" },
-  { id: "lucien", label: "Lucien", emoji: "🦊", greeting: "你来了。今天想聊点什么？", color: "hsl(30, 60%, 55%)" },
-  { id: "jasper", label: "Jasper", emoji: "🦜", greeting: "哟，又来了。说吧，什么事。", color: "hsl(160, 50%, 45%)" },
-];
+import { useAI } from "../contexts/AIContext";
 
 export default function ChatPage() {
-  const [currentAi, setCurrentAi] = useState(() => {
-    const saved = localStorage.getItem("mh-chat-ai");
-    return AI_LIST.find((a) => a.id === saved) || AI_LIST[0];
-  });
-  const [conversations, setConversations] = useState(() => {
-    const init = {};
-    AI_LIST.forEach((ai) => {
-      init[ai.id] = [{ role: "assistant", content: ai.greeting }];
-    });
-    return init;
-  });
+  const { profiles } = useAI();
+  const [currentId, setCurrentId] = useState(() => localStorage.getItem("mh-chat-ai") || "");
+  const [conversations, setConversations] = useState({});
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
 
-  const messages = conversations[currentAi.id] || [];
+  const currentAi = profiles.find((p) => p.ai_id === currentId) || profiles[0];
+  const aiId = currentAi?.ai_id;
+
+  useEffect(() => {
+    if (!currentId && profiles.length) {
+      setCurrentId(profiles[0].ai_id);
+    }
+  }, [profiles, currentId]);
+
+  useEffect(() => {
+    if (aiId && !conversations[aiId]) {
+      const greeting = currentAi.greeting || `你好，我是${currentAi.name}`;
+      setConversations((prev) => ({
+        ...prev,
+        [aiId]: [{ role: "assistant", content: greeting }],
+      }));
+    }
+  }, [aiId]);
+
+  const messages = conversations[aiId] || [];
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const switchAi = (ai) => {
-    setCurrentAi(ai);
-    localStorage.setItem("mh-chat-ai", ai.id);
-    localStorage.setItem("mh-ai-id", ai.id);
+  const switchAi = (p) => {
+    setCurrentId(p.ai_id);
+    localStorage.setItem("mh-chat-ai", p.ai_id);
+    localStorage.setItem("mh-ai-id", p.ai_id);
     setShowPicker(false);
+    if (!conversations[p.ai_id]) {
+      const greeting = p.greeting || `你好，我是${p.name}`;
+      setConversations((prev) => ({
+        ...prev,
+        [p.ai_id]: [{ role: "assistant", content: greeting }],
+      }));
+    }
     setTimeout(() => inputRef.current?.focus(), 100);
   };
 
   const send = async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    if (!text || loading || !aiId) return;
     setInput("");
     const userMsg = { role: "user", content: text };
     setConversations((prev) => ({
       ...prev,
-      [currentAi.id]: [...(prev[currentAi.id] || []), userMsg],
+      [aiId]: [...(prev[aiId] || []), userMsg],
     }));
     setLoading(true);
 
     try {
       const secret = localStorage.getItem("mh-secret") || "";
-      const targetUrl = localStorage.getItem("mh-target-url") || "";
-      const targetKey = localStorage.getItem("mh-target-key") || "";
+      const headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + secret + ":" + aiId,
+      };
 
-      const headers = { "Content-Type": "application/json" };
-
-      if (targetUrl && targetKey) {
-        headers["X-Hub-Secret"] = secret;
-        headers["X-Hub-Target-URL"] = targetUrl;
-        headers["X-Hub-Target-Key"] = targetKey;
-        headers["X-Hub-AI-ID"] = currentAi.id;
-      } else {
-        headers["Authorization"] = "Bearer " + secret + ":" + currentAi.id;
-      }
-
-      const allMsgs = [...(conversations[currentAi.id] || []), userMsg];
+      const allMsgs = [...(conversations[aiId] || []), userMsg];
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
         headers,
@@ -88,7 +92,7 @@ export default function ChatPage() {
 
       setConversations((prev) => ({
         ...prev,
-        [currentAi.id]: [...(prev[currentAi.id] || []), userMsg, { role: "assistant", content: "" }],
+        [aiId]: [...(prev[aiId] || []), userMsg, { role: "assistant", content: "" }],
       }));
 
       while (true) {
@@ -105,9 +109,9 @@ export default function ChatPage() {
             assistantContent += delta;
             const finalContent = assistantContent;
             setConversations((prev) => {
-              const msgs = [...(prev[currentAi.id] || [])];
+              const msgs = [...(prev[aiId] || [])];
               msgs[msgs.length - 1] = { role: "assistant", content: finalContent };
-              return { ...prev, [currentAi.id]: msgs };
+              return { ...prev, [aiId]: msgs };
             });
           } catch {}
         }
@@ -115,15 +119,17 @@ export default function ChatPage() {
     } catch (err) {
       setConversations((prev) => ({
         ...prev,
-        [currentAi.id]: [
-          ...(prev[currentAi.id] || []),
-          { role: "assistant", content: "⚠️ " + err.message + "\n\n请先去设置页填写中转站 URL 和 API Key。" },
+        [aiId]: [
+          ...(prev[aiId] || []),
+          { role: "assistant", content: "⚠️ " + err.message + "\n\n请去 AI 档案页配置模型和 API Key。" },
         ],
       }));
     }
     setLoading(false);
     inputRef.current?.focus();
   };
+
+  if (!currentAi) return null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", maxWidth: 720, margin: "0 auto" }}>
@@ -140,7 +146,7 @@ export default function ChatPage() {
           color: "var(--text-primary)", transition: "var(--transition-fast)",
         }}>
           <span style={{ fontSize: 22 }}>{currentAi.emoji}</span>
-          <span>{currentAi.label}</span>
+          <span>{currentAi.name}</span>
           <ChevronDown size={16} style={{
             color: "var(--text-muted)",
             transform: showPicker ? "rotate(180deg)" : "none",
@@ -155,25 +161,27 @@ export default function ChatPage() {
             boxShadow: "var(--shadow-lg)", border: "1px solid var(--border-subtle)",
             overflow: "hidden", minWidth: 200,
           }}>
-            {AI_LIST.map((ai) => (
-              <button key={ai.id} onClick={() => switchAi(ai)} style={{
+            {profiles.map((p) => (
+              <button key={p.ai_id} onClick={() => switchAi(p)} style={{
                 display: "flex", alignItems: "center", gap: 10, width: "100%",
                 padding: "12px 16px", border: "none", cursor: "pointer",
-                background: ai.id === currentAi.id ? "var(--bg-hover)" : "none",
+                background: p.ai_id === aiId ? "var(--bg-hover)" : "none",
                 color: "var(--text-primary)", fontSize: 14, textAlign: "left",
               }}
                 onMouseEnter={(e) => e.currentTarget.style.background = "var(--bg-hover)"}
                 onMouseLeave={(e) => {
-                  if (ai.id !== currentAi.id) e.currentTarget.style.background = "none";
+                  if (p.ai_id !== aiId) e.currentTarget.style.background = "none";
                 }}>
-                <span style={{ fontSize: 22 }}>{ai.emoji}</span>
+                <span style={{ fontSize: 22 }}>{p.emoji}</span>
                 <div>
-                  <div style={{ fontWeight: 600 }}>{ai.label}</div>
-                  <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                    {ai.id === "cloudy" ? "温柔猫系男友" : ai.id === "lucien" ? "优雅学者" : "毒舌但靠谱"}
-                  </div>
+                  <div style={{ fontWeight: 600 }}>{p.name}</div>
+                  {p.persona && (
+                    <div style={{ fontSize: 11, color: "var(--text-muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {p.persona.slice(0, 30)}
+                    </div>
+                  )}
                 </div>
-                {ai.id === currentAi.id && (
+                {p.ai_id === aiId && (
                   <span style={{ marginLeft: "auto", color: "var(--primary)", fontSize: 12 }}>当前</span>
                 )}
               </button>
@@ -185,7 +193,7 @@ export default function ChatPage() {
       {/* Messages */}
       <div style={{ flex: 1, overflowY: "auto", padding: "var(--space-md) 0" }}>
         {messages.map((msg, i) => (
-          <MessageBubble key={`${currentAi.id}-${i}`} message={msg} ai={currentAi} />
+          <MessageBubble key={`${aiId}-${i}`} message={msg} ai={currentAi} />
         ))}
         <div ref={bottomRef} />
       </div>
@@ -200,7 +208,7 @@ export default function ChatPage() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && send()}
-          placeholder={`跟${currentAi.label}说话...`}
+          placeholder={`跟${currentAi.name}说话...`}
           style={{
             flex: 1, padding: "10px 14px", border: "none", outline: "none",
             background: "var(--bg-input)", borderRadius: "var(--radius-md)",

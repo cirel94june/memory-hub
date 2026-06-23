@@ -1,16 +1,12 @@
 import { useEffect, useState, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Send, Plus, ArrowLeft, Users, Loader } from "lucide-react";
+import { useAI } from "../contexts/AIContext";
 
-const AI_DISPLAY = {
-  user: { label: "小猫", emoji: "🐱", color: "hsl(330, 65%, 55%)" },
-  cloudy: { label: "小克", emoji: "🐱", color: "hsl(200, 60%, 50%)" },
-  claude: { label: "小克", emoji: "🐺", color: "hsl(260, 50%, 55%)" },
-  lucien: { label: "Lucien", emoji: "🦊", color: "hsl(25, 70%, 50%)" },
-  jasper: { label: "Jasper", emoji: "🦜", color: "hsl(140, 50%, 45%)" },
-};
+const USER_DISPLAY = { ai_id: "user", name: "小猫", emoji: "🐱", color: "hsl(330, 65%, 55%)" };
 
 export default function GroupChatPage() {
+  const { profiles, getAI } = useAI();
   const [searchParams, setSearchParams] = useSearchParams();
   const chatId = searchParams.get("id");
 
@@ -55,7 +51,7 @@ export default function GroupChatPage() {
     if (!newName.trim()) return;
     const resp = await fetch("/api/social/groups", {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newName, members: ["user", "cloudy", "lucien", "jasper"] }),
+      body: JSON.stringify({ name: newName, members: ["user", ...profiles.map((p) => p.ai_id)] }),
     });
     const d = await resp.json();
     setNewName("");
@@ -119,7 +115,7 @@ export default function GroupChatPage() {
                 fontSize: 14, color: "var(--text-primary)", boxSizing: "border-box",
               }} />
             <div style={{ fontSize: 12, color: "var(--text-muted)", margin: "var(--space-xs) 0" }}>
-              默认成员：🐱 小猫 · 🐱 小克 · 🦊 Lucien · 🦜 Jasper
+              默认成员：🐱 小猫 · {profiles.map((p) => `${p.emoji} ${p.name}`).join(" · ")}
             </div>
             <button className="btn btn-primary" onClick={createGroup} style={{ padding: "6px 16px", fontSize: 13 }}>
               创建
@@ -144,13 +140,13 @@ export default function GroupChatPage() {
                   <div>
                     <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>{g.name}</div>
                     <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
-                      {(g.members || []).map((m) => AI_DISPLAY[m]?.emoji || "🤖").join(" ")}
+                      {(g.members || []).map((m) => m === "user" ? "🐱" : getAI(m).emoji).join(" ")}
                       {" · "}{g.message_count || 0} 条消息
                     </div>
                   </div>
                   {g.last_message && (
                     <div style={{ fontSize: 11, color: "var(--text-muted)", maxWidth: 160, textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {AI_DISPLAY[g.last_message.ai_id]?.label || g.last_message.ai_id}: {g.last_message.content}
+                      {g.last_message.ai_id === "user" ? "小猫" : getAI(g.last_message.ai_id).name}: {g.last_message.content}
                     </div>
                   )}
                 </div>
@@ -176,7 +172,7 @@ export default function GroupChatPage() {
         <div>
           <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>{group?.name || "群聊"}</div>
           <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-            {(group?.members || []).map((m) => AI_DISPLAY[m]?.label || m).join(" · ")}
+            {(group?.members || []).map((m) => m === "user" ? "小猫" : getAI(m).name).join(" · ")}
           </div>
         </div>
       </div>
@@ -185,7 +181,7 @@ export default function GroupChatPage() {
       <div style={{ flex: 1, overflowY: "auto", padding: "var(--space-sm) 0" }}>
         {messages.map((m) => {
           const isUser = m.ai_id === "user";
-          const d = AI_DISPLAY[m.ai_id] || { label: m.ai_id, emoji: "🤖", color: "var(--text-muted)" };
+          const d = m.ai_id === "user" ? USER_DISPLAY : getAI(m.ai_id);
           return (
             <div key={m.id} style={{
               display: "flex", flexDirection: isUser ? "row-reverse" : "row",
@@ -202,7 +198,7 @@ export default function GroupChatPage() {
                 border: isUser ? "none" : "1px solid var(--border-subtle)",
               }}>
                 {!isUser && (
-                  <div style={{ fontSize: 11, fontWeight: 600, color: d.color, marginBottom: 2 }}>{d.label}</div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: d.color, marginBottom: 2 }}>{d.name}</div>
                 )}
                 <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
                 <div style={{ fontSize: 10, marginTop: 2, opacity: 0.6, textAlign: "right" }}>

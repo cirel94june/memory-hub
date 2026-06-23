@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from config import HUB_SECRET, LLM_BASE_URL, LLM_API_KEY
+from ai_profiles import get_llm_config_for_ai
 import gateway as gateway_mod
 import conversation_capture
 
@@ -70,11 +71,11 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
             logger.info(f"[Proxy] Simple mode: ai_id={simple_ai_id}")
 
     if simple_ai_id:
-        # 简单模式：用服务端 .env 的 LLM 配置
-        # 自动生成 chat_id（简单模式的客户端无法传自定义头）
+        # 简单模式：优先用 AI 档案里的 per-AI 配置，fallback 到全局 .env
+        ai_cfg = get_llm_config_for_ai(simple_ai_id)
         return ProxyConfig(
-            target_base_url=LLM_BASE_URL,
-            target_api_key=LLM_API_KEY,
+            target_base_url=ai_cfg["base_url"],
+            target_api_key=ai_cfg["api_key"],
             ai_id=simple_ai_id,
             platform="proxy",
             inject_memory=True,
@@ -83,11 +84,13 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
             chat_type="private",
         )
 
-    # 完整模式：从自定义头读取
+    # 完整模式：从自定义头读取，fallback 到 per-AI 配置
+    ai_id = headers.get("x-hub-ai-id", "claude")
+    ai_cfg = get_llm_config_for_ai(ai_id)
     return ProxyConfig(
-        target_base_url=headers.get("x-hub-target-url", "") or LLM_BASE_URL,
-        target_api_key=headers.get("x-hub-target-key", "") or auth_raw,
-        ai_id=headers.get("x-hub-ai-id", "claude"),
+        target_base_url=headers.get("x-hub-target-url", "") or ai_cfg["base_url"],
+        target_api_key=headers.get("x-hub-target-key", "") or ai_cfg["api_key"],
+        ai_id=ai_id,
         platform=headers.get("x-hub-platform", "proxy"),
         inject_memory=headers.get("x-hub-inject", "true").lower() != "false",
         extract_memory=headers.get("x-hub-extract", "true").lower() != "false",
@@ -309,6 +312,11 @@ async def handle_chat_completions(request: Request, body: dict):
     # Step 2: 转发请求
     forward_body = dict(body)
     forward_body["messages"] = messages
+
+    # 模型名：如果前端传 "current" 或为空，用 per-AI 配置的模型名
+    ai_cfg = get_llm_config_for_ai(config.ai_id)
+    if not forward_body.get("model") or forward_body["model"] == "current":
+        forward_body["model"] = ai_cfg["model"]
 
     if is_stream:
         # 流式：透传 SSE，流结束后后台提取记忆

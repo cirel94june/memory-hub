@@ -2,6 +2,7 @@ import { useEffect, useState, useMemo, useRef } from "react";
 import { Clock, Filter, ChevronDown, ChevronUp, Calendar, Minus } from "lucide-react";
 import Markdown from "react-markdown";
 import MemoryDetailModal from "../components/MemoryDetailModal";
+import { useAI } from "../contexts/AIContext";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -19,11 +20,7 @@ const ROOM_EMOJI = {
   personality: "🪞", game_room: "🎮", social: "💬",
 };
 
-const AI_COLORS = {
-  claude: "var(--accent)", lucien: "#8B5CF6", jasper: "#F59E0B", import: "var(--text-muted)",
-};
-const AI_EMOJI = { claude: "🐱", lucien: "🦊", jasper: "🦜", import: "📥" };
-const AI_LABELS = { claude: "小克", lucien: "Lucien", jasper: "Jasper", import: "导入" };
+// AI display resolved dynamically via useAI context
 
 const WEEKDAY_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -104,6 +101,7 @@ function MiniNav({ timeline, activeDate, onJump }) {
 }
 
 function DayCard({ day, isExpanded, onToggle, onSelectMemory, isToday }) {
+  const { getAI } = useAI();
   const dateObj = new Date(day.date + "T00:00:00");
   const weekday = WEEKDAY_NAMES[dateObj.getDay()];
   const rel = relativeDate(day.date);
@@ -183,9 +181,9 @@ function DayCard({ day, isExpanded, onToggle, onSelectMemory, isToday }) {
                 <div style={{
                   position: "absolute", left: -22, top: 14,
                   width: 8, height: 8, borderRadius: "50%",
-                  background: AI_COLORS[m.source_ai] || "var(--text-muted)",
+                  background: getAI(m.source_ai)?.color || "var(--text-muted)",
                   border: "2px solid var(--bg-card)",
-                  boxShadow: `0 0 0 1px ${AI_COLORS[m.source_ai] || "var(--glass-border)"}`,
+                  boxShadow: `0 0 0 1px ${getAI(m.source_ai)?.color || "var(--glass-border)"}`,
                 }} />
 
                 <div style={{
@@ -201,7 +199,7 @@ function DayCard({ day, isExpanded, onToggle, onSelectMemory, isToday }) {
                   }}>{ROOM_EMOJI[m.room] || ""} {ROOM_LABELS[m.room] || m.room}</span>
                   {m.source_ai && (
                     <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
-                      {AI_EMOJI[m.source_ai] || "🤖"}
+                      {getAI(m.source_ai)?.emoji || "🤖"}
                     </span>
                   )}
                   {m.importance >= 0.8 && <span style={{ fontSize: 10 }}>⭐</span>}
@@ -270,10 +268,8 @@ const ROOMS_ALL = ["", "living_room", "psychology", "personality", "health", "ca
   "learning", "infra", "game_room"];
 const ROOMS_FILTER_LABELS = { "": "全部", ...ROOM_LABELS };
 
-const AI_FILTER = ["", "claude", "lucien", "jasper"];
-const AI_FILTER_LABELS = { "": "全部", ...AI_LABELS };
-
 export default function TimelinePage() {
+  const { profiles, getAI } = useAI();
   const [timeline, setTimeline] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -414,13 +410,15 @@ export default function TimelinePage() {
           </div>
           <div>
             <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>AI</div>
-            <div style={{ display: "flex", gap: "var(--space-xs)" }}>
-              {AI_FILTER.map((a) => (
-                <button key={a}
-                  className={`btn ${aiFilter === a ? "btn-primary" : "btn-ghost"}`}
-                  onClick={() => setAiFilter(a)}
+            <div style={{ display: "flex", gap: "var(--space-xs)", flexWrap: "wrap" }}>
+              <button className={`btn ${aiFilter === "" ? "btn-primary" : "btn-ghost"}`}
+                onClick={() => setAiFilter("")} style={{ padding: "4px 10px", fontSize: 12 }}>全部</button>
+              {profiles.map((p) => (
+                <button key={p.ai_id}
+                  className={`btn ${aiFilter === p.ai_id ? "btn-primary" : "btn-ghost"}`}
+                  onClick={() => setAiFilter(p.ai_id)}
                   style={{ padding: "4px 10px", fontSize: 12 }}
-                >{AI_EMOJI[a] || ""} {AI_FILTER_LABELS[a] || a}</button>
+                >{p.emoji} {p.name}</button>
               ))}
             </div>
           </div>

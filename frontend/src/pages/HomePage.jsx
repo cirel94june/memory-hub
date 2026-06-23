@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { Brain, MessageCircle, Heart, Calendar, TrendingUp, Sparkles, Zap, HeartPulse } from "lucide-react";
+import { Brain, MessageCircle, Heart, TrendingUp, Sparkles, Zap, HeartPulse } from "lucide-react";
 import { Link } from "react-router-dom";
+import { useAI } from "../contexts/AIContext";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -9,36 +10,8 @@ const ROOM_LABELS = {
   infra_changelog: "更新日志", diary: "日记", work_tasks: "工作", social: "社交",
 };
 
-const AI_DISPLAY = {
-  xiaoke: { label: "小克", emoji: "🐱" },
-  cloudy: { label: "小克", emoji: "🐱" },
-  claude: { label: "小克", emoji: "🐺" },
-  lucien: { label: "Lucien", emoji: "🦊" },
-  jasper: { label: "Jasper", emoji: "🦜" },
-  import: { label: "导入", emoji: "📥" },
-};
-
-const AI_IDS = ["cloudy", "lucien", "jasper"];
-const AI_META = {
-  cloudy: { label: "小克", emoji: "🐱", desc: "猫系男友", color: "var(--primary)" },
-  lucien: { label: "Lucien", emoji: "🦊", desc: "优雅学者", color: "hsl(30, 60%, 55%)" },
-  jasper: { label: "Jasper", emoji: "🦜", desc: "毒舌靠谱", color: "hsl(160, 50%, 45%)" },
-};
-
-function mergeAiSources(sources) {
-  const merged = {};
-  for (const s of sources) {
-    const key = (s.ai === "cloudy" || s.ai === "claude") ? "xiaoke" : s.ai;
-    if (!merged[key]) merged[key] = { ai: key, count: 0, ids: [] };
-    merged[key].count += s.count;
-    merged[key].ids.push(s.ai);
-  }
-  return Object.values(merged);
-}
-
-const AI_LINK_MAP = { xiaoke: "cloudy,claude" };
-
 export default function HomePage() {
+  const { profiles, getAI } = useAI();
   const [stats, setStats] = useState(null);
   const [personas, setPersonas] = useState({});
   const [whispers, setWhispers] = useState([]);
@@ -51,10 +24,10 @@ export default function HomePage() {
       .then(setStats)
       .catch(() => {});
 
-    AI_IDS.forEach((id) => {
-      fetch(`/api/persona/${id}`, { headers: authHeaders })
+    profiles.forEach((p) => {
+      fetch(`/api/persona/${p.ai_id}`, { headers: authHeaders })
         .then((r) => r.json())
-        .then((data) => setPersonas((prev) => ({ ...prev, [id]: data })))
+        .then((data) => setPersonas((prev) => ({ ...prev, [p.ai_id]: data })))
         .catch(() => {});
     });
 
@@ -62,7 +35,7 @@ export default function HomePage() {
       .then((r) => r.json())
       .then((d) => setWhispers(d.whispers || []))
       .catch(() => {});
-  }, []);
+  }, [profiles]);
 
   const startDate = new Date("2026-02-23");
   const today = new Date();
@@ -84,31 +57,29 @@ export default function HomePage() {
         </div>
       </div>
 
-      {/* All AI Status Cards */}
+      {/* All AI Status Cards — dynamic from profiles */}
       <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
-        {AI_IDS.map((id) => {
-          const meta = AI_META[id];
-          const p = personas[id];
+        {profiles.map((ai) => {
+          const p = personas[ai.ai_id];
           if (!p) return null;
           return (
-            <Link key={id} to="/chat" onClick={() => {
-              localStorage.setItem("mh-chat-ai", id);
-              localStorage.setItem("mh-ai-id", id);
+            <Link key={ai.ai_id} to="/chat" onClick={() => {
+              localStorage.setItem("mh-chat-ai", ai.ai_id);
+              localStorage.setItem("mh-ai-id", ai.ai_id);
             }} style={{ textDecoration: "none", color: "inherit" }}>
               <div className="glass" style={{
                 padding: "var(--space-md)", cursor: "pointer",
                 transition: "transform var(--transition-fast)",
-                borderLeft: `3px solid ${meta.color}`,
+                borderLeft: `3px solid ${ai.color}`,
               }}
                 onMouseEnter={(e) => e.currentTarget.style.transform = "translateY(-1px)"}
                 onMouseLeave={(e) => e.currentTarget.style.transform = "none"}
               >
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-sm)" }}>
-                  <span style={{ fontSize: 28 }}>{meta.emoji}</span>
+                  <span style={{ fontSize: 28 }}>{ai.emoji}</span>
                   <div style={{ flex: 1 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>{meta.label}</span>
-                      <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{meta.desc}</span>
+                      <span style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>{ai.name}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
                       <span style={{ fontSize: 16 }}>{p.mood_emoji}</span>
@@ -122,7 +93,7 @@ export default function HomePage() {
                       )}
                     </div>
                     <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-                      <MiniBar value={p.mood_valence} color={meta.color} label="心情" />
+                      <MiniBar value={p.mood_valence} color={ai.color} label="心情" />
                       <MiniBar value={p.energy} color="hsl(140, 50%, 55%)" label="精力" />
                     </div>
                   </div>
@@ -170,10 +141,10 @@ export default function HomePage() {
             谁在记忆
           </div>
           <div style={{ display: "flex", gap: "var(--space-sm)", flexWrap: "wrap" }}>
-            {mergeAiSources(stats.ai_sources).map((s) => {
-              const display = AI_DISPLAY[s.ai] || { label: s.ai, emoji: "🤖" };
+            {stats.ai_sources.map((s) => {
+              const ai = getAI(s.ai);
               return (
-                <Link key={s.ai} to={`/memories?ai=${encodeURIComponent(AI_LINK_MAP[s.ai] || s.ai)}`} style={{ textDecoration: "none" }}>
+                <Link key={s.ai} to={`/memories?ai=${encodeURIComponent(s.ai)}`} style={{ textDecoration: "none" }}>
                   <div style={{
                     padding: "4px 10px", borderRadius: "var(--radius-sm)",
                     background: "var(--primary-light)", fontSize: 12,
@@ -183,7 +154,7 @@ export default function HomePage() {
                     onMouseEnter={(e) => e.currentTarget.style.opacity = "0.8"}
                     onMouseLeave={(e) => e.currentTarget.style.opacity = "1"}
                   >
-                    {display.emoji} {display.label} <span style={{ fontWeight: 600 }}>{s.count}</span>
+                    {ai.emoji} {ai.name} <span style={{ fontWeight: 600 }}>{s.count}</span>
                   </div>
                 </Link>
               );
@@ -202,7 +173,7 @@ export default function HomePage() {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {whispers.map((w) => {
-              const display = AI_DISPLAY[w.ai_id] || { emoji: "🤖", label: w.ai_id };
+              const ai = getAI(w.ai_id);
               const time = w.created_at ? w.created_at.slice(11, 16) : "";
               return (
                 <div key={w.id} style={{
@@ -210,8 +181,8 @@ export default function HomePage() {
                   background: "var(--bg-hover)", fontSize: 12,
                 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-                    <span>{display.emoji}</span>
-                    <span style={{ color: "var(--text-muted)", fontSize: 10 }}>{display.label} · {time}</span>
+                    <span>{ai.emoji}</span>
+                    <span style={{ color: "var(--text-muted)", fontSize: 10 }}>{ai.name} · {time}</span>
                   </div>
                   <div style={{ color: "var(--text-secondary)", fontStyle: "italic", lineHeight: 1.5 }}>
                     {w.content}
@@ -248,7 +219,7 @@ function StatBadge({ icon, value, label }) {
   );
 }
 
-function MiniBar({ value, color, label }) {
+function MiniBar({ value, color }) {
   return (
     <div style={{ flex: 1, maxWidth: 100 }}>
       <div style={{ height: 4, background: "var(--bg-hover)", borderRadius: 2, overflow: "hidden" }}>

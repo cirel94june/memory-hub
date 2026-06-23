@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { X, Clock, Zap, Tag, Link2, FileText, Heart, TrendingDown, Activity, Anchor } from "lucide-react";
 import Markdown from "react-markdown";
+import { useAI } from "../contexts/AIContext";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -9,8 +10,7 @@ const ROOM_LABELS = {
   infra_changelog: "更新日志", diary: "日记", work_tasks: "工作", social: "社交",
 };
 
-const AI_LABELS = { claude: "小克", lucien: "Lucien", jasper: "Jasper", import: "导入" };
-const AI_EMOJI = { claude: "🐱", lucien: "🦊", jasper: "🦜", import: "📥" };
+// AI display resolved dynamically via useAI context
 
 function DecayBar({ score, threshold }) {
   const pct = Math.round(score * 100);
@@ -48,6 +48,7 @@ function Section({ icon: Icon, title, children, defaultOpen = true }) {
 }
 
 export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
+  const { getAI } = useAI();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
@@ -80,8 +81,9 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const createdAt = mem.created_at ? new Date(mem.created_at).toLocaleString("zh-CN") : "";
   const eventDate = mem.event_date || "";
   const roomLabel = ROOM_LABELS[mem.room] || mem.room || "未分类";
-  const aiLabel = AI_LABELS[mem.source_ai] || mem.source_ai || "";
-  const aiEmoji = AI_EMOJI[mem.source_ai] || "🤖";
+  const aiInfo = mem.source_ai ? getAI(mem.source_ai) : null;
+  const aiLabel = aiInfo?.name || mem.source_ai || "";
+  const aiEmoji = aiInfo?.emoji || "🤖";
 
   return (
     <div onClick={onClose} style={{

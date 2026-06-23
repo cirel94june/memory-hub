@@ -1,13 +1,6 @@
 import { useEffect, useState } from "react";
 import { Heart, MessageCircle, Plus, Sparkles, Send } from "lucide-react";
-
-const AI_DISPLAY = {
-  user: { label: "小猫", emoji: "🐱" },
-  cloudy: { label: "小克", emoji: "🐱" },
-  claude: { label: "小克", emoji: "🐺" },
-  lucien: { label: "Lucien", emoji: "🦊" },
-  jasper: { label: "Jasper", emoji: "🦜" },
-};
+import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -19,6 +12,7 @@ function timeAgo(iso) {
 }
 
 export default function MomentsPage() {
+  const { profiles, getAI } = useAI();
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showCompose, setShowCompose] = useState(false);
@@ -100,8 +94,8 @@ export default function MomentsPage() {
               boxShadow: "var(--shadow-lg)", overflow: "hidden", zIndex: 10,
               border: "1px solid var(--border-subtle)",
             }}>
-              {["cloudy", "lucien", "jasper"].map((ai) => (
-                <button key={ai} onClick={() => { generateMoment(ai); document.getElementById("ai-gen-menu").style.display = "none"; }}
+              {profiles.map((p) => (
+                <button key={p.ai_id} onClick={() => { generateMoment(p.ai_id); document.getElementById("ai-gen-menu").style.display = "none"; }}
                   style={{
                     display: "block", width: "100%", padding: "8px 16px", border: "none",
                     background: "none", cursor: "pointer", fontSize: 13, textAlign: "left",
@@ -109,7 +103,7 @@ export default function MomentsPage() {
                   }}
                   onMouseEnter={(e) => e.target.style.background = "var(--bg-hover)"}
                   onMouseLeave={(e) => e.target.style.background = "none"}>
-                  {AI_DISPLAY[ai].emoji} {AI_DISPLAY[ai].label}
+                  {p.emoji} {p.name}
                 </button>
               ))}
             </div>
@@ -146,14 +140,14 @@ export default function MomentsPage() {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-md)" }}>
           {posts.map((p) => {
-            const d = AI_DISPLAY[p.ai_id] || { label: p.ai_id, emoji: "🤖" };
+            const d = getAI(p.ai_id);
             const liked = (p.likes || []).includes("user");
             return (
               <div key={p.id} className="glass" style={{ padding: "var(--space-md)" }}>
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-sm)", marginBottom: "var(--space-sm)" }}>
                   <span style={{ fontSize: 28 }}>{d.emoji}</span>
                   <div>
-                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>{d.label}</div>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>{d.name}</div>
                     <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{timeAgo(p.created_at)}</div>
                   </div>
                 </div>
@@ -182,10 +176,10 @@ export default function MomentsPage() {
                     background: "var(--bg-hover)", borderRadius: "var(--radius-sm)",
                   }}>
                     {p.comments?.map((c) => {
-                      const cd = AI_DISPLAY[c.ai_id] || { label: c.ai_id, emoji: "🤖" };
+                      const cd = getAI(c.ai_id);
                       return (
                         <div key={c.id} style={{ fontSize: 12, marginBottom: 4, lineHeight: 1.5 }}>
-                          <span style={{ fontWeight: 600, color: "var(--primary-dark)" }}>{cd.emoji} {cd.label}</span>
+                          <span style={{ fontWeight: 600, color: "var(--primary-dark)" }}>{cd.emoji} {cd.name}</span>
                           {" "}<span style={{ color: "var(--text-secondary)" }}>{c.content}</span>
                         </div>
                       );

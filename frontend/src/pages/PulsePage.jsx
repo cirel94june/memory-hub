@@ -1,21 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { HeartPulse, RefreshCw, Moon, Sun, Shield, Flame, Heart } from "lucide-react";
-
-const AI_META_KNOWN = {
-  cloudy: { label: "小克", emoji: "🐱", color: "#D4A574" },
-  claude: { label: "小克", emoji: "🐱", color: "#D4A574" },
-  lucien: { label: "Lucien", emoji: "🦊", color: "#8B5CF6" },
-  jasper: { label: "Jasper", emoji: "🦜", color: "#F59E0B" },
-};
-
-const FALLBACK_COLORS = ["#06b6d4", "#14b8a6", "#f43f5e", "#6366f1", "#84cc16"];
-
-function getAiMeta(aiId, state) {
-  if (AI_META_KNOWN[aiId]) return AI_META_KNOWN[aiId];
-  const label = state?.label || aiId;
-  const color = state?.color || FALLBACK_COLORS[Math.abs([...aiId].reduce((a, c) => a + c.charCodeAt(0), 0)) % FALLBACK_COLORS.length];
-  return { label, emoji: "🤖", color };
-}
+import { useAI } from "../contexts/AIContext";
 
 const GROUP_META = {
   activation: { label: "精力", icon: Sun, color: "#f59e0b" },
@@ -107,7 +92,9 @@ function GroupRing({ groupName, value }) {
 }
 
 function AiPulseCard({ aiId, state, dims }) {
-  const meta = getAiMeta(aiId, state);
+  const { getAI: getAICtx } = useAI();
+  const ai = getAICtx(aiId);
+  const meta = { label: ai.name, emoji: ai.emoji, color: ai.color || "#888" };
   if (!state) return null;
 
   const display = state.display || {};
@@ -174,6 +161,7 @@ function AiPulseCard({ aiId, state, dims }) {
 }
 
 export default function PulsePage() {
+  const { getAI: getAICtx } = useAI();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -254,7 +242,8 @@ export default function PulsePage() {
           }}
         >全部</button>
         {aiIds.map(id => {
-          const m = getAiMeta(id, states[id]);
+          const ai = getAICtx(id);
+          const m = { label: ai.name, emoji: ai.emoji, color: ai.color || "#888" };
           const active = selectedAi === id;
           return (
             <button key={id} onClick={() => setSelectedAi(id)} style={{
