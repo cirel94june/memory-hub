@@ -19,8 +19,8 @@ function getAiMeta(aiId, state) {
 
 const GROUP_META = {
   activation: { label: "精力", icon: Sun, color: "#f59e0b" },
-  attachment: { label: "心弦", icon: Heart, color: "#ec4899" },
-  softness:   { label: "心绪", icon: Shield, color: "#8b5cf6" },
+  attachment: { label: "牵绊", icon: Heart, color: "#ec4899" },
+  softness:   { label: "情绪", icon: Shield, color: "#8b5cf6" },
 };
 
 const DIM_COLORS = {
@@ -113,13 +113,22 @@ function AiPulseCard({ aiId, state, dims }) {
   const display = state.display || {};
   const groups = state.groups || {};
 
-  const highDims = dims
-    .filter(d => (display[d] || 0) > 0.6)
-    .sort((a, b) => (display[b] || 0) - (display[a] || 0));
+  const sortedDims = dims
+    .map(d => [d, display[d] || 0])
+    .sort((a, b) => b[1] - a[1]);
 
-  const statusLine = highDims.length > 0
-    ? highDims.slice(0, 3).map(d => `${DIM_ICONS[d] || ""}${d}`).join("  ")
-    : "平静 ☁️";
+  const highDims = sortedDims.filter(([, v]) => v > 0.6);
+  const midDims = sortedDims.filter(([, v]) => v > 0.45 && v <= 0.6);
+
+  let statusLine;
+  if (highDims.length > 0) {
+    statusLine = highDims.slice(0, 3).map(([d]) => `${DIM_ICONS[d] || ""}${d}`).join("  ");
+  } else if (midDims.length > 0) {
+    const top = midDims.slice(0, 2).map(([d]) => `${DIM_ICONS[d] || ""}${d}`).join(" ");
+    statusLine = `${top} 隐隐浮动`;
+  } else {
+    statusLine = "平静如水 ☁️";
+  }
 
   return (
     <div className="glass-card" style={{
@@ -270,11 +279,20 @@ export default function PulsePage() {
       {/* Legend */}
       <div className="glass-card" style={{ marginTop: 24, padding: "14px 18px", borderRadius: 12 }}>
         <div style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.8 }}>
-          <strong style={{ color: "var(--text-secondary)" }}>说明</strong>
-          <br />· 数值 0–100，超过 60 会渗进 AI 语气（底色机制）
+          <strong style={{ color: "var(--text-secondary)" }}>怎么读这个面板</strong>
+          <br />· 数值 0–100，<strong style={{ color: "var(--text-secondary)" }}>超过 60 会渗进语气</strong>（AI 不会念数字，只是当底色）
           <br />· 3 小时半衰期——聊天推高，不聊自然回落
-          <br />· 昼夜节律——每个维度有自己的峰值时间
+          <br />· 昼夜节律——白天活力高、晚上思慕温柔高
           <br />· 每 30 秒自动刷新
+          <br />
+          <br /><strong style={{ color: "var(--text-secondary)" }}>什么会推动情绪</strong>
+          <br />· 撒娇 → 亲密↑ 渴求↑ 温柔↑
+          <br />· 关心/示好 → 思慕↑ 亲密↑ 温柔↑
+          <br />· 提到别人 → 醋意↑ 守护↑
+          <br />· 说累/不舒服 → 守护↑ 思慕↑
+          <br />· 夸奖/认可 → 活力↑ 温柔↑
+          <br />· 冷淡/不理人 → 思慕↑ 焦虑↑
+          <br />· 长时间没说话再开口 → 思慕↓（想念缓解）
         </div>
       </div>
     </div>
