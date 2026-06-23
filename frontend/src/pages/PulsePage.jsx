@@ -8,9 +8,9 @@ const AI_META = {
 };
 
 const GROUP_META = {
-  activation: { label: "觉醒", icon: Sun, color: "#f59e0b" },
-  attachment: { label: "依恋", icon: Heart, color: "#ec4899" },
-  softness:   { label: "底色", icon: Shield, color: "#8b5cf6" },
+  activation: { label: "精力", icon: Sun, color: "#f59e0b" },
+  attachment: { label: "心弦", icon: Heart, color: "#ec4899" },
+  softness:   { label: "心绪", icon: Shield, color: "#8b5cf6" },
 };
 
 const DIM_COLORS = {
@@ -23,33 +23,53 @@ const DIM_ICONS = {
   "守护": "🛡️", "渴求": "🔥", "醋意": "🍋", "焦虑": "😰", "温柔": "🌸",
 };
 
+const DIM_NOTES = {
+  "活力": "精神头，白天高晚上低",
+  "疲惫": "困倦感，凌晨最高，聊多了也会涨",
+  "思慕": "想你的程度，不聊天时慢慢升高",
+  "亲密": "想靠近，撒娇和亲密对话推高",
+  "守护": "想保护你，你说累或不舒服时升高",
+  "渴求": "心跳加速的感觉，夜里峰值",
+  "醋意": "吃醋，提到别人或暧昧时升高",
+  "焦虑": "紧张不安，冷淡或工作话题推高",
+  "温柔": "声音放软，被夸奖或认可时升高",
+};
+
 function DimBar({ dim, value, maxVal = 1 }) {
   const pct = Math.round(value * 100);
   const color = DIM_COLORS[dim] || "var(--primary)";
   const isHigh = value > 0.6;
+  const note = DIM_NOTES[dim];
 
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-      <span style={{ width: 24, textAlign: "center", fontSize: 14 }}>{DIM_ICONS[dim] || "·"}</span>
-      <span style={{ width: 40, fontSize: 13, color: "var(--text-secondary)", whiteSpace: "nowrap" }}>{dim}</span>
-      <div style={{
-        flex: 1, height: 18, borderRadius: 9,
-        background: "var(--glass-bg, rgba(255,255,255,0.06))",
-        overflow: "hidden", position: "relative",
-      }}>
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ width: 24, textAlign: "center", fontSize: 14 }}>{DIM_ICONS[dim] || "·"}</span>
+        <span style={{ width: 40, fontSize: 13, color: "var(--text-secondary)", whiteSpace: "nowrap" }}>{dim}</span>
         <div style={{
-          width: `${pct}%`, height: "100%", borderRadius: 9,
-          background: isHigh
-            ? `linear-gradient(90deg, ${color}88, ${color})`
-            : `${color}66`,
-          transition: "width 0.8s ease",
-          boxShadow: isHigh ? `0 0 8px ${color}44` : "none",
-        }} />
+          flex: 1, height: 18, borderRadius: 9,
+          background: "var(--glass-bg, rgba(255,255,255,0.06))",
+          overflow: "hidden", position: "relative",
+        }}>
+          <div style={{
+            width: `${pct}%`, height: "100%", borderRadius: 9,
+            background: isHigh
+              ? `linear-gradient(90deg, ${color}88, ${color})`
+              : `${color}66`,
+            transition: "width 0.8s ease",
+            boxShadow: isHigh ? `0 0 8px ${color}44` : "none",
+          }} />
+        </div>
+        <span style={{
+          width: 32, textAlign: "right", fontSize: 13, fontWeight: isHigh ? 600 : 400,
+          color: isHigh ? color : "var(--text-muted)",
+        }}>{pct}</span>
       </div>
-      <span style={{
-        width: 32, textAlign: "right", fontSize: 13, fontWeight: isHigh ? 600 : 400,
-        color: isHigh ? color : "var(--text-muted)",
-      }}>{pct}</span>
+      {note && (
+        <div style={{
+          marginLeft: 72, fontSize: 11, color: "var(--text-muted)", marginTop: 2, opacity: 0.7,
+        }}>{note}</div>
+      )}
     </div>
   );
 }

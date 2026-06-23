@@ -400,6 +400,11 @@ async def capture_conversation(
         ai_id=source_ai,
         platform=platform,
     )
+
+    # 9 维度情绪打标（fire-and-forget）
+    import asyncio
+    asyncio.ensure_future(gateway_mod._tag_pulse(user_message, source_ai))
+
     return json.dumps(result, ensure_ascii=False)
 
 
