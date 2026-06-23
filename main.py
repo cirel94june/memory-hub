@@ -689,6 +689,43 @@ async def api_update_profile(ai_id: str, request: Request, authorization: str = 
     return {"status": "ok", "profile": result}
 
 
+@app.post("/api/ai-profiles")
+async def api_create_profile(request: Request, authorization: str = Header(default="")):
+    """创建新 AI 角色"""
+    verify_secret(authorization)
+    from ai_profiles import create_profile
+    body = await request.json()
+    ai_id = body.get("ai_id", "").strip().lower()
+    if not ai_id or not ai_id.isalnum():
+        raise HTTPException(400, "ai_id 必须是纯英文字母/数字")
+    profile_data = {
+        "name": body.get("name", ai_id),
+        "emoji": body.get("emoji", "🤖"),
+        "color": body.get("color", "#888888"),
+        "platform": body.get("platform", ""),
+        "persona": body.get("persona", ""),
+        "greeting": body.get("greeting", ""),
+    }
+    try:
+        result = await create_profile(ai_id, profile_data)
+        return {"status": "ok", "ai_id": ai_id, "profile": result}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/ai-profiles/{ai_id}")
+async def api_delete_profile(ai_id: str, authorization: str = Header(default="")):
+    """删除 AI 角色（不删记忆）"""
+    verify_secret(authorization)
+    from ai_profiles import delete_profile
+    if ai_id in ("cloudy", "lucien", "jasper"):
+        raise HTTPException(400, "核心角色不能删除")
+    ok = await delete_profile(ai_id)
+    if not ok:
+        raise HTTPException(404, "角色不存在")
+    return {"status": "ok"}
+
+
 # ── Phase 6 P0: 前端可观测性 API ──
 
 @app.get("/api/memory/{memory_id}/detail")

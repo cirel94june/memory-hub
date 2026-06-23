@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain } from "lucide-react";
+import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain, Plus, Trash2, X } from "lucide-react";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -7,6 +7,8 @@ const ROOM_LABELS = {
   living_room: "客厅", preferences: "偏好", infra: "基建",
   infra_changelog: "更新日志", diary: "日记", work_tasks: "工作", social: "社交",
 };
+
+const CORE_IDS = new Set(["cloudy", "lucien", "jasper", "claude", "gemini", "gpt"]);
 
 export default function AiProfilesPage() {
   const [profiles, setProfiles] = useState([]);
@@ -16,6 +18,9 @@ export default function AiProfilesPage() {
   const [saved, setSaved] = useState("");
   const [memories, setMemories] = useState({});
   const [showMemories, setShowMemories] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [newAi, setNewAi] = useState({ ai_id: "", name: "", emoji: "🤖", color: "#6366f1", platform: "telegram" });
+  const [addError, setAddError] = useState("");
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -102,7 +107,64 @@ export default function AiProfilesPage() {
             {p.name}
           </button>
         ))}
+        <button onClick={() => { setShowAdd(true); setAddError(""); }}
+          style={{
+            display: "flex", alignItems: "center", gap: 4,
+            padding: "8px 14px", borderRadius: "var(--radius-md)",
+            border: "1px dashed var(--border-subtle)",
+            background: "transparent", cursor: "pointer",
+            fontSize: 13, color: "var(--text-muted)",
+          }}>
+          <Plus size={14} /> 添加角色
+        </button>
       </div>
+
+      {/* 添加角色对话框 */}
+      {showAdd && (
+        <div className="glass" style={{ padding: "var(--space-md)", marginBottom: "var(--space-md)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>添加新 AI 角色</h3>
+            <button onClick={() => setShowAdd(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}>
+              <X size={16} />
+            </button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-sm)" }}>
+            <Field label="ID（英文，不可改）" value={newAi.ai_id}
+              onChange={(v) => setNewAi({ ...newAi, ai_id: v.toLowerCase().replace(/[^a-z0-9]/g, "") })}
+              placeholder="如 miyuki" />
+            <Field label="名字" value={newAi.name}
+              onChange={(v) => setNewAi({ ...newAi, name: v })}
+              placeholder="如 美雪" />
+            <Field label="Emoji" value={newAi.emoji}
+              onChange={(v) => setNewAi({ ...newAi, emoji: v })} />
+            <Field label="颜色" value={newAi.color} type="color"
+              onChange={(v) => setNewAi({ ...newAi, color: v })} style={{ height: 38 }} />
+          </div>
+          {addError && <p style={{ fontSize: 12, color: "#ef4444", marginTop: 8 }}>{addError}</p>}
+          <button className="btn btn-primary" style={{ marginTop: 12, padding: "8px 20px", fontSize: 13 }}
+            onClick={async () => {
+              if (!newAi.ai_id || !newAi.name) { setAddError("ID 和名字不能为空"); return; }
+              try {
+                const resp = await fetch("/api/ai-profiles", {
+                  method: "POST",
+                  headers: { ...auth, "Content-Type": "application/json" },
+                  body: JSON.stringify(newAi),
+                });
+                if (!resp.ok) { const e = await resp.json(); setAddError(e.detail || "创建失败"); return; }
+                setShowAdd(false);
+                setNewAi({ ai_id: "", name: "", emoji: "🤖", color: "#6366f1", platform: "telegram" });
+                load();
+                const d = await resp.json();
+                setActiveTab(d.ai_id);
+              } catch { setAddError("网络错误"); }
+            }}>
+            创建
+          </button>
+          <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
+            创建后可以在身份栏编辑人设、模型配置等。情绪面板会自动显示新角色。
+          </p>
+        </div>
+      )}
 
       {profile && (
         <>
@@ -157,8 +219,8 @@ export default function AiProfilesPage() {
             </p>
           </Section>
 
-          {/* Save button */}
-          <div style={{ display: "flex", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
+          {/* Save / Delete buttons */}
+          <div style={{ display: "flex", gap: "var(--space-sm)", marginBottom: "var(--space-md)", alignItems: "center" }}>
             <button className="btn btn-primary" onClick={save}
               disabled={!hasChanges || saving}
               style={{ padding: "8px 20px", fontSize: 14 }}>
@@ -169,6 +231,21 @@ export default function AiProfilesPage() {
               <button className="btn btn-ghost" onClick={() => setEditing((prev) => ({ ...prev, [activeTab]: {} }))}
                 style={{ padding: "8px 16px", fontSize: 13 }}>
                 撤销
+              </button>
+            )}
+            <div style={{ flex: 1 }} />
+            {activeTab && !CORE_IDS.has(activeTab) && (
+              <button style={{
+                background: "none", border: "1px solid #ef444444", borderRadius: "var(--radius-sm)",
+                padding: "6px 12px", fontSize: 12, color: "#ef4444", cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 4,
+              }} onClick={async () => {
+                if (!confirm(`确定删除 ${profile.name}？记忆不会被删除。`)) return;
+                await fetch(`/api/ai-profiles/${activeTab}`, { method: "DELETE", headers: auth });
+                setActiveTab(null);
+                load();
+              }}>
+                <Trash2 size={12} /> 删除角色
               </button>
             )}
           </div>
