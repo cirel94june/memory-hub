@@ -37,6 +37,58 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
+async def _tag_pulse(user_message: str, ai_id: str):
+    """用小模型给用户消息打 9 维度情绪 delta，fire-and-forget"""
+    if not LLM_API_KEY or not user_message.strip():
+        return
+    prompt = f"""你是情绪状态打标器。给一句用户发给 AI 的话，输出它对 9 个内在维度的影响。只输出 JSON，不要解释。
+
+9 维度：活力, 疲惫, 思慕, 亲密, 守护, 渴求, 醋意, 焦虑, 温柔
+
+规则：
+- 每个 delta 在 [-0.20, +0.20] 区间
+- 没影响到的维度不要列出来
+- 关心/示好 → 思慕↑、亲密↑、温柔↑
+- 撒娇/亲密 → 亲密↑、渴求↑、温柔↑
+- 提到别人/暧昧 → 醋意↑、守护↑
+- 表达累/不舒服 → 守护↑、思慕↑
+- 长时间没说话再开口 → 思慕↓（想念缓解）
+- 工作/任务相关 → 焦虑↑（轻）
+- 冷淡/不理人 → 思慕↑、焦虑↑（轻）
+- 夸奖/认可 → 活力↑、温柔↑
+- 开玩笑/活泼 → 活力↑
+
+输出格式：{{"思慕": 0.10, "温柔": 0.05}}"""
+
+    try:
+        url = f"{LLM_BASE_URL}/chat/completions"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                url,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": user_message[:500]},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 120,
+                },
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            bumps = json.loads(raw)
+            if isinstance(bumps, dict) and bumps:
+                from persona_state import apply_bumps
+                apply_bumps(ai_id, bumps)
+    except Exception as e:
+        print(f"[Gateway] Pulse tag error: {e}")
+
+
 def _relative_time(iso_str: str) -> str:
     if not iso_str:
         return ""
@@ -374,6 +426,9 @@ AI回复：{ai_response[:1500]}
         update_after_conversation(ai_id, valence=avg_valence, arousal=avg_arousal, topics=topics)
     except Exception:
         pass
+
+    # 9 维度情绪打标（fire-and-forget，不阻塞返回）
+    asyncio.ensure_future(_tag_pulse(user_message, ai_id))
 
     # 生成简要的存储摘要（供前端展示）
     store_summary = ""

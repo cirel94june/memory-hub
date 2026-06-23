@@ -12,6 +12,7 @@ import AiProfilesPage from "./pages/AiProfilesPage";
 import ThemePage from "./pages/ThemePage";
 import SettingsPage from "./pages/SettingsPage";
 import TimelinePage from "./pages/TimelinePage";
+import PulsePage from "./pages/PulsePage";
 
 import "./styles/theme.css";
 import "./styles/layout.css";
@@ -26,6 +27,7 @@ export default function App() {
             <Route path="chat" element={<ChatPage />} />
             <Route path="memories" element={<MemoriesPage />} />
             <Route path="timeline" element={<TimelinePage />} />
+            <Route path="pulse" element={<PulsePage />} />
             <Route path="checkin" element={<CheckInPage />} />
             <Route path="moments" element={<MomentsPage />} />
             <Route path="group" element={<GroupChatPage />} />

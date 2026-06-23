@@ -55,6 +55,9 @@ async def lifespan(app: FastAPI):
         print("[Memory Hub] Daemon scheduler started (every 12h)")
         from ai_profiles import load_profiles
         await load_profiles()
+        from persona_state import load_state as load_pulse_state
+        load_pulse_state()
+        print("[Memory Hub] Pulse state loaded")
         try:
             yield
         finally:
@@ -1156,6 +1159,36 @@ async def api_export(authorization: str = Header(default="")):
     verify_secret(authorization)
     data = await memory_ops.export_all()
     return JSONResponse(content=data)
+
+
+# ── Pulse State（9 维度情绪面板）──
+
+@app.get("/api/pulse/{ai_id}")
+async def api_pulse_state(ai_id: str, authorization: str = Header(default="")):
+    """获取 AI 的 9 维度 pulse 状态（含 display + groups）"""
+    verify_secret(authorization)
+    from persona_state import get_state as get_pulse_state, PULSE_DIMS, PULSE_GROUPS, AI_PULSE_PROFILES
+    state = get_pulse_state(ai_id)
+    profile = AI_PULSE_PROFILES.get(ai_id, AI_PULSE_PROFILES.get("cloudy", {}))
+    return {
+        **state,
+        "ai_id": ai_id,
+        "label": profile.get("label", ai_id),
+        "dims": PULSE_DIMS,
+        "group_names": list(PULSE_GROUPS.keys()),
+    }
+
+
+@app.get("/api/pulse")
+async def api_pulse_all(authorization: str = Header(default="")):
+    """获取所有 AI 的 pulse 状态"""
+    verify_secret(authorization)
+    from persona_state import get_state as get_pulse_state, PULSE_DIMS, AI_PULSE_PROFILES
+    result = {}
+    for ai_id in AI_PULSE_PROFILES:
+        result[ai_id] = get_pulse_state(ai_id)
+        result[ai_id]["label"] = AI_PULSE_PROFILES[ai_id]["label"]
+    return {"states": result, "dims": PULSE_DIMS}
 
 
 # ── React SPA catch-all（必须在所有 API 路由之后）──
