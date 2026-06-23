@@ -60,6 +60,13 @@ MCP_INSTRUCTIONS = """\
 - 你不需要手动找旧记忆去更新，remember 内置了智能检测
 - 如果记忆有 event_date（事件发生日期），请传入
 
+### 锚定重要记忆（调 anchor）：
+- 用户说了非常重要的价值观、人生原则、关系定义
+- 你发现了不应该被遗忘的核心事实
+- 锚点记忆永不衰减，走廊里单独一节
+- 最多 20 条，不要滥用——只有"坐标系级别"的记忆才值得锚定
+- 不确定时，不要锚定——普通重要的记忆用 importance=0.8+ 就够了
+
 ## 房间速查
 - living_room: 核心身份（永远重要）
 - career/psychology/health/learning/relationships/preferences: 各主题
@@ -264,6 +271,35 @@ async def resolve_memory(memory_id: str, resolved: bool = True) -> str:
         resolved: True=已解决（默认），False=未解决/待办
     """
     result = await memory_ops.resolve_memory(memory_id, resolved)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def anchor(memory_id: str) -> str:
+    """将一条记忆设为锚点——永不衰减、走廊里单独显示的"坐标系"记忆。
+
+    适合锚定的内容：
+    - 用户的核心价值观、人生原则
+    - 你和用户之间的关系定义
+    - 绝对不能忘记的重要事实
+
+    最多 20 条锚点。不确定时不要锚定，普通重要记忆用 importance=0.8+ 就够。
+
+    Args:
+        memory_id: 记忆ID
+    """
+    result = await memory_ops.anchor_memory(memory_id)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+async def release_anchor(memory_id: str) -> str:
+    """解除锚点，记忆恢复正常衰减。
+
+    Args:
+        memory_id: 记忆ID
+    """
+    result = await memory_ops.release_anchor(memory_id)
     return json.dumps(result, ensure_ascii=False)
 
 

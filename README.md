@@ -104,7 +104,7 @@ React SPA，路由在 `/app/`，奶油紫色系，玻璃拟态卡片风。
 | 项目 | 仓库 | 借鉴了什么 | 状态 |
 |------|------|-----------|------|
 | **Ombre Brain** | [Yinglianchun/Ombre-Brain](https://github.com/Yinglianchun/Ombre-Brain) | supersede 链、年轮评论、时间涟漪、Persona State | ✅ 已缝合 |
-| **Ombre Brain 原版** | [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) | Anchor 锚点、Self-knowledge、Plan 系统 | 🔄 待移植 |
+| **Ombre Brain 原版** | [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) | Anchor 锚点✅、Self-knowledge、Plan 系统 | 🔄 部分移植 |
 | **AionsHome** | [death34018-hue/AionsHome](https://github.com/death34018-hue/AionsHome) | event_date、记忆源追溯、三人群聊 | ✅ 已缝合 |
 | **imprint-memory** | [Qizhan7/imprint-memory](https://github.com/Qizhan7/imprint-memory) | 对话自动捕获、混合搜索+RRF | ✅ 已缝合 |
 | **Aelios** | [wusaki0723/Aelios](https://github.com/wusaki0723/Aelios) | 三级记忆过滤 | ✅ 已缝合 |
@@ -114,7 +114,7 @@ React SPA，路由在 `/app/`，奶油紫色系，玻璃拟态卡片风。
 
 | 原版功能 | 说明 | 我们怎么接 | 优先级 |
 |---------|------|----------|-------|
-| **Anchor 锚点** | 最多 24 条"坐标系"记忆，不衰减不随机浮出，但可搜索 | 给记忆加 `anchored` 标记，走廊单独注入 | ⭐⭐⭐ 高 |
+| **Anchor 锚点** | 最多 20 条"坐标系"记忆，不衰减不随机浮出，但可搜索 | `anchored` 字段 + MCP 工具 + 走廊注入 + 前端按钮 | ✅ 已完成 |
 | **Self-knowledge** | AI 记录自我认知，对话开头注入 | 改造 `personality` 房间或新建 | ⭐⭐ 中 |
 | **Plan 计划系统** | 永不衰减的承诺/待办，dream 里复盘 | 增强 `resolved` 字段 + plan MCP 工具 | ⭐⭐ 中 |
 | **星图视觉** | 工程网格风格记忆网络 | P4 做星图时参考 | ⭐ 远期 |

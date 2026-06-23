@@ -930,6 +930,9 @@ async def run_decay() -> dict:
     decayed = 0
 
     for mem in database.iter_memories(status="active"):
+        if mem.get("anchored"):
+            continue
+
         try:
             created = datetime.fromisoformat(mem["created_at"])
             days = (now_dt - created).total_seconds() / 86400
@@ -979,6 +982,59 @@ async def export_all() -> dict:
         memories.append(clean)
     memories.sort(key=lambda x: x.get("created_at", ""))
     return {"exported_at": _now(), "count": len(memories), "memories": memories}
+
+
+# ── 锚点系统 ──
+
+ANCHOR_MAX = 20
+
+async def anchor_memory(memory_id: str) -> dict:
+    """将记忆设为锚点——不衰减、不随机浮出，但可搜索。最多 20 条。"""
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return {"error": f"Memory {memory_id} not found"}
+    if mem.get("anchored"):
+        return {"status": "already_anchored", "id": memory_id}
+
+    anchor_count = sum(1 for m in database.iter_memories(status="active") if m.get("anchored"))
+    if anchor_count >= ANCHOR_MAX:
+        return {"error": f"Anchor limit reached ({ANCHOR_MAX}). Release an existing anchor first."}
+
+    mem["anchored"] = True
+    mem["updated_at"] = _now()
+    store.set_memory(mem)
+    return {"status": "anchored", "id": memory_id, "content_preview": mem["content"][:100]}
+
+
+async def release_anchor(memory_id: str) -> dict:
+    """解除锚点，记忆恢复正常衰减。"""
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return {"error": f"Memory {memory_id} not found"}
+    if not mem.get("anchored"):
+        return {"status": "not_anchored", "id": memory_id}
+
+    mem["anchored"] = None
+    mem["updated_at"] = _now()
+    store.set_memory(mem)
+    return {"status": "released", "id": memory_id}
+
+
+async def list_anchors() -> list[dict]:
+    """列出所有锚点记忆。"""
+    anchors = []
+    for mem in database.iter_memories(status="active"):
+        if mem.get("anchored"):
+            anchors.append({
+                "id": mem["id"],
+                "content": mem["content"],
+                "room": mem.get("room", ""),
+                "category": mem.get("category", ""),
+                "importance": _safe_float(mem.get("importance"), 0.5),
+                "created_at": mem.get("created_at", ""),
+                "owner_ai": mem.get("owner_ai", ""),
+            })
+    return anchors
 
 
 # ── 按标签搜索 ──

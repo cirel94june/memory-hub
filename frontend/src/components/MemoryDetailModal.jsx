@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { X, Clock, Zap, Tag, Link2, FileText, Heart, TrendingDown, Activity } from "lucide-react";
+import { X, Clock, Zap, Tag, Link2, FileText, Heart, TrendingDown, Activity, Anchor } from "lucide-react";
 import Markdown from "react-markdown";
 
 const ROOM_LABELS = {
@@ -134,6 +134,12 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
                   background: "hsl(45, 90%, 88%)", color: "hsl(40, 80%, 35%)",
                 }}>⭐ 重要 {Math.round(mem.importance * 100)}%</span>
               )}
+              {mem.anchored && (
+                <span style={{
+                  fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)",
+                  background: "hsl(210, 80%, 90%)", color: "hsl(210, 70%, 35%)", fontWeight: 600,
+                }}>📌 锚点</span>
+              )}
               {mem.status && mem.status !== "active" && (
                 <span style={{
                   fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)",
@@ -173,7 +179,13 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
             {/* Decay bar */}
             {decay.current_score !== undefined && (
               <div style={{ marginBottom: "var(--space-lg)" }}>
-                <DecayBar score={decay.current_score} threshold={decay.threshold || 0.15} />
+                {mem.anchored ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "hsl(210, 70%, 45%)", fontWeight: 600 }}>
+                    <Anchor size={14} /> 锚点记忆 · 不参与衰减
+                  </div>
+                ) : (
+                  <DecayBar score={decay.current_score} threshold={decay.threshold || 0.15} />
+                )}
                 <div style={{ display: "flex", gap: "var(--space-lg)", marginTop: 6, fontSize: 11, color: "var(--text-muted)" }}>
                   <span><Activity size={10} style={{ verticalAlign: "middle" }} /> 存活 {decay.days_alive} 天</span>
                   <span><Zap size={10} style={{ verticalAlign: "middle" }} /> 被想起 {mem.activation_count || 0} 次</span>
@@ -323,6 +335,37 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
                   ))}
                 </div>
               </Section>
+            )}
+
+            {/* Anchor toggle */}
+            {mem.status === "active" && (
+              <div style={{ marginTop: "var(--space-md)", display: "flex", gap: 8 }}>
+                <button
+                  onClick={async () => {
+                    const isAnchored = mem.anchored;
+                    const method = isAnchored ? "DELETE" : "POST";
+                    const res = await fetch(`/api/memory/${mem.id}/anchor`, { method, headers: auth });
+                    const result = await res.json();
+                    if (result.error) { alert(result.error); return; }
+                    setData((prev) => ({
+                      ...prev,
+                      memory: { ...prev.memory, anchored: !isAnchored },
+                    }));
+                  }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 6,
+                    padding: "6px 14px", borderRadius: "var(--radius-sm)",
+                    border: `1px solid ${mem.anchored ? "hsl(210, 70%, 50%)" : "var(--glass-border)"}`,
+                    background: mem.anchored ? "hsl(210, 80%, 92%)" : "var(--bg-hover)",
+                    color: mem.anchored ? "hsl(210, 70%, 35%)" : "var(--text-secondary)",
+                    cursor: "pointer", fontSize: 12, fontWeight: 500,
+                    transition: "var(--transition-fast)",
+                  }}
+                >
+                  <Anchor size={13} />
+                  {mem.anchored ? "取消锚定" : "📌 设为锚点"}
+                </button>
+              </div>
             )}
 
             {/* Footer: ID */}

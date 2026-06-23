@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     history         TEXT NOT NULL DEFAULT '[]',
-    resolved        INTEGER
+    resolved        INTEGER,
+    anchored        INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_status     ON memories(status);
@@ -72,6 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_category   ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_mem_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_mem_updated    ON memories(updated_at);
 CREATE INDEX IF NOT EXISTS idx_mem_resolved   ON memories(resolved);
+CREATE INDEX IF NOT EXISTS idx_mem_anchored   ON memories(anchored);
 CREATE INDEX IF NOT EXISTS idx_mem_room_status ON memories(room, status);
 """
 
@@ -155,6 +157,15 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     else:
         d["resolved"] = True
 
+    # anchored: INTEGER -> Python bool | None
+    a = d.get("anchored")
+    if a is None:
+        d["anchored"] = None
+    elif a == 0:
+        d["anchored"] = False
+    else:
+        d["anchored"] = True
+
     # Deserialise list/dict JSON columns
     for key in ("comments", "history"):
         val = d.get(key)
@@ -237,6 +248,12 @@ async def init_db(db_path: str = None) -> None:
         f"USING vec0(embedding float[{EMBEDDING_DIM}])"
     )
 
+    # ── Migrations for existing databases ──
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    if "anchored" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
+        logger.info("Migrated: added 'anchored' column")
+
     conn.commit()
     _conn = conn
     logger.info("Database initialised successfully")
@@ -253,7 +270,7 @@ _ALL_COLUMNS = [
     "source_ai", "source_platform", "tags", "linked_memories",
     "supersedes", "superseded_by", "event_date", "source_context",
     "comments", "embedding", "status", "created_at", "updated_at",
-    "history", "resolved",
+    "history", "resolved", "anchored",
 ]
 
 
@@ -277,7 +294,7 @@ def set_memory(mem: dict) -> None:
     # Prepare values — serialise list/dict fields to JSON strings
     def _prep(key):
         val = mem.get(key)
-        if key == "resolved":
+        if key in ("resolved", "anchored"):
             return _resolved_to_int(val)
         if key in ("comments", "history"):
             if isinstance(val, (list, dict)):

@@ -268,6 +268,26 @@ async def api_delete(memory_id: str, authorization: str = Header(default="")):
     return await memory_ops.delete_memory(memory_id)
 
 
+# ── 锚点 ──
+
+@app.post("/api/memory/{memory_id}/anchor")
+async def api_anchor(memory_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return await memory_ops.anchor_memory(memory_id)
+
+
+@app.delete("/api/memory/{memory_id}/anchor")
+async def api_release_anchor(memory_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return await memory_ops.release_anchor(memory_id)
+
+
+@app.get("/api/anchors")
+async def api_list_anchors(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return await memory_ops.list_anchors()
+
+
 # ── Gateway（核心：自动记忆注入 + 提取） ──
 
 class ContextRequest(BaseModel):

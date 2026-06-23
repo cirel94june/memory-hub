@@ -78,6 +78,13 @@ async def build_corridor(ai_id: str) -> str:
     if personality:
         sections.append("【你对自己的认知】\n" + "\n".join(f"· {x}" for x in personality[:3]))
 
+    # 4.5. 锚点记忆（价值观/原则/重要关系，永不衰减的坐标系）
+    anchors = [m["content"] for m in all_mems.values()
+               if m.get("anchored") and m.get("status") == "active"
+               and (not m.get("owner_ai") or m.get("owner_ai") == ai_id)]
+    if anchors:
+        sections.append("【锚点·不变的事】\n" + "\n".join(f"📌 {x[:200]}" for x in anchors[:10]))
+
     if diary:
         sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
 
