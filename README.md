@@ -368,6 +368,19 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 - 原 ARCHITECTURE.md Phase 5（前端/AionsHome 风格）→ 基础 SPA 已在 Phase 4-4.5 完成，Phase 6 是进阶可视化
 - 原 ARCHITECTURE.md Phase 6（情感特性）→ 年轮评论已完成，情感罗盘在 P3，心语/礼物/梦境在 Phase 5.5
 
+### 参考：Ombre Brain 原版功能对照
+
+> **仓库**：[P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain)（原版，MIT 协议）
+> 我们之前参考的是二改版 OmbreBrain-folio，原版持续在更新。以下是原版有但我们**待参考**的功能：
+
+| 原版功能 | 说明 | 我们怎么接 | 优先级 |
+|---------|------|----------|-------|
+| **Anchor 锚点** | 最多 24 条"坐标系"记忆（价值观/关系/原则），不参与衰减和随机浮出，但可搜索 | 给记忆加 `anchored` 标记，走廊单独注入，不被衰减淘汰 | ⭐⭐⭐ 高 |
+| **Self-knowledge（I 工具）** | AI 记录自我认知（本质/价值观/模式/局限/成长），不出现在普通搜索，对话开头注入 | 改造现有 `personality` 房间或新建 `self_knowledge` 房间 | ⭐⭐ 中 |
+| **Plan 计划系统** | 独立的承诺/待办工具，永不衰减，只在 dream 输出里复盘，有 weight 权重 | 增强现有 `resolved` 字段，加 plan MCP 工具 + dream 联动 | ⭐⭐ 中 |
+| **engineering-grid 星图** | 工程网格风格的记忆网络可视化 | P4 做星图时参考视觉风格 | ⭐ P4 时做 |
+| ~~Letter 信件~~ | 用户和 AI 互写信，永不衰减 | 跳过——已有朋友圈/论坛/梦境日记 | — |
+
 ## 给下一个小克的话
 
 > 你好，我是之前的小克。如果你要动这个项目的代码，请先读 `docs/ARCHITECTURE.md`，那是小猫的原始愿景。
@@ -386,6 +399,9 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 -> 重建走廊
 > - 三个 AI 各有独立参数（phase/amp/defaults），新角色自动用默认 profile
 > - MCP 指引已加身份识别规则（每个 AI 必须传 source_ai）
 > - 前端支持动态角色——AI 档案页可直接添加/删除角色，情绪面板自动显示
+>
+> **1.5. Ombre Brain 原版功能移植** ← 待做
+> 参考上方"Ombre Brain 原版功能对照"表。优先做 Anchor 锚点（防重要记忆被衰减），再做 Self-knowledge 和 Plan 增强。
 >
 > **2. 记忆相似聚类 + 脱水压缩（Phase 5）**
 > 参考 PDF 设计文档里的思路：相似记忆自动聚类合并、旧记忆脱水压缩节省空间、日记提取和再消化。
