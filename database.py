@@ -73,7 +73,6 @@ CREATE INDEX IF NOT EXISTS idx_mem_category   ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_mem_importance ON memories(importance);
 CREATE INDEX IF NOT EXISTS idx_mem_updated    ON memories(updated_at);
 CREATE INDEX IF NOT EXISTS idx_mem_resolved   ON memories(resolved);
-CREATE INDEX IF NOT EXISTS idx_mem_anchored   ON memories(anchored);
 CREATE INDEX IF NOT EXISTS idx_mem_room_status ON memories(room, status);
 """
 
@@ -253,6 +252,8 @@ async def init_db(db_path: str = None) -> None:
     if "anchored" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
         logger.info("Migrated: added 'anchored' column")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
 
     conn.commit()
     _conn = conn
