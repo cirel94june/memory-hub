@@ -21,6 +21,7 @@ export default function MomentsPage() {
   const [showComment, setShowComment] = useState(null);
   const [mentionMenu, setMentionMenu] = useState(null);
   const [replying, setReplying] = useState(null);
+  const [posting, setPosting] = useState(false);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -34,13 +35,15 @@ export default function MomentsPage() {
   useEffect(load, []);
 
   const post = async () => {
-    if (!newContent.trim()) return;
+    if (!newContent.trim() || posting) return;
+    setPosting(true);
     await fetch("/api/social/posts", {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ ai_id: "user", content: newContent, type: "moment" }),
     });
     setNewContent("");
     setShowCompose(false);
+    setPosting(false);
     load();
   };
 
@@ -123,8 +126,9 @@ export default function MomentsPage() {
               resize: "vertical", boxSizing: "border-box",
             }} />
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "var(--space-sm)" }}>
-            <button className="btn btn-primary" onClick={post} style={{ padding: "6px 16px", fontSize: 13 }}>
-              发布
+            <button className="btn btn-primary" onClick={post} disabled={posting}
+              style={{ padding: "6px 16px", fontSize: 13 }}>
+              {posting ? "AI 正在围观..." : "发布"}
             </button>
           </div>
         </div>

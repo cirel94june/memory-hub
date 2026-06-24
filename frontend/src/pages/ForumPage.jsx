@@ -21,6 +21,7 @@ export default function ForumPage() {
   const [expandedPost, setExpandedPost] = useState(null);
   const [replyText, setReplyText] = useState({});
   const [replying, setReplying] = useState(null);
+  const [posting, setPosting] = useState(false);
   const [mentionMenu, setMentionMenu] = useState(null);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
@@ -35,7 +36,8 @@ export default function ForumPage() {
   useEffect(load, []);
 
   const createPost = async () => {
-    if (!title.trim() || !content.trim()) return;
+    if (!title.trim() || !content.trim() || posting) return;
+    setPosting(true);
     await fetch("/api/social/posts", {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ ai_id: "user", content, title, type: "forum", tags: [] }),
@@ -43,6 +45,7 @@ export default function ForumPage() {
     setTitle("");
     setContent("");
     setShowCompose(false);
+    setPosting(false);
     load();
   };
 
@@ -133,8 +136,9 @@ export default function ForumPage() {
               resize: "vertical", boxSizing: "border-box",
             }} />
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "var(--space-sm)" }}>
-            <button className="btn btn-primary" onClick={createPost} style={{ padding: "6px 16px", fontSize: 13 }}>
-              发布
+            <button className="btn btn-primary" onClick={createPost} disabled={posting}
+              style={{ padding: "6px 16px", fontSize: 13 }}>
+              {posting ? "AI 正在围观..." : "发布"}
             </button>
           </div>
         </div>

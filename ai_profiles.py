@@ -62,7 +62,17 @@ async def save_profiles():
 
 
 def get_profile(ai_id: str) -> dict | None:
-    return _profiles.get(ai_id)
+    p = _profiles.get(ai_id)
+    if p:
+        return p
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    aliases = AI_ALIAS_GROUPS.get(canonical, AI_ALIAS_GROUPS.get(ai_id, []))
+    for alias in aliases:
+        p = _profiles.get(alias)
+        if p:
+            return p
+    return None
 
 
 def get_all_profiles() -> dict:
@@ -122,9 +132,17 @@ async def delete_profile(ai_id: str) -> bool:
 
 
 def get_llm_config_for_ai(ai_id: str) -> dict:
-    """获取某 AI 的模型配置，fallback 到全局默认"""
-    from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
+    """获取某 AI 的模型配置，fallback 到全局默认。支持别名（claude→cloudy）"""
+    from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, AI_ALIASES, AI_ALIAS_GROUPS
     profile = _profiles.get(ai_id, {})
+    if not profile.get("model_url"):
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        aliases = AI_ALIAS_GROUPS.get(canonical, AI_ALIAS_GROUPS.get(ai_id, [ai_id]))
+        for alias in aliases:
+            p = _profiles.get(alias, {})
+            if p.get("model_url"):
+                profile = p
+                break
     return {
         "base_url": profile.get("model_url") or LLM_BASE_URL,
         "model": profile.get("model_name") or LLM_MODEL,
