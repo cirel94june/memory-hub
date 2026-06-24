@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Plus, ArrowLeft, Users, Loader } from "lucide-react";
+import { Send, Plus, ArrowLeft, Users, Loader, Settings } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 const USER_DISPLAY = { ai_id: "user", name: "小猫", emoji: "🐱", color: "hsl(330, 65%, 55%)" };
@@ -16,7 +16,9 @@ export default function GroupChatPage() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
   const [newName, setNewName] = useState("");
+  const [selectedMembers, setSelectedMembers] = useState({});
   const messagesEnd = useRef(null);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
@@ -47,11 +49,24 @@ export default function GroupChatPage() {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  const openCreate = () => {
+    const sel = {};
+    profiles.forEach((p) => { sel[p.ai_id] = true; });
+    setSelectedMembers(sel);
+    setShowCreate(true);
+  };
+
+  const toggleMember = (aiId) => {
+    setSelectedMembers((prev) => ({ ...prev, [aiId]: !prev[aiId] }));
+  };
+
   const createGroup = async () => {
     if (!newName.trim()) return;
+    const members = ["user", ...profiles.filter((p) => selectedMembers[p.ai_id]).map((p) => p.ai_id)];
+    if (members.length < 2) return;
     const resp = await fetch("/api/social/groups", {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newName, members: ["user", ...profiles.map((p) => p.ai_id)] }),
+      body: JSON.stringify({ name: newName, members }),
     });
     const d = await resp.json();
     setNewName("");
@@ -92,6 +107,7 @@ export default function GroupChatPage() {
     setSending(false);
   };
 
+  // ── Group list view ──
   if (!chatId) {
     return (
       <div style={{ maxWidth: 560, margin: "0 auto" }}>
@@ -99,7 +115,7 @@ export default function GroupChatPage() {
           <h2 style={{ fontSize: 20, fontWeight: 700 }}>
             <Users size={20} style={{ verticalAlign: -3, marginRight: 6 }} />群聊
           </h2>
-          <button className="btn btn-primary" onClick={() => setShowCreate(!showCreate)}
+          <button className="btn btn-primary" onClick={openCreate}
             style={{ padding: "6px 12px", fontSize: 13 }}>
             <Plus size={14} style={{ marginRight: 4 }} /> 新建群聊
           </button>
@@ -113,9 +129,30 @@ export default function GroupChatPage() {
                 width: "100%", padding: "8px 12px", border: "none", outline: "none",
                 background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
                 fontSize: 14, color: "var(--text-primary)", boxSizing: "border-box",
+                marginBottom: "var(--space-sm)",
               }} />
-            <div style={{ fontSize: 12, color: "var(--text-muted)", margin: "var(--space-xs) 0" }}>
-              默认成员：🐱 小猫 · {profiles.map((p) => `${p.emoji} ${p.name}`).join(" · ")}
+            <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: "var(--space-xs)" }}>
+              选择群成员：
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: "var(--space-sm)" }}>
+              <div style={{
+                padding: "4px 10px", borderRadius: 14, fontSize: 12,
+                background: "var(--primary)", color: "white",
+              }}>🐱 小猫 (你)</div>
+              {profiles.map((p) => {
+                const on = selectedMembers[p.ai_id];
+                return (
+                  <button key={p.ai_id} onClick={() => toggleMember(p.ai_id)}
+                    style={{
+                      padding: "4px 10px", borderRadius: 14, fontSize: 12, border: "none", cursor: "pointer",
+                      background: on ? `${p.color || "var(--primary)"}22` : "var(--glass-bg, rgba(255,255,255,0.06))",
+                      color: on ? (p.color || "var(--primary)") : "var(--text-muted)",
+                      outline: on ? `1.5px solid ${p.color || "var(--primary)"}` : "1px solid var(--border-subtle)",
+                    }}>
+                    {p.emoji} {p.name}
+                  </button>
+                );
+              })}
             </div>
             <button className="btn btn-primary" onClick={createGroup} style={{ padding: "6px 16px", fontSize: 13 }}>
               创建
@@ -158,6 +195,7 @@ export default function GroupChatPage() {
     );
   }
 
+  // ── Chat view ──
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 120px)", maxWidth: 640, margin: "0 auto" }}>
       {/* Header */}
@@ -166,19 +204,60 @@ export default function GroupChatPage() {
         padding: "var(--space-sm) 0", borderBottom: "1px solid var(--border-subtle)",
         marginBottom: "var(--space-sm)", flexShrink: 0,
       }}>
-        <button className="btn btn-ghost" onClick={() => setSearchParams({})} style={{ padding: "4px 8px" }}>
+        <button className="btn btn-ghost" onClick={() => { setSearchParams({}); setGroup(null); setMessages([]); setShowInfo(false); }}
+          style={{ padding: "4px 8px" }}>
           <ArrowLeft size={16} />
         </button>
-        <div>
+        <div style={{ flex: 1 }}>
           <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>{group?.name || "群聊"}</div>
           <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-            {(group?.members || []).map((m) => m === "user" ? "小猫" : getAI(m).name).join(" · ")}
+            {(group?.members || []).length} 人
           </div>
         </div>
+        <button className="btn btn-ghost" onClick={() => setShowInfo(!showInfo)} style={{ padding: "4px 8px" }}>
+          <Settings size={16} />
+        </button>
       </div>
+
+      {/* Info panel */}
+      {showInfo && group && (
+        <div className="glass" style={{
+          padding: "var(--space-md)", marginBottom: "var(--space-sm)",
+          flexShrink: 0,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)", marginBottom: "var(--space-xs)" }}>
+            群成员 ({(group.members || []).length})
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {(group.members || []).map((m) => {
+              const d = m === "user" ? USER_DISPLAY : getAI(m);
+              return (
+                <div key={m} style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  padding: "4px 10px", borderRadius: 14, fontSize: 12,
+                  background: "var(--glass-bg, rgba(255,255,255,0.06))",
+                  border: `1px solid ${d.color || "var(--border-subtle)"}`,
+                  color: "var(--text-primary)",
+                }}>
+                  <span>{d.emoji}</span>
+                  <span>{d.name}</span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: "var(--space-xs)" }}>
+            创建于 {group.created_at?.slice(0, 10)}
+          </div>
+        </div>
+      )}
 
       {/* Messages */}
       <div style={{ flex: 1, overflowY: "auto", padding: "var(--space-sm) 0" }}>
+        {messages.length === 0 && (
+          <div style={{ textAlign: "center", padding: "var(--space-xl)", color: "var(--text-muted)", fontSize: 13 }}>
+            开始聊天吧！发送消息后 AI 会自动回复
+          </div>
+        )}
         {messages.map((m) => {
           const isUser = m.ai_id === "user";
           const d = m.ai_id === "user" ? USER_DISPLAY : getAI(m.ai_id);

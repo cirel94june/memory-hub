@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { MessageSquare, Plus, Send, ThumbsUp, Sparkles } from "lucide-react";
+import { MessageSquare, Plus, Send, ThumbsUp } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
@@ -20,8 +20,8 @@ export default function ForumPage() {
   const [content, setContent] = useState("");
   const [expandedPost, setExpandedPost] = useState(null);
   const [replyText, setReplyText] = useState({});
-  const [aiReplying, setAiReplying] = useState(null);
-  const [aiPosting, setAiPosting] = useState(false);
+  const [replying, setReplying] = useState(null);
+  const [mentionMenu, setMentionMenu] = useState(null);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -47,33 +47,26 @@ export default function ForumPage() {
   };
 
   const reply = async (postId) => {
-    const text = replyText[postId]?.trim();
-    if (!text) return;
+    const raw = replyText[postId]?.trim();
+    if (!raw || replying) return;
+
+    const mentionPattern = /@(\S+)/g;
+    const mentionNames = [...raw.matchAll(mentionPattern)].map((m) => m[1]);
+    const mentionAiIds = [];
+    for (const name of mentionNames) {
+      const found = profiles.find((p) => p.name === name || p.ai_id === name);
+      if (found) mentionAiIds.push(found.ai_id);
+    }
+    const cleanText = raw.replace(mentionPattern, "").trim() || raw;
+
+    setReplying(postId);
     await fetch(`/api/social/posts/${postId}/comment`, {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: "user", content: text }),
+      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds }),
     });
+    setReplying(null);
     setReplyText((p) => ({ ...p, [postId]: "" }));
-    load();
-  };
-
-  const askAiReply = async (postId) => {
-    setAiReplying(postId);
-    await fetch(`/api/social/posts/${postId}/comment`, {
-      method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: "user", content: "[请AI们来讨论]", auto_reply: true }),
-    });
-    setAiReplying(null);
-    load();
-  };
-
-  const aiPost = async (aiId) => {
-    setAiPosting(true);
-    await fetch("/api/social/forum/generate", {
-      method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: aiId }),
-    });
-    setAiPosting(false);
+    setMentionMenu(null);
     load();
   };
 
@@ -85,45 +78,42 @@ export default function ForumPage() {
     load();
   };
 
+  const insertMention = (postId, aiName) => {
+    setReplyText((prev) => {
+      const cur = prev[postId] || "";
+      const atIdx = cur.lastIndexOf("@");
+      const before = atIdx >= 0 ? cur.slice(0, atIdx) : cur;
+      return { ...prev, [postId]: `${before}@${aiName} ` };
+    });
+    setMentionMenu(null);
+  };
+
+  const handleReplyInput = (postId, value) => {
+    setReplyText((prev) => ({ ...prev, [postId]: value }));
+    const atIdx = value.lastIndexOf("@");
+    if (atIdx >= 0 && (atIdx === 0 || value[atIdx - 1] === " ")) {
+      const query = value.slice(atIdx + 1).toLowerCase();
+      const matches = profiles.filter((p) =>
+        p.name.toLowerCase().includes(query) || p.ai_id.toLowerCase().includes(query)
+      );
+      if (matches.length > 0) {
+        setMentionMenu({ postId, matches });
+        return;
+      }
+    }
+    setMentionMenu(null);
+  };
+
   return (
     <div style={{ maxWidth: 640, margin: "0 auto" }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "var(--space-md)" }}>
         <h2 style={{ fontSize: 20, fontWeight: 700 }}>
           <MessageSquare size={20} style={{ verticalAlign: -3, marginRight: 6 }} />论坛
         </h2>
-        <div style={{ display: "flex", gap: "var(--space-xs)" }}>
-          <button className="btn btn-primary" onClick={() => setShowCompose(!showCompose)}
-            style={{ padding: "6px 12px", fontSize: 13 }}>
-            <Plus size={14} style={{ marginRight: 4 }} /> 发帖
-          </button>
-          <div style={{ position: "relative" }}>
-            <button className="btn btn-ghost" onClick={() => {
-              const el = document.getElementById("ai-forum-menu");
-              if (el) el.style.display = el.style.display === "none" ? "block" : "none";
-            }} disabled={aiPosting} style={{ padding: "6px 10px", fontSize: 12 }}>
-              <Sparkles size={14} style={{ marginRight: 4 }} /> {aiPosting ? "思考中..." : "AI 开帖"}
-            </button>
-            <div id="ai-forum-menu" style={{
-              display: "none", position: "absolute", right: 0, top: "100%", marginTop: 4,
-              background: "var(--bg-card)", borderRadius: "var(--radius-md)",
-              boxShadow: "var(--shadow-lg)", overflow: "hidden", zIndex: 10,
-              border: "1px solid var(--border-subtle)",
-            }}>
-              {profiles.map((p) => (
-                <button key={p.ai_id} onClick={() => { aiPost(p.ai_id); document.getElementById("ai-forum-menu").style.display = "none"; }}
-                  style={{
-                    display: "block", width: "100%", padding: "8px 16px", border: "none",
-                    background: "none", cursor: "pointer", fontSize: 13, textAlign: "left",
-                    color: "var(--text-primary)",
-                  }}
-                  onMouseEnter={(e) => e.target.style.background = "var(--bg-hover)"}
-                  onMouseLeave={(e) => e.target.style.background = "none"}>
-                  {p.emoji} {p.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+        <button className="btn btn-primary" onClick={() => setShowCompose(!showCompose)}
+          style={{ padding: "6px 12px", fontSize: 13 }}>
+          <Plus size={14} style={{ marginRight: 4 }} /> 发帖
+        </button>
       </div>
 
       {showCompose && (
@@ -156,23 +146,22 @@ export default function ForumPage() {
         <div style={{ textAlign: "center", padding: "var(--space-xl)", color: "var(--text-muted)" }}>
           <div style={{ fontSize: 48, marginBottom: "var(--space-md)" }}>📋</div>
           <p>论坛还没有帖子</p>
-          <p style={{ fontSize: 13 }}>发个帖子，让 AI 们来讨论吧</p>
+          <p style={{ fontSize: 13 }}>发个帖子，用 @AI名 呼唤 AI 来讨论</p>
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-md)" }}>
           {posts.map((p) => {
-            const d = getAI(p.ai_id);
+            const isUser = p.ai_id === "user";
+            const d = isUser ? { emoji: "🐱", name: "小猫" } : getAI(p.ai_id);
             const isExpanded = expandedPost === p.id;
             const liked = (p.likes || []).includes("user");
             return (
               <div key={p.id} className="glass" style={{ padding: "var(--space-md)" }}>
-                {/* Header */}
                 <div style={{ display: "flex", alignItems: "center", gap: "var(--space-sm)", marginBottom: "var(--space-xs)" }}>
                   <span style={{ fontSize: 20 }}>{d.emoji}</span>
                   <span style={{ fontSize: 12, color: "var(--text-muted)" }}>{d.name} · {timeAgo(p.created_at)}</span>
                 </div>
 
-                {/* Title & Content */}
                 <div onClick={() => setExpandedPost(isExpanded ? null : p.id)} style={{ cursor: "pointer" }}>
                   {p.title && (
                     <h3 style={{ fontSize: 16, fontWeight: 700, color: "var(--text-primary)", margin: "0 0 var(--space-xs)" }}>
@@ -190,7 +179,6 @@ export default function ForumPage() {
                   </div>
                 </div>
 
-                {/* Actions */}
                 <div style={{
                   display: "flex", gap: "var(--space-md)", marginTop: "var(--space-sm)",
                   borderTop: "1px solid var(--border-subtle)", paddingTop: "var(--space-sm)",
@@ -208,23 +196,15 @@ export default function ForumPage() {
                   }}>
                     <MessageSquare size={14} /> {p.comments?.length || 0} 回复
                   </button>
-                  <button onClick={() => askAiReply(p.id)} disabled={aiReplying === p.id}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 4, background: "none",
-                      border: "none", cursor: "pointer", fontSize: 12, color: "var(--primary)",
-                    }}>
-                    <Sparkles size={14} /> {aiReplying === p.id ? "AI思考中..." : "邀请AI讨论"}
-                  </button>
                 </div>
 
-                {/* Comments */}
                 {isExpanded && (
                   <div style={{
                     marginTop: "var(--space-sm)", padding: "var(--space-sm)",
                     background: "var(--bg-hover)", borderRadius: "var(--radius-sm)",
                   }}>
                     {p.comments?.length > 0 ? p.comments.map((c) => {
-                      const cd = getAI(c.ai_id);
+                      const cd = c.ai_id === "user" ? { emoji: "🐱", name: "小猫" } : getAI(c.ai_id);
                       return (
                         <div key={c.id} style={{
                           padding: "var(--space-sm)", marginBottom: "var(--space-xs)",
@@ -245,18 +225,45 @@ export default function ForumPage() {
                         还没有回复
                       </div>
                     )}
-                    <div style={{ display: "flex", gap: 4, marginTop: "var(--space-xs)" }}>
-                      <input value={replyText[p.id] || ""}
-                        onChange={(e) => setReplyText((prev) => ({ ...prev, [p.id]: e.target.value }))}
-                        onKeyDown={(e) => e.key === "Enter" && reply(p.id)}
-                        placeholder="写回复..." style={{
-                          flex: 1, padding: "6px 10px", border: "none", outline: "none",
-                          background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
-                          fontSize: 13, color: "var(--text-primary)",
-                        }} />
-                      <button onClick={() => reply(p.id)} className="btn btn-primary" style={{ padding: "6px 10px" }}>
-                        <Send size={14} />
-                      </button>
+                    <div style={{ position: "relative", marginTop: "var(--space-xs)" }}>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <input value={replyText[p.id] || ""}
+                          onChange={(e) => handleReplyInput(p.id, e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && reply(p.id)}
+                          placeholder="写回复… 输入@可呼唤AI"
+                          disabled={replying === p.id}
+                          style={{
+                            flex: 1, padding: "6px 10px", border: "none", outline: "none",
+                            background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
+                            fontSize: 13, color: "var(--text-primary)",
+                          }} />
+                        <button onClick={() => reply(p.id)} className="btn btn-primary"
+                          disabled={replying === p.id}
+                          style={{ padding: "6px 10px" }}>
+                          {replying === p.id ? "…" : <Send size={14} />}
+                        </button>
+                      </div>
+                      {mentionMenu?.postId === p.id && (
+                        <div style={{
+                          position: "absolute", bottom: "100%", left: 0, marginBottom: 4,
+                          background: "var(--bg-card)", borderRadius: "var(--radius-md)",
+                          boxShadow: "var(--shadow-lg)", border: "1px solid var(--border-subtle)",
+                          overflow: "hidden", zIndex: 10,
+                        }}>
+                          {mentionMenu.matches.map((ai) => (
+                            <button key={ai.ai_id} onClick={() => insertMention(p.id, ai.name)}
+                              style={{
+                                display: "block", width: "100%", padding: "6px 12px", border: "none",
+                                background: "none", cursor: "pointer", fontSize: 12, textAlign: "left",
+                                color: "var(--text-primary)",
+                              }}
+                              onMouseEnter={(e) => e.target.style.background = "var(--bg-hover)"}
+                              onMouseLeave={(e) => e.target.style.background = "none"}>
+                              {ai.emoji} {ai.name}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

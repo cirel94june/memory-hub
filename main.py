@@ -1296,8 +1296,55 @@ async def api_create_post(request: Request, authorization: str = Header(default=
 async def api_add_comment(post_id: int, request: Request, authorization: str = Header(default="")):
     verify_secret(authorization)
     body = await request.json()
-    cid = social.add_comment(post_id, body.get("ai_id", "user"), body.get("content", ""))
-    return {"id": cid, "ok": True}
+    commenter = body.get("ai_id", "user")
+    content = body.get("content", "")
+    cid = social.add_comment(post_id, commenter, content)
+
+    ai_comments = []
+    mention_ids = body.get("mention_ai", [])
+    if mention_ids:
+        post_data = social.list_posts()
+        post = None
+        for p in post_data.get("items", []):
+            if p["id"] == post_id:
+                post = p
+                break
+        if post:
+            from ai_profiles import get_profile
+            poster_profile = get_profile(post["ai_id"]) or {}
+            poster_name = poster_profile.get("name") or post["ai_id"]
+            existing_comments = post.get("comments", [])
+            comment_lines = []
+            for c in existing_comments[-5:]:
+                cn = "小猫" if c["ai_id"] == "user" else ((get_profile(c["ai_id"]) or {}).get("name", c["ai_id"]))
+                comment_lines.append(f"{cn}: {c['content']}")
+            comment_lines.append(f"小猫: {content}")
+            comment_ctx = "\n".join(comment_lines)
+
+            for mentioned_ai in mention_ids:
+                m_profile = get_profile(mentioned_ai) or {}
+                m_name = m_profile.get("name") or mentioned_ai
+                is_own_post = mentioned_ai == post["ai_id"]
+                if is_own_post:
+                    prompt = (
+                        f"这是你（{m_name}）发的{'朋友圈' if post['type'] == 'moment' else '论坛帖子'}：\n"
+                        f"「{post['content'][:200]}」\n\n"
+                        f"评论区：\n{comment_ctx}\n\n"
+                        f"小猫@了你，请回复。简短自然，50字以内。不要加名字前缀。"
+                    )
+                else:
+                    prompt = (
+                        f"{poster_name}发了一条{'朋友圈' if post['type'] == 'moment' else '论坛帖子'}：\n"
+                        f"「{post['content'][:200]}」\n\n"
+                        f"评论区：\n{comment_ctx}\n\n"
+                        f"小猫@了你（{m_name}），请针对这条内容发表评论。简短自然，50字以内。不要加名字前缀。"
+                    )
+                reply = await _social_call_llm(mentioned_ai, prompt, max_tokens=150)
+                if reply:
+                    reply_id = social.add_comment(post_id, mentioned_ai, reply)
+                    ai_comments.append({"id": reply_id, "ai_id": mentioned_ai, "content": reply})
+
+    return {"id": cid, "ok": True, "ai_comments": ai_comments}
 
 
 @app.post("/api/social/posts/{post_id}/like")
@@ -1311,15 +1358,26 @@ async def api_toggle_like(post_id: int, request: Request, authorization: str = H
 async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> str:
     """用指定 AI 的模型配置调 LLM"""
     from ai_profiles import get_llm_config_for_ai, get_profile
-    cfg = get_llm_config_for_ai(ai_id)
+    from config import AI_ALIASES
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    cfg = get_llm_config_for_ai(canonical)
+    if not cfg["api_key"]:
+        cfg = get_llm_config_for_ai(ai_id)
     if not cfg["api_key"]:
         return ""
-    profile = get_profile(ai_id) or {}
+    profile = get_profile(canonical) or get_profile(ai_id) or {}
     persona = profile.get("persona", "")
-    messages = []
+    name = profile.get("name") or ai_id
+    system = (
+        f"你是{name}。你有自己独立的身份、想法和经历，和用户（小猫/ceci）是不同的人。"
+        f"请始终以{name}的第一人称视角说话，不要混淆你的经历和用户的经历。"
+    )
     if persona:
-        messages.append({"role": "system", "content": persona})
-    messages.append({"role": "user", "content": prompt})
+        system += f"\n\n你的人设：{persona}"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -1428,17 +1486,23 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
 
             for resp_ai in responders:
                 from ai_profiles import get_profile
-                profile = get_profile(resp_ai) or {}
+                from config import AI_ALIASES
+                canonical_r = AI_ALIASES.get(resp_ai, resp_ai)
+                profile = get_profile(canonical_r) or get_profile(resp_ai) or {}
                 name = profile.get("name") or resp_ai
                 chat_lines = []
                 for m in history[-10:]:
-                    speaker = "小猫" if m["ai_id"] == "user" else (get_profile(m["ai_id"]) or {}).get("name", m["ai_id"])
+                    if m["ai_id"] == "user":
+                        speaker = "小猫"
+                    else:
+                        cr = AI_ALIASES.get(m["ai_id"], m["ai_id"])
+                        speaker = (get_profile(cr) or get_profile(m["ai_id"]) or {}).get("name", m["ai_id"])
                     chat_lines.append(f"{speaker}: {m['content']}")
                 chat_lines.append(f"小猫: {content}")
                 chat_context = "\n".join(chat_lines)
                 reply = await _social_call_llm(
                     resp_ai,
-                    f"你是{name}，正在一个群聊里。以下是最近的聊天记录：\n\n{chat_context}\n\n"
+                    f"以下是群聊「{g.get('name', '群聊')}」的最近对话：\n\n{chat_context}\n\n"
                     f"请自然地回复，简短一些（50字以内）。不要重复别人说过的话。直接回复，不要加你的名字前缀。",
                     max_tokens=150,
                 )
