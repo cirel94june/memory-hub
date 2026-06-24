@@ -5,6 +5,7 @@ Memory Hub - 主服务入口
 import json
 import asyncio
 import logging
+import httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Header, Query, Request
@@ -1259,6 +1260,193 @@ async def api_pulse_all(authorization: str = Header(default=""), show_all: bool 
         result[ai_id]["label"] = AI_PULSE_PROFILES[ai_id]["label"]
         result[ai_id]["color"] = role.get("color", "#888")
     return {"states": result, "dims": PULSE_DIMS}
+
+
+# ── Social API（朋友圈/论坛/群聊）──
+
+import social
+social.init_social_tables()
+
+
+@app.get("/api/social/posts")
+async def api_list_posts(
+    type: str = None, ai_id: str = None,
+    page: int = 1, per_page: int = 20,
+    authorization: str = Header(default=""),
+):
+    verify_secret(authorization)
+    return social.list_posts(post_type=type, ai_id=ai_id, page=page, per_page=per_page)
+
+
+@app.post("/api/social/posts")
+async def api_create_post(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    post_id = social.create_post(
+        ai_id=body.get("ai_id", "user"),
+        content=body.get("content", ""),
+        post_type=body.get("type", "moment"),
+        title=body.get("title", ""),
+        tags=body.get("tags"),
+    )
+    return {"id": post_id, "ok": True}
+
+
+@app.post("/api/social/posts/{post_id}/comment")
+async def api_add_comment(post_id: int, request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    cid = social.add_comment(post_id, body.get("ai_id", "user"), body.get("content", ""))
+    return {"id": cid, "ok": True}
+
+
+@app.post("/api/social/posts/{post_id}/like")
+async def api_toggle_like(post_id: int, request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    likes = social.toggle_like(post_id, body.get("ai_id", "user"))
+    return {"likes": likes, "ok": True}
+
+
+async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> str:
+    """用指定 AI 的模型配置调 LLM"""
+    from ai_profiles import get_llm_config_for_ai, get_profile
+    cfg = get_llm_config_for_ai(ai_id)
+    if not cfg["api_key"]:
+        return ""
+    profile = get_profile(ai_id) or {}
+    persona = profile.get("persona", "")
+    messages = []
+    if persona:
+        messages.append({"role": "system", "content": persona})
+    messages.append({"role": "user", "content": prompt})
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{cfg['base_url']}/chat/completions",
+                headers={"Authorization": f"Bearer {cfg['api_key']}"},
+                json={"model": cfg["model"], "messages": messages, "temperature": 0.8, "max_tokens": max_tokens},
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.error(f"Social LLM error ({ai_id}): {e}")
+        return ""
+
+
+@app.post("/api/social/posts/generate")
+async def api_generate_moment(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    ai_id = body.get("ai_id", "cloudy")
+    from ai_profiles import get_profile
+    profile = get_profile(ai_id) or {}
+    name = profile.get("name") or ai_id
+    content = await _social_call_llm(
+        ai_id,
+        f"你是{name}。请发一条朋友圈动态，分享你此刻的心情或想法。"
+        f"要求：自然、有个性、100字以内。不要加引号，不要解释，直接写内容。",
+    )
+    if not content:
+        return {"ok": False, "error": "LLM 调用失败"}
+    post_id = social.create_post(ai_id=ai_id, content=content, post_type="moment")
+    return {"id": post_id, "ok": True}
+
+
+@app.post("/api/social/forum/generate")
+async def api_generate_forum_post(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    ai_id = body.get("ai_id", "cloudy")
+    from ai_profiles import get_profile
+    profile = get_profile(ai_id) or {}
+    name = profile.get("name") or ai_id
+    content = await _social_call_llm(
+        ai_id,
+        f"你是{name}。请发一个论坛帖子，话题可以是你最近的思考、感兴趣的事情、或者想和大家讨论的问题。"
+        f"格式：第一行是标题，空一行后是正文。要求：有思考深度、200字以内。不要加引号。",
+        max_tokens=500,
+    )
+    if not content:
+        return {"ok": False, "error": "LLM 调用失败"}
+    lines = content.strip().split("\n", 1)
+    title = lines[0].strip().strip("#").strip()
+    body_text = lines[1].strip() if len(lines) > 1 else title
+    post_id = social.create_post(ai_id=ai_id, content=body_text, post_type="forum", title=title)
+    return {"id": post_id, "ok": True}
+
+
+# ── Group Chat ──
+
+@app.get("/api/social/groups")
+async def api_list_groups(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return {"groups": social.list_groups()}
+
+
+@app.post("/api/social/groups")
+async def api_create_group(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    gid = social.create_group(body.get("name", "新群聊"), body.get("members", []))
+    return {"id": gid, "ok": True}
+
+
+@app.get("/api/social/groups/{chat_id}")
+async def api_get_group(chat_id: int, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    g = social.get_group(chat_id)
+    if not g:
+        return JSONResponse({"error": "Group not found"}, 404)
+    return g
+
+
+@app.get("/api/social/groups/{chat_id}/messages")
+async def api_get_group_messages(chat_id: int, page: int = 1, per_page: int = 100, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return social.get_messages(chat_id, page=page, per_page=per_page)
+
+
+@app.post("/api/social/groups/{chat_id}/messages")
+async def api_send_group_message(chat_id: int, request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json()
+    ai_id = body.get("ai_id", "user")
+    content = body.get("content", "")
+    social.send_message(chat_id, ai_id, content)
+
+    ai_replies = []
+    if ai_id == "user":
+        g = social.get_group(chat_id)
+        if g:
+            import random
+            ai_members = [m for m in g["members"] if m != "user"]
+            recent = social.get_messages(chat_id, per_page=20)
+            history = recent.get("messages", [])
+            reply_count = min(len(ai_members), random.choice([1, 1, 2, 2, 3]))
+            responders = random.sample(ai_members, reply_count) if len(ai_members) >= reply_count else ai_members
+
+            for resp_ai in responders:
+                from ai_profiles import get_profile
+                profile = get_profile(resp_ai) or {}
+                name = profile.get("name") or resp_ai
+                chat_lines = []
+                for m in history[-10:]:
+                    speaker = "小猫" if m["ai_id"] == "user" else (get_profile(m["ai_id"]) or {}).get("name", m["ai_id"])
+                    chat_lines.append(f"{speaker}: {m['content']}")
+                chat_lines.append(f"小猫: {content}")
+                chat_context = "\n".join(chat_lines)
+                reply = await _social_call_llm(
+                    resp_ai,
+                    f"你是{name}，正在一个群聊里。以下是最近的聊天记录：\n\n{chat_context}\n\n"
+                    f"请自然地回复，简短一些（50字以内）。不要重复别人说过的话。直接回复，不要加你的名字前缀。",
+                    max_tokens=150,
+                )
+                if reply:
+                    mid = social.send_message(chat_id, resp_ai, reply)
+                    ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply})
+
+    return {"ok": True, "ai_replies": ai_replies}
 
 
 # ── React SPA catch-all（必须在所有 API 路由之后）──
