@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Heart, MessageCircle, Plus, Send } from "lucide-react";
+import { Heart, MessageCircle, Plus, Send, Trash2 } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
@@ -52,6 +52,12 @@ export default function MomentsPage() {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ ai_id: "user" }),
     });
+    load();
+  };
+
+  const deletePost = async (postId) => {
+    if (!confirm("确定删除这条动态？")) return;
+    await fetch(`/api/social/posts/${postId}`, { method: "DELETE", headers: auth });
     load();
   };
 
@@ -172,6 +178,13 @@ export default function MomentsPage() {
                     border: "none", cursor: "pointer", fontSize: 12, color: "var(--text-muted)",
                   }}>
                     <MessageCircle size={14} /> {p.comments?.length || 0}
+                  </button>
+                  <button onClick={() => deletePost(p.id)} style={{
+                    display: "flex", alignItems: "center", gap: 4, background: "none",
+                    border: "none", cursor: "pointer", fontSize: 12, color: "var(--text-muted)",
+                    marginLeft: "auto",
+                  }}>
+                    <Trash2 size={14} />
                   </button>
                 </div>
 

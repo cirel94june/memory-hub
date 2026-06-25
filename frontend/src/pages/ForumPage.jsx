@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { MessageSquare, Plus, Send, ThumbsUp } from "lucide-react";
+import { MessageSquare, Plus, Send, ThumbsUp, Trash2 } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
@@ -78,6 +78,12 @@ export default function ForumPage() {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
       body: JSON.stringify({ ai_id: "user" }),
     });
+    load();
+  };
+
+  const deletePost = async (postId) => {
+    if (!confirm("确定删除这个帖子？")) return;
+    await fetch(`/api/social/posts/${postId}`, { method: "DELETE", headers: auth });
     load();
   };
 
@@ -199,6 +205,13 @@ export default function ForumPage() {
                     border: "none", cursor: "pointer", fontSize: 12, color: "var(--text-muted)",
                   }}>
                     <MessageSquare size={14} /> {p.comments?.length || 0} 回复
+                  </button>
+                  <button onClick={() => deletePost(p.id)} style={{
+                    display: "flex", alignItems: "center", gap: 4, background: "none",
+                    border: "none", cursor: "pointer", fontSize: 12, color: "var(--text-muted)",
+                    marginLeft: "auto",
+                  }}>
+                    <Trash2 size={14} />
                   </button>
                 </div>
 

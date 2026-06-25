@@ -667,6 +667,32 @@ async def api_list_profiles(authorization: str = Header(default="")):
     return {"profiles": profiles}
 
 
+@app.get("/api/ai-profiles/debug-llm")
+async def api_debug_llm(authorization: str = Header(default="")):
+    """诊断每个 AI 解析到的实际模型配置"""
+    verify_secret(authorization)
+    from ai_profiles import get_llm_config_for_ai, get_all_profiles
+    from config import AI_ALIASES, LLM_BASE_URL, LLM_MODEL
+    result = {}
+    for ai_id in _get_unique_ai_ids():
+        cfg = get_llm_config_for_ai(ai_id)
+        is_fallback = cfg["base_url"] == LLM_BASE_URL and cfg["model"] == LLM_MODEL
+        result[ai_id] = {
+            "base_url": cfg["base_url"],
+            "model": cfg["model"],
+            "has_key": bool(cfg["api_key"]),
+            "is_global_fallback": is_fallback,
+            "alias_of": AI_ALIASES.get(ai_id),
+        }
+    raw_profiles = get_all_profiles()
+    profile_keys = list(raw_profiles.keys())
+    return {
+        "ai_configs": result,
+        "global_fallback": {"base_url": LLM_BASE_URL, "model": LLM_MODEL, "has_key": bool(LLM_BASE_URL)},
+        "raw_profile_keys": profile_keys,
+    }
+
+
 @app.get("/api/ai-profiles/{ai_id}/memories")
 async def api_ai_memories(ai_id: str, limit: int = Query(default=30, le=100), authorization: str = Header(default="")):
     """获取某 AI 的相关记忆（合并别名查询）"""
@@ -1411,6 +1437,20 @@ async def api_toggle_like(post_id: int, request: Request, authorization: str = H
     body = await request.json()
     likes = social.toggle_like(post_id, body.get("ai_id", "user"))
     return {"likes": likes, "ok": True}
+
+
+@app.delete("/api/social/posts/{post_id}")
+async def api_delete_post(post_id: int, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    social.delete_post(post_id)
+    return {"ok": True}
+
+
+@app.delete("/api/social/comments/{comment_id}")
+async def api_delete_comment(comment_id: int, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    social.delete_comment(comment_id)
+    return {"ok": True}
 
 
 async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> str:

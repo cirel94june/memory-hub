@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { Send, Loader2, ChevronDown } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
@@ -11,6 +11,7 @@ export default function ChatPage() {
   const [showPicker, setShowPicker] = useState(false);
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
+  const abortRef = useRef(null);
 
   const currentAi = profiles.find((p) => p.ai_id === currentId) || profiles[0];
   const aiId = currentAi?.ai_id;
@@ -52,82 +53,122 @@ export default function ChatPage() {
     setTimeout(() => inputRef.current?.focus(), 100);
   };
 
-  const send = async () => {
+  const send = useCallback(async () => {
     const text = input.trim();
     if (!text || loading || !aiId) return;
+
+    const targetAi = aiId;
     setInput("");
     const userMsg = { role: "user", content: text };
+
     setConversations((prev) => ({
       ...prev,
-      [aiId]: [...(prev[aiId] || []), userMsg],
+      [targetAi]: [...(prev[targetAi] || []), userMsg],
     }));
     setLoading(true);
 
     try {
       const secret = localStorage.getItem("mh-secret") || "";
-      const headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + secret + ":" + aiId,
-      };
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-      const allMsgs = [...(conversations[aiId] || []), userMsg];
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
-        headers,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + secret + ":" + targetAi,
+        },
         body: JSON.stringify({
           model: "current",
-          messages: allMsgs.slice(-20),
+          messages: [...(conversations[targetAi] || []), userMsg].slice(-20),
           stream: true,
         }),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
         const errText = await res.text();
-        throw new Error("HTTP " + res.status + ": " + errText.slice(0, 200));
+        throw new Error("HTTP " + res.status + ": " + errText.slice(0, 300));
       }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let assistantContent = "";
+      let gotContent = false;
 
       setConversations((prev) => ({
         ...prev,
-        [aiId]: [...(prev[aiId] || []), { role: "assistant", content: "" }],
+        [targetAi]: [...(prev[targetAi] || []), { role: "assistant", content: "" }],
       }));
 
+      let buffer = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
-        const lines = chunk.split("\n").filter((l) => l.startsWith("data: "));
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
         for (const line of lines) {
-          const data = line.slice(6);
-          if (data === "[DONE]") break;
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: ")) continue;
+          const data = trimmed.slice(6);
+          if (data === "[DONE]") continue;
           try {
             const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content || "";
-            assistantContent += delta;
-            const finalContent = assistantContent;
-            setConversations((prev) => {
-              const msgs = [...(prev[aiId] || [])];
-              msgs[msgs.length - 1] = { role: "assistant", content: finalContent };
-              return { ...prev, [aiId]: msgs };
-            });
-          } catch {}
+            if (parsed.error) {
+              throw new Error(parsed.error.message || JSON.stringify(parsed.error));
+            }
+            const delta = parsed.choices?.[0]?.delta?.content;
+            if (delta) {
+              gotContent = true;
+              assistantContent += delta;
+              const snap = assistantContent;
+              setConversations((prev) => {
+                const msgs = [...(prev[targetAi] || [])];
+                msgs[msgs.length - 1] = { role: "assistant", content: snap };
+                return { ...prev, [targetAi]: msgs };
+              });
+            }
+          } catch (e) {
+            if (e.message && !e.message.includes("JSON")) throw e;
+          }
         }
       }
+
+      if (!gotContent) {
+        setConversations((prev) => {
+          const msgs = [...(prev[targetAi] || [])];
+          msgs[msgs.length - 1] = {
+            role: "assistant",
+            content: "⚠️ AI 没有返回任何内容。请检查该 AI 的模型配置（AI 档案页 → 模型设置）。",
+          };
+          return { ...prev, [targetAi]: msgs };
+        });
+      }
     } catch (err) {
-      setConversations((prev) => ({
-        ...prev,
-        [aiId]: [
-          ...(prev[aiId] || []),
-          { role: "assistant", content: "⚠️ " + err.message + "\n\n请去 AI 档案页配置模型和 API Key。" },
-        ],
-      }));
+      if (err.name === "AbortError") return;
+      setConversations((prev) => {
+        const msgs = [...(prev[targetAi] || [])];
+        if (msgs.length > 0 && msgs[msgs.length - 1].role === "assistant" && !msgs[msgs.length - 1].content) {
+          msgs[msgs.length - 1] = {
+            role: "assistant",
+            content: "⚠️ " + err.message + "\n\n请去 AI 档案页配置模型和 API Key。",
+          };
+        } else {
+          msgs.push({
+            role: "assistant",
+            content: "⚠️ " + err.message + "\n\n请去 AI 档案页配置模型和 API Key。",
+          });
+        }
+        return { ...prev, [targetAi]: msgs };
+      });
     }
     setLoading(false);
+    abortRef.current = null;
     inputRef.current?.focus();
-  };
+  }, [input, loading, aiId, conversations]);
 
   if (!currentAi) return null;
 
@@ -226,6 +267,7 @@ export default function ChatPage() {
 
 function MessageBubble({ message, ai }) {
   const isUser = message.role === "user";
+  const isError = !isUser && message.content?.startsWith("⚠️");
   return (
     <div style={{
       display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
@@ -241,10 +283,10 @@ function MessageBubble({ message, ai }) {
         borderRadius: isUser
           ? "var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg)"
           : "var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm)",
-        background: isUser ? "var(--primary)" : "var(--bg-card)",
-        color: isUser ? "var(--text-on-primary)" : "var(--text-primary)",
+        background: isError ? "rgba(239, 68, 68, 0.1)" : isUser ? "var(--primary)" : "var(--bg-card)",
+        color: isError ? "var(--text-primary)" : isUser ? "var(--text-on-primary)" : "var(--text-primary)",
         backdropFilter: isUser ? "none" : "blur(var(--glass-blur))",
-        border: isUser ? "none" : "1px solid var(--glass-border)",
+        border: isError ? "1px solid rgba(239, 68, 68, 0.3)" : isUser ? "none" : "1px solid var(--glass-border)",
         fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
       }}>
         {message.content || "..."}

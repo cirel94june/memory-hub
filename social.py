@@ -124,6 +124,21 @@ def toggle_like(post_id: int, ai_id: str):
     c.close()
     return likes
 
+
+def delete_post(post_id: int):
+    c = _conn()
+    c.execute("DELETE FROM social_comments WHERE post_id = ?", (post_id,))
+    c.execute("DELETE FROM social_posts WHERE id = ?", (post_id,))
+    c.commit()
+    c.close()
+
+
+def delete_comment(comment_id: int):
+    c = _conn()
+    c.execute("DELETE FROM social_comments WHERE id = ?", (comment_id,))
+    c.commit()
+    c.close()
+
 # --- Group Chat ---
 
 def create_group(name: str, members: list):

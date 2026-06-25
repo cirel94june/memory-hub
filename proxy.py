@@ -197,7 +197,14 @@ async def _forward_stream(
             ) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
-                    yield f"data: {error_body.decode()}\n\n"
+                    try:
+                        err_json = json.loads(error_body)
+                        err_msg = err_json.get("error", {}).get("message", error_body.decode()[:300])
+                    except Exception:
+                        err_msg = error_body.decode()[:300]
+                    error_event = json.dumps({"error": {"message": f"Upstream API error ({resp.status_code}): {err_msg}"}})
+                    yield f"data: {error_event}\n\n"
+                    yield "data: [DONE]\n\n"
                     return
                 async for line in resp.aiter_lines():
                     if not line:
