@@ -1455,9 +1455,13 @@ async def api_delete_comment(comment_id: int, authorization: str = Header(defaul
 
 async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> str:
     """用指定 AI 的模型配置调 LLM（get_profile/get_llm_config 已自带别名解析）"""
+    import logging
+    _log = logging.getLogger("memory_hub.social")
     from ai_profiles import get_llm_config_for_ai, get_profile
     cfg = get_llm_config_for_ai(ai_id)
+    _log.info(f"[Social LLM] ai={ai_id} → base_url={cfg['base_url'][:50]}, model={cfg['model']}, has_key={bool(cfg['api_key'])}")
     if not cfg["api_key"]:
+        _log.warning(f"[Social LLM] ai={ai_id} 无 API key，跳过")
         return ""
     profile = get_profile(ai_id) or {}
     persona = profile.get("persona", "")

@@ -73,6 +73,7 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
     if simple_ai_id:
         # 简单模式：优先用 AI 档案里的 per-AI 配置，fallback 到全局 .env
         ai_cfg = get_llm_config_for_ai(simple_ai_id)
+        logger.info(f"[Proxy] Config for {simple_ai_id}: base_url={ai_cfg['base_url'][:50]}, model={ai_cfg['model']}, has_key={bool(ai_cfg['api_key'])}")
         return ProxyConfig(
             target_base_url=ai_cfg["base_url"],
             target_api_key=ai_cfg["api_key"],

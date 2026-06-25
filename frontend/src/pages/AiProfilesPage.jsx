@@ -198,7 +198,7 @@ export default function AiProfilesPage() {
           </Section>
 
           {/* LLM Config */}
-          <Section title="模型配置（社交场景用）" icon={<Cpu size={14} />}>
+          <Section title="模型配置（聊天+社交全场景）" icon={<Cpu size={14} />}>
             <Field label="API Base URL" value={getVal("llm_base_url")} onChange={(v) => setVal("llm_base_url", v)}
               placeholder="留空则用全局默认" mono />
             <Field label="API Key" value={getVal("llm_api_key")}
@@ -216,8 +216,8 @@ export default function AiProfilesPage() {
               ))}
             </div>
             <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
-              留空的字段会自动 fallback 到全局 LLM 配置（设置页的小模型）。
-              可以给不同 AI 用不同模型——比如小克用 Sonnet，Jasper 用 DeepSeek。
+              ⚠️ 此配置影响所有场景：前端聊天、朋友圈、论坛、群聊。
+              三个字段必须都填才能生效——留空会 fallback 到全局小模型（daemon 用的 DeepSeek），可能导致 OOC。
             </p>
           </Section>
 
