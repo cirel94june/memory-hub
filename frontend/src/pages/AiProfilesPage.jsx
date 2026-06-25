@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain, Plus, Trash2, X } from "lucide-react";
+import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain, Plus, Trash2, X, Activity } from "lucide-react";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -21,6 +21,8 @@ export default function AiProfilesPage() {
   const [showAdd, setShowAdd] = useState(false);
   const [newAi, setNewAi] = useState({ ai_id: "", name: "", emoji: "🤖", color: "#6366f1", platform: "telegram" });
   const [addError, setAddError] = useState("");
+  const [debugInfo, setDebugInfo] = useState(null);
+  const [debugLoading, setDebugLoading] = useState(false);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -217,6 +219,55 @@ export default function AiProfilesPage() {
               留空的字段会自动 fallback 到全局 LLM 配置（设置页的小模型）。
               可以给不同 AI 用不同模型——比如小克用 Sonnet，Jasper 用 DeepSeek。
             </p>
+          </Section>
+
+          {/* LLM Debug */}
+          <Section title="模型诊断" icon={<Activity size={14} />}>
+            <button className="btn btn-ghost" onClick={async () => {
+              setDebugLoading(true);
+              try {
+                const r = await fetch("/api/ai-profiles/debug-llm", { headers: auth });
+                setDebugInfo(await r.json());
+              } catch (e) { setDebugInfo({ error: e.message }); }
+              setDebugLoading(false);
+            }} style={{ padding: "6px 14px", fontSize: 12 }}>
+              {debugLoading ? "检测中..." : "🔍 检测所有 AI 的模型配置"}
+            </button>
+            {debugInfo && !debugInfo.error && (
+              <div style={{ marginTop: "var(--space-sm)" }}>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>
+                  全局默认：{debugInfo.global_fallback?.model} @ {debugInfo.global_fallback?.base_url?.replace(/https?:\/\//, "").slice(0, 30)}
+                </div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                  profile 存储 keys: {debugInfo.raw_profile_keys?.join(", ")}
+                </div>
+                {Object.entries(debugInfo.ai_configs || {}).map(([aid, cfg]) => {
+                  const p = profiles.find((x) => x.ai_id === aid);
+                  return (
+                    <div key={aid} style={{
+                      padding: "6px 8px", marginBottom: 4, borderRadius: "var(--radius-sm)",
+                      background: cfg.is_global_fallback ? "rgba(239,68,68,0.08)" : "rgba(34,197,94,0.08)",
+                      border: `1px solid ${cfg.is_global_fallback ? "rgba(239,68,68,0.2)" : "rgba(34,197,94,0.2)"}`,
+                      fontSize: 12,
+                    }}>
+                      <span style={{ fontWeight: 600 }}>{p?.emoji || "🤖"} {p?.name || aid}</span>
+                      <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>
+                        {cfg.model}
+                      </span>
+                      <span style={{ color: "var(--text-muted)", marginLeft: 8, fontSize: 10 }}>
+                        @ {cfg.base_url?.replace(/https?:\/\//, "").slice(0, 35)}
+                      </span>
+                      {!cfg.has_key && <span style={{ color: "#ef4444", marginLeft: 8, fontSize: 10 }}>❌ 无API Key</span>}
+                      {cfg.is_global_fallback && <span style={{ color: "#ef4444", marginLeft: 8, fontSize: 10 }}>⚠️ 用的全局默认</span>}
+                      {cfg.alias_of && <span style={{ color: "var(--text-muted)", marginLeft: 8, fontSize: 10 }}>(→{cfg.alias_of})</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            {debugInfo?.error && (
+              <div style={{ fontSize: 12, color: "#ef4444", marginTop: 4 }}>错误：{debugInfo.error}</div>
+            )}
           </Section>
 
           {/* Save / Delete buttons */}
