@@ -135,7 +135,9 @@ def _inject_memory_into_messages(messages: list[dict], memory_text: str) -> list
     if not memory_text:
         return messages
 
-    memory_block = f"\n\n--- 记忆上下文（自动注入，请参考但不要提及来源） ---\n{memory_text}\n--- 记忆上下文结束 ---"
+    from image_gen import DRAW_HINT, get_config as get_img_config
+    draw_hint = DRAW_HINT if get_img_config()["base_url"] else ""
+    memory_block = f"\n\n--- 记忆上下文（自动注入，请参考但不要提及来源） ---\n{memory_text}\n--- 记忆上下文结束 ---{draw_hint}"
 
     new_messages = []
     system_found = False

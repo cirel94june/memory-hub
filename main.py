@@ -1540,6 +1540,10 @@ async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> st
     except Exception:
         pass
 
+    from image_gen import DRAW_HINT, get_config as get_img_config
+    if get_img_config()["base_url"]:
+        system_parts.append(DRAW_HINT)
+
     messages = [
         {"role": "system", "content": "\n".join(system_parts)},
         {"role": "user", "content": prompt},
@@ -1552,7 +1556,11 @@ async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> st
                 json={"model": cfg["model"], "messages": messages, "temperature": 0.8, "max_tokens": max_tokens},
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            reply = resp.json()["choices"][0]["message"]["content"].strip()
+
+        from image_gen import process_draw_tags
+        reply = await process_draw_tags(reply, ai_name=name)
+        return reply
     except Exception as e:
         logging.error(f"Social LLM error ({ai_id}): {e}")
         return ""

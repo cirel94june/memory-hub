@@ -195,3 +195,40 @@ async def _download_and_save(url: str, client=None) -> dict:
     except Exception as e:
         log.error(f"Failed to download image: {e}")
         return {"error": f"图片下载失败: {e}"}
+
+
+DRAW_HINT = (
+    "\n\n【画图能力】你可以画图！当你想画图时，在回复中写 [draw:图片描述] 标签，系统会自动调用画图API生成图片。"
+    "描述用英文效果更好。例如：[draw:a cute penguin sitting on ice under northern lights]。"
+    "不要每次都画图，只在合适的时候画（比如聊到有趣的画面、有人让你画、发朋友圈想配图时）。"
+)
+
+
+async def process_draw_tags(text: str, ai_name: str = "") -> str:
+    """检测文本中的 [draw:xxx] 标签，调用画图 API，替换为 [img]url[/img]"""
+    import re
+    pattern = r'\[draw:(.*?)\]'
+    matches = list(re.finditer(pattern, text))
+    if not matches:
+        return text
+
+    cfg = get_config()
+    if not cfg["base_url"] or not cfg["api_key"]:
+        for m in matches:
+            text = text.replace(m.group(0), "（画图API未配置）")
+        return text
+
+    for m in matches:
+        prompt = m.group(1).strip()
+        if not prompt:
+            continue
+        log.info(f"Processing draw tag: {prompt[:50]}")
+        result = await generate_image(prompt, ai_name=ai_name)
+        if result.get("url"):
+            text = text.replace(m.group(0), f"[img]{result['url']}[/img]")
+        elif result.get("error"):
+            text = text.replace(m.group(0), f"（画图失败: {result['error'][:50]}）")
+        else:
+            text = text.replace(m.group(0), "（画图失败）")
+
+    return text

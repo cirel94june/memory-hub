@@ -148,6 +148,42 @@ export default function ChatPage() {
           return { ...prev, [targetAi]: msgs };
         });
       }
+
+      // Process [draw:xxx] tags if present
+      if (assistantContent.includes("[draw:")) {
+        const drawPattern = /\[draw:(.*?)\]/g;
+        const drawMatches = [...assistantContent.matchAll(drawPattern)];
+        if (drawMatches.length > 0) {
+          setConversations((prev) => {
+            const msgs = [...(prev[targetAi] || [])];
+            msgs[msgs.length - 1] = { role: "assistant", content: assistantContent.replace(drawPattern, "🎨 画图中...") };
+            return { ...prev, [targetAi]: msgs };
+          });
+          let processed = assistantContent;
+          for (const dm of drawMatches) {
+            try {
+              const drawRes = await fetch("/api/draw", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+                body: JSON.stringify({ prompt: dm[1], ai_id: targetAi }),
+              });
+              const drawData = await drawRes.json();
+              if (drawData.url) {
+                processed = processed.replace(dm[0], `[img]${drawData.url}[/img]`);
+              } else {
+                processed = processed.replace(dm[0], `（画图失败: ${drawData.error || "未知错误"}）`);
+              }
+            } catch {
+              processed = processed.replace(dm[0], "（画图失败）");
+            }
+          }
+          setConversations((prev) => {
+            const msgs = [...(prev[targetAi] || [])];
+            msgs[msgs.length - 1] = { role: "assistant", content: processed };
+            return { ...prev, [targetAi]: msgs };
+          });
+        }
+      }
     } catch (err) {
       if (err.name === "AbortError") return;
       setConversations((prev) => {
@@ -325,7 +361,7 @@ export default function ChatPage() {
 function MessageBubble({ message, ai }) {
   const isUser = message.role === "user";
   const isError = !isUser && message.content?.startsWith("⚠️");
-  const imgMatch = message.content?.match(/^\[img\](.*?)\[\/img\]$/);
+  const hasImage = message.content?.includes("[img]");
   return (
     <div style={{
       display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
@@ -337,7 +373,7 @@ function MessageBubble({ message, ai }) {
       )}
       <div style={{
         maxWidth: "78%",
-        padding: imgMatch ? 4 : "10px 14px",
+        padding: "10px 14px",
         borderRadius: isUser
           ? "var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg)"
           : "var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm)",
@@ -348,15 +384,22 @@ function MessageBubble({ message, ai }) {
         fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
         overflow: "hidden",
       }}>
-        {imgMatch ? (
-          <img src={imgMatch[1]} alt="AI 画的图" style={{
-            maxWidth: "100%", borderRadius: "var(--radius-md)",
-            display: "block",
-          }} />
-        ) : (
-          message.content || "..."
-        )}
+        {hasImage ? <RichContent text={message.content} /> : (message.content || "...")}
       </div>
     </div>
   );
+}
+
+function RichContent({ text }) {
+  if (!text) return null;
+  const parts = text.split(/(\[img\].*?\[\/img\])/g);
+  return parts.map((part, i) => {
+    const m = part.match(/^\[img\](.*?)\[\/img\]$/);
+    if (m) {
+      return <img key={i} src={m[1]} alt="AI 画的图" style={{
+        maxWidth: "100%", borderRadius: "var(--radius-md)", marginTop: 4, display: "block",
+      }} />;
+    }
+    return part ? <span key={i}>{part}</span> : null;
+  });
 }
