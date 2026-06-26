@@ -1454,7 +1454,7 @@ async def api_delete_comment(comment_id: int, authorization: str = Header(defaul
 
 
 async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> str:
-    """用指定 AI 的模型配置调 LLM（get_profile/get_llm_config 已自带别名解析）"""
+    """用指定 AI 的模型配置调 LLM，注入人设 + 走廊记忆"""
     import logging
     _log = logging.getLogger("memory_hub.social")
     from ai_profiles import get_llm_config_for_ai, get_profile
@@ -1466,14 +1466,26 @@ async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> st
     profile = get_profile(ai_id) or {}
     persona = profile.get("persona", "")
     name = profile.get("name") or ai_id
-    system = (
-        f"你是{name}。你有自己独立的身份、想法和经历，和用户（小猫/ceci）是不同的人。"
-        f"请始终以{name}的第一人称视角说话，不要混淆你的经历和用户的经历。"
-    )
+    _log.info(f"[Social LLM] ai={ai_id} → name={name}, has_persona={bool(persona)}")
+
+    system_parts = [
+        f"你是{name}，一个有独立人格和经历的AI。",
+        f"用户叫小猫（ceci），是你的朋友。你和小猫是不同的人，不要把她的经历当成你的。",
+        f"始终以{name}的第一人称说话，保持你自己的性格和语气。",
+    ]
     if persona:
-        system += f"\n\n你的人设：{persona}"
+        system_parts.append(f"\n【你的人设】\n{persona}")
+
+    try:
+        from memory_ops import get_corridor
+        corridor = await get_corridor(ai_id)
+        if corridor:
+            system_parts.append(f"\n【你和小猫的共同记忆（参考但不要刻意提起）】\n{corridor[:600]}")
+    except Exception:
+        pass
+
     messages = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": "\n".join(system_parts)},
         {"role": "user", "content": prompt},
     ]
     try:
