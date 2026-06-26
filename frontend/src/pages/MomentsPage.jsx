@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Heart, MessageCircle, Plus, Send, Trash2 } from "lucide-react";
+import { Heart, MessageCircle, Plus, Send, Trash2, Paintbrush, Loader2 } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 function timeAgo(iso) {
@@ -22,6 +22,8 @@ export default function MomentsPage() {
   const [mentionMenu, setMentionMenu] = useState(null);
   const [replying, setReplying] = useState(null);
   const [posting, setPosting] = useState(false);
+  const [drawPrompt, setDrawPrompt] = useState("");
+  const [drawing, setDrawing] = useState(false);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -45,6 +47,33 @@ export default function MomentsPage() {
     setShowCompose(false);
     setPosting(false);
     load();
+  };
+
+  const drawAndPost = async () => {
+    const prompt = drawPrompt.trim();
+    if (!prompt || drawing) return;
+    setDrawing(true);
+    try {
+      const res = await fetch("/api/draw", {
+        method: "POST", headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, ai_id: "user" }),
+      });
+      const data = await res.json();
+      if (data.url) {
+        const content = (newContent.trim() ? newContent.trim() + "\n" : "") + `[img]${data.url}[/img]`;
+        await fetch("/api/social/posts", {
+          method: "POST", headers: { ...auth, "Content-Type": "application/json" },
+          body: JSON.stringify({ ai_id: "user", content, type: "moment" }),
+        });
+        setNewContent("");
+        setDrawPrompt("");
+        setShowCompose(false);
+        load();
+      } else {
+        alert(data.error || "画图失败");
+      }
+    } catch (e) { alert("画图失败: " + e.message); }
+    setDrawing(false);
   };
 
   const like = async (postId) => {
@@ -131,8 +160,21 @@ export default function MomentsPage() {
               padding: "var(--space-sm)", fontSize: 14, color: "var(--text-primary)",
               resize: "vertical", boxSizing: "border-box",
             }} />
+          <div style={{ display: "flex", gap: "var(--space-xs)", marginTop: "var(--space-sm)", alignItems: "center" }}>
+            <input value={drawPrompt} onChange={(e) => setDrawPrompt(e.target.value)}
+              placeholder="画图描述（选填）"
+              style={{
+                flex: 1, padding: "6px 10px", border: "none", outline: "none",
+                background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
+                fontSize: 12, color: "var(--text-primary)",
+              }} />
+            <button className="btn btn-ghost" onClick={drawAndPost} disabled={!drawPrompt.trim() || drawing}
+              style={{ padding: "6px 10px", fontSize: 12, whiteSpace: "nowrap" }}>
+              {drawing ? <><Loader2 size={12} className="spin" /> 画中...</> : <><Paintbrush size={12} /> 画图发布</>}
+            </button>
+          </div>
           <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "var(--space-sm)" }}>
-            <button className="btn btn-primary" onClick={post} disabled={posting}
+            <button className="btn btn-primary" onClick={post} disabled={posting || drawing}
               style={{ padding: "6px 16px", fontSize: 13 }}>
               {posting ? "AI 正在围观..." : "发布"}
             </button>
@@ -163,7 +205,7 @@ export default function MomentsPage() {
                   </div>
                 </div>
                 <div style={{ fontSize: 14, lineHeight: 1.7, color: "var(--text-primary)", marginBottom: "var(--space-sm)", whiteSpace: "pre-wrap" }}>
-                  {p.content}
+                  <RichContent text={p.content} />
                 </div>
                 <div style={{ display: "flex", gap: "var(--space-md)", borderTop: "1px solid var(--border-subtle)", paddingTop: "var(--space-sm)" }}>
                   <button onClick={() => like(p.id)} style={{
@@ -253,4 +295,16 @@ export default function MomentsPage() {
       )}
     </div>
   );
+}
+
+function RichContent({ text }) {
+  if (!text) return null;
+  const parts = text.split(/(\[img\].*?\[\/img\])/g);
+  return parts.map((part, i) => {
+    const m = part.match(/^\[img\](.*?)\[\/img\]$/);
+    if (m) {
+      return <img key={i} src={m[1]} alt="" style={{ maxWidth: "100%", borderRadius: "var(--radius-md)", marginTop: 4, display: "block" }} />;
+    }
+    return part ? <span key={i}>{part}</span> : null;
+  });
 }

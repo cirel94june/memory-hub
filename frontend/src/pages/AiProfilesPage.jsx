@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain, Plus, Trash2, X, Activity } from "lucide-react";
+import { Bot, Save, ChevronDown, ChevronUp, Globe, Key, Cpu, MessageSquare, Brain, Plus, Trash2, X, Activity, Paintbrush } from "lucide-react";
 
 const ROOM_LABELS = {
   psychology: "心理", personality: "性格", health: "健康", career: "职业",
@@ -23,6 +23,10 @@ export default function AiProfilesPage() {
   const [addError, setAddError] = useState("");
   const [debugInfo, setDebugInfo] = useState(null);
   const [debugLoading, setDebugLoading] = useState(false);
+  const [imgCfg, setImgCfg] = useState({ base_url: "", model: "", api_key: "", has_key: false });
+  const [imgEditing, setImgEditing] = useState({});
+  const [imgSaving, setImgSaving] = useState(false);
+  const [imgSaved, setImgSaved] = useState(false);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
@@ -37,6 +41,13 @@ export default function AiProfilesPage() {
   };
 
   useEffect(load, []);
+
+  useEffect(() => {
+    fetch("/api/image-config", { headers: auth })
+      .then((r) => r.json())
+      .then((d) => setImgCfg(d))
+      .catch(() => {});
+  }, []);
 
   const loadMemories = (aiId) => {
     fetch(`/api/ai-profiles/${aiId}/memories?limit=30`, { headers: auth })
@@ -268,6 +279,49 @@ export default function AiProfilesPage() {
             {debugInfo?.error && (
               <div style={{ fontSize: 12, color: "#ef4444", marginTop: 4 }}>错误：{debugInfo.error}</div>
             )}
+          </Section>
+
+          {/* Image API Config (global) */}
+          <Section title="画图 API 配置（全局共用）" icon={<Paintbrush size={14} />}>
+            <Field label="API Base URL" value={imgEditing.base_url ?? imgCfg.base_url} onChange={(v) => setImgEditing((p) => ({ ...p, base_url: v }))}
+              placeholder="如 https://api.example.com/v1" mono />
+            <Field label="API Key" value={imgEditing.api_key ?? ""} onChange={(v) => setImgEditing((p) => ({ ...p, api_key: v }))}
+              type="password" placeholder={imgCfg.has_key ? "已设置（留空不修改）" : "填写中转站的 API Key"} mono />
+            <Field label="模型名称" value={imgEditing.model ?? imgCfg.model} onChange={(v) => setImgEditing((p) => ({ ...p, model: v }))}
+              placeholder="如 gpt-5.5" mono />
+            <div style={{ display: "flex", gap: "var(--space-xs)", flexWrap: "wrap", marginTop: 4 }}>
+              {["gpt-5.5", "gpt-4o-image", "dall-e-3"].map((m) => (
+                <button key={m} onClick={() => setImgEditing((p) => ({ ...p, model: m }))}
+                  className="btn btn-ghost" style={{ padding: "2px 8px", fontSize: 11, fontFamily: "monospace" }}>
+                  {m}
+                </button>
+              ))}
+            </div>
+            <p style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
+              所有 AI 共用这个画图 API。在聊天和朋友圈里都可以让 AI 画图。
+            </p>
+            <button className="btn btn-primary" onClick={async () => {
+              if (!Object.keys(imgEditing).length) return;
+              setImgSaving(true);
+              const body = { ...imgEditing };
+              if (body.api_key === "") delete body.api_key;
+              try {
+                await fetch("/api/image-config", {
+                  method: "PUT", headers: { ...auth, "Content-Type": "application/json" },
+                  body: JSON.stringify(body),
+                });
+                setImgSaved(true);
+                setImgEditing({});
+                const r = await fetch("/api/image-config", { headers: auth });
+                setImgCfg(await r.json());
+                setTimeout(() => setImgSaved(false), 2000);
+              } catch {}
+              setImgSaving(false);
+            }} disabled={!Object.keys(imgEditing).length || imgSaving}
+              style={{ padding: "6px 16px", fontSize: 12, marginTop: 8 }}>
+              <Save size={12} style={{ marginRight: 4 }} />
+              {imgSaved ? "已保存" : imgSaving ? "保存中..." : "保存画图配置"}
+            </button>
           </Section>
 
           {/* Save / Delete buttons */}

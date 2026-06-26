@@ -185,7 +185,7 @@ export default function ForumPage() {
                     WebkitBoxOrient: "vertical", overflow: "hidden",
                     whiteSpace: "pre-wrap",
                   }}>
-                    {p.content}
+                    <RichContent text={p.content} />
                   </div>
                 </div>
 
@@ -291,4 +291,16 @@ export default function ForumPage() {
       )}
     </div>
   );
+}
+
+function RichContent({ text }) {
+  if (!text) return null;
+  const parts = text.split(/(\[img\].*?\[\/img\])/g);
+  return parts.map((part, i) => {
+    const m = part.match(/^\[img\](.*?)\[\/img\]$/);
+    if (m) {
+      return <img key={i} src={m[1]} alt="" style={{ maxWidth: "100%", borderRadius: "var(--radius-md)", marginTop: 4, display: "block" }} />;
+    }
+    return part ? <span key={i}>{part}</span> : null;
+  });
 }

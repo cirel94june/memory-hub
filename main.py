@@ -56,6 +56,9 @@ async def lifespan(app: FastAPI):
         print("[Memory Hub] Daemon scheduler started (every 12h)")
         from ai_profiles import load_profiles
         await load_profiles()
+        from image_gen import load_config as load_image_config
+        await load_image_config()
+        print("[Memory Hub] Image API config loaded")
         from persona_state import load_state as load_pulse_state
         load_pulse_state()
         print("[Memory Hub] Pulse state loaded")
@@ -92,6 +95,11 @@ from mcp_server import mcp as _mcp_inst
 _mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+import os as _os
+_uploads_dir = _os.path.join(_os.path.dirname(__file__), "uploads")
+_os.makedirs(_uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 
 # ── React SPA 前端 (/app/) ──
 import os
@@ -691,6 +699,54 @@ async def api_debug_llm(authorization: str = Header(default="")):
         "global_fallback": {"base_url": LLM_BASE_URL, "model": LLM_MODEL, "has_key": bool(LLM_BASE_URL)},
         "raw_profile_keys": profile_keys,
     }
+
+
+# ── 画图 API ──
+
+@app.get("/api/image-config")
+async def api_get_image_config(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    from image_gen import get_config
+    cfg = get_config()
+    return {
+        "base_url": cfg["base_url"],
+        "model": cfg["model"],
+        "has_key": bool(cfg["api_key"]),
+    }
+
+
+@app.put("/api/image-config")
+async def api_update_image_config(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    from image_gen import update_config
+    body = await request.json()
+    updates = {}
+    for k in ("base_url", "api_key", "model"):
+        if k in body and body[k]:
+            updates[k] = body[k]
+    await update_config(updates)
+    return {"status": "ok"}
+
+
+@app.post("/api/draw")
+async def api_draw(request: Request, authorization: str = Header(default="")):
+    """画图接口：任何 AI 都可以调用"""
+    verify_secret(authorization)
+    body = await request.json()
+    prompt = body.get("prompt", "").strip()
+    ai_id = body.get("ai_id", "")
+    if not prompt:
+        raise HTTPException(400, "prompt 不能为空")
+
+    from image_gen import generate_image
+    from ai_profiles import get_profile
+    ai_name = ""
+    if ai_id:
+        profile = get_profile(ai_id) or {}
+        ai_name = profile.get("name", ai_id)
+
+    result = await generate_image(prompt, ai_name=ai_name)
+    return result
 
 
 @app.get("/api/ai-profiles/{ai_id}/memories")

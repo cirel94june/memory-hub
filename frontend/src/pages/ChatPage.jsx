@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Loader2, ChevronDown } from "lucide-react";
+import { Send, Loader2, ChevronDown, Paintbrush } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 export default function ChatPage() {
@@ -12,6 +12,7 @@ export default function ChatPage() {
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const abortRef = useRef(null);
+  const [drawing, setDrawing] = useState(false);
 
   const currentAi = profiles.find((p) => p.ai_id === currentId) || profiles[0];
   const aiId = currentAi?.ai_id;
@@ -170,6 +171,52 @@ export default function ChatPage() {
     inputRef.current?.focus();
   }, [input, loading, aiId, conversations]);
 
+  const draw = useCallback(async () => {
+    const text = input.trim();
+    if (!text || loading || drawing || !aiId) return;
+    const targetAi = aiId;
+    setInput("");
+    setConversations((prev) => ({
+      ...prev,
+      [targetAi]: [...(prev[targetAi] || []), { role: "user", content: `🎨 画画：${text}` }],
+    }));
+    setDrawing(true);
+    setConversations((prev) => ({
+      ...prev,
+      [targetAi]: [...(prev[targetAi] || []), { role: "assistant", content: "🎨 正在画画..." }],
+    }));
+    try {
+      const secret = localStorage.getItem("mh-secret") || "";
+      const res = await fetch("/api/draw", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secret}` },
+        body: JSON.stringify({ prompt: text, ai_id: targetAi }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setConversations((prev) => {
+          const msgs = [...(prev[targetAi] || [])];
+          msgs[msgs.length - 1] = { role: "assistant", content: `⚠️ ${data.error}${data.text_reply ? "\n\n" + data.text_reply : ""}` };
+          return { ...prev, [targetAi]: msgs };
+        });
+      } else if (data.url) {
+        setConversations((prev) => {
+          const msgs = [...(prev[targetAi] || [])];
+          msgs[msgs.length - 1] = { role: "assistant", content: `[img]${data.url}[/img]` };
+          return { ...prev, [targetAi]: msgs };
+        });
+      }
+    } catch (err) {
+      setConversations((prev) => {
+        const msgs = [...(prev[targetAi] || [])];
+        msgs[msgs.length - 1] = { role: "assistant", content: `⚠️ 画图失败: ${err.message}` };
+        return { ...prev, [targetAi]: msgs };
+      });
+    }
+    setDrawing(false);
+    inputRef.current?.focus();
+  }, [input, loading, drawing, aiId]);
+
   if (!currentAi) return null;
 
   return (
@@ -256,6 +303,16 @@ export default function ChatPage() {
             fontSize: 14, color: "var(--text-primary)",
           }}
         />
+        <button onClick={draw} disabled={loading || drawing || !input.trim()}
+          title="让 AI 画画"
+          style={{
+            padding: "10px 12px", borderRadius: "var(--radius-md)", border: "none",
+            background: drawing ? "var(--bg-hover)" : "var(--bg-card)",
+            color: drawing ? "var(--primary)" : "var(--text-muted)",
+            cursor: loading || drawing ? "not-allowed" : "pointer",
+          }}>
+          {drawing ? <Loader2 size={18} className="spin" /> : <Paintbrush size={18} />}
+        </button>
         <button className="btn btn-primary" onClick={send} disabled={loading}
           style={{ padding: "10px 14px", borderRadius: "var(--radius-md)" }}>
           {loading ? <Loader2 size={18} className="spin" /> : <Send size={18} />}
@@ -268,6 +325,7 @@ export default function ChatPage() {
 function MessageBubble({ message, ai }) {
   const isUser = message.role === "user";
   const isError = !isUser && message.content?.startsWith("⚠️");
+  const imgMatch = message.content?.match(/^\[img\](.*?)\[\/img\]$/);
   return (
     <div style={{
       display: "flex", justifyContent: isUser ? "flex-end" : "flex-start",
@@ -279,7 +337,7 @@ function MessageBubble({ message, ai }) {
       )}
       <div style={{
         maxWidth: "78%",
-        padding: "10px 14px",
+        padding: imgMatch ? 4 : "10px 14px",
         borderRadius: isUser
           ? "var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg)"
           : "var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm)",
@@ -288,8 +346,16 @@ function MessageBubble({ message, ai }) {
         backdropFilter: isUser ? "none" : "blur(var(--glass-blur))",
         border: isError ? "1px solid rgba(239, 68, 68, 0.3)" : isUser ? "none" : "1px solid var(--glass-border)",
         fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+        overflow: "hidden",
       }}>
-        {message.content || "..."}
+        {imgMatch ? (
+          <img src={imgMatch[1]} alt="AI 画的图" style={{
+            maxWidth: "100%", borderRadius: "var(--radius-md)",
+            display: "block",
+          }} />
+        ) : (
+          message.content || "..."
+        )}
       </div>
     </div>
   );

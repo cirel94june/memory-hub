@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .env
 memories.db
+uploads/
 
 # memory_hub.db 是社交模块(social.py)的活数据库，不要删除！
 # 它存储 social_posts / group_messages / ai_profiles 等表
