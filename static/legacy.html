@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Memory Hub 后台日志台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8f5f0;
+      --paper: #fffaf3;
+      --ink: #332f2b;
+      --muted: #7b7168;
+      --line: #e5dacf;
+      --accent: #6e4f9a;
+      --accent-soft: #efe7fb;
+      --bad: #b94d43;
+      --ok: #3f7d58;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(980px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 24px 0 40px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    h1 { margin: 0; font-size: 24px; }
+    p { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    a { color: var(--accent); font-weight: 700; text-decoration: none; }
+    section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 10px 24px rgba(55, 45, 35, 0.05);
+    }
+    h2 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 12px;
+      font-size: 15px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    input, select {
+      min-height: 36px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 13px;
+    }
+    input[type="password"], input[type="text"] { flex: 1; min-width: 220px; }
+    button {
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 12px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .stat {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .stat strong { display: block; font-size: 18px; }
+    .stat span { color: var(--muted); font-size: 11px; }
+    .fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+    label input { width: 100%; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .log-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .log {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+    .log.error { border-left-color: var(--bad); }
+    .log.config { border-left-color: var(--ok); }
+    .log-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 5px;
+    }
+    .msg {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    .meta {
+      margin-top: 6px;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+      word-break: break-all;
+    }
+    .status { min-height: 20px; color: var(--muted); font-size: 12px; }
+    .ok { color: var(--ok); }
+    .bad { color: var(--bad); }
+    @media (max-width: 720px) {
+      header { display: block; }
+      .grid, .fields { grid-template-columns: 1fr; }
+      input[type="password"], input[type="text"] { min-width: 0; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>后台日志台</h1>
+        <p>这里保留给临时查看小模型活动、测试后台模型、手动触发记忆整理。日常管理请用 <a href="/app/">新版 Memory Hub</a>。</p>
+      </div>
+      <a href="/app/">返回新版</a>
+    </header>
+
+    <section>
+      <h2>连接</h2>
+      <div class="row">
+        <input id="secret" type="password" placeholder="HUB_SECRET" />
+        <button class="primary" id="saveSecret">保存密钥</button>
+        <button id="refreshAll">刷新</button>
+      </div>
+      <p id="connectionStatus" class="status"></p>
+    </section>
+
+    <section>
+      <h2>小模型设置</h2>
+      <div class="fields">
+        <label>Base URL
+          <input id="llmBaseUrl" type="text" placeholder="留空则使用 .env 默认值" />
+        </label>
+        <label>模型名称
+          <input id="llmModel" type="text" placeholder="例如 deepseek-chat" />
+        </label>
+        <label>API Key
+          <input id="llmApiKey" type="password" placeholder="留空不覆盖" />
+        </label>
+        <label>当前状态
+          <input id="llmState" type="text" disabled />
+        </label>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <button class="primary" id="saveLlm">保存小模型设置</button>
+        <button id="testLlm">测试小模型</button>
+        <button id="resetLlm">重置为 .env</button>
+      </div>
+      <p id="llmStatus" class="status"></p>
+    </section>
+
+    <section>
+      <h2>手动整理</h2>
+      <div class="row">
+        <button class="primary" id="runMaintain">开始后台整理</button>
+      </div>
+      <p id="maintainStatus" class="status">整理会在后端后台运行，开始后可以稍等一会儿再刷新活动日志。</p>
+    </section>
+
+    <section>
+      <h2>活动统计</h2>
+      <div id="stats" class="grid"></div>
+    </section>
+
+    <section>
+      <h2>活动日志</h2>
+      <div class="row">
+        <select id="actionFilter">
+          <option value="">全部动作</option>
+          <option value="config">配置/测试</option>
+          <option value="extract">记忆提取</option>
+          <option value="merge">合并</option>
+          <option value="compress">压缩</option>
+          <option value="archive">归档</option>
+          <option value="error">错误</option>
+        </select>
+        <select id="limit">
+          <option value="50">最近 50 条</option>
+          <option value="100">最近 100 条</option>
+          <option value="200">最近 200 条</option>
+        </select>
+        <button id="loadLogs">刷新日志</button>
+      </div>
+      <p id="logStatus" class="status"></p>
+      <div id="logs" class="log-list"></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function getSecret() {
+      return $("secret").value || localStorage.getItem("mh-secret") || "";
+    }
+
+    function authHeaders(extra = {}) {
+      return { ...extra, Authorization: "Bearer " + getSecret() };
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        ...options,
+        headers: authHeaders(options.headers || {}),
+      });
+      let data = {};
+      try { data = await res.json(); } catch {}
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || ("HTTP " + res.status));
+      }
+      return data;
+    }
+
+    function fmtTime(value) {
+      if (!value) return "";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return String(value);
+      return d.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function shortMeta(log) {
+      const meta = {};
+      for (const key of ["model", "duration_ms", "memory_id", "source_ai", "room"]) {
+        if (log[key] !== undefined && log[key] !== null && log[key] !== "") meta[key] = log[key];
+      }
+      return Object.keys(meta).length ? JSON.stringify(meta, null, 2) : "";
+    }
+
+    async function loadLLM() {
+      $("llmStatus").textContent = "正在读取小模型设置...";
+      try {
+        const data = await api("/api/settings/llm");
+        $("llmBaseUrl").value = data.current?.llm_base_url || "";
+        $("llmModel").value = data.current?.llm_model || "";
+        $("llmState").value = (data.current?.llm_api_key_set ? "Key 已设置" : "Key 未设置") + (data.is_overridden ? " · 运行中覆盖" : " · .env 默认");
+        $("llmStatus").textContent = "已读取小模型设置";
+        $("llmStatus").className = "status ok";
+      } catch (err) {
+        $("llmStatus").textContent = "读取失败：" + err.message;
+        $("llmStatus").className = "status bad";
+      }
+    }
+
+    async function saveLLM() {
+      $("llmStatus").textContent = "正在保存...";
+      try {
+        await api("/api/settings/llm", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            llm_base_url: $("llmBaseUrl").value,
+            llm_model: $("llmModel").value,
+            llm_api_key: $("llmApiKey").value,
+          }),
+        });
+        $("llmApiKey").value = "";
+        $("llmStatus").textContent = "已保存";
+        $("llmStatus").className = "status ok";
+        await loadLLM();
+      } catch (err) {
+        $("llmStatus").textContent = "保存失败：" + err.message;
+        $("llmStatus").className = "status bad";
+      }
+    }
+
+    async function testLLM() {
+      $("llmStatus").textContent = "正在测试小模型...";
+      try {
+        const data = await api("/api/settings/llm/test", { method: "POST" });
+        if (data.status === "ok") {
+          $("llmStatus").textContent = `测试成功：${data.model} · ${data.duration_ms}ms · ${data.response || ""}`;
+          $("llmStatus").className = "status ok";
+        } else {
+          $("llmStatus").textContent = `测试失败：${data.error || "未知错误"}`;
+          $("llmStatus").className = "status bad";
+        }
+        await loadLogs();
+      } catch (err) {
+        $("llmStatus").textContent = "测试失败：" + err.message;
+        $("llmStatus").className = "status bad";
+      }
+    }
+
+    async function resetLLM() {
+      if (!confirm("把小模型设置重置为 VPS .env 默认值？")) return;
+      try {
+        await api("/api/settings/llm/reset", { method: "POST" });
+        $("llmStatus").textContent = "已重置";
+        $("llmStatus").className = "status ok";
+        await loadLLM();
+      } catch (err) {
+        $("llmStatus").textContent = "重置失败：" + err.message;
+        $("llmStatus").className = "status bad";
+      }
+    }
+
+    async function runMaintain() {
+      if (!confirm("开始后台整理记忆？这可能需要几分钟。")) return;
+      $("maintainStatus").textContent = "正在提交整理任务...";
+      try {
+        const data = await api("/api/daemon/maintain", { method: "POST" });
+        $("maintainStatus").textContent = data.status === "accepted"
+          ? "整理任务已开始。稍后刷新活动日志查看进度。"
+          : "已触发整理：" + JSON.stringify(data);
+        $("maintainStatus").className = "status ok";
+      } catch (err) {
+        $("maintainStatus").textContent = "启动失败：" + err.message;
+        $("maintainStatus").className = "status bad";
+      }
+    }
+
+    async function loadStats() {
+      const box = $("stats");
+      box.innerHTML = "";
+      try {
+        const data = await api("/api/activity/stats");
+        const entries = Object.entries(data || {});
+        if (!entries.length) {
+          box.innerHTML = '<p class="status">暂无统计</p>';
+          return;
+        }
+        for (const [key, value] of entries) {
+          const card = document.createElement("div");
+          card.className = "stat";
+          card.innerHTML = `<strong>${value}</strong><span>${key}</span>`;
+          box.appendChild(card);
+        }
+      } catch (err) {
+        box.innerHTML = `<p class="status bad">统计读取失败：${err.message}</p>`;
+      }
+    }
+
+    async function loadLogs() {
+      $("logStatus").textContent = "正在读取日志...";
+      const list = $("logs");
+      list.innerHTML = "";
+      try {
+        const params = new URLSearchParams({ limit: $("limit").value });
+        if ($("actionFilter").value) params.set("action", $("actionFilter").value);
+        const data = await api("/api/activity/log?" + params.toString());
+        $("logStatus").textContent = `已读取 ${data.logs?.length || 0} 条`;
+        $("logStatus").className = "status ok";
+        for (const log of data.logs || []) {
+          const item = document.createElement("article");
+          item.className = "log " + (log.action || "");
+          const meta = shortMeta(log);
+          item.innerHTML = `
+            <div class="log-head">
+              <span>${log.action || "activity"}</span>
+              <span>${fmtTime(log.timestamp || log.created_at)}</span>
+            </div>
+            <div class="msg"></div>
+            ${meta ? `<pre class="meta">${meta}</pre>` : ""}
+          `;
+          item.querySelector(".msg").textContent = log.message || log.content || JSON.stringify(log);
+          list.appendChild(item);
+        }
+      } catch (err) {
+        $("logStatus").textContent = "日志读取失败：" + err.message;
+        $("logStatus").className = "status bad";
+      }
+    }
+
+    async function refreshAll() {
+      await Promise.allSettled([loadLLM(), loadStats(), loadLogs()]);
+    }
+
+    $("secret").value = localStorage.getItem("mh-secret") || "";
+    $("saveSecret").onclick = () => {
+      localStorage.setItem("mh-secret", $("secret").value);
+      $("connectionStatus").textContent = "已保存密钥到这个浏览器";
+      $("connectionStatus").className = "status ok";
+      refreshAll();
+    };
+    $("refreshAll").onclick = refreshAll;
+    $("saveLlm").onclick = saveLLM;
+    $("testLlm").onclick = testLLM;
+    $("resetLlm").onclick = resetLLM;
+    $("runMaintain").onclick = runMaintain;
+    $("loadLogs").onclick = loadLogs;
+    $("actionFilter").onchange = loadLogs;
+    $("limit").onchange = loadLogs;
+    refreshAll();
+  </script>
+</body>
+</html>
