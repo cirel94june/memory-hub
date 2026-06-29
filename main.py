@@ -8,7 +8,7 @@ import logging
 import httpx
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Header, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -395,11 +395,21 @@ async def api_decay(authorization: str = Header(default="")):
     return await memory_ops.run_decay()
 
 
-@app.post("/api/daemon/maintain")
-async def api_maintain(authorization: str = Header(default="")):
+async def _run_maintenance_background():
+    """Run maintenance outside the HTTP request so proxies do not time out."""
+    try:
+        result = await daemon.run_full_maintenance()
+        logging.getLogger("daemon").info(f"Manual maintenance done: {json.dumps(result, ensure_ascii=False)}")
+    except Exception as e:
+        logging.getLogger("daemon").exception(f"Manual maintenance failed: {e}")
+
+
+@app.post("/api/daemon/maintain", status_code=202)
+async def api_maintain(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
     """一键执行完整记忆整理（合并+压缩+归档+衰减+走廊重建）"""
     verify_secret(authorization)
-    return await daemon.run_full_maintenance()
+    background_tasks.add_task(_run_maintenance_background)
+    return {"status": "accepted", "message": "maintenance started"}
 
 
 @app.get("/api/daemon/test-llm")
