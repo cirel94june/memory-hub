@@ -9,7 +9,7 @@ on:
 jobs:
   maintain:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Trigger Memory Maintenance
         run: |
@@ -18,8 +18,12 @@ jobs:
             "https://xiaokememory.camdvr.org/api/daemon/maintain" \
             -H "Authorization: Bearer ${{ secrets.HUB_SECRET }}" \
             -H "Content-Type: application/json" \
-            --max-time 120)
+            --max-time 600)
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | head -n -1)
           echo "Status: $HTTP_CODE"
           echo "Result: $BODY"
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Maintenance request failed with HTTP $HTTP_CODE"
+            exit 1
+          fi

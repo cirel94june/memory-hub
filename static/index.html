@@ -290,6 +290,39 @@ body {
 }
 .importance-dot.filled { background: var(--accent); }
 
+.importance-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.importance-label {
+  font-size: 11px;
+  color: var(--text2);
+  white-space: nowrap;
+}
+.importance-dot-btn {
+  width: 10px;
+  height: 10px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--border);
+  cursor: pointer;
+  transition: transform 0.15s, background 0.15s;
+}
+.importance-dot-btn:hover {
+  transform: scale(1.2);
+  background: #e8c4a8;
+}
+.importance-dot-btn.filled { background: var(--accent); }
+.importance-val {
+  font-size: 11px;
+  color: var(--text2);
+  min-width: 24px;
+  font-variant-numeric: tabular-nums;
+}
+.importance-editor.saving .importance-val { color: var(--accent); }
+
 .memory-actions {
   display: flex;
   gap: 6px;
@@ -400,6 +433,129 @@ body {
   max-height: none;
 }
 
+/* ── 日历热力图 ── */
+.calendar-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+}
+.calendar-panel h3 {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.calendar-panel h3 .cal-year {
+  color: var(--text2);
+  font-weight: 400;
+  font-size: 13px;
+}
+.cal-nav {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.cal-months {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.cal-month {
+  flex-shrink: 0;
+}
+.cal-month-label {
+  font-size: 11px;
+  color: var(--text3);
+  margin-bottom: 4px;
+  font-weight: 500;
+  padding-left: 2px;
+}
+.cal-weeks {
+  display: flex;
+  gap: 2px;
+}
+.cal-week {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cal-day {
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  background: var(--border);
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+}
+.cal-day:hover {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  z-index: 1;
+}
+.cal-day.selected {
+  outline: 2px solid var(--text);
+  outline-offset: -1px;
+  z-index: 2;
+}
+.cal-day.empty { background: transparent; cursor: default; }
+.cal-day.empty:hover { outline: none; }
+.cal-day.future { background: var(--bg); cursor: default; }
+.cal-day.future:hover { outline: none; }
+.cal-day.lv1 { background: #f5dcc4; }
+.cal-day.lv2 { background: #e8be8e; }
+.cal-day.lv3 { background: #d4a06a; }
+.cal-day.lv4 { background: #c4854a; }
+.cal-day.lv5 { background: #a06030; }
+.cal-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text3);
+  justify-content: flex-end;
+}
+.cal-legend-box {
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+}
+.cal-tooltip {
+  position: fixed;
+  background: var(--text);
+  color: white;
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  pointer-events: none;
+  z-index: 300;
+  white-space: nowrap;
+  display: none;
+}
+.cal-day-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--accent);
+}
+.cal-day-header h3 {
+  font-size: 16px;
+  font-weight: 700;
+}
+.cal-day-header .count {
+  font-size: 13px;
+  color: var(--text2);
+}
+
 /* ── 响应式 ── */
 @media (max-width: 768px) {
   .layout { flex-direction: column; padding: 12px; gap: 16px; }
@@ -488,7 +644,7 @@ body {
     <span class="header-badge" id="headerBadge">0 memories</span>
   </div>
   <div class="header-actions">
-    <button class="btn" id="viewToggle" onclick="toggleTimelineView()">📅 时间线</button>
+    <button class="btn" id="viewToggle" onclick="toggleCalendarView()">📅 日历</button>
     <button class="btn" onclick="openAddModal()">+ 添加</button>
     <button class="btn" onclick="openImportModal()">📥 导入</button>
     <button class="btn" onclick="runMaintain()">整理</button>
@@ -502,6 +658,8 @@ body {
   <div class="main">
     <!-- 记忆页（默认） -->
     <div class="page-panel active" id="page-memories">
+      <div id="calendarPanel" class="calendar-panel" style="display:none"></div>
+      <div id="calendarDayDetail" style="display:none"></div>
       <div class="stats-panel" id="statsPanel"></div>
       <div class="search-bar">
         <input type="text" id="searchInput" placeholder="搜索记忆..." onkeydown="if(event.key==='Enter')searchMemories()">
@@ -556,9 +714,21 @@ body {
         <h3>📋 .env 默认配置（只读）</h3>
         <div id="defaultConfig" style="font-size:13px;color:var(--text2);font-family:monospace;line-height:1.8"></div>
       </div>
+
+      <div class="settings-card">
+        <h3>🧮 Embedding 模型（只读）</h3>
+        <p style="font-size:12px;color:var(--text2);margin-bottom:12px">更换 embedding 模型需要重建所有向量，不支持在线切换</p>
+        <div id="embeddingInfo" style="font-size:13px;font-family:monospace;line-height:1.8;color:var(--text2)">加载中...</div>
+        <div style="margin-top:10px">
+          <button class="btn" onclick="testEmbedding()">🧪 测试 Embedding</button>
+          <span id="embeddingTestResult" style="margin-left:10px;font-size:13px"></span>
+        </div>
+      </div>
     </div>
   </div>
 </div>
+
+<div class="cal-tooltip" id="calTooltip"></div>
 
 <!-- 添加/编辑模态框 -->
 <div class="modal-overlay" id="addModal" onclick="if(event.target===this)closeAddModal()">
@@ -606,8 +776,11 @@ body {
       </select>
     </div>
 
-    <label>重要度: <span id="mImpVal">0.5</span></label>
+    <label>重要度: <span id="mImpVal">0.5</span> <span style="font-weight:400;color:var(--text2)">（0=可遗忘，1=核心记忆）</span></label>
     <input type="range" id="mImportance" min="0" max="1" step="0.1" value="0.5">
+    <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-top:4px">
+      <span>低</span><span>中</span><span>高</span>
+    </div>
 
     <div class="modal-actions">
       <button class="btn" onclick="closeAddModal()">取消</button>
@@ -793,6 +966,50 @@ function parseDomain(v) {
   return [];
 }
 
+function importanceEditorHtml(m) {
+  const imp = typeof m.importance === 'number' ? m.importance : parseFloat(m.importance) || 0.5;
+  const impLevel = Math.max(0, Math.min(5, Math.round(imp * 5)));
+  const dots = Array.from({ length: 5 }, (_, i) =>
+    `<button type="button" class="importance-dot-btn ${i < impLevel ? 'filled' : ''}" ` +
+    `onclick="setImportance('${m.id}', ${(i + 1) / 5}, this)" title="设为 ${((i + 1) / 5).toFixed(1)}"></button>`
+  ).join('');
+  return `<div class="importance-editor" id="imp-editor-${m.id}">
+    <span class="importance-label">重要度</span>
+    ${dots}
+    <span class="importance-val" id="imp-val-${m.id}">${imp.toFixed(1)}</span>
+  </div>`;
+}
+
+async function setImportance(id, value, btnEl) {
+  const editor = document.getElementById('imp-editor-' + id) || btnEl.closest('.importance-editor');
+  const card = btnEl.closest('.memory-card');
+  if (editor) editor.classList.add('saving');
+  try {
+    await api(`/api/memory/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ importance: value, changed_by: 'user' }),
+    });
+    const impLevel = Math.round(value * 5);
+    const scope = editor || card;
+    if (scope) {
+      scope.querySelectorAll('.importance-dot-btn').forEach((btn, i) => {
+        btn.classList.toggle('filled', i < impLevel);
+        btn.title = `设为 ${((i + 1) / 5).toFixed(1)}`;
+      });
+    }
+    const valEl = document.getElementById('imp-val-' + id);
+    if (valEl) valEl.textContent = value.toFixed(1);
+    if (card) {
+      card.classList.toggle('high-importance', value >= 0.9);
+      card.classList.toggle('truncated', card.querySelector('.memory-content')?.textContent.length < 40 && value >= 0.8);
+    }
+  } catch (e) {
+    alert('重要度保存失败：' + (e.message || e));
+  } finally {
+    if (editor) editor.classList.remove('saving');
+  }
+}
+
 function renderMemories(items) {
   const el = document.getElementById('memoryList');
   if (!items || !items.length) {
@@ -803,7 +1020,6 @@ function renderMemories(items) {
     const domains = parseDomain(m.domain);
     const isTruncated = m.content && m.content.length < 40 && m.importance >= 0.8;
     const isLong = m.content && m.content.length > 200;
-    const impLevel = Math.round((m.importance || 0.5) * 5);
     const cardClass = isTruncated ? 'truncated' : (m.importance >= 0.9 ? 'high-importance' : '');
     const category = m.category && m.category.length < 60 ? m.category : '';
 
@@ -821,7 +1037,7 @@ function renderMemories(items) {
         </div>
         <div class="memory-footer">
           <div class="memory-meta">
-            <span class="importance-dots">${Array.from({length:5},(_,i)=>`<span class="importance-dot ${i<impLevel?'filled':''}"></span>`).join('')}</span>
+            ${importanceEditorHtml(m)}
             <span>${m.created_at?.slice(0,10) || ''}</span>
             ${m.decay_score < 0.3 ? '<span style="color:var(--warning)">即将遗忘</span>' : ''}
           </div>
@@ -990,8 +1206,11 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
-// ── Timeline view ──
-let isTimelineView = false;
+// ── Calendar heatmap view ──
+let isCalendarView = false;
+let calendarData = {};  // { 'YYYY-MM-DD': [memories] }
+let allMemoriesCache = [];
+let selectedCalDate = null;
 
 function ensureMemoriesView() {
   if (currentView !== 'memories') {
@@ -1002,72 +1221,225 @@ function ensureMemoriesView() {
   }
 }
 
-function toggleTimelineView() {
+function toggleCalendarView() {
   ensureMemoriesView();
-  isTimelineView = !isTimelineView;
-  document.getElementById('viewToggle').textContent = isTimelineView ? '📋 列表' : '📅 时间线';
-  if (isTimelineView) {
-    loadTimeline();
+  isCalendarView = !isCalendarView;
+  const btn = document.getElementById('viewToggle');
+  const calPanel = document.getElementById('calendarPanel');
+  const dayDetail = document.getElementById('calendarDayDetail');
+  const statsPanel = document.getElementById('statsPanel');
+  const searchBar = document.querySelector('.search-bar');
+  const memList = document.getElementById('memoryList');
+  const pag = document.getElementById('pagination');
+
+  if (isCalendarView) {
+    btn.textContent = '📋 列表';
+    calPanel.style.display = '';
+    statsPanel.style.display = 'none';
+    searchBar.style.display = 'none';
+    memList.innerHTML = '';
+    pag.innerHTML = '';
+    loadCalendar();
   } else {
+    btn.textContent = '📅 日历';
+    calPanel.style.display = 'none';
+    dayDetail.style.display = 'none';
+    statsPanel.style.display = '';
+    searchBar.style.display = '';
+    selectedCalDate = null;
     loadMemories();
   }
 }
 
-async function loadTimeline() {
-  const data = await api('/api/memory/list?per_page=200&status=active');
-  const items = data.items || [];
-  // Sort by created_at descending
-  items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+async function loadCalendar() {
+  const data = await api('/api/memory/list?per_page=1000&status=active');
+  allMemoriesCache = data.items || [];
 
-  // Group by date
-  const groups = {};
-  items.forEach(m => {
-    const date = (m.created_at || '').slice(0, 10) || 'unknown';
-    if (!groups[date]) groups[date] = [];
-    groups[date].push(m);
+  calendarData = {};
+  allMemoriesCache.forEach(m => {
+    const date = (m.created_at || '').slice(0, 10);
+    if (!date || date === 'unknown') return;
+    if (!calendarData[date]) calendarData[date] = [];
+    calendarData[date].push(m);
   });
 
-  const el = document.getElementById('memoryList');
-  if (!Object.keys(groups).length) {
-    el.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>还没有记忆</p></div>';
+  renderCalendar();
+}
+
+function renderCalendar() {
+  const panel = document.getElementById('calendarPanel');
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0, 10);
+
+  // Show last 6 months
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(today.getFullYear(), today.getMonth() - i, 1);
+    months.push({ year: d.getFullYear(), month: d.getMonth() });
+  }
+
+  const WEEKDAYS = ['日','一','二','三','四','五','六'];
+  const MONTH_NAMES = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+
+  // Find max count for color scaling
+  const counts = Object.values(calendarData).map(arr => arr.length);
+  const maxCount = Math.max(...counts, 1);
+
+  function getLevel(count) {
+    if (!count) return '';
+    const ratio = count / maxCount;
+    if (ratio <= 0.15) return 'lv1';
+    if (ratio <= 0.35) return 'lv2';
+    if (ratio <= 0.55) return 'lv3';
+    if (ratio <= 0.80) return 'lv4';
+    return 'lv5';
+  }
+
+  let monthsHtml = '';
+  for (const { year, month } of months) {
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const startDow = firstDay.getDay();
+
+    // Build weeks grid
+    const weeks = [];
+    let currentWeek = [];
+    // Pad beginning
+    for (let i = 0; i < startDow; i++) {
+      currentWeek.push(null);
+    }
+    for (let d = 1; d <= lastDay.getDate(); d++) {
+      const dateStr = `${year}-${String(month+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const isFuture = dateStr > todayStr;
+      currentWeek.push({ date: dateStr, day: d, future: isFuture });
+      if (currentWeek.length === 7) {
+        weeks.push(currentWeek);
+        currentWeek = [];
+      }
+    }
+    if (currentWeek.length) {
+      while (currentWeek.length < 7) currentWeek.push(null);
+      weeks.push(currentWeek);
+    }
+
+    // Transpose to columns (each column = a week)
+    monthsHtml += `<div class="cal-month">
+      <div class="cal-month-label">${MONTH_NAMES[month]}</div>
+      <div class="cal-weeks">`;
+
+    for (const week of weeks) {
+      monthsHtml += '<div class="cal-week">';
+      for (const cell of week) {
+        if (!cell) {
+          monthsHtml += '<div class="cal-day empty"></div>';
+        } else if (cell.future) {
+          monthsHtml += '<div class="cal-day future"></div>';
+        } else {
+          const count = (calendarData[cell.date] || []).length;
+          const level = getLevel(count);
+          const sel = selectedCalDate === cell.date ? ' selected' : '';
+          monthsHtml += `<div class="cal-day ${level}${sel}" data-date="${cell.date}" data-count="${count}"
+            onclick="selectCalDay('${cell.date}')"
+            onmouseenter="showCalTip(event,'${cell.date}',${count})"
+            onmouseleave="hideCalTip()"></div>`;
+        }
+      }
+      monthsHtml += '</div>';
+    }
+    monthsHtml += '</div></div>';
+  }
+
+  const totalDays = Object.keys(calendarData).length;
+  const totalMems = allMemoriesCache.length;
+
+  panel.innerHTML = `
+    <h3>
+      记忆日历
+      <span class="cal-year">${totalMems} 条记忆，分布在 ${totalDays} 天</span>
+    </h3>
+    <div class="cal-months">${monthsHtml}</div>
+    <div class="cal-legend">
+      少
+      <div class="cal-legend-box" style="background:var(--border)"></div>
+      <div class="cal-legend-box" style="background:#f5dcc4"></div>
+      <div class="cal-legend-box" style="background:#e8be8e"></div>
+      <div class="cal-legend-box" style="background:#d4a06a"></div>
+      <div class="cal-legend-box" style="background:#c4854a"></div>
+      <div class="cal-legend-box" style="background:#a06030"></div>
+      多
+    </div>
+  `;
+}
+
+function showCalTip(e, date, count) {
+  const tip = document.getElementById('calTooltip');
+  const weekday = ['周日','周一','周二','周三','周四','周五','周六'][new Date(date + 'T00:00:00').getDay()];
+  tip.textContent = `${date} ${weekday} — ${count ? count + ' 条记忆' : '无记忆'}`;
+  tip.style.display = 'block';
+  tip.style.left = (e.clientX + 12) + 'px';
+  tip.style.top = (e.clientY - 30) + 'px';
+}
+
+function hideCalTip() {
+  document.getElementById('calTooltip').style.display = 'none';
+}
+
+function selectCalDay(date) {
+  selectedCalDate = date;
+  // Update selected state in calendar
+  document.querySelectorAll('.cal-day.selected').forEach(el => el.classList.remove('selected'));
+  const target = document.querySelector(`.cal-day[data-date="${date}"]`);
+  if (target) target.classList.add('selected');
+
+  const memories = calendarData[date] || [];
+  const detail = document.getElementById('calendarDayDetail');
+  const memList = document.getElementById('memoryList');
+
+  if (!memories.length) {
+    detail.style.display = 'none';
+    memList.innerHTML = '<div class="empty"><div class="empty-icon">~</div><p>这天没有新记忆</p></div>';
     document.getElementById('pagination').innerHTML = '';
     return;
   }
 
+  const weekday = ['周日','周一','周二','周三','周四','周五','周六'][new Date(date + 'T00:00:00').getDay()];
+  detail.style.display = 'block';
+  detail.innerHTML = `<div class="cal-day-header">
+    <h3>${date} ${weekday}</h3>
+    <span class="count">${memories.length} 条记忆</span>
+  </div>`;
+
+  // Sort by time descending
+  memories.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+  // Render using timeline style
   let html = '<div class="timeline">';
-  for (const [date, mems] of Object.entries(groups)) {
-    const weekday = ['日','一','二','三','四','五','六'][new Date(date + 'T00:00:00').getDay()] || '';
-    html += `<div class="timeline-date">
-      <div class="timeline-date-label">${date} <span style="color:var(--text3);font-weight:400">周${weekday}</span> <span class="nav-count">${mems.length}条</span></div>
-    </div>`;
-    for (const m of mems) {
-      const time = (m.created_at || '').slice(11, 16) || '';
-      const roomMeta = ROOM_META[m.room] || {};
-      const impLevel = Math.round((m.importance || 0.5) * 5);
-      const sourceTag = m.source_platform ? `<span class="tag" style="background:#e8e0d4">${m.source_platform}</span>` : '';
-      const aiTag = m.source_ai ? `<span class="tag tag-ai" style="background:${AI_COLORS[m.source_ai]||'#888'}">${m.source_ai}</span>` : '';
-      html += `
-        <div class="timeline-item">
-          <div class="timeline-time">${time}</div>
-          <div class="timeline-dot" style="background:${AI_COLORS[m.source_ai||m.owner_ai]||'var(--accent)'}"></div>
-          <div class="timeline-content memory-card" data-id="${m.id}">
-            <div class="memory-content" style="margin-bottom:6px">${escHtml(m.content)}</div>
-            <div class="memory-tags">
-              <span class="tag tag-room">${roomMeta.icon||''} ${roomMeta.name||m.room}</span>
-              ${aiTag}${sourceTag}
-              <span class="importance-dots">${Array.from({length:5},(_,i)=>`<span class="importance-dot ${i<impLevel?'filled':''}"></span>`).join('')}</span>
-            </div>
-            <div class="memory-actions" style="opacity:0.7;margin-top:6px">
-              <button class="btn btn-sm" onclick="editMemory('${m.id}')">编辑</button>
-              <button class="btn btn-sm" onclick="archiveMemory('${m.id}')">归档</button>
-              <button class="btn btn-sm btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
-            </div>
+  for (const m of memories) {
+    const time = (m.created_at || '').slice(11, 16) || '';
+    const roomMeta = ROOM_META[m.room] || {};
+    const sourceTag = m.source_platform ? `<span class="tag" style="background:#e8e0d4">${m.source_platform}</span>` : '';
+    const aiTag = m.source_ai ? `<span class="tag tag-ai" style="background:${AI_COLORS[m.source_ai]||'#888'}">${m.source_ai}</span>` : '';
+    html += `
+      <div class="timeline-item">
+        <div class="timeline-time">${time}</div>
+        <div class="timeline-dot" style="background:${AI_COLORS[m.source_ai||m.owner_ai]||'var(--accent)'}"></div>
+        <div class="timeline-content memory-card" data-id="${m.id}">
+          <div class="memory-content" style="margin-bottom:6px">${escHtml(m.content)}</div>
+          <div class="memory-tags">
+            <span class="tag tag-room">${roomMeta.icon||''} ${roomMeta.name||m.room}</span>
+            ${aiTag}${sourceTag}
+            ${importanceEditorHtml(m)}
           </div>
-        </div>`;
-    }
+          <div class="memory-actions" style="opacity:0.7;margin-top:6px">
+            <button class="btn btn-sm" onclick="editMemory('${m.id}')">编辑</button>
+            <button class="btn btn-sm" onclick="archiveMemory('${m.id}')">归档</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteMemory('${m.id}')">删除</button>
+          </div>
+        </div>
+      </div>`;
   }
   html += '</div>';
-  el.innerHTML = html;
+  memList.innerHTML = html;
   document.getElementById('pagination').innerHTML = '';
 }
 
@@ -1105,7 +1477,7 @@ async function doImport() {
     if (data.status === 'success') {
       resultDiv.innerHTML = `✅ 导入完成！<br>解析消息: ${data.parsed_messages} 条（用户 ${data.user_messages} / AI ${data.ai_messages}）<br>处理分块: ${data.chunks_processed} 块<br><b>提取记忆: ${data.memories_extracted} 条</b>`;
       loadRoomCounts();
-      if (isTimelineView) loadTimeline(); else loadMemories();
+      if (isCalendarView) loadCalendar(); else loadMemories();
     } else {
       resultDiv.innerHTML = `❌ ${data.message || '导入失败'}`;
     }
@@ -1215,6 +1587,13 @@ async function loadLLMSettings() {
 
   document.getElementById('defaultConfig').innerHTML =
     `LLM_BASE_URL = ${escHtml(d.llm_base_url)}<br>LLM_MODEL = ${escHtml(d.llm_model)}`;
+
+  // Load embedding info
+  const emb = await api('/api/settings/embedding');
+  if (emb) {
+    document.getElementById('embeddingInfo').innerHTML =
+      `模型: ${escHtml(emb.model)}<br>维度: ${emb.dim}<br>API: ${escHtml(emb.base_url)}<br>Key: ${emb.api_key_set ? '已设置' : '❌ 未设置'}`;
+  }
 }
 
 async function saveLLMSettings() {
@@ -1252,6 +1631,20 @@ async function resetLLMSettings() {
   await api('/api/settings/llm/reset', { method: 'POST' });
   showSettingsResult('✅ 已恢复默认配置', true);
   loadLLMSettings();
+}
+
+async function testEmbedding() {
+  const el = document.getElementById('embeddingTestResult');
+  el.textContent = '🧪 测试中...';
+  el.style.color = 'var(--text2)';
+  const res = await api('/api/settings/embedding/test', { method: 'POST' });
+  if (res.status === 'ok') {
+    el.textContent = `✅ 正常！维度=${res.dim} (${res.duration_ms}ms)`;
+    el.style.color = 'var(--success)';
+  } else {
+    el.textContent = `❌ 失败: ${res.error}`;
+    el.style.color = 'var(--danger)';
+  }
 }
 
 function showSettingsResult(msg, ok) {
