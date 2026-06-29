@@ -6,25 +6,37 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [llm, setLlm] = useState(null);
   const [llmModel, setLlmModel] = useState("");
+  const [llmBaseUrl, setLlmBaseUrl] = useState("");
+  const [llmApiKey, setLlmApiKey] = useState("");
   const [llmLoading, setLlmLoading] = useState(false);
   const [embInfo, setEmbInfo] = useState(null);
 
   useEffect(() => {
     loadLLM();
-    fetch("/api/settings/embedding").then(r => r.json()).then(setEmbInfo).catch(() => {});
+    loadEmbedding();
   }, []);
 
   const loadLLM = () => {
-    fetch("/api/settings/llm").then(r => r.json()).then(d => {
+    fetch("/api/settings/llm", { headers: { Authorization: "Bearer " + secret } }).then(r => r.json()).then(d => {
       setLlm(d);
-      setLlmModel(d.model || "");
+      setLlmModel(d.current?.llm_model || "");
+      setLlmBaseUrl(d.current?.llm_base_url || "");
     }).catch(() => {});
+  };
+
+  const loadEmbedding = () => {
+    fetch("/api/daemon/test-llm", { headers: { Authorization: "Bearer " + secret } })
+      .then(r => r.json())
+      .then(setEmbInfo)
+      .catch(() => {});
   };
 
   const save = () => {
     localStorage.setItem("mh-secret", secret);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+    loadLLM();
+    loadEmbedding();
   };
 
   const testConn = async () => {
@@ -39,17 +51,22 @@ export default function SettingsPage() {
     }
   };
 
-  const switchModel = async () => {
-    if (!llmModel.trim()) return;
+  const saveLLMSettings = async () => {
+    if (!llmModel.trim() && !llmBaseUrl.trim() && !llmApiKey.trim()) return;
     setLlmLoading(true);
     try {
       const res = await fetch("/api/settings/llm", {
-        method: "POST",
+        method: "PUT",
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + secret },
-        body: JSON.stringify({ model: llmModel }),
+        body: JSON.stringify({
+          llm_base_url: llmBaseUrl,
+          llm_model: llmModel,
+          llm_api_key: llmApiKey,
+        }),
       });
       const d = await res.json();
-      alert(res.ok ? ("✅ 已切换到 " + d.model) : ("❌ " + (d.detail || "failed")));
+      alert(res.ok ? ("✅ 已保存小模型设置") : ("❌ " + (d.detail || "failed")));
+      if (res.ok) setLlmApiKey("");
       loadLLM();
     } catch (e) {
       alert("❌ " + e.message);
@@ -66,7 +83,7 @@ export default function SettingsPage() {
       });
       const d = await res.json();
       if (res.ok) {
-        alert("✅ 小模型正常！\n模型: " + d.model + "\n耗时: " + d.duration + "\n回复: " + (d.response || "").slice(0, 100));
+        alert("✅ 小模型正常！\n模型: " + d.model + "\n耗时: " + d.duration_ms + "ms\n回复: " + (d.response || "").slice(0, 100));
       } else {
         alert("❌ " + (d.detail || d.error || "test failed"));
       }
@@ -101,11 +118,14 @@ export default function SettingsPage() {
         </p>
         {llm ? (
           <>
-            <InfoRow label="当前模型" value={llm.model} />
-            <InfoRow label="Base URL" value={llm.base_url} />
-            <InfoRow label="API Key" value={llm.api_key_set ? "✅ 已设置" : "❌ 未设置"} />
+            <InfoRow label="当前模型" value={llm.current?.llm_model || "未设置"} />
+            <InfoRow label="Base URL" value={llm.current?.llm_base_url || "未设置"} />
+            <InfoRow label="API Key" value={llm.current?.llm_api_key_set ? "✅ 已设置" : "❌ 未设置"} />
+            <InfoRow label="来源" value={llm.is_overridden ? "运行中覆盖" : ".env 默认"} />
             <div style={{ marginTop: "var(--space-md)" }}>
-              <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>切换模型</label>
+              <Field label="Base URL" value={llmBaseUrl} onChange={setLlmBaseUrl} placeholder="留空则使用 .env 默认值" />
+              <Field label="API Key（留空不覆盖）" value={llmApiKey} onChange={setLlmApiKey} type="password" placeholder="sk-..." />
+              <label style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, display: "block" }}>模型名称</label>
               <div style={{ display: "flex", gap: "var(--space-sm)" }}>
                 <input value={llmModel} onChange={(e) => setLlmModel(e.target.value)}
                   style={{
@@ -113,9 +133,9 @@ export default function SettingsPage() {
                     border: "1px solid var(--glass-border)", borderRadius: "var(--radius-sm)",
                     fontSize: 13, color: "var(--text-primary)", outline: "none", fontFamily: "monospace",
                   }} />
-                <button className="btn btn-primary" onClick={switchModel} disabled={llmLoading}
+                <button className="btn btn-primary" onClick={saveLLMSettings} disabled={llmLoading}
                   style={{ whiteSpace: "nowrap" }}>
-                  <RefreshCw size={14} /> 切换
+                  <RefreshCw size={14} /> 保存
                 </button>
               </div>
               <div style={{ display: "flex", gap: "var(--space-xs)", flexWrap: "wrap", marginTop: "var(--space-sm)" }}>
@@ -141,10 +161,9 @@ export default function SettingsPage() {
         </p>
         {embInfo ? (
           <>
-            <InfoRow label="模型" value={embInfo.model} />
-            <InfoRow label="维度" value={embInfo.dim} />
-            <InfoRow label="API" value={embInfo.base_url} />
-            <InfoRow label="Key" value={embInfo.api_key_set ? "✅ 已设置" : "❌ 未设置"} />
+            <InfoRow label="模型" value={embInfo.embedding_model || "未知"} />
+            <InfoRow label="状态" value={embInfo.embedding_ok ? "✅ 正常" : "❌ 异常"} />
+            <InfoRow label="维度" value={embInfo.embedding_dim || 0} />
           </>
         ) : (
           <p style={{ color: "var(--text-muted)", fontSize: 13 }}>加载中...</p>
@@ -152,9 +171,9 @@ export default function SettingsPage() {
       </Section>
 
       <div style={{ textAlign: "center", marginTop: "var(--space-lg)" }}>
-        <a href="/static/index.html" target="_blank" rel="noopener"
+        <a href="/static/legacy.html" target="_blank" rel="noopener"
           style={{ fontSize: 12, color: "var(--text-muted)" }}>
-          打开旧版管理页面（含完整日志） ↗
+          打开后台日志台（小模型活动 / 手动整理） ↗
         </a>
       </div>
     </div>
