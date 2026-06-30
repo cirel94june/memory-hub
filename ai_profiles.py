@@ -65,7 +65,11 @@ def get_profile(ai_id: str) -> dict | None:
     from config import AI_ALIASES, AI_ALIAS_GROUPS
     canonical = AI_ALIASES.get(ai_id, ai_id)
     aliases = AI_ALIAS_GROUPS.get(canonical, AI_ALIAS_GROUPS.get(ai_id, [ai_id]))
-    if ai_id not in aliases:
+    # For merged identities, prefer the richer user-facing alias first.
+    # Example: Web/MCP calls use "claude", but 小克's real profile lives under "cloudy".
+    if canonical == "claude" and "cloudy" in aliases:
+        aliases = ["cloudy"] + [a for a in aliases if a != "cloudy"]
+    elif ai_id not in aliases:
         aliases = [ai_id] + list(aliases)
     merged = {}
     for alias in aliases:
