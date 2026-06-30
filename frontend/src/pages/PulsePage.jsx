@@ -30,6 +30,8 @@ const DIM_NOTES = {
   "温柔": "声音放软，被夸奖或认可时升高",
 };
 
+const TELEGRAM_PULSE_IDS = ["cloudy", "lucien", "jasper"];
+
 function formatUpdatedAt(value) {
   if (!value) return "还没有对话推动记录";
   const diff = Math.max(0, Date.now() / 1000 - Number(value));
@@ -197,7 +199,8 @@ export default function PulsePage() {
         state_ai_id: "claude",
       };
     }
-    return { ...payload, states };
+    const displayIds = TELEGRAM_PULSE_IDS.filter(id => states[id]);
+    return { ...payload, states, displayIds };
   };
 
   const fetchData = useCallback(() => {
@@ -242,7 +245,9 @@ export default function PulsePage() {
 
   const states = data?.states || {};
   const dims = data?.dims || [];
-  const aiIds = Object.keys(states);
+  const aiIds = data?.displayIds?.length
+    ? data.displayIds
+    : Object.keys(states).filter(id => id !== "claude");
   const displayIds = selectedAi ? [selectedAi] : aiIds;
 
   return (
