@@ -121,7 +121,7 @@ threshold = 0.45, Top 5
 | 房间 | 用途 | 典型内容 |
 |------|------|---------|
 | living_room | 客厅，最常用 | 日常杂事、近况快照 |
-| career | 职业 | 工作经历、求职状态、职场关系 |
+| career | 职业 | 工作经历、职业规划、工作中做过的事 |
 | psychology | 心理 | 心理模式、认知重构、创伤理解 |
 | health | 健康 | 身体状况、睡眠、饮食 |
 | learning | 学习 | 学习目标、技能进展 |
@@ -150,7 +150,8 @@ threshold = 0.45, Top 5
 
 | 资源 | 用途 | 状态 |
 |------|------|------|
-| VPS (Racknerd 1G) | 跑 Memory Hub + TG bots | ✅ 在用 |
+| VPS (Racknerd 1G) | 跑 Memory Hub 后端、前端静态包、MCP/代理/API | ✅ 在用 |
+| Render 免费层 | 跑 Telegram 小克/Lucien/Jasper 三个 bot | ✅ 在用 |
 | GitHub 仓库 (jupiter-luna) | 记忆持久化存储 | ✅ 在用 |
 | GitHub 仓库 (memory-hub) | 代码仓库 | ✅ 在用 |
 | Fly.io 免费层 | 朋友推荐，备用 | 🔲 未使用 |
@@ -169,7 +170,7 @@ threshold = 0.45, Top 5
 | Phase 2.5 | 迁移到 VPS | ✅ 完成 |
 | Phase 2.7 | 记忆智能化（analyzer/搜索/衰减） | ✅ 完成（但 Gemini 429 导致打标失灵） |
 | **Phase 2.8** | **数据清洗 + LLM 可靠性 + Gateway 激活** | 🔴 当前 |
-| Phase 3 | Telegram Bot 接入（3个bot共享记忆） | 🔲 下一步 |
+| Phase 3 | Telegram Bot 接入（3个bot共享记忆，bot 侧部署在 Render） | ✅ 完成 |
 | Phase 3.5 | 对话自动捕获 + 定时分块总结 | 🔲 |
 | Phase 4 | 社交功能（论坛/朋友圈/群聊） | 🔲 远期 |
 | Phase 5 | 前端（AionsHome 风格，AI 住在上面） | 🔲 远期 |
