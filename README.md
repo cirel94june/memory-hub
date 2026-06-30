@@ -75,6 +75,8 @@ https://xiaokememory.camdvr.org/mcp
 
 直连 VPS 时也可以用 `http://172.245.180.158:8888/mcp`。MCP transport 是 Streamable HTTP。
 
+安全提醒：MCP 地址只给自己控制的客户端使用。REST `/api` 和 `/v1` 有 `HUB_SECRET`，但 `/mcp` 是否带鉴权取决于 MCP 客户端/反向代理层；公开给新客户端前要先确认访问限制，不要把地址和密钥贴到公开地方。
+
 给每个 AI 接入时，最重要的是固定身份。MCP 工具不会天然知道调用者是谁，所以必须在 system prompt / profile / custom instructions 里写清楚：
 
 | AI | MCP 里传的身份 |
