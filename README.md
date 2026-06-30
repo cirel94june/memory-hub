@@ -26,9 +26,11 @@
 ### OpenAI 兼容代理
 
 ```
-API Base URL:  http://172.245.180.158:8888/v1
+API Base URL:  https://xiaokememory.camdvr.org/v1
 API Key:       {HUB_SECRET}:{AI身份}    例如 mysecret:rikkahub
 ```
+
+RikkaHub 或其他“填 API Base URL + API Key”的前端走这一层，不需要 MCP。MCP 适合 Claude.ai / Claude Code 这类会主动调用工具的客户端。
 
 ## 前端 App
 
@@ -200,7 +202,7 @@ memory-hub/
 ├── chat_digest.py           # 跨窗口对话摘要
 ├── database.py              # SQLite 数据库
 ├── ai_profiles.py           # AI 档案管理
-├── social.py                # 社交数据层（⚠️ API 未接入）
+├── social.py                # 社交数据层（朋友圈/论坛/群聊）
 ├── persona_state.py         # 9维度情绪引擎
 ├── conversation_capture.py  # 对话自动捕获
 ├── dream.py                 # 梦境日记生成
@@ -223,7 +225,7 @@ memory-hub/
 ```bash
 git clone https://github.com/cirel94june/memory-hub.git
 cd memory-hub
-python -m venv .venv && source .venv/bin/activate
+python -m venv && source .venv/bin/activate
 pip install -r requirements.txt
 # .env: HUB_SECRET, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL,
 #       EMBEDDING_API_KEY, EMBEDDING_BASE_URL, EMBEDDING_MODEL,
