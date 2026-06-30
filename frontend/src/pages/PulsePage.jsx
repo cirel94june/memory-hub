@@ -30,6 +30,15 @@ const DIM_NOTES = {
   "温柔": "声音放软，被夸奖或认可时升高",
 };
 
+function formatUpdatedAt(value) {
+  if (!value) return "还没有对话推动记录";
+  const diff = Math.max(0, Date.now() / 1000 - Number(value));
+  if (diff < 60) return "刚刚有更新";
+  if (diff < 3600) return `${Math.floor(diff / 60)}分钟前更新`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}小时前更新`;
+  return `${Math.floor(diff / 86400)}天前更新`;
+}
+
 function DimBar({ dim, value, maxVal = 1 }) {
   const pct = Math.round(value * 100);
   const color = DIM_COLORS[dim] || "var(--primary)";
@@ -156,6 +165,14 @@ function AiPulseCard({ aiId, state, dims }) {
           {state.session_count > 0 && ` · 今日 ${state.session_count} 轮对话`}
         </div>
       )}
+      <div style={{
+        fontSize: 11, color: "var(--text-muted)", marginTop: 10,
+        display: "flex", gap: 8, flexWrap: "wrap",
+      }}>
+        <span>状态来源：{state.state_ai_id && state.state_ai_id !== aiId ? `${state.state_ai_id}（别名共享）` : aiId}</span>
+        <span>·</span>
+        <span>{formatUpdatedAt(state.updated_at)}</span>
+      </div>
     </div>
   );
 }
@@ -169,15 +186,29 @@ export default function PulsePage() {
 
   const authHeaders = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
+  const normalizePulseData = (payload) => {
+    const rawStates = payload?.states || {};
+    const states = { ...rawStates };
+    if (rawStates.claude && states.cloudy) {
+      states.cloudy = {
+        ...rawStates.claude,
+        label: states.cloudy.label || "小克",
+        color: states.cloudy.color,
+        state_ai_id: "claude",
+      };
+    }
+    return { ...payload, states };
+  };
+
   const fetchData = useCallback(() => {
     setLoading(true);
     setError(null);
-    fetch("/api/pulse", { headers: authHeaders })
+    fetch("/api/pulse?show_all=true", { headers: authHeaders })
       .then(r => {
         if (!r.ok) throw new Error(`${r.status}`);
         return r.json();
       })
-      .then(d => { setData(d); setLoading(false); })
+      .then(d => { setData(normalizePulseData(d)); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
   }, []);
 
