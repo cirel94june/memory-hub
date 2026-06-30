@@ -23,6 +23,22 @@ function shiftHex(hex, delta) {
   return `#${h(r)}${h(g)}${h(b)}`;
 }
 
+function hexToHue(hex) {
+  const m = String(hex || "").replace("#", "");
+  if (m.length !== 6) return 270;
+  const r = parseInt(m.slice(0, 2), 16) / 255;
+  const g = parseInt(m.slice(2, 4), 16) / 255;
+  const b = parseInt(m.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  if (max === min) return 270;
+  let h = 0;
+  if (max === r) h = (g - b) / (max - min);
+  else if (max === g) h = 2 + (b - r) / (max - min);
+  else h = 4 + (r - g) / (max - min);
+  return Math.round((h * 60 + 360) % 360);
+}
+
 export const PRESETS = {
   moonlight: {
     name: "月光紫", desc: "冷紫 · 略带粉气",
@@ -58,7 +74,8 @@ function applyColors(root, c, isDark) {
 
   // backward compat aliases
   root.style.setProperty("--primary", c.accent);
-  root.style.setProperty("--primary-light", hexToRgba(c.accent, 0.15));
+  root.style.setProperty("--primary-h", hexToHue(c.accent));
+  root.style.setProperty("--primary-light", hexToRgba(c.accent, isDark ? 0.24 : 0.18));
   root.style.setProperty("--primary-dark", shiftHex(c.accent, -40));
 
   // backgrounds
@@ -66,17 +83,17 @@ function applyColors(root, c, isDark) {
   root.style.setProperty("--bg-card", isDark ? hexToRgba(c.paper, 0.72) : hexToRgba(c.paper, 0.85));
   root.style.setProperty("--bg-sidebar", isDark ? hexToRgba(c.paper, 0.6) : hexToRgba(c.paper, 0.7));
   root.style.setProperty("--bg-input", isDark ? hexToRgba(c.paper, 0.5) : hexToRgba(c.paper, 0.8));
-  root.style.setProperty("--bg-hover", isDark ? hexToRgba(c.ink, 0.06) : hexToRgba(c.ink, 0.04));
+  root.style.setProperty("--bg-hover", isDark ? hexToRgba(c.ink, 0.10) : hexToRgba(c.ink, 0.07));
 
   // text hierarchy from ink
   root.style.setProperty("--text-primary", c.ink);
-  root.style.setProperty("--text-secondary", isDark ? shiftHex(c.ink, -60) : shiftHex(c.ink, 80));
-  root.style.setProperty("--text-muted", isDark ? shiftHex(c.ink, -120) : shiftHex(c.ink, 140));
+  root.style.setProperty("--text-secondary", isDark ? shiftHex(c.ink, -45) : shiftHex(c.ink, 55));
+  root.style.setProperty("--text-muted", isDark ? shiftHex(c.ink, -95) : shiftHex(c.ink, 95));
   root.style.setProperty("--text-on-primary", "#fff");
 
   // glass
   root.style.setProperty("--glass-border", isDark
-    ? hexToRgba(c.ink, 0.08) : hexToRgba(c.ink, 0.06));
+    ? hexToRgba(c.ink, 0.14) : hexToRgba(c.ink, 0.10));
   root.style.setProperty("--glass-shadow", isDark
     ? `0 8px 32px ${hexToRgba("#000", 0.25)}` : `0 2px 8px ${hexToRgba(c.ink, 0.04)}`);
 
