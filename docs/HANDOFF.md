@@ -12,6 +12,11 @@ P0（后端API）+ P1（记忆详情模态框）+ P6（视觉升级/主题系统
 下一步：P3 观测台（情感罗盘+衰减仪表盘）或 P4 记忆星图（力导向图）。
 deploy.yml 已加前端自动构建，push 后 CI 会自动 npm build，不需要手动到 VPS 构建。
 
+**工作规则（2026-06-30）**：
+- 只要不是单纯 debug / 临时探查的改动，都要同步更新 GitHub 上的文档，尤其是 `README.md`、`docs/HANDOFF.md`、`docs/ARCHITECTURE.md` 或相关子项目 README。
+- 小猫会在家里和公司电脑之间切换，不要让重要背景只存在本地工作区、聊天上下文、临时命令输出或未推送代码里。
+- 做完功能、部署、架构、环境变量、跨仓库联动、排障结论后，及时把“现在真实情况”和“下次要怎么接手”写回 GitHub 文档。
+
 **部署边界提醒（2026-06-30）**：
 - Memory Hub 本体跑在 VPS：FastAPI、React 静态包、MCP、OpenAI 兼容代理、SQLite。
 - Telegram 三个 bot 已搬到 GitHub + Render 免费层，不在 VPS 上。
