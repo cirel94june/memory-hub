@@ -119,6 +119,7 @@
       border-radius: 6px;
       padding: 10px 12px;
     }
+    .log.failed { border-left-color: var(--bad); background: #fff8f7; }
     .log.error { border-left-color: var(--bad); }
     .log.config { border-left-color: var(--ok); }
     .log-head {
@@ -134,6 +135,30 @@
       word-break: break-word;
       font-size: 13px;
       line-height: 1.55;
+    }
+    .summary {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--accent-soft);
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .bad .summary, .failed .summary { background: #f8e3df; }
+    .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 7px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      background: #f7f1ea;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
     }
     .meta {
       margin-top: 6px;
@@ -215,10 +240,18 @@
         <select id="actionFilter">
           <option value="">全部动作</option>
           <option value="config">配置/测试</option>
+          <option value="pulse">情绪更新</option>
+          <option value="analyze">分析/打标</option>
           <option value="extract">记忆提取</option>
+          <option value="remember">新增记忆</option>
+          <option value="update">更新记忆</option>
           <option value="merge">合并</option>
+          <option value="digest">长文拆分</option>
           <option value="compress">压缩</option>
           <option value="archive">归档</option>
+          <option value="decay">衰减/归档</option>
+          <option value="recall">搜索</option>
+          <option value="relation">关系分类</option>
           <option value="error">错误</option>
         </select>
         <select id="limit">
@@ -266,10 +299,70 @@
 
     function shortMeta(log) {
       const meta = {};
-      for (const key of ["model", "duration_ms", "memory_id", "source_ai", "room"]) {
+      for (const key of ["model", "duration_ms", "tokens_used", "memory_id", "ai_id"]) {
         if (log[key] !== undefined && log[key] !== null && log[key] !== "") meta[key] = log[key];
       }
       return Object.keys(meta).length ? JSON.stringify(meta, null, 2) : "";
+    }
+
+    const ACTION_LABELS = {
+      analyze: "分析/打标",
+      extract: "记忆提取",
+      remember: "新增记忆",
+      update: "更新记忆",
+      merge: "合并记忆",
+      digest: "长文拆分",
+      compress: "压缩整理",
+      archive: "归档",
+      decay: "衰减/归档",
+      recall: "搜索召回",
+      relation: "关系分类",
+      config: "配置/测试",
+      pulse: "情绪更新",
+      error: "错误",
+    };
+
+    function actionLabel(action) {
+      return ACTION_LABELS[action] || action || "活动";
+    }
+
+    function explainLog(log) {
+      const action = log.action || "";
+      const detail = log.detail || log.message || log.content || "";
+      if (!log.success) return "这一步没有成功，需要看错误详情。";
+      if (action === "analyze") return "小模型正在判断这段内容应该进入哪个房间、重要程度和标签。";
+      if (action === "extract" || action === "remember") return "系统从对话里提取出候选记忆，并准备写入记忆库。";
+      if (action === "merge") return "系统发现相近记忆，正在判断是否合并，避免重复。";
+      if (action === "compress" || action === "digest") return "系统在把较长或零散内容压成更好检索的摘要。";
+      if (action === "archive" || action === "decay") return "系统在降低旧记忆权重，或把低价值内容移出日常检索。";
+      if (action === "recall") return "系统在根据问题召回相关记忆。";
+      if (action === "relation") return "系统在判断这条记忆和哪个 AI / 关系场景更相关。";
+      if (action === "pulse") return "情绪面板收到了一次对话推动，数值会慢慢衰减回落。";
+      if (action === "config") return "后台配置或模型连通性发生了变化。";
+      if (action === "error") return "后台报错了，可以把这条发给 Lucien 看。";
+      return detail ? "后台记录了一步操作。" : "后台有一条活动记录。";
+    }
+
+    function renderExtra(extra) {
+      if (!extra || typeof extra !== "object") return "";
+      const rows = Object.entries(extra)
+        .filter(([, value]) => value !== undefined && value !== null && value !== "")
+        .map(([key, value]) => {
+          const shown = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+          return `${key}: ${shown}`;
+        });
+      return rows.length ? rows.join("\n") : "";
+    }
+
+    function renderChips(log) {
+      const chips = [];
+      if (log.model) chips.push("模型 " + log.model);
+      if (log.duration_ms) chips.push(log.duration_ms + "ms");
+      if (log.tokens_used) chips.push(log.tokens_used + " tokens");
+      if (log.ai_id) chips.push("AI " + log.ai_id);
+      if (log.memory_id) chips.push("记忆 " + log.memory_id);
+      chips.push(log.success === false ? "失败" : "成功");
+      return chips.map((c) => `<span class="chip">${c}</span>`).join("");
     }
 
     async function loadLLM() {
@@ -360,15 +453,18 @@
       box.innerHTML = "";
       try {
         const data = await api("/api/activity/stats");
-        const entries = Object.entries(data || {});
-        if (!entries.length) {
-          box.innerHTML = '<p class="status">暂无统计</p>';
-          return;
-        }
-        for (const [key, value] of entries) {
+        const cards = [
+          ["缓冲日志", data.total_in_buffer || 0],
+          ["1小时内", data.last_hour?.total || 0],
+          ["1小时错误", data.last_hour?.errors || 0],
+          ["24小时内", data.last_day?.total || 0],
+          ["24小时错误", data.last_day?.errors || 0],
+          ["24小时 tokens", data.last_day?.tokens_total || 0],
+        ];
+        for (const [label, value] of cards) {
           const card = document.createElement("div");
           card.className = "stat";
-          card.innerHTML = `<strong>${value}</strong><span>${key}</span>`;
+          card.innerHTML = `<strong>${value}</strong><span>${label}</span>`;
           box.appendChild(card);
         }
       } catch (err) {
@@ -388,17 +484,21 @@
         $("logStatus").className = "status ok";
         for (const log of data.logs || []) {
           const item = document.createElement("article");
-          item.className = "log " + (log.action || "");
+          item.className = "log " + (log.action || "") + (log.success === false ? " failed" : "");
           const meta = shortMeta(log);
+          const extra = renderExtra(log.extra);
           item.innerHTML = `
             <div class="log-head">
-              <span>${log.action || "activity"}</span>
-              <span>${fmtTime(log.timestamp || log.created_at)}</span>
+              <span>${actionLabel(log.action)}</span>
+              <span>${fmtTime(log.ts || log.timestamp || log.created_at)}</span>
             </div>
+            <div class="summary">${explainLog(log)}</div>
             <div class="msg"></div>
+            <div class="chips">${renderChips(log)}</div>
             ${meta ? `<pre class="meta">${meta}</pre>` : ""}
+            ${extra ? `<pre class="meta">${extra}</pre>` : ""}
           `;
-          item.querySelector(".msg").textContent = log.message || log.content || JSON.stringify(log);
+          item.querySelector(".msg").textContent = log.detail || log.message || log.content || JSON.stringify(log);
           list.appendChild(item);
         }
       } catch (err) {
