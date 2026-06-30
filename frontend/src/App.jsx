@@ -4,7 +4,7 @@ import { AIProvider } from "./contexts/AIContext";
 import Layout from "./components/Layout";
 import HomePage from "./pages/HomePage";
 import ChatPage from "./pages/ChatPage";
-import MemoriesPage from "./pages/MemoriesPage";
+import MemoriesHubPage from "./pages/MemoriesHubPage";
 import CheckInPage from "./pages/CheckInPage";
 import MomentsPage from "./pages/MomentsPage";
 import GroupChatPage from "./pages/GroupChatPage";
@@ -12,7 +12,6 @@ import ForumPage from "./pages/ForumPage";
 import AiProfilesPage from "./pages/AiProfilesPage";
 import ThemePage from "./pages/ThemePage";
 import SettingsPage from "./pages/SettingsPage";
-import TimelinePage from "./pages/TimelinePage";
 import PulsePage from "./pages/PulsePage";
 
 import "./styles/theme.css";
@@ -27,8 +26,8 @@ export default function App() {
             <Route element={<Layout />}>
               <Route index element={<HomePage />} />
               <Route path="chat" element={<ChatPage />} />
-              <Route path="memories" element={<MemoriesPage />} />
-              <Route path="timeline" element={<TimelinePage />} />
+              <Route path="memories" element={<MemoriesHubPage />} />
+              <Route path="timeline" element={<MemoriesHubPage initialView="timeline" />} />
               <Route path="pulse" element={<PulsePage />} />
               <Route path="checkin" element={<CheckInPage />} />
               <Route path="moments" element={<MomentsPage />} />
