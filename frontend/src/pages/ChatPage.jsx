@@ -1,14 +1,34 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Send, Loader2, ChevronDown, Paintbrush } from "lucide-react";
+import { Send, Loader2, ChevronDown, Paintbrush, Trash2, CheckSquare, Square, X } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
+
+const CHAT_STORAGE_KEY = "mh-chat-conversations-v1";
+
+function loadSavedConversations() {
+  try {
+    const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function trimConversations(next) {
+  return Object.fromEntries(
+    Object.entries(next).map(([ai, msgs]) => [ai, Array.isArray(msgs) ? msgs.slice(-200) : []])
+  );
+}
 
 export default function ChatPage() {
   const { profiles } = useAI();
   const [currentId, setCurrentId] = useState(() => localStorage.getItem("mh-chat-ai") || "");
-  const [conversations, setConversations] = useState({});
+  const [conversations, setConversations] = useState(loadSavedConversations);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedMessages, setSelectedMessages] = useState({});
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const abortRef = useRef(null);
@@ -34,16 +54,23 @@ export default function ChatPage() {
   }, [aiId]);
 
   const messages = conversations[aiId] || [];
+  const selectedKeys = Object.keys(selectedMessages).filter((key) => key.startsWith(`${aiId}:`) && selectedMessages[key]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(trimConversations(conversations)));
+  }, [conversations]);
 
   const switchAi = (p) => {
     setCurrentId(p.ai_id);
     localStorage.setItem("mh-chat-ai", p.ai_id);
     localStorage.setItem("mh-ai-id", p.ai_id);
     setShowPicker(false);
+    setSelectMode(false);
+    setSelectedMessages({});
     if (!conversations[p.ai_id]) {
       const greeting = p.greeting || `你好，我是${p.name}`;
       setConversations((prev) => ({
@@ -52,6 +79,33 @@ export default function ChatPage() {
       }));
     }
     setTimeout(() => inputRef.current?.focus(), 100);
+  };
+
+  const toggleSelect = (index) => {
+    const key = `${aiId}:${index}`;
+    setSelectedMessages((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const deleteSelected = () => {
+    if (!aiId || selectedKeys.length === 0) return;
+    const selectedIndexes = new Set(selectedKeys.map((key) => Number(key.split(":")[1])));
+    setConversations((prev) => ({
+      ...prev,
+      [aiId]: (prev[aiId] || []).filter((_, index) => !selectedIndexes.has(index)),
+    }));
+    setSelectedMessages({});
+    setSelectMode(false);
+  };
+
+  const clearCurrentChat = () => {
+    if (!aiId) return;
+    const greeting = currentAi.greeting || `你好，我是${currentAi.name}`;
+    setConversations((prev) => ({
+      ...prev,
+      [aiId]: [{ role: "assistant", content: greeting }],
+    }));
+    setSelectedMessages({});
+    setSelectMode(false);
   };
 
   const send = useCallback(async () => {
@@ -262,6 +316,32 @@ export default function ChatPage() {
         display: "flex", alignItems: "center", justifyContent: "center",
         padding: "var(--space-sm) 0", position: "relative",
       }}>
+        <div style={{ position: "absolute", left: 0, display: "flex", gap: 6 }}>
+          <button onClick={() => { setSelectMode((v) => !v); setSelectedMessages({}); }}
+            title={selectMode ? "退出选择" : "选择消息"}
+            style={{
+              display: "inline-flex", alignItems: "center", justifyContent: "center",
+              width: 34, height: 34, border: "1px solid var(--border-subtle)",
+              borderRadius: "var(--radius-md)", background: selectMode ? "var(--bg-hover)" : "var(--bg-card)",
+              color: "var(--text-primary)", cursor: "pointer",
+            }}>
+            {selectMode ? <X size={16} /> : <CheckSquare size={16} />}
+          </button>
+          {selectMode && (
+            <button onClick={deleteSelected} disabled={selectedKeys.length === 0}
+              title="删除选中的消息"
+              style={{
+                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                width: 34, height: 34, border: "1px solid var(--border-subtle)",
+                borderRadius: "var(--radius-md)", background: "var(--bg-card)",
+                color: selectedKeys.length ? "var(--danger, #dc2626)" : "var(--text-muted)",
+                cursor: selectedKeys.length ? "pointer" : "not-allowed",
+              }}>
+              <Trash2 size={16} />
+            </button>
+          )}
+        </div>
+
         <button onClick={() => setShowPicker(!showPicker)} style={{
           display: "flex", alignItems: "center", gap: 8,
           background: "var(--bg-card)", border: "1px solid var(--border-subtle)",
@@ -312,12 +392,30 @@ export default function ChatPage() {
             ))}
           </div>
         )}
+
+        <button onClick={clearCurrentChat} title="清空当前聊天"
+          style={{
+            position: "absolute", right: 0,
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            width: 34, height: 34, border: "1px solid var(--border-subtle)",
+            borderRadius: "var(--radius-md)", background: "var(--bg-card)",
+            color: "var(--text-muted)", cursor: "pointer",
+          }}>
+          <Trash2 size={16} />
+        </button>
       </div>
 
       {/* Messages */}
       <div style={{ flex: 1, overflowY: "auto", padding: "var(--space-md) 0" }}>
         {messages.map((msg, i) => (
-          <MessageBubble key={`${aiId}-${i}`} message={msg} ai={currentAi} />
+          <MessageBubble
+            key={`${aiId}-${i}`}
+            message={msg}
+            ai={currentAi}
+            selectable={selectMode}
+            selected={!!selectedMessages[`${aiId}:${i}`]}
+            onToggle={() => toggleSelect(i)}
+          />
         ))}
         <div ref={bottomRef} />
       </div>
@@ -358,7 +456,7 @@ export default function ChatPage() {
   );
 }
 
-function MessageBubble({ message, ai }) {
+function MessageBubble({ message, ai, selectable = false, selected = false, onToggle }) {
   const isUser = message.role === "user";
   const isError = !isUser && message.content?.startsWith("⚠️");
   const hasImage = message.content?.includes("[img]");
@@ -368,6 +466,16 @@ function MessageBubble({ message, ai }) {
       marginBottom: "var(--space-sm)", padding: "0 var(--space-sm)",
       alignItems: "flex-end", gap: 6,
     }}>
+      {selectable && !isUser && (
+        <button onClick={onToggle} title={selected ? "取消选择" : "选择消息"}
+          style={{
+            width: 24, height: 24, border: "none", background: "transparent",
+            color: selected ? "var(--primary)" : "var(--text-muted)",
+            cursor: "pointer", padding: 0, marginBottom: 8,
+          }}>
+          {selected ? <CheckSquare size={18} /> : <Square size={18} />}
+        </button>
+      )}
       {!isUser && (
         <span style={{ fontSize: 20, marginBottom: 4, flexShrink: 0 }}>{ai.emoji}</span>
       )}
@@ -383,9 +491,23 @@ function MessageBubble({ message, ai }) {
         border: isError ? "1px solid rgba(239, 68, 68, 0.3)" : isUser ? "none" : "1px solid var(--glass-border)",
         fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
         overflow: "hidden",
+        outline: selected ? "2px solid var(--primary)" : "none",
+        cursor: selectable ? "pointer" : "default",
       }}>
-        {hasImage ? <RichContent text={message.content} /> : (message.content || "...")}
+        <div onClick={selectable ? onToggle : undefined}>
+          {hasImage ? <RichContent text={message.content} /> : (message.content || "...")}
+        </div>
       </div>
+      {selectable && isUser && (
+        <button onClick={onToggle} title={selected ? "取消选择" : "选择消息"}
+          style={{
+            width: 24, height: 24, border: "none", background: "transparent",
+            color: selected ? "var(--primary)" : "var(--text-muted)",
+            cursor: "pointer", padding: 0, marginBottom: 8,
+          }}>
+          {selected ? <CheckSquare size={18} /> : <Square size={18} />}
+        </button>
+      )}
     </div>
   );
 }
