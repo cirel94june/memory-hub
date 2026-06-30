@@ -40,6 +40,28 @@ CHUNK_SIZES = {
 MAX_BUFFER_SIZE = 150
 EXTRACT_COOLDOWN = 600  # 同一个 chat 提取后冷却10分钟
 
+
+def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
+    """Let the pulse panel react to captured Telegram conversations.
+
+    Telegram bots use /api/capture/log for cheap buffered memory extraction.
+    Pulse updates should still happen per actual bot reply, without forcing the
+    full post-process memory extraction path on every message.
+    """
+    if not ai_response.strip() or not user_message.strip():
+        return
+    try:
+        from config import AI_ALIASES
+        from persona_state import update_after_conversation
+        from gateway import _tag_pulse
+
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        update_after_conversation(canonical, valence=0.5, arousal=0.35, topics=[])
+        asyncio.create_task(_tag_pulse(user_message, canonical))
+        logger.info(f"[Pulse] queued update for {canonical} from capture/log")
+    except Exception as e:
+        logger.warning(f"[Pulse] capture update skipped: {e}")
+
 # ── 基础提取 prompt（私聊 + 通用） ──
 EXTRACT_PROMPT_BASE = """你是记忆提取专家。从对话中提取值得**长期**记住的信息。
 
@@ -201,6 +223,7 @@ async def log_conversation(
         "chat_type": chat_type,
         "timestamp": now,
     })
+    _touch_pulse(user_message, ai_response, ai_id)
 
     # 防止内存爆
     if len(_conversation_buffers[key]) > MAX_BUFFER_SIZE:
