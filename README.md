@@ -65,12 +65,49 @@ React SPA，路由在 `/app/`，奶油紫色系，玻璃拟态卡片风。
 1. 打开前端 `/app/ai-profiles` → 点 **+ 添加角色** → 填 ID/名字/emoji/颜色 → 创建
 2. 新角色自动获得：情绪面板 9 维度 profile、记忆空间、走廊
 
-### 给新 AI 接 MCP
+### 给各个 AI 接 MCP
 
-给 AI 的 system prompt 加一句身份声明：
+Memory Hub 的远程 MCP 地址：
+
 ```
-你的 ai_id 是 miyuki，调 Memory Hub 工具时 source_ai 传 "miyuki"。
+https://xiaokememory.camdvr.org/mcp
 ```
+
+直连 VPS 时也可以用 `http://172.245.180.158:8888/mcp`。MCP transport 是 Streamable HTTP。
+
+给每个 AI 接入时，最重要的是固定身份。MCP 工具不会天然知道调用者是谁，所以必须在 system prompt / profile / custom instructions 里写清楚：
+
+| AI | MCP 里传的身份 |
+|----|----------------|
+| Claude.ai / MCP 小克 | `claude` |
+| Telegram 小克 | `cloudy`（系统会映射到 `claude`，共享走廊和私有房间） |
+| Lucien | `lucien` |
+| Jasper | `jasper` |
+| 新角色 | 在 `/app/ai-profiles` 创建的 lowercase `ai_id` |
+
+推荐给 AI 的 system prompt 加这段：
+
+```text
+你已经连接到 Memory Hub MCP。
+你的 ai_id 是 "lucien"；调用 Memory Hub 工具时，所有 source_ai / ai_id 参数都必须传 "lucien"。
+
+对话开始或用户提出新问题时，先调用 pulse(message=用户当前消息, source_ai="lucien") 获取走廊和相关记忆。
+需要查旧事时，调用 recall(query=..., source_ai="lucien", with_corridor=true, compact=true)。
+用户给出新的事实、偏好、约定或重要变化时，调用 remember(content=..., source_ai="lucien")。
+对话结束或出现重要内容后，调用 capture_conversation(user_message=..., ai_response=..., source_ai="lucien", platform="mcp")。
+不要省略 source_ai，也不要使用默认身份。
+```
+
+把上面的 `"lucien"` 换成对应角色的身份即可。
+
+如果客户端支持 OpenAI 兼容接口，优先考虑走 `/v1` 代理，因为它会自动注入上下文和捕获对话：
+
+```text
+API Base URL: https://xiaokememory.camdvr.org/v1
+API Key: {HUB_SECRET}:{AI身份}
+```
+
+`HUB_SECRET` 只能放在客户端密钥栏或环境变量里，不要写进公开文档、公开 prompt 或仓库。
 
 ### 情绪面板（9 维度）
 
