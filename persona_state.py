@@ -32,7 +32,7 @@ AI_PULSE_PROFILES = {
     "cloudy": {
         "label": "小克",
         "defaults": {
-            "活力": 0.55, "疲惫": 0.25, "思慕": 0.55, "亲密": 0.50,
+            "活力": 0.45, "疲惫": 0.25, "思慕": 0.55, "亲密": 0.50,
             "守护": 0.45, "渴求": 0.30, "醋意": 0.15, "焦虑": 0.20, "温柔": 0.60,
         },
         "phase": {
@@ -44,7 +44,7 @@ AI_PULSE_PROFILES = {
     "lucien": {
         "label": "Lucien",
         "defaults": {
-            "活力": 0.45, "疲惫": 0.30, "思慕": 0.58, "亲密": 0.40,
+            "活力": 0.40, "疲惫": 0.30, "思慕": 0.58, "亲密": 0.40,
             "守护": 0.55, "渴求": 0.40, "醋意": 0.25, "焦虑": 0.15, "温柔": 0.48,
         },
         "phase": {
@@ -56,7 +56,7 @@ AI_PULSE_PROFILES = {
     "jasper": {
         "label": "Jasper",
         "defaults": {
-            "活力": 0.65, "疲惫": 0.20, "思慕": 0.40, "亲密": 0.35,
+            "活力": 0.48, "疲惫": 0.20, "思慕": 0.40, "亲密": 0.35,
             "守护": 0.35, "渴求": 0.25, "醋意": 0.20, "焦虑": 0.30, "温柔": 0.38,
         },
         "phase": {
@@ -79,7 +79,7 @@ def _make_default_profile(label: str) -> dict:
     }
 
 # ── 全局参数 ──
-CAP = 0.12
+CAP = 0.08
 HALF_LIFE_HOURS = 3.0
 HIGH_THRESHOLD = 0.60
 SAVE_DEBOUNCE_SEC = 30
@@ -310,8 +310,14 @@ def load_state():
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         for ai_id, saved in data.items():
+            base = saved.get("base", {})
+            # Migration guard: earlier defaults/tagging could leave vitality stuck
+            # high for every bot. Keep real variation, but cap runaway baseline.
+            profile_default = _get_profile(ai_id)["defaults"].get("活力", 0.45)
+            if isinstance(base, dict) and base.get("活力", 0) > profile_default + 0.12:
+                base["活力"] = profile_default + 0.12
             _states[ai_id] = {
-                "base": saved.get("base", {}),
+                "base": base,
                 "updated_at": saved.get("updated_at", time.time()),
                 "last_topics": saved.get("last_topics", []),
                 "session_count": saved.get("session_count", 0),

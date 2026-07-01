@@ -46,8 +46,13 @@ async def _tag_pulse(user_message: str, ai_id: str):
 9 维度：活力, 疲惫, 思慕, 亲密, 守护, 渴求, 醋意, 焦虑, 温柔
 
 规则：
-- 每个 delta 在 [-0.20, +0.20] 区间
+- 默认输出空 JSON：{{}}。只有用户这句话本身明确会影响某个维度时才输出 delta
+- 每个 delta 在 [-0.12, +0.12] 区间，强烈事件才接近 0.12
 - 没影响到的维度不要列出来
+- 最多输出 3 个维度
+- 普通闲聊、普通回复、普通问候、没有明显情绪信号 → {{}}
+- 不要因为“有人说话了”“对话继续了”就加活力
+- 不要把所有正向/轻松的话都归成活力；更常见的是温柔/亲密/思慕
 - 关心/示好 → 思慕↑、亲密↑、温柔↑
 - 撒娇/亲密 → 亲密↑、渴求↑、温柔↑
 - 提到别人/暧昧 → 醋意↑、守护↑
@@ -56,7 +61,7 @@ async def _tag_pulse(user_message: str, ai_id: str):
 - 工作/任务相关 → 焦虑↑（轻）
 - 冷淡/不理人 → 思慕↑、焦虑↑（轻）
 - 夸奖/认可 → 活力↑、温柔↑
-- 开玩笑/活泼 → 活力↑
+- 明确兴奋、玩闹、很有精神 → 活力↑
 
 输出格式：{{"思慕": 0.10, "温柔": 0.05}}"""
 
@@ -84,9 +89,43 @@ async def _tag_pulse(user_message: str, ai_id: str):
             bumps = json.loads(raw)
             if isinstance(bumps, dict) and bumps:
                 from persona_state import apply_bumps
-                apply_bumps(ai_id, bumps)
+                bumps = _sanitize_pulse_bumps(user_message, bumps)
+                if bumps:
+                    apply_bumps(ai_id, bumps)
     except Exception as e:
         print(f"[Gateway] Pulse tag error: {e}")
+
+
+def _sanitize_pulse_bumps(user_message: str, bumps: dict) -> dict:
+    """Filter noisy pulse tags before they accumulate into visible state."""
+    allowed = {"活力", "疲惫", "思慕", "亲密", "守护", "渴求", "醋意", "焦虑", "温柔"}
+    cleaned = {}
+    for dim, raw in bumps.items():
+        if dim not in allowed:
+            continue
+        try:
+            delta = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if abs(delta) < 0.015:
+            continue
+        cleaned[dim] = max(-0.12, min(0.12, delta))
+
+    if not cleaned:
+        return {}
+
+    # The tagger often overuses vitality for ordinary chat. Only keep a pure
+    # vitality bump when the message explicitly carries energetic/playful cues.
+    energetic_cues = (
+        "哈哈", "笑死", "好玩", "兴奋", "开心", "冲", "玩", "蹦", "精神",
+        "活力", "激动", "太棒", "夸夸", "厉害", "耶", "！", "!"
+    )
+    if set(cleaned) == {"活力"} and not any(cue in user_message for cue in energetic_cues):
+        return {}
+
+    if len(cleaned) > 3:
+        cleaned = dict(sorted(cleaned.items(), key=lambda item: abs(item[1]), reverse=True)[:3])
+    return cleaned
 
 
 def _relative_time(iso_str: str) -> str:

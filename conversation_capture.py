@@ -52,11 +52,9 @@ def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
         return
     try:
         from config import AI_ALIASES
-        from persona_state import update_after_conversation
         from gateway import _tag_pulse
 
         canonical = AI_ALIASES.get(ai_id, ai_id)
-        update_after_conversation(canonical, valence=0.5, arousal=0.35, topics=[])
         asyncio.create_task(_tag_pulse(user_message, canonical))
         logger.info(f"[Pulse] queued update for {canonical} from capture/log")
     except Exception as e:

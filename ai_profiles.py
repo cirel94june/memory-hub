@@ -80,6 +80,35 @@ def get_profile(ai_id: str) -> dict | None:
     return merged or None
 
 
+def _model_fields(profile: dict) -> dict:
+    return {
+        "model_url": profile.get("model_url") or "",
+        "model_name": profile.get("model_name") or "",
+        "model_key": profile.get("model_key") or "",
+    }
+
+
+def get_model_profile(ai_id: str) -> dict:
+    """Resolve model config without letting a display/persona alias mask it.
+
+    小克 has two ids: Web/MCP uses claude, Telegram uses cloudy. Persona should
+    prefer the user-facing 小克 profile, but model settings should prefer the
+    exact id the user configured on the AI profile page.
+    """
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    aliases = AI_ALIAS_GROUPS.get(canonical, AI_ALIAS_GROUPS.get(ai_id, [ai_id]))
+    ordered = [ai_id] + [a for a in aliases if a != ai_id]
+
+    merged = {}
+    for alias in ordered:
+        fields = _model_fields(_profiles.get(alias, {}))
+        for k, v in fields.items():
+            if v and not merged.get(k):
+                merged[k] = v
+    return merged
+
+
 def get_all_profiles() -> dict:
     return dict(_profiles)
 
@@ -139,7 +168,7 @@ async def delete_profile(ai_id: str) -> bool:
 def get_llm_config_for_ai(ai_id: str) -> dict:
     """获取某 AI 的模型配置，fallback 到全局默认。自动合并别名 profiles。"""
     from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
-    profile = get_profile(ai_id) or {}
+    profile = get_model_profile(ai_id)
     return {
         "base_url": profile.get("model_url") or LLM_BASE_URL,
         "model": profile.get("model_name") or LLM_MODEL,

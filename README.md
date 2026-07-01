@@ -21,7 +21,8 @@
 | Claude.ai | MCP → `http://VPS:8888/mcp` | AI 主动调工具 | ✅ |
 | Claude Code | MCP + auto-surfacing hook | 自动 | ✅ |
 | Telegram 小克/Lucien/Jasper | REST API (Gateway) | 全自动 | ✅ |
-| RikkaHub / 任意 OpenAI 客户端 | 代理 → `/v1` | 全自动 | ✅ |
+| RikkaHub / 已有中转站前端 | MCP → `/mcp` | AI 主动调工具 | ✅ |
+| 任意可改 API Base 的 OpenAI 客户端 | 代理 → `/v1` | 全自动 | ✅ |
 
 ### OpenAI 兼容代理
 
@@ -30,7 +31,7 @@ API Base URL:  https://xiaokememory.camdvr.org/v1
 API Key:       {HUB_SECRET}:{AI身份}    例如 mysecret:rikkahub
 ```
 
-RikkaHub 或其他“填 API Base URL + API Key”的前端走这一层，不需要 MCP。MCP 适合 Claude.ai / Claude Code 这类会主动调用工具的客户端。
+如果客户端的 `/v1` 已经要直连中转站，就不要把 Memory Hub 填到 API Base URL 里；这种场景应该把 Memory Hub 作为 MCP 记忆工具接入。只有在客户端可以把 Memory Hub 当作 OpenAI 兼容代理时，才走 `/v1`。
 
 ## 前端 App
 
@@ -104,7 +105,7 @@ https://xiaokememory.camdvr.org/mcp
 
 把上面的 `"lucien"` 换成对应角色的身份即可。
 
-如果客户端支持 OpenAI 兼容接口，优先考虑走 `/v1` 代理，因为它会自动注入上下文和捕获对话：
+如果客户端的 API Base URL 可以交给 Memory Hub 托管，也可以走 `/v1` 代理，因为它会自动注入上下文和捕获对话：
 
 ```text
 API Base URL: https://xiaokememory.camdvr.org/v1
@@ -123,7 +124,7 @@ API Key: {HUB_SECRET}:{AI身份}
 
 | 可调参数 | 默认 | 文件 |
 |---------|------|------|
-| `CAP`（节律幅度） | 0.12 | persona_state.py |
+| `CAP`（节律幅度） | 0.08 | persona_state.py |
 | `HALF_LIFE_HOURS` | 3.0 | persona_state.py |
 | `HIGH_THRESHOLD` | 0.60 | persona_state.py |
 
@@ -225,7 +226,7 @@ memory-hub/
 ```bash
 git clone https://github.com/cirel94june/memory-hub.git
 cd memory-hub
-python -m venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # .env: HUB_SECRET, LLM_API_KEY, LLM_BASE_URL, LLM_MODEL,
 #       EMBEDDING_API_KEY, EMBEDDING_BASE_URL, EMBEDDING_MODEL,

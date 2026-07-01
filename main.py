@@ -646,7 +646,7 @@ async def api_ai_aliases():
 async def api_list_profiles(authorization: str = Header(default="")):
     """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""
     verify_secret(authorization)
-    from ai_profiles import get_all_profiles
+    from ai_profiles import get_all_profiles, get_model_profile
     from config import AI_ROLES, AI_ALIASES
     all_p = get_all_profiles()
     seen_canonical = set()
@@ -668,8 +668,11 @@ async def api_list_profiles(authorization: str = Header(default="")):
                 if ar.get("platform"):
                     best_role = ar
                 if ap:
-                    p = {**p, **{k: v for k, v in ap.items() if v}}
+                    for k, v in ap.items():
+                        if v and not p.get(k):
+                            p[k] = v
         role = best_role
+        model_profile = get_model_profile(ai_id)
         profiles.append({
             "ai_id": ai_id,
             "name": p.get("name") or role.get("name", ai_id),
@@ -678,9 +681,9 @@ async def api_list_profiles(authorization: str = Header(default="")):
             "platform": p.get("platform", ""),
             "greeting": p.get("greeting", ""),
             "persona": p.get("persona", ""),
-            "llm_base_url": p.get("model_url", ""),
-            "llm_model": p.get("model_name", ""),
-            "llm_api_key_set": bool(p.get("model_key")),
+            "llm_base_url": model_profile.get("model_url", ""),
+            "llm_model": model_profile.get("model_name", ""),
+            "llm_api_key_set": bool(model_profile.get("model_key")),
         })
     return {"profiles": profiles}
 
