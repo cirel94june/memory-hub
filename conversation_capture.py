@@ -16,6 +16,7 @@ import json
 import time
 import logging
 from datetime import datetime, timezone
+from time_utils import local_now, local_today
 from typing import Optional
 
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
@@ -212,7 +213,7 @@ async def log_conversation(
     if chat_type:
         _buffer_chat_types[key] = chat_type
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = local_now().isoformat()
     _conversation_buffers[key].append({
         "user": user_message[:1000],
         "ai": ai_response[:1000] if ai_response else "",
@@ -322,7 +323,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         lines.append(line)
     conversation_text = "\n".join(lines)
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = local_today()
     context_label = {"private": "私聊", "private_group": "私密小群", "public_group": "公开大群"}.get(chat_type, "对话")
     prompt = f"今天日期：{today}\n来源：{context_label}，共{len(buffer)}条消息（展示了{len(lines)}条）：\n\n{conversation_text}"
 
@@ -422,7 +423,7 @@ async def extract_from_messages(
         lines.append(f"{role}: {content}")
 
     conversation_text = "\n".join(lines)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = local_today()
     prompt = f"今天日期：{today}\n来源：MCP 前端对话，共 {len(messages)} 条消息：\n\n{conversation_text}"
 
     extract_prompt = _get_extract_prompt(chat_type)

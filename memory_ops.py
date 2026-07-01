@@ -952,6 +952,83 @@ async def delete_memory(memory_id: str) -> dict:
     return {"id": memory_id, "status": "deleted"}
 
 
+def _normalize_for_dedup(content: str) -> str:
+    text = (content or "").strip().lower()
+    for prefix in ("[用户]", "[互动]", "[AI]", "[鐢ㄦ埛]", "[浜掑姩]"):
+        if text.startswith(prefix.lower()):
+            text = text[len(prefix):].strip()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+async def deduplicate_public_memories(similarity_threshold: float = 0.92, dry_run: bool = True) -> dict:
+    """Conservatively archive duplicate shared memories."""
+    active = [
+        m for m in database.iter_memories(status="active")
+        if m.get("layer", "shared") == "shared"
+        and not m.get("owner_ai")
+        and m.get("room") != "game_room"
+    ]
+    archived = []
+    checked = set()
+
+    for i, a in enumerate(active):
+        a_key = _normalize_for_dedup(a.get("content", ""))
+        for b in active[i + 1:]:
+            pair_key = tuple(sorted([a["id"], b["id"]]))
+            if pair_key in checked:
+                continue
+            checked.add(pair_key)
+            if a.get("room") != b.get("room"):
+                continue
+            if a.get("category", "") and b.get("category", "") and a.get("category") != b.get("category"):
+                continue
+
+            duplicate = False
+            reason = ""
+            b_key = _normalize_for_dedup(b.get("content", ""))
+            if a_key and a_key == b_key:
+                duplicate = True
+                reason = "normalized_equal"
+            elif a.get("embedding") and b.get("embedding"):
+                sim = cosine_similarity(unpack_embedding(a["embedding"]), unpack_embedding(b["embedding"]))
+                if sim >= similarity_threshold:
+                    duplicate = True
+                    reason = f"embedding_sim={sim:.2f}"
+            if not duplicate:
+                continue
+
+            older = a if a.get("created_at", "") <= b.get("created_at", "") else b
+            newer = b if older is a else a
+            archived.append({
+                "archived_id": older["id"],
+                "kept_id": newer["id"],
+                "reason": reason,
+                "archived_preview": older.get("content", "")[:80],
+                "kept_preview": newer.get("content", "")[:80],
+            })
+            if not dry_run:
+                older["status"] = "archived"
+                older["updated_at"] = _now()
+                comments = older.get("comments", [])
+                if not isinstance(comments, list):
+                    comments = []
+                comments.append({
+                    "date": _now(),
+                    "author": "deduplicate_public_memories",
+                    "kind": "supersede_note",
+                    "content": f"公共记忆去重：与 {newer['id']} 重复，原因 {reason}，归档较旧条目。",
+                })
+                older["comments"] = comments
+                store.set_memory(older)
+
+    return {
+        "dry_run": dry_run,
+        "candidates": len(archived),
+        "archived": 0 if dry_run else len(archived),
+        "items": archived[:50],
+    }
+
+
 # ── 记忆衰减（含情感维度） ──
 
 async def run_decay() -> dict:

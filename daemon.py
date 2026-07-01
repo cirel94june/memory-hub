@@ -777,6 +777,9 @@ async def run_full_maintenance() -> dict:
     # 10.7 自动去重（高相似度记忆归档较旧的）
     results["dedup"] = await _detect_contradictions()
     log.info(f"  Dedup: {results['dedup']}")
+    from memory_ops import deduplicate_public_memories
+    results["public_dedup"] = await deduplicate_public_memories(dry_run=False)
+    log.info(f"  Public dedup: {results['public_dedup']}")
 
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:

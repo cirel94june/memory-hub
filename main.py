@@ -268,6 +268,18 @@ async def api_living_room(authorization: str = Header(default="")):
     return {"items": items}
 
 
+@app.post("/api/memory/deduplicate-public")
+async def api_deduplicate_public(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json() if request.headers.get("content-length") else {}
+    dry_run = bool(body.get("dry_run", True))
+    threshold = float(body.get("similarity_threshold", 0.92))
+    return await memory_ops.deduplicate_public_memories(
+        similarity_threshold=threshold,
+        dry_run=dry_run,
+    )
+
+
 @app.post("/api/memory/{memory_id}/archive")
 async def api_archive(memory_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
@@ -977,14 +989,15 @@ async def api_memory_timeline(
     """按日期分组的记忆摘要 + 每日计数/热度"""
     verify_secret(authorization)
     import database as db
-    from datetime import datetime, timezone, timedelta
+    from datetime import timedelta
+    from time_utils import local_date_key, local_now
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
+    cutoff = (local_now() - timedelta(days=days)).strftime("%Y-%m-%d")
     all_mems = db.query_memories(status="active", order_by="created_at DESC")
 
     by_date = {}
     for m in all_mems:
-        created = m.get("created_at", "")[:10]
+        created = local_date_key(m.get("created_at", ""))
         if not created or created < cutoff:
             continue
         if room and m.get("room") != room:
@@ -1040,11 +1053,12 @@ async def api_memory_by_date(
     """获取某一天的全部记忆（完整内容）"""
     verify_secret(authorization)
     import database as db
+    from time_utils import local_date_key
 
     all_mems = db.query_memories(status="active", order_by="created_at ASC")
     items = []
     for m in all_mems:
-        created = m.get("created_at", "")[:10]
+        created = local_date_key(m.get("created_at", ""))
         if created == date:
             items.append(m)
     return {"date": date, "items": items, "count": len(items)}
@@ -1058,14 +1072,16 @@ async def api_memory_calendar(
     """日历热图数据：每天记忆条数"""
     verify_secret(authorization)
     import database as db
-    from datetime import datetime, timezone, timedelta
+    from time_utils import local_date_key
+    from datetime import timedelta
+    from time_utils import local_date_key, local_now
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=months * 31)).isoformat()[:10]
+    cutoff = (local_now() - timedelta(days=months * 31)).strftime("%Y-%m-%d")
     all_mems = db.query_memories(status="active", order_by="created_at DESC")
 
     counts = {}
     for m in all_mems:
-        created = m.get("created_at", "")[:10]
+        created = local_date_key(m.get("created_at", ""))
         if not created or created < cutoff:
             continue
         counts[created] = counts.get(created, 0) + 1
@@ -1100,10 +1116,10 @@ async def api_memory_graph(authorization: str = Header(default="")):
             "room": m.get("room", ""),
             "importance": float(m.get("importance") or 0.5),
             "tags": tags[:5],
-            "created_at": m.get("created_at", "")[:10],
+            "created_at": local_date_key(m.get("created_at", "")),
         })
 
-        date_key = m.get("created_at", "")[:10]
+        date_key = local_date_key(m.get("created_at", ""))
         if date_key:
             date_groups.setdefault(date_key, []).append(mid)
 
