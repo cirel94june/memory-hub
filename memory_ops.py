@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
-                    MERGE_SIMILARITY, ROOMS, get_room)
+                    MERGE_SIMILARITY, ROOMS, get_room, AI_ALIASES, AI_ALIAS_GROUPS)
 from embedding import get_embedding, pack_embedding, unpack_embedding, cosine_similarity
 import github_store as store
 import database
@@ -35,6 +35,13 @@ def _safe_float(val, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
+
+
+def _identity_ids(ai_id: str) -> set[str]:
+    if not ai_id:
+        return set()
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    return set(AI_ALIAS_GROUPS.get(canonical, [canonical, ai_id]))
 
 
 def _distance_to_cosine(distance: float) -> float:
@@ -563,6 +570,7 @@ async def recall(
 
     + unresolved 记忆优先浮现（最多 2 条）
     """
+    ai_ids = _identity_ids(ai_id)
     query_vec = await get_embedding(query)
 
     # 如果没指定 domain，用 analyzer 快速分析 query
@@ -622,7 +630,7 @@ async def recall(
         """Check private layer access — must be done in Python since
         database queries don't enforce cross-field logic like this."""
         if mem.get("layer") == "private":
-            if not ai_id or mem.get("owner_ai") != ai_id:
+            if not ai_ids or mem.get("owner_ai") not in ai_ids:
                 return False
         return True
 
@@ -893,16 +901,32 @@ async def get_ai_private_summary(ai_id: str, limit: int = 10) -> list[dict]:
 async def list_memories(
     layer: str = None, room: str = None, owner_ai: str = None,
     source_ai: str = None,
+    ai_id: str = None,
     status: str = "active", page: int = 1, per_page: int = 20,
 ) -> dict:
-    mems = database.query_memories(
-        layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
-        limit=per_page, offset=(page - 1) * per_page,
-        order_by="updated_at DESC",
-    )
-    total = len(database.query_memories(
-        layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
-    ))
+    if ai_id:
+        ids = _identity_ids(ai_id)
+        all_mems = database.query_memories(
+            layer=layer, room=room, owner_ai=owner_ai, status=status,
+            order_by="updated_at DESC",
+        )
+
+        def related(mem):
+            return mem.get("source_ai") in ids or mem.get("owner_ai") in ids
+
+        filtered = [m for m in all_mems if related(m)]
+        total = len(filtered)
+        start = (page - 1) * per_page
+        mems = filtered[start:start + per_page]
+    else:
+        mems = database.query_memories(
+            layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
+            limit=per_page, offset=(page - 1) * per_page,
+            order_by="updated_at DESC",
+        )
+        total = len(database.query_memories(
+            layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
+        ))
 
     clean = []
     for m in mems:

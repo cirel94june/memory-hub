@@ -251,12 +251,13 @@ async def api_list(
     layer: str = None, room: str = None, owner_ai: str = None,
     status: str = "active", page: int = 1, per_page: int = 20,
     source_ai: str = None,
+    ai_id: str = None,
     authorization: str = Header(default=""),
 ):
     verify_secret(authorization)
     return await memory_ops.list_memories(
         layer=layer, room=room, owner_ai=owner_ai,
-        source_ai=source_ai, status=status, page=page, per_page=per_page,
+        source_ai=source_ai, ai_id=ai_id, status=status, page=page, per_page=per_page,
     )
 
 
@@ -792,7 +793,11 @@ async def api_ai_memories(ai_id: str, limit: int = Query(default=30, le=100), au
                 "source_ai": m.get("source_ai", ""),
             })
     combined.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return {"memories": combined[:limit], "total": len(combined)}
+    limited = combined[:limit]
+    rooms = {}
+    for item in limited:
+        rooms.setdefault(item.get("room") or "living_room", []).append(item)
+    return {"memories": limited, "rooms": rooms, "total": len(combined)}
 
 
 @app.put("/api/ai-profiles/{ai_id}")

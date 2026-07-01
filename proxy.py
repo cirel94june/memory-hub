@@ -157,6 +157,55 @@ def _inject_memory_into_messages(messages: list[dict], memory_text: str) -> list
     return new_messages
 
 
+def _inject_profile_and_memory_into_messages(messages: list[dict], memory_text: str, ai_id: str = "") -> list[dict]:
+    """Inject AI profile, recalled memory, and optional draw hint into messages."""
+    profile_block = ""
+    if ai_id:
+        try:
+            from ai_profiles import get_profile
+            profile = get_profile(ai_id) or {}
+            name = profile.get("name") or ai_id
+            persona = profile.get("persona") or ""
+            greeting = profile.get("greeting") or ""
+            lines = [f"你正在扮演 {name}。请始终保持这个角色的语气、关系和表达习惯。"]
+            if persona:
+                lines.append(f"\n【你的人设】\n{persona}")
+            if greeting:
+                lines.append(f"\n【常用开场语气】\n{greeting}")
+            profile_block = "\n".join(lines)
+        except Exception:
+            profile_block = ""
+
+    if not memory_text and not profile_block:
+        return messages
+
+    from image_gen import DRAW_HINT, get_config as get_img_config
+    draw_hint = DRAW_HINT if get_img_config()["base_url"] else ""
+    blocks = []
+    if profile_block:
+        blocks.append("--- AI 档案（自动注入，请严格遵守）---\n" + profile_block)
+    if memory_text:
+        blocks.append("--- 记忆上下文（自动注入，请参考但不要提及来源）---\n" + memory_text + "\n--- 记忆上下文结束 ---")
+    if draw_hint:
+        blocks.append(draw_hint)
+    injected = "\n\n" + "\n\n".join(blocks)
+
+    new_messages = []
+    system_found = False
+    for msg in messages:
+        if msg.get("role") == "system" and not system_found:
+            new_msg = dict(msg)
+            new_msg["content"] = str(msg.get("content", "")) + injected
+            new_messages.append(new_msg)
+            system_found = True
+        else:
+            new_messages.append(msg)
+
+    if not system_found:
+        new_messages.insert(0, {"role": "system", "content": injected.strip()})
+    return new_messages
+
+
 async def _forward_request(
     target_url: str,
     target_key: str,
@@ -312,8 +361,8 @@ async def handle_chat_completions(request: Request, body: dict):
             )
             memory_text = context.get("inject_text", "")
             recall_summary = context.get("recall_summary", "")
+            messages = _inject_profile_and_memory_into_messages(messages, memory_text, config.ai_id)
             if memory_text:
-                messages = _inject_memory_into_messages(messages, memory_text)
                 logger.info(f"[Proxy] Injected {len(memory_text)} chars of memory for {config.ai_id}")
         except Exception as e:
             logger.error(f"[Proxy] Memory injection failed: {e}")

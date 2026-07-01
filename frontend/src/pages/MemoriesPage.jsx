@@ -207,7 +207,7 @@ export default function MemoriesPage() {
     const params = new URLSearchParams({ page, per_page: 20 });
     if (room) params.set("room", room);
     if (layer) params.set("layer", layer);
-    if (aiFilter) params.set("source_ai", aiFilter);
+    if (aiFilter) params.set("ai_id", aiFilter);
     fetch(`/api/memory/list?${params}`, { headers: authHeaders })
       .then((r) => r.json())
       .then((d) => { setMemories(d.items || []); setTotal(d.total || 0); })
