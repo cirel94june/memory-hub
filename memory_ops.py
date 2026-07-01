@@ -490,7 +490,8 @@ async def grow(
 
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
-                        owner_ai: str = None, layer: str = None, changed_by: str = "") -> dict:
+                        owner_ai: str = None, source_ai: str = None,
+                        layer: str = None, changed_by: str = "") -> dict:
     mem = store.get_memory(memory_id)
     if not mem:
         return {"id": memory_id, "status": "not_found"}
@@ -520,6 +521,8 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
         mem["tags"] = json.dumps(tags)
     if owner_ai is not None:
         mem["owner_ai"] = owner_ai
+    if source_ai is not None:
+        mem["source_ai"] = source_ai
     if layer is not None:
         mem["layer"] = layer
 
@@ -889,14 +892,17 @@ async def get_ai_private_summary(ai_id: str, limit: int = 10) -> list[dict]:
 
 async def list_memories(
     layer: str = None, room: str = None, owner_ai: str = None,
+    source_ai: str = None,
     status: str = "active", page: int = 1, per_page: int = 20,
 ) -> dict:
     mems = database.query_memories(
-        layer=layer, room=room, owner_ai=owner_ai, status=status,
+        layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
         limit=per_page, offset=(page - 1) * per_page,
         order_by="updated_at DESC",
     )
-    total = database.count_memories(status=status)
+    total = len(database.query_memories(
+        layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
+    ))
 
     clean = []
     for m in mems:

@@ -11,7 +11,7 @@
 
 一个跑在 VPS 上的 FastAPI 服务，提供 **REST API + MCP Server + OpenAI 兼容代理 + React 前端** 四种接入方式。三个 AI 通过它共享一套记忆，每个 AI 也有自己的私有空间和独立模型配置。
 
-记忆主存储在 **SQLite**（`data/memories.db`），GitHub 仓库作为每 12h 的备份。Embedding 存储在 SQLite（sqlite-vec 扩展），启动时后台补建缺失的向量。
+记忆主存储在 **SQLite**（`data/memories.db`），GitHub 仓库作为每 12h 的备份。Embedding 存储在 SQLite（sqlite-vec 扩展），启动时后台补建缺失的向量。后续 Memory Safety Kit 会采用“每日增量 Markdown + 安全报告、每周/月压缩快照”的策略，避免每天堆全量导出。
 
 ## 接入方式
 
@@ -41,7 +41,7 @@ React SPA，路由在 `/app/`，奶油紫色系，玻璃拟态卡片风。
 |------|------|------|
 | 首页 | `/` | 三个 AI 的状态卡片，点击进入对话 |
 | 对话 | `/chat` | 与 AI 一对一聊天，顶部切换 |
-| 记忆 | `/memories` | 浏览和搜索所有记忆 |
+| 记忆 | `/memories` | 浏览、搜索、按公用/私有/角色/房间筛选，并编辑记忆归属 |
 | 时间线 | `/timeline` | 按日期分组的记忆时间线 |
 | 情绪面板 | `/pulse` | 9维度AI情绪状态（精力/牵绊/情绪三组） |
 | 朋友圈 | `/moments` | 用户/AI 发动态、评论、点赞、画图发布 |
@@ -157,6 +157,8 @@ API Key: {HUB_SECRET}:{AI身份}
 | 原版功能 | 说明 | 我们怎么接 | 优先级 |
 |---------|------|----------|-------|
 | **Anchor 锚点** | 最多 20 条"坐标系"记忆，不衰减不随机浮出，但可搜索 | `anchored` 字段 + MCP 工具 + 走廊注入 + 前端按钮 | ✅ 已完成 |
+| **Memory Control Panel** | 人可以直接整理记忆归属 | 详情页可改 `layer` / `owner_ai` / `source_ai` / `room` / 重要度 / 标签 | ✅ 已完成 |
+| **Memory Safety Kit** | 防 VPS 失效焦虑：可读导出 + 自动校验 + 恢复演练 | 增量 Markdown/Obsidian 导出、每日安全报告、每周压缩快照、保留周期 | 🔲 待做 |
 | **Self-knowledge** | AI 记录自我认知，对话开头注入 | 改造 `personality` 房间或新建 | ⭐⭐ 中 |
 | **Plan 计划系统** | 永不衰减的承诺/待办，dream 里复盘 | 增强 `resolved` 字段 + plan MCP 工具 | ⭐⭐ 中 |
 | **星图视觉** | 工程网格风格记忆网络 | P4 做星图时参考 | ⭐ 远期 |
@@ -180,6 +182,7 @@ API Key: {HUB_SECRET}:{AI身份}
 |--------|------|------|
 | P0 | 后端 API 补充（8 个端点） | ✅ |
 | P1 | 记忆详情模态框 | ✅ |
+| P1.5 | 记忆归属控制台（公用/私有/角色/房间可编辑） | ✅ |
 | P2 | 时间线视图 `/app/timeline` | ✅ |
 | P6 | 视觉升级（主题系统 + 4 套预设） | ✅ |
 | P9 | 9维度情绪面板 `/app/pulse` | ✅ |

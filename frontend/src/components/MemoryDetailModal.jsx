@@ -5,8 +5,10 @@ import {
   Clock,
   Edit3,
   FileText,
+  Globe2,
   Heart,
   Link2,
+  Lock,
   Save,
   Tag,
   TrendingDown,
@@ -124,12 +126,21 @@ const inputStyle = {
 };
 
 export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
-  const { getAI } = useAI();
+  const { getAI, profiles } = useAI();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [editForm, setEditForm] = useState({ content: "", importance: 0.5, room: "living_room", category: "", tags: "" });
+  const [editForm, setEditForm] = useState({
+    content: "",
+    importance: 0.5,
+    room: "living_room",
+    category: "",
+    tags: "",
+    layer: "shared",
+    owner_ai: "",
+    source_ai: "",
+  });
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
 
   const loadDetail = async () => {
@@ -146,6 +157,9 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
         room: mem.room || "living_room",
         category: mem.category || "",
         tags: parseTags(mem.tags).join("，"),
+        layer: mem.layer || "shared",
+        owner_ai: mem.owner_ai || "",
+        source_ai: mem.source_ai || "",
       });
     } catch {
       setData(null);
@@ -179,6 +193,10 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const aiInfo = mem.source_ai ? getAI(mem.source_ai) : null;
   const aiLabel = aiInfo?.name || mem.source_ai || "";
   const aiEmoji = aiInfo?.emoji || "🤖";
+  const ownerInfo = mem.owner_ai ? getAI(mem.owner_ai) : null;
+  const ownerLabel = ownerInfo?.name || mem.owner_ai || "";
+  const ownerEmoji = ownerInfo?.emoji || "🤖";
+  const layerLabel = mem.layer === "private" ? "私有记忆" : "公用记忆";
 
   const saveEdit = async () => {
     const importance = Math.max(0, Math.min(1, Number(editForm.importance) || 0));
@@ -193,6 +211,9 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
           room: editForm.room,
           category: editForm.category.trim(),
           tags: parseTagInput(editForm.tags),
+          layer: editForm.layer,
+          owner_ai: editForm.layer === "private" ? editForm.owner_ai : "",
+          source_ai: editForm.source_ai,
           changed_by: "user",
         }),
       });
@@ -236,6 +257,10 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
           <>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: "var(--space-md)", paddingRight: 36 }}>
               <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: "var(--primary-light)", color: "var(--primary-dark)", fontWeight: 600 }}>{roomLabel}</span>
+              <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: mem.layer === "private" ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)", color: mem.layer === "private" ? "#b91c1c" : "#15803d", display: "inline-flex", alignItems: "center", gap: 4 }}>
+                {mem.layer === "private" ? <Lock size={11} /> : <Globe2 size={11} />} {layerLabel}
+              </span>
+              {ownerLabel && <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: "var(--bg-hover)", color: "var(--text-secondary)" }}>归属 {ownerEmoji} {ownerLabel}</span>}
               {aiLabel && <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: "var(--bg-hover)", color: "var(--text-secondary)" }}>{aiEmoji} {aiLabel}</span>}
               <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: "hsl(45, 90%, 88%)", color: "hsl(40, 80%, 35%)" }}>重要 {Math.round(Number(mem.importance || 0) * 100)}%</span>
               {mem.anchored && <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: "var(--radius-sm)", background: "hsl(210, 80%, 90%)", color: "hsl(210, 70%, 35%)", fontWeight: 600 }}>📌 锚点</span>}
@@ -253,6 +278,29 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
                       style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }}
                     />
                   </Field>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-md)" }}>
+                    <Field label="可见范围">
+                      <select
+                        value={editForm.layer}
+                        onChange={(e) => setEditForm((f) => ({ ...f, layer: e.target.value, owner_ai: e.target.value === "private" ? f.owner_ai : "" }))}
+                        style={inputStyle}
+                      >
+                        <option value="shared">公用：所有 AI 都能用</option>
+                        <option value="private">私有：只给指定 AI</option>
+                      </select>
+                    </Field>
+                    <Field label="归属 AI">
+                      <select
+                        value={editForm.owner_ai}
+                        onChange={(e) => setEditForm((f) => ({ ...f, owner_ai: e.target.value, layer: e.target.value ? "private" : f.layer }))}
+                        style={inputStyle}
+                        disabled={editForm.layer !== "private"}
+                      >
+                        <option value="">不指定</option>
+                        {profiles.map((p) => <option key={p.ai_id} value={p.ai_id}>{p.emoji} {p.name}</option>)}
+                      </select>
+                    </Field>
+                  </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-md)" }}>
                     <Field label={`重要度 ${Math.round(Number(editForm.importance || 0) * 100)}%`}>
                       <input
@@ -272,6 +320,12 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
                   </div>
                   <Field label="分类">
                     <input value={editForm.category} onChange={(e) => setEditForm((f) => ({ ...f, category: e.target.value }))} style={inputStyle} />
+                  </Field>
+                  <Field label="来源 / 关联角色">
+                    <select value={editForm.source_ai} onChange={(e) => setEditForm((f) => ({ ...f, source_ai: e.target.value }))} style={inputStyle}>
+                      <option value="">不指定</option>
+                      {profiles.map((p) => <option key={p.ai_id} value={p.ai_id}>{p.emoji} {p.name}</option>)}
+                    </select>
                   </Field>
                   <Field label="标签（用逗号分隔）">
                     <input value={editForm.tags} onChange={(e) => setEditForm((f) => ({ ...f, tags: e.target.value }))} style={inputStyle} />

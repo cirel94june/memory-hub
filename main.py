@@ -209,6 +209,7 @@ class UpdateRequest(BaseModel):
     category: Optional[str] = None
     tags: Optional[list[str]] = None
     owner_ai: Optional[str] = None
+    source_ai: Optional[str] = None
     layer: Optional[str] = None
     changed_by: str = ""
 
@@ -218,7 +219,8 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
     result = await memory_ops.update_memory(
         memory_id=memory_id, content=body.content, importance=body.importance,
         room=body.room, category=body.category, tags=body.tags,
-        owner_ai=body.owner_ai, layer=body.layer, changed_by=body.changed_by,
+        owner_ai=body.owner_ai, source_ai=body.source_ai,
+        layer=body.layer, changed_by=body.changed_by,
     )
     return result
 
@@ -254,7 +256,7 @@ async def api_list(
     verify_secret(authorization)
     return await memory_ops.list_memories(
         layer=layer, room=room, owner_ai=owner_ai,
-        status=status, page=page, per_page=per_page,
+        source_ai=source_ai, status=status, page=page, per_page=per_page,
     )
 
 

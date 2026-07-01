@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo } from "react";
 import { useSearchParams, useNavigate } from "react-router-dom";
-import { Search, Trash2, Calendar, ChevronLeft, ChevronRight, ArrowLeft, User } from "lucide-react";
+import { Search, Trash2, Calendar, ChevronLeft, ChevronRight, ArrowLeft } from "lucide-react";
 import Markdown from "react-markdown";
 import MemoryDetailModal from "../components/MemoryDetailModal";
 import { useAI } from "../contexts/AIContext";
@@ -26,10 +26,10 @@ function getLevel(count, max) {
 
 const LEVEL_COLORS = [
   "var(--bg-hover)",
-  "hsl(var(--primary-h), 50%, 80%)",
-  "hsl(var(--primary-h), 55%, 65%)",
-  "hsl(var(--primary-h), 60%, 50%)",
-  "hsl(var(--primary-h), 65%, 38%)",
+  "var(--accent-a15)",
+  "var(--accent-a25)",
+  "var(--accent-a40)",
+  "var(--accent)",
 ];
 
 function CalendarHeatmap({ onSelectDay }) {
@@ -189,6 +189,7 @@ export default function MemoriesPage() {
   const [memories, setMemories] = useState([]);
   const [total, setTotal] = useState(0);
   const [room, setRoom] = useState(roomFromUrl);
+  const [layer, setLayer] = useState("");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const [expanded, setExpanded] = useState(null);
@@ -205,6 +206,7 @@ export default function MemoriesPage() {
     setDayMemories(null);
     const params = new URLSearchParams({ page, per_page: 20 });
     if (room) params.set("room", room);
+    if (layer) params.set("layer", layer);
     if (aiFilter) params.set("source_ai", aiFilter);
     fetch(`/api/memory/list?${params}`, { headers: authHeaders })
       .then((r) => r.json())
@@ -236,7 +238,7 @@ export default function MemoriesPage() {
       setShowAiRooms(false);
       if (!dayFilter) load();
     }
-  }, [room, page, aiFilter, roomFromUrl]);
+  }, [room, layer, page, aiFilter, roomFromUrl]);
 
   const onSelectDay = (dateStr, count) => {
     if (!count) {
@@ -281,7 +283,11 @@ export default function MemoriesPage() {
   const aiInfo = getAI(aiFilter);
   const aiLabel = aiInfo?.name || aiFilter;
 
-  const renderCard = (m) => (
+  const renderCard = (m) => {
+    const sourceAI = m.source_ai ? getAI(m.source_ai) : null;
+    const ownerAI = m.owner_ai ? getAI(m.owner_ai) : null;
+    const isPrivate = m.layer === "private";
+    return (
     <div key={m.id} className="glass" style={{ padding: "var(--space-md)", cursor: "pointer" }}
       onClick={() => setDetailId(m.id)}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -291,12 +297,25 @@ export default function MemoriesPage() {
               fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-sm)",
               background: "var(--primary-light)", color: "var(--primary-dark)",
             }}>{ROOM_LABELS[m.room] || m.room}</span>
+            <span style={{
+              fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-sm)",
+              background: isPrivate ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)",
+              color: isPrivate ? "#b91c1c" : "#15803d",
+            }}>{isPrivate ? "私有" : "公用"}</span>
+            {ownerAI && (
+              <span style={{
+                fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-sm)",
+                background: "var(--bg-hover)", color: "var(--text-secondary)",
+              }}>
+                归属 {ownerAI.emoji} {ownerAI.name}
+              </span>
+            )}
             {!aiFilter && m.source_ai && (
               <span style={{
                 fontSize: 11, padding: "2px 8px", borderRadius: "var(--radius-sm)",
                 background: "var(--bg-hover)", color: "var(--text-secondary)", cursor: "pointer",
               }} onClick={(e) => { e.stopPropagation(); navigate(`/memories?ai=${encodeURIComponent(m.source_ai)}`); }}>
-                {getAI(m.source_ai).emoji} {getAI(m.source_ai).name}
+                来源 {sourceAI?.emoji} {sourceAI?.name || m.source_ai}
               </span>
             )}
             {m.importance >= 0.8 && <span style={{ fontSize: 11 }}>⭐</span>}
@@ -320,7 +339,8 @@ export default function MemoriesPage() {
         </button>
       </div>
     </div>
-  );
+    );
+  };
 
   if (showAiRooms && aiFilter) {
     return (
@@ -394,6 +414,20 @@ export default function MemoriesPage() {
             <button className="btn btn-primary" onClick={doSearch} style={{ padding: "8px 12px" }}>
               <Search size={16} />
             </button>
+          </div>
+
+          <div style={{ display: "flex", gap: "var(--space-xs)", flexWrap: "wrap", marginBottom: "var(--space-sm)" }}>
+            {[
+              ["", "全部范围"],
+              ["shared", "公用"],
+              ["private", "私有"],
+            ].map(([value, label]) => (
+              <button key={value} className={`btn ${layer === value ? "btn-primary" : "btn-ghost"}`}
+                onClick={() => { setLayer(value); setPage(1); }}
+                style={{ padding: "4px 10px", fontSize: 12 }}>
+                {label}
+              </button>
+            ))}
           </div>
 
           <div style={{ display: "flex", gap: "var(--space-xs)", flexWrap: "wrap", marginBottom: "var(--space-md)" }}>
