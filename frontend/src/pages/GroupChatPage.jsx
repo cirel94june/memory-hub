@@ -81,7 +81,7 @@ export default function GroupChatPage() {
     if (!input.trim() || sending) return;
     const text = input;
     const target = replyTo;
-    const mentionPattern = /@(\S+)/g;
+    const mentionPattern = /@([^\s@，。！？、；：)）\]}】》」』]+)/g;
     const mentionAiIds = [...text.matchAll(mentionPattern)].map((m) => {
       const key = m[1].toLowerCase();
       const found = profiles.find((p) => (p.name || "").toLowerCase() === key || (p.ai_id || "").toLowerCase() === key);

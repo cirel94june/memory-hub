@@ -1448,9 +1448,53 @@ def _get_social_ai_ids() -> list[str]:
     return result
 
 
+def _normalize_social_ai_id(raw_id: str | None) -> str | None:
+    """Map UI/API aliases such as claude/cloudy/name text to the social bot id."""
+    if not raw_id:
+        return None
+    import string
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    from ai_profiles import get_all_profiles
+
+    key = str(raw_id).strip().lower()
+    key = key.strip(string.punctuation + "，。！？、；：）】》」』")
+    if not key:
+        return None
+
+    social_ids = _get_social_ai_ids()
+    social_set = set(social_ids)
+    if key in social_set:
+        return key
+
+    canonical = AI_ALIASES.get(key, key)
+    for social_id in social_ids:
+        aliases = set(AI_ALIAS_GROUPS.get(canonical, AI_ALIAS_GROUPS.get(social_id, [social_id])))
+        aliases.update({social_id, AI_ALIASES.get(social_id, social_id)})
+        if key in aliases or canonical in aliases:
+            return social_id
+
+    profiles = get_all_profiles()
+    for social_id in social_ids:
+        canonical = AI_ALIASES.get(social_id, social_id)
+        names = {social_id, canonical}
+        for alias in AI_ALIAS_GROUPS.get(canonical, [social_id]):
+            profile = profiles.get(alias, {})
+            names.update({alias, profile.get("name", "")})
+        if key in {name.lower() for name in names if name}:
+            return social_id
+    return None
+
+
 def _resolve_social_mentions(content: str, explicit_ids: list | None = None) -> list[str]:
     """Resolve @mentions from frontend ids and visible text, keeping only social bots."""
     import re
+    resolved = []
+    for raw in list(explicit_ids or []) + re.findall(r"@([^\s@]+)", content or ""):
+        ai_id = _normalize_social_ai_id(raw)
+        if ai_id and ai_id not in resolved:
+            resolved.append(ai_id)
+    return resolved
+
     import string
     from config import AI_ALIASES
     from ai_profiles import get_all_profiles
@@ -1792,14 +1836,19 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
         if g:
             import random
             social_members = set(_get_social_ai_ids())
-            ai_members = [m for m in g["members"] if m != "user" and m in social_members]
+            ai_members = []
+            for member in g["members"]:
+                normalized = _normalize_social_ai_id(member)
+                if normalized and normalized in social_members and normalized not in ai_members:
+                    ai_members.append(normalized)
             recent = social.get_messages(chat_id, per_page=20)
             history = recent.get("messages", [])
             mentioned = [m for m in _resolve_social_mentions(content, body.get("mention_ai", [])) if m in ai_members]
             reply_target = social.get_message(reply_to) if reply_to else None
             responders = []
-            if reply_target and reply_target.get("ai_id") in ai_members:
-                responders.append(reply_target["ai_id"])
+            reply_target_ai = _normalize_social_ai_id(reply_target.get("ai_id")) if reply_target else None
+            if reply_target_ai and reply_target_ai in ai_members:
+                responders.append(reply_target_ai)
             for mid in mentioned:
                 if mid not in responders:
                     responders.append(mid)
@@ -1835,7 +1884,7 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
                 if reply:
                     mid = social.send_message(chat_id, resp_ai, reply, reply_to=user_mid)
                     ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply, "reply_to": user_mid})
-                    trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "mentioned" if resp_ai in mentioned else ("reply_target" if reply_target and reply_target.get("ai_id") == resp_ai else "group_auto")})
+                    trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "mentioned" if resp_ai in mentioned else ("reply_target" if reply_target_ai == resp_ai else "group_auto")})
                     await _capture_social_exchange(chat_id, resp_ai, content, reply)
 
             # Keep one user message to one response wave. AI-to-AI mentions are displayed
