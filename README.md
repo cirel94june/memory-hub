@@ -172,8 +172,8 @@ API Key: {HUB_SECRET}:{AI身份}
 
 | 项目 | 仓库 | 借鉴了什么 | 状态 |
 |------|------|-----------|------|
-| **Ombre Brain** | [Yinglianchun/Ombre-Brain](https://github.com/Yinglianchun/Ombre-Brain) | supersede 链、年轮评论、时间涟漪、Persona State | ✅ 已缝合 |
-| **Ombre Brain 原版** | [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) | Anchor 锚点✅、Self-knowledge、Plan 系统 | 🔄 部分移植 |
+| **Ombre Brain 二改** | [Yinglianchun/Ombre-Brain](https://github.com/Yinglianchun/Ombre-Brain) | Gateway 自动注入、Portrait/Handoff、Darkroom、Dream Context、Memory Edge/Word Map、写入门卫 | 🔄 部分缝合，待拆分移植 |
+| **Ombre Brain 原版** | [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) | breath/hold/grow/trace/pulse、Anchor、Self-knowledge、Plan、Dashboard | 🔄 部分移植 |
 | **AionsHome** | [death34018-hue/AionsHome](https://github.com/death34018-hue/AionsHome) | event_date、记忆源追溯、三人群聊 | ✅ 已缝合 |
 | **imprint-memory** | [Qizhan7/imprint-memory](https://github.com/Qizhan7/imprint-memory) | 对话自动捕获、混合搜索+RRF | ✅ 已缝合 |
 | **Aelios** | [wusaki0723/Aelios](https://github.com/wusaki0723/Aelios) | 三级记忆过滤 | ✅ 已缝合 |
@@ -189,6 +189,31 @@ API Key: {HUB_SECRET}:{AI身份}
 | **Self-knowledge** | AI 记录自我认知，对话开头注入 | 改造 `personality` 房间或新建 | ⭐⭐ 中 |
 | **Plan 计划系统** | 永不衰减的承诺/待办，dream 里复盘 | 增强 `resolved` 字段 + plan MCP 工具 | ⭐⭐ 中 |
 | **星图视觉** | 工程网格风格记忆网络 | P4 做星图时参考 | ⭐ 远期 |
+
+### Ombre Brain 二改功能对照（待拆分）
+
+Yinglianchun/Ombre-Brain 是 P0luz/Ombre-Brain 的二次开发版，不适合整套替换 Memory Hub；更适合拆功能思路，按 Memory Hub 现有 SQLite/Gateway/React 架构逐步缝合。
+
+| 二改功能 | 对 Memory Hub 的价值 | 当前状态 | 优先级 |
+|---------|----------------------|----------|-------|
+| **Portrait / Handoff** | AI 醒来时看到用户画像、关系画像、最近连续性，而不是只看零散记忆 | 走廊、chat_digest、Persona State 已有基础；缺每日画像状态和醒来诊断 | ⭐⭐⭐ 高 |
+| **Raw Event Vault 原文保险箱** | 防止总结错了以后找不回原话，也能做恢复/审计 | 只有 `source_context` 片段；还没有独立原文库 | ⭐⭐⭐ 高 |
+| **自动写入门卫** | 控制低价值记忆，不让闲聊/重复内容疯狂进入长期记忆 | 有 importance 阈值和 quick 去重；缺 novelty/durability/repeat gate 与 pending 区 | ⭐⭐⭐ 高 |
+| **Dream Context / 夜梦浮现** | 夜里小模型把近期材料变成 AI 梦境，醒来或对话时可偶尔浮现 | `dream.py` 已接 daemon，但缺浮现开关、注入开关、skip 诊断 | ⭐⭐ 中 |
+| **Memory Moment / Edge / Word Map Lite** | 把记忆拆成可追溯片段和关系边，召回更可解释 | 当前是 SQLite 记忆 + linked/superseded；星图/图召回未做 | ⭐⭐ 中 |
+| **Relationship Weather 日印象** | 每天维护 AI 对关系的感受，前端可观察，不一定注入 | 情绪面板有 9 维度状态；缺日印象历史和关系天气页 | ⭐⭐ 中 |
+| **Darkroom / whisper** | 给 AI 放“还没想透、不该直接给用户看”的内在反思 | 未实现；要先定义可见边界，避免污染普通记忆 | ⭐ 中 |
+| **Dashboard 高级编辑/诊断** | 批量删除、事件日期编辑、年轮评论、手动 reflect、召回诊断 | 记忆详情编辑已有；批量/诊断/召回链路未完整 | ⭐⭐ 中 |
+| **Query Planner / Detail Recall** | 针对复杂问题先规划召回，再查细节 | 当前 recall 是混合搜索直取 top；未做 query planner | ⭐ 中 |
+| **Connector OAuth / Supabase sync** | 给 ChatGPT/Claude Connector 或外部云同步使用 | 当前已有 MCP/REST/GitHub 备份；不是近期主线 | ⭐ 远期 |
+
+### 已实现但需要核查的“自动后台功能”
+
+| 功能 | 代码位置 | 真实触发条件 | 现在的问题 |
+|------|----------|--------------|------------|
+| **人生章节** | `daemon.py` 的 `distill_psychology()`，daemon 第 5 步 | 只处理 `room=psychology`、`category!=life_chapter`、30 天以上的活跃记忆；总数至少 3 条，且同月至少 2 条；LLM 成功后才写入 `category=life_chapter` 并归档原碎片 | 已实现但很容易因为材料不足而不产出；前端没有“为什么没生成”的诊断 |
+| **夜间梦境日记** | `dream.py` 的 `generate_dreams()`，daemon 第 10.8 步 | 当天同一 AI 至少 2 条 `chat_digests`；当天没生成过梦；按 canonical AI 分组；写入 `layer=private`、`room=diary`、`category=dream` | 已实现但不是每天必有；如果 chat_digest 没生成或日期不匹配就跳过；目前写在 `diary` 而不是 `dreams` 房间，缺 Dream Context 浮现 |
+| **MCP dream 工具** | `mcp_server.py` 的 `dream()` | AI 主动调用时写入 `room=dreams` | 这是手动自省工具，和 daemon 夜梦是两套路径，后续应统一展示 |
 
 ## 开发阶段
 
