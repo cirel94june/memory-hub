@@ -207,6 +207,20 @@ def send_message(chat_id: int, ai_id: str, content: str, reply_to: int = None):
     c.close()
     return mid
 
+def get_message(message_id: int):
+    c = _conn()
+    c.row_factory = sqlite3.Row
+    row = c.execute("SELECT * FROM group_messages WHERE id = ?", (message_id,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def delete_message(message_id: int):
+    c = _conn()
+    c.execute("UPDATE group_messages SET reply_to = NULL WHERE reply_to = ?", (message_id,))
+    c.execute("DELETE FROM group_messages WHERE id = ?", (message_id,))
+    c.commit()
+    c.close()
+
 def get_messages(chat_id: int, page: int = 1, per_page: int = 50):
     c = _conn()
     c.row_factory = sqlite3.Row

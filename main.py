@@ -1754,18 +1754,30 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
     body = await request.json()
     ai_id = body.get("ai_id", "user")
     content = body.get("content", "")
-    social.send_message(chat_id, ai_id, content)
+    reply_to = body.get("reply_to")
+    user_mid = social.send_message(chat_id, ai_id, content, reply_to=reply_to)
 
     ai_replies = []
+    trace = []
     if ai_id == "user":
         g = social.get_group(chat_id)
         if g:
             import random
-            ai_members = [m for m in g["members"] if m != "user"]
+            social_members = set(_get_social_ai_ids())
+            ai_members = [m for m in g["members"] if m != "user" and m in social_members]
             recent = social.get_messages(chat_id, per_page=20)
             history = recent.get("messages", [])
-            reply_count = min(len(ai_members), random.choice([1, 1, 2, 2, 3]))
-            responders = random.sample(ai_members, reply_count) if len(ai_members) >= reply_count else ai_members
+            mentioned = [m for m in _resolve_social_mentions(content, body.get("mention_ai", [])) if m in ai_members]
+            reply_target = social.get_message(reply_to) if reply_to else None
+            responders = []
+            if reply_target and reply_target.get("ai_id") in ai_members:
+                responders.append(reply_target["ai_id"])
+            for mid in mentioned:
+                if mid not in responders:
+                    responders.append(mid)
+            if not responders:
+                reply_count = min(len(ai_members), random.choice([1, 1, 2, 2, 3]))
+                responders = random.sample(ai_members, reply_count) if len(ai_members) >= reply_count else ai_members
 
             for resp_ai in responders:
                 from ai_profiles import get_profile
@@ -1780,17 +1792,54 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
                     chat_lines.append(f"{speaker}: {m['content']}")
                 chat_lines.append(f"小猫: {content}")
                 chat_context = "\n".join(chat_lines)
+                target_hint = ""
+                if reply_target:
+                    target_name = "小猫" if reply_target["ai_id"] == "user" else ((get_profile(reply_target["ai_id"]) or {}).get("name", reply_target["ai_id"]))
+                    target_hint = f"\n\n小猫正在回复这条消息：{target_name}: {reply_target['content'][:200]}"
+                mention_hint = "小猫@了你。" if resp_ai in mentioned else ""
                 reply = await _social_call_llm(
                     resp_ai,
                     f"以下是群聊「{g.get('name', '群聊')}」的最近对话：\n\n{chat_context}\n\n"
+                    f"{target_hint}\n{mention_hint}\n"
                     f"请自然地回复，简短一些（50字以内）。不要重复别人说过的话。直接回复，不要加你的名字前缀。",
                     max_tokens=150,
                 )
                 if reply:
-                    mid = social.send_message(chat_id, resp_ai, reply)
-                    ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply})
+                    mid = social.send_message(chat_id, resp_ai, reply, reply_to=user_mid)
+                    ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply, "reply_to": user_mid})
+                    trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "mentioned" if resp_ai in mentioned else ("reply_target" if reply_target and reply_target.get("ai_id") == resp_ai else "group_auto")})
+                    await _capture_social_exchange(chat_id, resp_ai, content, reply)
 
-    return {"ok": True, "ai_replies": ai_replies}
+            # One-hop bot-to-bot mentions: if an AI explicitly @mentions another member, let that member answer once.
+            extra_responders = []
+            for r in ai_replies:
+                for mid in _resolve_social_mentions(r["content"], []):
+                    if mid in ai_members and mid not in responders and mid not in extra_responders:
+                        extra_responders.append(mid)
+            for resp_ai in extra_responders[:2]:
+                from ai_profiles import get_profile
+                name = (get_profile(resp_ai) or {}).get("name", resp_ai)
+                trigger = next((r for r in ai_replies if f"@{resp_ai}" in r["content"].lower() or f"@{name}".lower() in r["content"].lower()), ai_replies[-1] if ai_replies else None)
+                prompt = (
+                    f"群聊「{g.get('name', '群聊')}」里有人@了你（{name}）。\n"
+                    f"最近一句是：{trigger['content'] if trigger else content}\n\n"
+                    f"请以{name}的身份自然回复，50字以内，不要加名字前缀。"
+                )
+                reply = await _social_call_llm(resp_ai, prompt, max_tokens=150)
+                if reply:
+                    mid = social.send_message(chat_id, resp_ai, reply, reply_to=(trigger or {}).get("id"))
+                    ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply, "reply_to": (trigger or {}).get("id")})
+                    trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "bot_mentioned"})
+                    await _capture_social_exchange(chat_id, resp_ai, trigger["content"] if trigger else content, reply)
+
+    return {"ok": True, "id": user_mid, "ai_replies": ai_replies, "trace": trace}
+
+
+@app.delete("/api/social/groups/messages/{message_id}")
+async def api_delete_group_message(message_id: int, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    social.delete_message(message_id)
+    return {"ok": True}
 
 
 # ── React SPA catch-all（必须在所有 API 路由之后）──

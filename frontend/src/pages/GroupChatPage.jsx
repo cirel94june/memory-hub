@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Send, Plus, ArrowLeft, Users, Loader, Settings } from "lucide-react";
+import { Send, Plus, ArrowLeft, Users, Loader, Settings, Reply, Trash2, X } from "lucide-react";
 import { useAI } from "../contexts/AIContext";
 
 const USER_DISPLAY = { ai_id: "user", name: "小猫", emoji: "🐱", color: "hsl(330, 65%, 55%)" };
@@ -19,6 +19,8 @@ export default function GroupChatPage() {
   const [showInfo, setShowInfo] = useState(false);
   const [newName, setNewName] = useState("");
   const [selectedMembers, setSelectedMembers] = useState({});
+  const [replyTo, setReplyTo] = useState(null);
+  const [activity, setActivity] = useState([]);
   const messagesEnd = useRef(null);
 
   const auth = { Authorization: `Bearer ${localStorage.getItem("mh-secret") || ""}` };
@@ -78,33 +80,57 @@ export default function GroupChatPage() {
   const sendMsg = async () => {
     if (!input.trim() || sending) return;
     const text = input;
+    const target = replyTo;
+    const mentionPattern = /@(\S+)/g;
+    const mentionAiIds = [...text.matchAll(mentionPattern)].map((m) => {
+      const key = m[1].toLowerCase();
+      const found = profiles.find((p) => (p.name || "").toLowerCase() === key || (p.ai_id || "").toLowerCase() === key);
+      return found?.ai_id;
+    }).filter(Boolean);
+    const tempId = Date.now();
     setInput("");
+    setReplyTo(null);
     setSending(true);
 
     setMessages((prev) => [...prev, {
-      id: Date.now(), chat_id: parseInt(chatId), ai_id: "user",
-      content: text, created_at: new Date().toISOString(),
+      id: tempId, chat_id: parseInt(chatId), ai_id: "user",
+      content: text, reply_to: target?.id || null, created_at: new Date().toISOString(),
     }]);
 
     try {
       const resp = await fetch(`/api/social/groups/${chatId}/messages`, {
         method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-        body: JSON.stringify({ ai_id: "user", content: text }),
+        body: JSON.stringify({ ai_id: "user", content: text, mention_ai: mentionAiIds, reply_to: target?.id || null }),
       });
       const d = await resp.json();
+      if (d.id) {
+        setMessages((prev) => prev.map((m) => m.id === tempId ? { ...m, id: d.id } : m));
+      }
       if (d.ai_replies) {
         setMessages((prev) => [
           ...prev,
           ...d.ai_replies.map((r) => ({
             id: r.id, chat_id: parseInt(chatId), ai_id: r.ai_id,
-            content: r.content, created_at: new Date().toISOString(),
+            content: r.content, reply_to: r.reply_to || null, created_at: new Date().toISOString(),
           })),
         ]);
       }
+      if (d.trace?.length) setActivity(d.trace);
     } catch (e) {
       console.error(e);
     }
     setSending(false);
+  };
+
+  const deleteMessage = async (messageId) => {
+    if (!confirm("删除这条消息？")) return;
+    await fetch(`/api/social/groups/messages/${messageId}`, { method: "DELETE", headers: auth });
+    setMessages((prev) => prev.filter((m) => m.id !== messageId).map((m) => m.reply_to === messageId ? { ...m, reply_to: null } : m));
+  };
+
+  const mentionMember = (memberId) => {
+    const d = getAI(memberId);
+    setInput((prev) => `${prev}${prev && !prev.endsWith(" ") ? " " : ""}@${d.name || memberId} `);
   };
 
   // ── Group list view ──
@@ -261,6 +287,8 @@ export default function GroupChatPage() {
         {messages.map((m) => {
           const isUser = m.ai_id === "user";
           const d = m.ai_id === "user" ? USER_DISPLAY : getAI(m.ai_id);
+          const parent = m.reply_to ? messages.find((item) => item.id === m.reply_to) : null;
+          const parentName = parent ? (parent.ai_id === "user" ? "小猫" : getAI(parent.ai_id).name) : "";
           return (
             <div key={m.id} style={{
               display: "flex", flexDirection: isUser ? "row-reverse" : "row",
@@ -279,9 +307,25 @@ export default function GroupChatPage() {
                 {!isUser && (
                   <div style={{ fontSize: 11, fontWeight: 600, color: d.color, marginBottom: 2 }}>{d.name}</div>
                 )}
+                {parent && (
+                  <div style={{
+                    fontSize: 11, opacity: 0.75, padding: "3px 6px", marginBottom: 4,
+                    borderRadius: 6, background: isUser ? "rgba(255,255,255,0.18)" : "var(--bg-hover)",
+                  }}>
+                    回复 {parentName}: {parent.content.slice(0, 38)}
+                  </div>
+                )}
                 <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
                 <div style={{ fontSize: 10, marginTop: 2, opacity: 0.6, textAlign: "right" }}>
                   {m.created_at?.slice(11, 16)}
+                </div>
+                <div style={{ display: "flex", justifyContent: isUser ? "flex-start" : "flex-end", gap: 6, marginTop: 4, opacity: 0.7 }}>
+                  <button onClick={() => setReplyTo(m)} title="回复" style={{ border: "none", background: "transparent", color: "inherit", cursor: "pointer", padding: 0 }}>
+                    <Reply size={12} />
+                  </button>
+                  <button onClick={() => deleteMessage(m.id)} title="删除" style={{ border: "none", background: "transparent", color: "inherit", cursor: "pointer", padding: 0 }}>
+                    <Trash2 size={12} />
+                  </button>
                 </div>
               </div>
             </div>
@@ -292,26 +336,56 @@ export default function GroupChatPage() {
             <Loader size={14} style={{ animation: "spin 1s linear infinite" }} /> AI 们正在打字...
           </div>
         )}
+        {activity.length > 0 && (
+          <div style={{ fontSize: 11, color: "var(--text-muted)", padding: "0 var(--space-sm) var(--space-xs)" }}>
+            {activity.map((a, idx) => {
+              const d = getAI(a.ai_id);
+              const reason = a.reason === "mentioned" ? "被 @ 后读取记忆并回复" : a.reason === "reply_target" ? "被回复后读取记忆并回复" : a.reason === "bot_mentioned" ? "被其他 AI @ 后回复" : "读取群聊上下文并回复";
+              return <div key={`${a.ai_id}-${idx}`}>{d.emoji} {d.name}：{reason}</div>;
+            })}
+          </div>
+        )}
         <div ref={messagesEnd} />
       </div>
 
       {/* Input */}
       <div style={{
-        display: "flex", gap: "var(--space-sm)", padding: "var(--space-sm) 0",
-        borderTop: "1px solid var(--border-subtle)", flexShrink: 0,
+        padding: "var(--space-sm) 0", borderTop: "1px solid var(--border-subtle)", flexShrink: 0,
       }}>
-        <input value={input} onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMsg()}
-          placeholder="说点什么..." disabled={sending}
-          style={{
-            flex: 1, padding: "10px 14px", border: "none", outline: "none",
-            background: "var(--bg-input)", borderRadius: "var(--radius-md)",
-            fontSize: 14, color: "var(--text-primary)",
-          }} />
-        <button className="btn btn-primary" onClick={sendMsg} disabled={sending || !input.trim()}
-          style={{ padding: "10px 14px", borderRadius: "var(--radius-md)" }}>
-          <Send size={16} />
-        </button>
+        {replyTo && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 12, color: "var(--text-secondary)", marginBottom: 6 }}>
+            <span>回复 {replyTo.ai_id === "user" ? "小猫" : getAI(replyTo.ai_id).name}: {replyTo.content.slice(0, 48)}</span>
+            <button onClick={() => setReplyTo(null)} style={{ border: "none", background: "transparent", color: "var(--text-muted)", cursor: "pointer" }}><X size={14} /></button>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 6, marginBottom: 6, overflowX: "auto" }}>
+          {(group?.members || []).filter((m) => m !== "user").map((m) => {
+            const d = getAI(m);
+            return (
+              <button key={m} onClick={() => mentionMember(m)}
+                style={{
+                  border: "1px solid var(--border-subtle)", background: "var(--bg-card)", color: "var(--text-secondary)",
+                  borderRadius: 999, padding: "3px 8px", fontSize: 11, cursor: "pointer", whiteSpace: "nowrap",
+                }}>
+                @{d.name}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", gap: "var(--space-sm)" }}>
+          <input value={input} onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMsg()}
+            placeholder="说点什么，或 @某个 AI..." disabled={sending}
+            style={{
+              flex: 1, padding: "10px 14px", border: "none", outline: "none",
+              background: "var(--bg-input)", borderRadius: "var(--radius-md)",
+              fontSize: 14, color: "var(--text-primary)",
+            }} />
+          <button className="btn btn-primary" onClick={sendMsg} disabled={sending || !input.trim()}
+            style={{ padding: "10px 14px", borderRadius: "var(--radius-md)" }}>
+            <Send size={16} />
+          </button>
+        </div>
       </div>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
