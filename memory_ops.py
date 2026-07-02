@@ -1029,6 +1029,36 @@ async def deduplicate_public_memories(similarity_threshold: float = 0.92, dry_ru
     }
 
 
+async def fix_private_capture_layers(dry_run: bool = True) -> dict:
+    """Move memories captured from private chats back to the owner's private layer."""
+    fixed = []
+    for mem in database.iter_memories(status="active"):
+        platform = mem.get("source_platform") or ""
+        source_ai = mem.get("source_ai") or ""
+        if mem.get("layer") == "private":
+            continue
+        if not source_ai:
+            continue
+        is_private_capture = (
+            platform.endswith(":private")
+            or platform in ("proxy", "mcp_extract")
+        )
+        if not is_private_capture:
+            continue
+        fixed.append({
+            "id": mem["id"],
+            "source_ai": source_ai,
+            "old_layer": mem.get("layer", "shared"),
+            "preview": mem.get("content", "")[:80],
+        })
+        if not dry_run:
+            mem["layer"] = "private"
+            mem["owner_ai"] = source_ai
+            mem["updated_at"] = _now()
+            store.set_memory(mem)
+    return {"dry_run": dry_run, "fixed": 0 if dry_run else len(fixed), "candidates": len(fixed), "items": fixed[:50]}
+
+
 # ── 记忆衰减（含情感维度） ──
 
 async def run_decay() -> dict:

@@ -282,7 +282,7 @@ async def _rerank_memories(query: str, candidates: list[dict], top_k: int = 5) -
     return candidates[:top_k]
 
 
-async def post_process(user_message: str, ai_response: str, ai_id: str, platform: str = "") -> dict:
+async def post_process(user_message: str, ai_response: str, ai_id: str, platform: str = "", chat_type: str = "") -> dict:
     """
     核心功能：AI 回复之后，自动提取值得记住的信息。
 
@@ -426,7 +426,8 @@ AI回复：{ai_response[:1500]}
             about = action.get("about", "user")
             if about not in valid_about:
                 about = "user"
-            owner = ai_id if action.get("layer") == "private" else ""
+            layer = "private" if chat_type == "private" else action.get("layer", "shared")
+            owner = ai_id if layer == "private" else ""
             # 给记忆内容加上 about 前缀，让走廊和搜索时能区分
             if about == "user" and not content.startswith("[用户]"):
                 content = f"[用户] {content}"
@@ -437,14 +438,14 @@ AI回复：{ai_response[:1500]}
             source_ctx = f"用户: {user_message[:400]}\nAI: {ai_response[:400]}"
             await remember(
                 content=content,
-                layer=action.get("layer", "shared"),
+                layer=layer,
                 room=room,
                 category=action.get("category", ""),
                 owner_ai=owner,
                 importance=imp,
                 emotion_arousal=action.get("emotion_arousal", 0.3),
                 source_ai=ai_id,
-                source_platform=platform,
+                source_platform=f"{platform}:{chat_type}" if chat_type else platform,
                 source_context=source_ctx,
                 quick=True,
             )

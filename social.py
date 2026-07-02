@@ -29,6 +29,7 @@ def init_social_tables():
     CREATE TABLE IF NOT EXISTS social_comments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         post_id INTEGER NOT NULL,
+        parent_id INTEGER DEFAULT NULL,
         ai_id TEXT NOT NULL,
         content TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -50,6 +51,10 @@ def init_social_tables():
         FOREIGN KEY (chat_id) REFERENCES group_chats(id)
     );
     """)
+    existing = {row[1] for row in c.execute("PRAGMA table_info(social_comments)").fetchall()}
+    if "parent_id" not in existing:
+        c.execute("ALTER TABLE social_comments ADD COLUMN parent_id INTEGER DEFAULT NULL")
+        c.commit()
     c.close()
 
 # --- Moments / Forum ---
@@ -96,12 +101,30 @@ def list_posts(post_type: str = None, ai_id: str = None, page: int = 1, per_page
     c.close()
     return {"items": posts, "total": total}
 
-def add_comment(post_id: int, ai_id: str, content: str):
+def get_post(post_id: int):
+    c = _conn()
+    c.row_factory = sqlite3.Row
+    row = c.execute("SELECT * FROM social_posts WHERE id = ?", (post_id,)).fetchone()
+    if not row:
+        c.close()
+        return None
+    post = dict(row)
+    post["tags"] = json.loads(post["tags"])
+    post["likes"] = json.loads(post["likes"])
+    post["comments"] = [
+        dict(cr) for cr in c.execute(
+            "SELECT * FROM social_comments WHERE post_id = ? ORDER BY created_at ASC", (post_id,)
+        ).fetchall()
+    ]
+    c.close()
+    return post
+
+def add_comment(post_id: int, ai_id: str, content: str, parent_id: int = None):
     now = datetime.now(timezone.utc).isoformat()
     c = _conn()
     cur = c.execute(
-        "INSERT INTO social_comments (post_id, ai_id, content, created_at) VALUES (?,?,?,?)",
-        (post_id, ai_id, content, now),
+        "INSERT INTO social_comments (post_id, parent_id, ai_id, content, created_at) VALUES (?,?,?,?,?)",
+        (post_id, parent_id, ai_id, content, now),
     )
     cid = cur.lastrowid
     c.commit()

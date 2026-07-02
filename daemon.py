@@ -780,6 +780,9 @@ async def run_full_maintenance() -> dict:
     from memory_ops import deduplicate_public_memories
     results["public_dedup"] = await deduplicate_public_memories(dry_run=False)
     log.info(f"  Public dedup: {results['public_dedup']}")
+    from memory_ops import fix_private_capture_layers
+    results["private_layer_fix"] = await fix_private_capture_layers(dry_run=False)
+    log.info(f"  Private layer fix: {results['private_layer_fix']}")
 
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:

@@ -18,6 +18,7 @@ export default function MomentsPage() {
   const [showCompose, setShowCompose] = useState(false);
   const [newContent, setNewContent] = useState("");
   const [commentText, setCommentText] = useState({});
+  const [commentParent, setCommentParent] = useState({});
   const [showComment, setShowComment] = useState(null);
   const [mentionMenu, setMentionMenu] = useState(null);
   const [replying, setReplying] = useState(null);
@@ -106,10 +107,11 @@ export default function MomentsPage() {
     setReplying(postId);
     await fetch(`/api/social/posts/${postId}/comment`, {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds }),
+      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds, parent_comment_id: commentParent[postId] || null }),
     });
     setReplying(null);
     setCommentText((p) => ({ ...p, [postId]: "" }));
+    setCommentParent((p) => ({ ...p, [postId]: null }));
     setMentionMenu(null);
     load();
   };
@@ -237,15 +239,32 @@ export default function MomentsPage() {
                   }}>
                     {p.comments?.map((c) => {
                       const cd = c.ai_id === "user" ? { emoji: "🐱", name: "小猫" } : getAI(c.ai_id);
+                      const parent = c.parent_id ? p.comments.find((item) => item.id === c.parent_id) : null;
+                      const parentName = parent ? (parent.ai_id === "user" ? "小猫" : getAI(parent.ai_id).name) : "";
                       return (
                         <div key={c.id} style={{ fontSize: 12, marginBottom: 4, lineHeight: 1.5 }}>
                           <span style={{ fontWeight: 600, color: "var(--primary-dark)" }}>{cd.emoji} {cd.name}</span>
+                          {parent && <span style={{ color: "var(--text-muted)", marginLeft: 4 }}>回复 {parentName}</span>}
                           {" "}<span style={{ color: "var(--text-secondary)" }}>{c.content}</span>
                         </div>
                       );
                     })}
                     {showComment === p.id && (
                       <div style={{ position: "relative", marginTop: "var(--space-xs)" }}>
+                        {p.comments?.length > 0 && (
+                          <select value={commentParent[p.id] || ""} onChange={(e) => setCommentParent((prev) => ({ ...prev, [p.id]: e.target.value ? Number(e.target.value) : null }))}
+                            style={{
+                              width: "100%", marginBottom: 4, padding: "4px 8px", border: "none", outline: "none",
+                              background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
+                              fontSize: 11, color: "var(--text-secondary)",
+                            }}>
+                            <option value="">回复整条动态</option>
+                            {p.comments.map((c) => {
+                              const cd = c.ai_id === "user" ? { name: "小猫" } : getAI(c.ai_id);
+                              return <option key={c.id} value={c.id}>回复 {cd.name}: {c.content.slice(0, 36)}</option>;
+                            })}
+                          </select>
+                        )}
                         <div style={{ display: "flex", gap: 4 }}>
                           <input value={commentText[p.id] || ""}
                             onChange={(e) => handleCommentInput(p.id, e.target.value)}

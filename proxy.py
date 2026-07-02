@@ -300,6 +300,7 @@ async def _background_extract(user_message: str, ai_response: str, ai_id: str, p
             ai_response=ai_response[:1000],
             ai_id=ai_id,
             platform=platform,
+            chat_type=chat_type or "private",
         )
     except Exception as e:
         logger.error(f"Proxy extract post_process error: {e}")

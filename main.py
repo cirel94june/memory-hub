@@ -280,6 +280,13 @@ async def api_deduplicate_public(request: Request, authorization: str = Header(d
     )
 
 
+@app.post("/api/memory/fix-private-layers")
+async def api_fix_private_layers(request: Request, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    body = await request.json() if request.headers.get("content-length") else {}
+    return await memory_ops.fix_private_capture_layers(dry_run=bool(body.get("dry_run", True)))
+
+
 @app.post("/api/memory/{memory_id}/archive")
 async def api_archive(memory_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
@@ -349,6 +356,7 @@ async def api_post_process(body: PostProcessRequest, authorization: str = Header
         ai_response=body.ai_response,
         ai_id=body.ai_id,
         platform=body.platform,
+        chat_type=body.chat_type,
     )
     if body.chat_id:
         try:
@@ -1452,18 +1460,14 @@ async def api_add_comment(post_id: int, request: Request, authorization: str = H
     body = await request.json()
     commenter = body.get("ai_id", "user")
     content = body.get("content", "")
-    cid = social.add_comment(post_id, commenter, content)
+    parent_comment_id = body.get("parent_comment_id")
+    cid = social.add_comment(post_id, commenter, content, parent_id=parent_comment_id)
 
     ai_comments = []
     if commenter != "user":
         return {"id": cid, "ok": True, "ai_comments": ai_comments}
 
-    post_data = social.list_posts()
-    post = None
-    for p in post_data.get("items", []):
-        if p["id"] == post_id:
-            post = p
-            break
+    post = social.get_post(post_id)
     if not post:
         return {"id": cid, "ok": True, "ai_comments": ai_comments}
 
@@ -1473,12 +1477,18 @@ async def api_add_comment(post_id: int, request: Request, authorization: str = H
     poster_name = poster_profile.get("name") or poster_ai
 
     existing_comments = post.get("comments", [])
+    parent_comment = None
+    if parent_comment_id:
+        parent_comment = next((c for c in existing_comments if c.get("id") == parent_comment_id), None)
     comment_lines = []
     for c in existing_comments[-5:]:
         cn = "小猫" if c["ai_id"] == "user" else ((get_profile(c["ai_id"]) or {}).get("name", c["ai_id"]))
         comment_lines.append(f"{cn}: {c['content']}")
     comment_lines.append(f"小猫: {content}")
     comment_ctx = "\n".join(comment_lines)
+    if parent_comment:
+        parent_name = "小猫" if parent_comment["ai_id"] == "user" else ((get_profile(parent_comment["ai_id"]) or {}).get("name", parent_comment["ai_id"]))
+        comment_ctx += f"\n\n小猫正在回复这条评论：{parent_name}: {parent_comment['content'][:200]}"
     post_type_label = "朋友圈" if post["type"] == "moment" else "论坛帖子"
 
     responders = set()
@@ -1517,7 +1527,7 @@ async def api_add_comment(post_id: int, request: Request, authorization: str = H
             )
         reply = await _social_call_llm(resp_ai, prompt, max_tokens=150)
         if reply:
-            reply_id = social.add_comment(post_id, resp_ai, reply)
+            reply_id = social.add_comment(post_id, resp_ai, reply, parent_id=cid)
             ai_comments.append({"id": reply_id, "ai_id": resp_ai, "content": reply})
 
     return {"id": cid, "ok": True, "ai_comments": ai_comments}
@@ -1569,12 +1579,18 @@ async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> st
         system_parts.append(f"\n【你的人设】\n{persona}")
 
     try:
-        from memory_ops import get_corridor
-        corridor = await get_corridor(ai_id)
-        if corridor:
-            system_parts.append(f"\n【你和小猫的共同记忆（参考但不要刻意提起）】\n{corridor[:600]}")
-    except Exception:
-        pass
+        from gateway import build_context
+        ctx = await build_context(
+            user_message=prompt[:800],
+            ai_id=ai_id,
+            recent_messages=[],
+            chat_id=f"social:{ai_id}",
+        )
+        memory_text = ctx.get("inject_text", "")
+        if memory_text:
+            system_parts.append(f"\n【你和小猫的相关记忆（参考但不要刻意提起）】\n{memory_text[:1200]}")
+    except Exception as e:
+        _log.warning(f"[Social LLM] memory context failed for {ai_id}: {e}")
 
     from image_gen import DRAW_HINT, get_config as get_img_config
     if get_img_config()["base_url"]:

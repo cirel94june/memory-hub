@@ -20,6 +20,7 @@ export default function ForumPage() {
   const [content, setContent] = useState("");
   const [expandedPost, setExpandedPost] = useState(null);
   const [replyText, setReplyText] = useState({});
+  const [replyParent, setReplyParent] = useState({});
   const [replying, setReplying] = useState(null);
   const [posting, setPosting] = useState(false);
   const [mentionMenu, setMentionMenu] = useState(null);
@@ -65,10 +66,11 @@ export default function ForumPage() {
     setReplying(postId);
     await fetch(`/api/social/posts/${postId}/comment`, {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds }),
+      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds, parent_comment_id: replyParent[postId] || null }),
     });
     setReplying(null);
     setReplyText((p) => ({ ...p, [postId]: "" }));
+    setReplyParent((p) => ({ ...p, [postId]: null }));
     setMentionMenu(null);
     load();
   };
@@ -222,6 +224,8 @@ export default function ForumPage() {
                   }}>
                     {p.comments?.length > 0 ? p.comments.map((c) => {
                       const cd = c.ai_id === "user" ? { emoji: "🐱", name: "小猫" } : getAI(c.ai_id);
+                      const parent = c.parent_id ? p.comments.find((item) => item.id === c.parent_id) : null;
+                      const parentName = parent ? (parent.ai_id === "user" ? "小猫" : getAI(parent.ai_id).name) : "";
                       return (
                         <div key={c.id} style={{
                           padding: "var(--space-sm)", marginBottom: "var(--space-xs)",
@@ -230,6 +234,7 @@ export default function ForumPage() {
                           <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
                             <span style={{ fontSize: 14 }}>{cd.emoji}</span>
                             <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-primary)" }}>{cd.name}</span>
+                            {parent && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>回复 {parentName}</span>}
                             <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{timeAgo(c.created_at)}</span>
                           </div>
                           <div style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-secondary)", whiteSpace: "pre-wrap" }}>
@@ -243,6 +248,20 @@ export default function ForumPage() {
                       </div>
                     )}
                     <div style={{ position: "relative", marginTop: "var(--space-xs)" }}>
+                      {p.comments?.length > 0 && (
+                        <select value={replyParent[p.id] || ""} onChange={(e) => setReplyParent((prev) => ({ ...prev, [p.id]: e.target.value ? Number(e.target.value) : null }))}
+                          style={{
+                            width: "100%", marginBottom: 4, padding: "5px 8px", border: "none", outline: "none",
+                            background: "var(--bg-input)", borderRadius: "var(--radius-sm)",
+                            fontSize: 12, color: "var(--text-secondary)",
+                          }}>
+                          <option value="">回复整个帖子</option>
+                          {p.comments.map((c) => {
+                            const cd = c.ai_id === "user" ? { name: "小猫" } : getAI(c.ai_id);
+                            return <option key={c.id} value={c.id}>回复 {cd.name}: {c.content.slice(0, 42)}</option>;
+                          })}
+                        </select>
+                      )}
                       <div style={{ display: "flex", gap: 4 }}>
                         <input value={replyText[p.id] || ""}
                           onChange={(e) => handleReplyInput(p.id, e.target.value)}

@@ -376,9 +376,12 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
 
         # 附上LLM实际看到的对话原文作为源追溯
         source_ctx = conversation_text[:1500]
+        is_private_memory = chat_type == "private"
         result = await memory_ops.remember(
             content=content,
+            layer="private" if is_private_memory else "shared",
             room=item.get("room", "living_room"),
+            owner_ai=ai_id if is_private_memory else "",
             importance=max(0.4, min(1.0, raw_importance)),
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
@@ -458,7 +461,9 @@ async def extract_from_messages(
             content = f"[AI] {content}"
         result = await memory_ops.remember(
             content=content,
+            layer="private" if chat_type == "private" else "shared",
             room=item.get("room", "living_room"),
+            owner_ai=ai_id if chat_type == "private" else "",
             importance=max(0.1, min(1.0, float(item.get("importance", 0.5)))),
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
