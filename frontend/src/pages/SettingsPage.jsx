@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Save, Wifi, RefreshCw, FlaskConical, Bot, Key, Database } from "lucide-react";
+import { Save, Wifi, RefreshCw, FlaskConical, Bot, Key, Database, Activity } from "lucide-react";
 
 export default function SettingsPage() {
   const [secret, setSecret] = useState(() => localStorage.getItem("mh-secret") || "");
@@ -10,10 +10,12 @@ export default function SettingsPage() {
   const [llmApiKey, setLlmApiKey] = useState("");
   const [llmLoading, setLlmLoading] = useState(false);
   const [embInfo, setEmbInfo] = useState(null);
+  const [daemonStatus, setDaemonStatus] = useState(null);
 
   useEffect(() => {
     loadLLM();
     loadEmbedding();
+    loadDaemonStatus();
   }, []);
 
   const loadLLM = () => {
@@ -31,12 +33,20 @@ export default function SettingsPage() {
       .catch(() => {});
   };
 
+  const loadDaemonStatus = () => {
+    fetch("/api/daemon/status", { headers: { Authorization: "Bearer " + secret } })
+      .then(r => r.json())
+      .then(setDaemonStatus)
+      .catch(() => {});
+  };
+
   const save = () => {
     localStorage.setItem("mh-secret", secret);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
     loadLLM();
     loadEmbedding();
+    loadDaemonStatus();
   };
 
   const testConn = async () => {
@@ -170,6 +180,50 @@ export default function SettingsPage() {
         )}
       </Section>
 
+      <Section icon={<Activity size={16} />} title="后台整理状态">
+        <div style={{ display: "flex", gap: "var(--space-sm)", flexWrap: "wrap" }}>
+          <button className="btn btn-ghost" onClick={loadDaemonStatus}>
+            <RefreshCw size={14} /> 刷新状态
+          </button>
+          <button className="btn btn-primary" onClick={async () => {
+            await fetch("/api/daemon/maintain", { method: "POST", headers: { Authorization: "Bearer " + secret } });
+            setTimeout(loadDaemonStatus, 800);
+          }}>
+            <Activity size={14} /> 手动整理
+          </button>
+        </div>
+        {daemonStatus ? (
+          <>
+            <InfoRow label="状态" value={daemonStatus.status || "unknown"} />
+            <InfoRow label="更新时间" value={daemonStatus.updated_at || "还没有"} />
+            {daemonStatus.started_at && <InfoRow label="开始时间" value={daemonStatus.started_at} />}
+            {daemonStatus.finished_at && <InfoRow label="结束时间" value={daemonStatus.finished_at} />}
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: "var(--space-sm)" }}>
+              {(daemonStatus.steps || []).slice(-8).map((step) => (
+                <div key={step.key} style={{
+                  padding: "8px 10px",
+                  border: "1px solid var(--glass-border)",
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--bg-card)",
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 12 }}>
+                    <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{step.label || step.key}</span>
+                    <span style={{ color: step.status === "error" ? "#b91c1c" : "var(--text-muted)", fontFamily: "monospace" }}>
+                      {step.status} · {step.duration_ms || 0}ms
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, wordBreak: "break-word" }}>
+                    {step.error ? step.error.message : summarizeStep(step.result)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p style={{ color: "var(--text-muted)", fontSize: 13 }}>还没有状态记录</p>
+        )}
+      </Section>
+
       <div style={{ textAlign: "center", marginTop: "var(--space-lg)" }}>
         <a href="/static/legacy.html" target="_blank" rel="noopener"
           style={{ fontSize: 12, color: "var(--text-muted)" }}>
@@ -178,6 +232,23 @@ export default function SettingsPage() {
       </div>
     </div>
   );
+}
+
+function summarizeStep(result) {
+  if (result === null || result === undefined) return "";
+  if (typeof result === "string") return result;
+  if (typeof result === "number" || typeof result === "boolean") return String(result);
+  if (Array.isArray(result)) return `${result.length} 项`;
+  if (typeof result === "object") {
+    const parts = Object.entries(result)
+      .slice(0, 5)
+      .map(([key, value]) => {
+        if (typeof value === "object" && value !== null) return `${key}: ${Array.isArray(value) ? value.length + "项" : "..."}`;
+        return `${key}: ${String(value).slice(0, 40)}`;
+      });
+    return parts.join(" · ");
+  }
+  return String(result);
 }
 
 function Section({ icon, title, children }) {

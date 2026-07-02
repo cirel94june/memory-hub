@@ -453,6 +453,14 @@ async def api_maintain(background_tasks: BackgroundTasks, authorization: str = H
     return {"status": "accepted", "message": "maintenance started"}
 
 
+@app.get("/api/daemon/status")
+async def api_daemon_status(authorization: str = Header(default="")):
+    """查看最近一次后台整理报告。"""
+    verify_secret(authorization)
+    import daemon_status
+    return daemon_status.read_status()
+
+
 @app.get("/api/daemon/test-llm")
 async def api_test_llm(authorization: str = Header(default="")):
     """测试 daemon 小模型是否连通"""

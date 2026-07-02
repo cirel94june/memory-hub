@@ -5,7 +5,7 @@
 """
 import sqlite3
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import httpx
 
@@ -50,6 +50,45 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
+def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 6) -> list[sqlite3.Row]:
+    """Pick recent active private/small-group material when chat digests are sparse.
+
+    This mirrors Ombre's "daytime residue" idea: dreams may use recent memories that
+    survived extraction/decay, but should not use archived items, low-value chatter,
+    infra logs, or previous dreams.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    placeholders = ",".join("?" * len(alias_ids))
+    social_platform_filter = (
+        "(source_platform LIKE '%:private' OR source_platform LIKE '%:private_group' "
+        "OR source_platform LIKE '%:small_group')"
+    )
+    rows = conn.execute(
+        f"""
+        SELECT content, room, category, importance, created_at, source_platform
+        FROM memories
+        WHERE status='active'
+          AND created_at >= ?
+          AND importance >= 0.5
+          AND room NOT IN ('infra', 'infra_changelog', 'work_tasks')
+          AND category != 'dream'
+          AND (tags IS NULL OR tags NOT LIKE '%dream%')
+          AND (
+            source_ai IN ({placeholders})
+            OR owner_ai IN ({placeholders})
+            OR (source_ai=? AND {social_platform_filter})
+          )
+        ORDER BY
+          importance DESC,
+          emotion_arousal DESC,
+          created_at DESC
+        LIMIT ?
+        """,
+        (cutoff, *alias_ids, *alias_ids, canonical, limit),
+    ).fetchall()
+    return rows
+
+
 async def generate_dreams() -> dict:
     """为每个有今日对话摘要的 AI 生成梦境日记"""
     import memory_ops
@@ -81,10 +120,6 @@ async def generate_dreams() -> dict:
             (*alias_ids, today + "%"),
         ).fetchall()
 
-        if len(rows) < 2:
-            results[canonical] = "skipped (too few digests)"
-            continue
-
         # 检查今天是否已经生成过梦境
         existing = conn.execute(
             "SELECT id FROM memories WHERE source_ai=? AND room='diary' "
@@ -103,6 +138,18 @@ async def generate_dreams() -> dict:
             label = type_labels.get(r["chat_type"], "")
             prefix = f"[{ts}|{label}]" if label else f"[{ts}]"
             digest_lines.append(f"{prefix} {r['summary']}")
+
+        memory_rows = []
+        if len(rows) < 2:
+            memory_rows = _fetch_memory_residue(conn, canonical, alias_ids)
+            if len(memory_rows) < 3:
+                results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
+                continue
+
+        for m in memory_rows:
+            ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
+            room = m["room"] or "memory"
+            digest_lines.append(f"[{ts}|记忆:{room}] {m['content'][:160]}")
 
         digest_text = "\n".join(digest_lines)
         prompt = DREAM_PROMPT.format(name=name, digests=digest_text)

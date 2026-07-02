@@ -8,11 +8,13 @@ Memory Daemon：定期后台整理
 """
 import json
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 
 from config import (LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, MERGE_SIMILARITY, get_room, AI_ROLES)
 from embedding import get_embedding, cosine_similarity, unpack_embedding, pack_embedding
 import github_store as store
+import daemon_status
 
 log = logging.getLogger("daemon")
 
@@ -719,43 +721,56 @@ async def run_full_maintenance() -> dict:
     from memory_ops import run_decay
 
     results = {}
+    steps = []
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    daemon_status.write_status({"status": "running", "started_at": started_at, "steps": []})
+
+    async def run_step(key: str, label: str, func):
+        step_start = time.perf_counter()
+        try:
+            value = await func()
+            elapsed_ms = round((time.perf_counter() - step_start) * 1000)
+            results[key] = value
+            steps.append({"key": key, "label": label, "status": "ok", "duration_ms": elapsed_ms, "result": value})
+            daemon_status.write_status({"status": "running", "started_at": started_at, "steps": steps})
+            log.info(f"  {label}: {value}")
+            return value
+        except Exception as e:
+            elapsed_ms = round((time.perf_counter() - step_start) * 1000)
+            error = {"type": type(e).__name__, "message": str(e)}
+            results[key] = {"error": error}
+            steps.append({"key": key, "label": label, "status": "error", "duration_ms": elapsed_ms, "error": error})
+            daemon_status.write_status({"status": "failed", "started_at": started_at, "steps": steps, "failed_step": key, "error": error})
+            log.exception(f"  {label} failed: {e}")
+            raise
 
     # 1. 合并相似记忆
-    results["merge"] = await merge_similar()
-    log.info(f"  Merge: {results['merge']}")
+    await run_step("merge", "Merge similar memories", merge_similar)
 
     # 2. 压缩日记
-    results["compress"] = await compress_diaries()
-    log.info(f"  Compress: {results['compress']}")
+    await run_step("compress", "Compress diaries", compress_diaries)
 
     # 3. 工作事务归档
-    results["work_archive"] = await archive_old_work()
-    log.info(f"  Work archive: {results['work_archive']}")
+    await run_step("work_archive", "Archive old work", archive_old_work)
 
     # 4. 客厅整理
-    results["living_room"] = await tidy_living_room()
-    log.info(f"  Living room: {results['living_room']}")
+    await run_step("living_room", "Tidy living room", tidy_living_room)
 
     # 5. 心理感悟蒸馏
-    results["psychology"] = await distill_psychology()
-    log.info(f"  Psychology: {results['psychology']}")
+    await run_step("psychology", "Distill psychology", distill_psychology)
 
     # 6. 过时记忆检测
-    results["stale"] = await detect_stale_memories()
-    log.info(f"  Stale detection: {results['stale']}")
+    await run_step("stale", "Detect stale memories", detect_stale_memories)
 
     # 8. 刷新对话捕获缓冲区（确保残留对话不丢）
     try:
         from conversation_capture import force_extract
-        capture_result = await force_extract()
-        results["capture_flush"] = capture_result
-        log.info(f"  Capture flush: {capture_result}")
+        await run_step("capture_flush", "Flush capture buffers", force_extract)
     except Exception as e:
         log.warning(f"  Capture flush failed: {e}")
 
     # 9. 衰减
-    results["decay"] = await run_decay()
-    log.info(f"  Decay: {results['decay']}")
+    await run_step("decay", "Run decay", run_decay)
 
     # 10. Persona State 休息（恢复精力）
     try:
@@ -767,37 +782,38 @@ async def run_full_maintenance() -> dict:
         log.warning(f"  Persona rest failed: {e}")
 
     # 10.5 补分析 quick 模式存入的记忆
-    results["backfill_analysis"] = await _backfill_analysis()
-    log.info(f"  Backfill analysis: {results['backfill_analysis']}")
+    await run_step("backfill_analysis", "Backfill analysis", _backfill_analysis)
 
     # 10.6 自动补 about 前缀
-    results["fix_about"] = await _auto_fix_about_prefix()
-    log.info(f"  Fix about prefix: {results['fix_about']}")
+    await run_step("fix_about", "Fix about prefixes", _auto_fix_about_prefix)
 
     # 10.7 自动去重（高相似度记忆归档较旧的）
-    results["dedup"] = await _detect_contradictions()
-    log.info(f"  Dedup: {results['dedup']}")
+    await run_step("dedup", "Deduplicate memories", _detect_contradictions)
     from memory_ops import deduplicate_public_memories
-    results["public_dedup"] = await deduplicate_public_memories(dry_run=False)
-    log.info(f"  Public dedup: {results['public_dedup']}")
+    await run_step("public_dedup", "Deduplicate public memories", lambda: deduplicate_public_memories(dry_run=False))
     from memory_ops import fix_private_capture_layers
-    results["private_layer_fix"] = await fix_private_capture_layers(dry_run=False)
-    log.info(f"  Private layer fix: {results['private_layer_fix']}")
+    await run_step("private_layer_fix", "Fix private capture layers", lambda: fix_private_capture_layers(dry_run=False))
 
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:
         from dream import generate_dreams
-        results["dreams"] = await generate_dreams()
-        log.info(f"  Dreams: {results['dreams']}")
+        await run_step("dreams", "Generate dreams", generate_dreams)
     except Exception as e:
         log.warning(f"  Dreams failed: {e}")
 
     # 11. 推送到 GitHub
-    await store.push_dirty()
+    await run_step("github_push", "Push dirty store", store.push_dirty)
 
     # 12. 重建所有 AI 的走廊（含 persona state + unresolved）
     from corridor import rebuild_all_corridors
-    await rebuild_all_corridors()
+    await run_step("corridors", "Rebuild corridors", rebuild_all_corridors)
     log.info("Maintenance complete, corridors rebuilt")
 
+    daemon_status.write_status({
+        "status": "success",
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "steps": steps,
+        "results": results,
+    })
     return results
