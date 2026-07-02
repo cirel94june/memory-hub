@@ -388,7 +388,7 @@ class ConversationLogRequest(BaseModel):
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
     """记录一轮对话，缓冲区满时自动提取记忆"""
     verify_secret(authorization)
-    return await conversation_capture.log_conversation(
+    result = await conversation_capture.log_conversation(
         user_message=body.user_message,
         ai_response=body.ai_response,
         ai_id=body.ai_id,
@@ -396,6 +396,24 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         chat_id=body.chat_id,
         chat_type=body.chat_type,
     )
+    if body.chat_id:
+        try:
+            from chat_digest import generate_and_save
+            digest_type = {
+                "private_group": "small_group",
+                "public_group": "big_group",
+            }.get(body.chat_type, body.chat_type or "private")
+            await generate_and_save(
+                user_message=body.user_message,
+                ai_response=body.ai_response,
+                ai_id=body.ai_id,
+                chat_id=body.chat_id,
+                chat_type=digest_type,
+                reply_reason="capture_log",
+            )
+        except Exception:
+            pass
+    return result
 
 @app.post("/api/capture/extract")
 async def api_force_extract(authorization: str = Header(default="")):
@@ -1425,6 +1443,7 @@ def _get_social_ai_ids() -> list[str]:
 def _resolve_social_mentions(content: str, explicit_ids: list | None = None) -> list[str]:
     """Resolve @mentions from frontend ids and visible text, keeping only social bots."""
     import re
+    import string
     from config import AI_ALIASES
     from ai_profiles import get_all_profiles
     allowed = set(_get_social_ai_ids())
@@ -1438,6 +1457,7 @@ def _resolve_social_mentions(content: str, explicit_ids: list | None = None) -> 
     resolved = []
     for raw in list(explicit_ids or []) + re.findall(r"@([^\s@]+)", content or ""):
         key = str(raw).strip().lower()
+        key = key.strip(string.punctuation + "，。！？、；：）】》」』…")
         ai_id = name_to_id.get(key) or AI_ALIASES.get(key, key)
         if ai_id in allowed and ai_id not in resolved:
             resolved.append(ai_id)
@@ -1810,27 +1830,9 @@ async def api_send_group_message(chat_id: int, request: Request, authorization: 
                     trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "mentioned" if resp_ai in mentioned else ("reply_target" if reply_target and reply_target.get("ai_id") == resp_ai else "group_auto")})
                     await _capture_social_exchange(chat_id, resp_ai, content, reply)
 
-            # One-hop bot-to-bot mentions: if an AI explicitly @mentions another member, let that member answer once.
-            extra_responders = []
-            for r in ai_replies:
-                for mid in _resolve_social_mentions(r["content"], []):
-                    if mid in ai_members and mid not in responders and mid not in extra_responders:
-                        extra_responders.append(mid)
-            for resp_ai in extra_responders[:2]:
-                from ai_profiles import get_profile
-                name = (get_profile(resp_ai) or {}).get("name", resp_ai)
-                trigger = next((r for r in ai_replies if f"@{resp_ai}" in r["content"].lower() or f"@{name}".lower() in r["content"].lower()), ai_replies[-1] if ai_replies else None)
-                prompt = (
-                    f"群聊「{g.get('name', '群聊')}」里有人@了你（{name}）。\n"
-                    f"最近一句是：{trigger['content'] if trigger else content}\n\n"
-                    f"请以{name}的身份自然回复，50字以内，不要加名字前缀。"
-                )
-                reply = await _social_call_llm(resp_ai, prompt, max_tokens=150)
-                if reply:
-                    mid = social.send_message(chat_id, resp_ai, reply, reply_to=(trigger or {}).get("id"))
-                    ai_replies.append({"id": mid, "ai_id": resp_ai, "content": reply, "reply_to": (trigger or {}).get("id")})
-                    trace.append({"ai_id": resp_ai, "action": "read_memory_and_replied", "reason": "bot_mentioned"})
-                    await _capture_social_exchange(chat_id, resp_ai, trigger["content"] if trigger else content, reply)
+            # Keep one user message to one response wave. AI-to-AI mentions are displayed
+            # as text, but they do not recursively wake more bots; otherwise replying to
+            # one bot can fan out into repeated replies.
 
     return {"ok": True, "id": user_mid, "ai_replies": ai_replies, "trace": trace}
 

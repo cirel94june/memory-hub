@@ -212,7 +212,7 @@ Yinglianchun/Ombre-Brain 是 P0luz/Ombre-Brain 的二次开发版，不适合整
 | 功能 | 代码位置 | 真实触发条件 | 现在的问题 |
 |------|----------|--------------|------------|
 | **人生章节** | `daemon.py` 的 `distill_psychology()`，daemon 第 5 步 | 只处理 `room=psychology`、`category!=life_chapter`、30 天以上的活跃记忆；总数至少 3 条，且同月至少 2 条；LLM 成功后才写入 `category=life_chapter` 并归档原碎片 | 已实现但很容易因为材料不足而不产出；前端没有“为什么没生成”的诊断 |
-| **夜间梦境日记** | `dream.py` 的 `generate_dreams()`，daemon 第 10.8 步 | 当天同一 AI 至少 2 条 `chat_digests`；当天没生成过梦；按 canonical AI 分组；写入 `layer=private`、`room=diary`、`category=dream` | 已实现但不是每天必有；如果 chat_digest 没生成或日期不匹配就跳过；目前写在 `diary` 而不是 `dreams` 房间，缺 Dream Context 浮现 |
+| **夜间梦境日记** | `dream.py` 的 `generate_dreams()`，daemon 第 10.8 步 | 优先看当天同一 AI 的 `chat_digests`；摘要不足时，从最近 72 小时内 active、importance >= 0.5 的私聊/小群有效记忆补材料；当天没生成过梦；按 canonical AI 分组；写入 `layer=private`、`room=diary`、`category=dream` | 已实现但不是每天必有；Telegram `/api/capture/log` 现在也会写 digest；目前写在 `diary` 而不是 `dreams` 房间，缺 Dream Context 浮现 |
 | **MCP dream 工具** | `mcp_server.py` 的 `dream()` | AI 主动调用时写入 `room=dreams` | 这是手动自省工具，和 daemon 夜梦是两套路径，后续应统一展示 |
 
 ## 开发阶段
