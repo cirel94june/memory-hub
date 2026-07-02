@@ -99,15 +99,15 @@ export default function MomentsPage() {
     const mentionNames = [...raw.matchAll(mentionPattern)].map((m) => m[1]);
     const mentionAiIds = [];
     for (const name of mentionNames) {
-      const found = profiles.find((p) => p.name === name || p.ai_id === name);
+      const key = name.toLowerCase();
+      const found = profiles.find((p) => (p.name || "").toLowerCase() === key || (p.ai_id || "").toLowerCase() === key);
       if (found) mentionAiIds.push(found.ai_id);
     }
-    const cleanText = raw.replace(mentionPattern, "").trim() || raw;
 
     setReplying(postId);
     await fetch(`/api/social/posts/${postId}/comment`, {
       method: "POST", headers: { ...auth, "Content-Type": "application/json" },
-      body: JSON.stringify({ ai_id: "user", content: cleanText, mention_ai: mentionAiIds, parent_comment_id: commentParent[postId] || null }),
+      body: JSON.stringify({ ai_id: "user", content: raw, mention_ai: mentionAiIds, parent_comment_id: commentParent[postId] || null }),
     });
     setReplying(null);
     setCommentText((p) => ({ ...p, [postId]: "" }));

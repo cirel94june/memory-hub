@@ -1407,6 +1407,59 @@ def _get_unique_ai_ids() -> list[str]:
     return result
 
 
+def _get_social_ai_ids() -> list[str]:
+    """Return character bots that should naturally appear in social scenes."""
+    from config import AI_ROLES, AI_ALIASES
+    seen = set()
+    result = []
+    for ai_id, role in AI_ROLES.items():
+        if not role.get("platform"):
+            continue
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        if canonical not in seen and canonical != "user":
+            seen.add(canonical)
+            result.append(ai_id)
+    return result
+
+
+def _resolve_social_mentions(content: str, explicit_ids: list | None = None) -> list[str]:
+    """Resolve @mentions from frontend ids and visible text, keeping only social bots."""
+    import re
+    from config import AI_ALIASES
+    from ai_profiles import get_all_profiles
+    allowed = set(_get_social_ai_ids())
+    profiles = get_all_profiles()
+    name_to_id = {}
+    for ai_id in allowed:
+        profile = profiles.get(ai_id, {})
+        for key in (ai_id, profile.get("name", "")):
+            if key:
+                name_to_id[key.lower()] = ai_id
+    resolved = []
+    for raw in list(explicit_ids or []) + re.findall(r"@([^\s@]+)", content or ""):
+        key = str(raw).strip().lower()
+        ai_id = name_to_id.get(key) or AI_ALIASES.get(key, key)
+        if ai_id in allowed and ai_id not in resolved:
+            resolved.append(ai_id)
+    return resolved
+
+
+async def _capture_social_exchange(post_id: int, ai_id: str, user_text: str, ai_text: str):
+    """Let social replies enter the memory buffer as small-group context."""
+    try:
+        import conversation_capture
+        await conversation_capture.log_conversation(
+            user_message=user_text[:2000],
+            ai_response=ai_text[:2000],
+            ai_id=ai_id,
+            platform="social",
+            chat_id=f"social:{post_id}",
+            chat_type="private_group",
+        )
+    except Exception:
+        pass
+
+
 @app.get("/api/social/posts")
 async def api_list_posts(
     type: str = None, ai_id: str = None,
@@ -1433,7 +1486,7 @@ async def api_create_post(request: Request, authorization: str = Header(default=
     ai_comments = []
     if poster == "user" and post_content.strip():
         import random
-        all_ai = _get_unique_ai_ids()
+        all_ai = _get_social_ai_ids()
         react_count = min(len(all_ai), random.choice([1, 2, 2, 3]))
         reactors = random.sample(all_ai, react_count) if len(all_ai) >= react_count else all_ai
         type_label = "朋友圈" if post_type == "moment" else "论坛帖子"
@@ -1450,6 +1503,7 @@ async def api_create_post(request: Request, authorization: str = Header(default=
             if reply:
                 cid = social.add_comment(post_id, ai_id, reply)
                 ai_comments.append({"id": cid, "ai_id": ai_id, "content": reply})
+                await _capture_social_exchange(post_id, ai_id, post_content, reply)
 
     return {"id": post_id, "ok": True, "ai_comments": ai_comments}
 
@@ -1492,14 +1546,16 @@ async def api_add_comment(post_id: int, request: Request, authorization: str = H
     post_type_label = "朋友圈" if post["type"] == "moment" else "论坛帖子"
 
     responders = set()
-    mention_ids = body.get("mention_ai", [])
+    mention_ids = _resolve_social_mentions(content, body.get("mention_ai", []))
     for mid in mention_ids:
         responders.add(mid)
-    if poster_ai != "user":
+    if parent_comment and parent_comment.get("ai_id") != "user":
+        responders.add(parent_comment["ai_id"])
+    elif poster_ai != "user":
         responders.add(poster_ai)
-    else:
+    elif not responders:
         import random
-        all_ai = [aid for aid in _get_unique_ai_ids() if aid not in responders]
+        all_ai = [aid for aid in _get_social_ai_ids() if aid not in responders]
         pick_count = min(len(all_ai), random.choice([1, 1, 2]))
         responders.update(random.sample(all_ai, pick_count) if len(all_ai) >= pick_count else all_ai)
 
@@ -1529,6 +1585,7 @@ async def api_add_comment(post_id: int, request: Request, authorization: str = H
         if reply:
             reply_id = social.add_comment(post_id, resp_ai, reply, parent_id=cid)
             ai_comments.append({"id": reply_id, "ai_id": resp_ai, "content": reply})
+            await _capture_social_exchange(post_id, resp_ai, content, reply)
 
     return {"id": cid, "ok": True, "ai_comments": ai_comments}
 
