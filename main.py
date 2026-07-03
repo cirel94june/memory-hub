@@ -1257,6 +1257,9 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "recommendation": decay["recommendation"],
             "protections": decay["protections"],
             "pressures": decay["pressures"],
+            "protection_reasons": decay.get("protection_reasons", []),
+            "pressure_reasons": decay.get("pressure_reasons", []),
+            "lane_reason": decay.get("lane_reason", ""),
             "days_alive": decay["days_alive"],
             "days_to_archive": decay["days_to_archive"],
             "activation_count": decay["factors"]["activation_count"],
@@ -1951,5 +1954,6 @@ asgi_app = MCPGateway(app)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
+
 
 

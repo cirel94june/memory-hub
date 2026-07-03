@@ -139,6 +139,11 @@ function MemoryRow({ item, onOpen }) {
               <StatusPill tone={item.days_to_archive <= 3 ? "bad" : "neutral"}>{item.days_to_archive} 天到线</StatusPill>
             )}
           </div>
+          {item.lane_reason && (
+            <div style={{ marginTop: 7, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+              {item.lane_reason}
+            </div>
+          )}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
             {(item.protections || []).map((p) => <StatusPill key={`p-${p}`} tone="good">{label(REASON_LABELS, p)}</StatusPill>)}
             {(item.pressures || []).map((p) => <StatusPill key={`d-${p}`} tone="warn">{label(REASON_LABELS, p)}</StatusPill>)}
@@ -412,4 +417,5 @@ export default function ObservatoryPage() {
     </div>
   );
 }
+
 

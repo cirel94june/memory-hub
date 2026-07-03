@@ -1060,6 +1060,38 @@ async def fix_private_capture_layers(dry_run: bool = True) -> dict:
 
 
 # ── 记忆衰减（含情感维度） ──
+PROTECTION_REASON_TEXT = {
+    "anchored": "你手动设为了锚点：它不参与衰减，和重要度高低无关。",
+    "living_room": "它在客厅：客厅是核心身份和当前状态，默认给最高保护。",
+    "high_importance": "重要度达到 80% 以上：系统把它当作长期重要记忆。",
+    "often_recalled": "它已经被召回至少 3 次：说明 AI 经常用到它。",
+    "emotionally_strong": "情绪唤醒度较高：强情绪记忆会衰减更慢。",
+}
+
+PRESSURE_REASON_TEXT = {
+    "low_importance": "重要度低于 50%：更容易进入衰减。",
+    "never_recalled": "从未被召回：系统暂时没有证据说明它常用。",
+    "fast_decay_room": "它所在房间属于快衰减房间。",
+    "auto_capture_unrecalled": "这是自动捕获且长期没被召回的记忆，会加速衰减。",
+    "old": "它已经存在较久，会受到时间衰减压力。",
+}
+
+
+def _lane_reason(lane: str, protections: list[str], pressures: list[str]) -> str:
+    if lane == "protected":
+        if "anchored" in protections:
+            return PROTECTION_REASON_TEXT["anchored"]
+        if "living_room" in protections:
+            return PROTECTION_REASON_TEXT["living_room"]
+        return "这条记忆命中了强保护规则。"
+    if lane == "long_term":
+        reasons = [PROTECTION_REASON_TEXT[p] for p in protections if p in PROTECTION_REASON_TEXT]
+        return " ".join(reasons) or "这条记忆重要度较高或经常被想起，因此暂时放在长期记忆。"
+    if lane == "short_term":
+        reasons = [PRESSURE_REASON_TEXT[p] for p in pressures if p in PRESSURE_REASON_TEXT]
+        return " ".join(reasons) or "这条记忆更像短期材料，会自然衰减。"
+    reasons = [PRESSURE_REASON_TEXT[p] for p in pressures if p in PRESSURE_REASON_TEXT]
+    return " ".join(reasons) or "这条记忆没有强保护理由，先放在观察中。"
 
 def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
     """Explain why a memory is kept, watched, or allowed to decay."""
@@ -1147,6 +1179,9 @@ def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
         "recommendation": recommendation,
         "protections": protections,
         "pressures": pressures,
+        "protection_reasons": [PROTECTION_REASON_TEXT[p] for p in protections if p in PROTECTION_REASON_TEXT],
+        "pressure_reasons": [PRESSURE_REASON_TEXT[p] for p in pressures if p in PRESSURE_REASON_TEXT],
+        "lane_reason": _lane_reason(lane, protections, pressures),
         "factors": {
             "importance": round(importance, 3),
             "activation_count": activations,
@@ -1340,4 +1375,5 @@ async def batch_remember(
             skipped += 1
         results.append(r)
     return {"total": len(results), "created": created, "merged": merged, "skipped": skipped, "items": results}
+
 
