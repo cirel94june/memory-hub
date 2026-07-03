@@ -359,6 +359,7 @@ async def handle_chat_completions(request: Request, body: dict):
                 ai_id=config.ai_id,
                 recent_messages=recent,
                 chat_id=config.chat_id,
+                chat_type=config.chat_type or "private",
             )
             memory_text = context.get("inject_text", "")
             recall_summary = context.get("recall_summary", "")
@@ -476,3 +477,6 @@ async def handle_models(request: Request):
             }
         ],
     })
+
+
+

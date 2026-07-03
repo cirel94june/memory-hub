@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Archive,
+  Eye,
   Gauge,
   RefreshCw,
   Shield,
@@ -11,6 +12,7 @@ import {
 } from "lucide-react";
 import MemoriesHubPage from "./MemoriesHubPage";
 import MemoryDetailModal from "../components/MemoryDetailModal";
+import { useAI } from "../contexts/AIContext";
 
 const LANE_LABELS = {
   protected: "保护中",
@@ -157,6 +159,99 @@ function MemoryRow({ item, onOpen }) {
   );
 }
 
+
+function WakePreview({ auth }) {
+  const { profiles } = useAI();
+  const socialProfiles = profiles.filter((p) => ["cloudy", "lucien", "jasper", "claude"].includes(p.ai_id) || p.platform === "telegram");
+  const [aiId, setAiId] = useState(socialProfiles[0]?.ai_id || "cloudy");
+  const [surface, setSurface] = useState("private");
+  const [message, setMessage] = useState("我今天想让你回忆一下最近我们聊过什么");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const surfaceMap = {
+    private: { label: "私聊", chatType: "private", chatId: `preview:private:${aiId}` },
+    social: { label: "朋友圈/论坛", chatType: "private_group", chatId: `social:${aiId}` },
+    group: { label: "群聊", chatType: "private_group", chatId: "preview:group" },
+    mcp: { label: "MCP 唤醒", chatType: "private", chatId: `mcp:${aiId}` },
+  };
+
+  const preview = async () => {
+    setLoading(true);
+    try {
+      const cfg = surfaceMap[surface] || surfaceMap.private;
+      const res = await fetch("/api/gateway/context", {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ai_id: aiId,
+          user_message: message,
+          chat_id: cfg.chatId,
+          chat_type: cfg.chatType,
+          compact: false,
+          max_memories: 5,
+        }),
+      });
+      setResult(res.ok ? await res.json() : { error: await res.text() });
+    } catch (e) {
+      setResult({ error: String(e) });
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { preview(); }, []);
+
+  return (
+    <div className="glass" style={{ padding: "var(--space-md)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
+        <Eye size={16} /> 醒来预览
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginBottom: 10 }}>
+        <select className="input" value={aiId} onChange={(e) => setAiId(e.target.value)}>
+          {socialProfiles.map((p) => <option key={p.ai_id} value={p.ai_id}>{p.name || p.ai_id}</option>)}
+        </select>
+        <select className="input" value={surface} onChange={(e) => setSurface(e.target.value)}>
+          {Object.entries(surfaceMap).map(([key, cfg]) => <option key={key} value={key}>{cfg.label}</option>)}
+        </select>
+        <button className="btn btn-primary" onClick={preview} disabled={loading}>
+          <RefreshCw size={14} /> {loading ? "读取中" : "预览"}
+        </button>
+      </div>
+      <textarea
+        className="input"
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        rows={3}
+        style={{ width: "100%", resize: "vertical", marginBottom: 10 }}
+      />
+      {result?.error && <div style={{ color: "#b91c1c", fontSize: 13, marginBottom: 8 }}>{result.error}</div>}
+      {result && !result.error && (
+        <>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+            <StatusPill>{result.memory_count || 0} 条相关记忆</StatusPill>
+            <StatusPill>{result.estimated_tokens || 0} token 估算</StatusPill>
+            {result.detail_mode && <StatusPill tone="warn">细节模式</StatusPill>}
+            {(result.recalled_ids || []).slice(0, 5).map((id) => <StatusPill key={id}>{id}</StatusPill>)}
+          </div>
+          <pre style={{
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            maxHeight: 520,
+            overflow: "auto",
+            margin: 0,
+            padding: 12,
+            borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--glass-border)",
+            background: "var(--bg-card)",
+            color: "var(--text-primary)",
+            fontSize: 12,
+            lineHeight: 1.6,
+          }}>{result.inject_text || "这一轮没有注入记忆。"}</pre>
+        </>
+      )}
+    </div>
+  );
+}
 function PanelList({ icon: Icon, title, items, empty, onOpen }) {
   return (
     <div className="glass" style={{ padding: "var(--space-md)" }}>
@@ -221,13 +316,14 @@ export default function ObservatoryPage() {
 
       <div className="glass" style={{
         display: "grid",
-        gridTemplateColumns: "repeat(3, 1fr)",
+        gridTemplateColumns: "repeat(4, 1fr)",
         gap: 4,
         padding: 4,
         marginBottom: "var(--space-md)",
       }}>
         {[
           ["overview", "总览"],
+          ["wake", "醒来预览"],
           ["timeline", "时间线"],
           ["edit", "记忆编辑"],
         ].map(([key, title]) => (
@@ -242,6 +338,7 @@ export default function ObservatoryPage() {
         ))}
       </div>
 
+      {tab === "wake" && <WakePreview auth={auth} />}
       {tab === "timeline" && <MemoriesHubPage initialView="timeline" />}
       {tab === "edit" && <MemoriesHubPage />}
       {tab === "overview" && (
@@ -315,3 +412,4 @@ export default function ObservatoryPage() {
     </div>
   );
 }
+

@@ -387,6 +387,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             source_ai=ai_id,
             source_platform=f"auto_capture:{platform}:{chat_type}",
             source_context=source_ctx,
+            auto_analyze=False,
             quick=True,
         )
         memories.append(result)
@@ -468,8 +469,10 @@ async def extract_from_messages(
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform="mcp_extract",
+            auto_analyze=False,
             quick=quick,
         )
         memories.append(result)
 
     return memories
+

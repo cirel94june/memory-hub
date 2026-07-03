@@ -152,6 +152,7 @@ def _relative_time(iso_str: str) -> str:
 
 # cloudy(TG) 和 claude(MCP/Web) 是同一个小克，共享私有房间和走廊
 
+
 def _wants_detail(text: str) -> bool:
     if not text:
         return False
@@ -491,6 +492,7 @@ AI回复：{ai_response[:1500]}
                 source_ai=ai_id,
                 source_platform=f"{platform}:{chat_type}" if chat_type else platform,
                 source_context=source_ctx,
+                auto_analyze=False,
                 quick=True,
             )
             executed.append(action)
@@ -536,3 +538,5 @@ AI回复：{ai_response[:1500]}
             pass
 
     return {"actions": executed, "store_summary": store_summary}
+
+

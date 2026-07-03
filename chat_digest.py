@@ -127,41 +127,42 @@ async def generate_and_save(
 
 
 def get_recent_digests(
-    ai_id: str, exclude_chat_id: str = "", limit: int = 5
+    ai_id: str,
+    exclude_chat_id: str = "",
+    limit: int = 5,
+    include_types: list[str] | None = None,
 ) -> list[dict]:
-    """获取最近的对话摘要（排除当前窗口），按优先级排序：私聊 > 小群 > 大群"""
+    """获取最近的对话摘要，可按聊天类型过滤。"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    params: list = [ai_id]
+    type_filter = ""
+    if include_types:
+        placeholders = ", ".join(["?"] * len(include_types))
+        type_filter = f" AND chat_type IN ({placeholders}) "
+        params.extend(include_types)
+
+    exclude_filter = ""
     if exclude_chat_id:
-        cur = conn.execute(
-            "SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
-            "WHERE ai_id = ? AND chat_id != ? "
-            "ORDER BY "
-            "  CASE chat_type "
-            "    WHEN 'private' THEN 0 "
-            "    WHEN 'small_group' THEN 1 "
-            "    WHEN 'big_group' THEN 2 "
-            "    ELSE 1 "
-            "  END, "
-            "  created_at DESC "
-            "LIMIT ?",
-            (ai_id, exclude_chat_id, limit),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
-            "WHERE ai_id = ? "
-            "ORDER BY "
-            "  CASE chat_type "
-            "    WHEN 'private' THEN 0 "
-            "    WHEN 'small_group' THEN 1 "
-            "    WHEN 'big_group' THEN 2 "
-            "    ELSE 1 "
-            "  END, "
-            "  created_at DESC "
-            "LIMIT ?",
-            (ai_id, limit),
-        )
+        exclude_filter = " AND chat_id != ? "
+        params.append(exclude_chat_id)
+
+    params.append(limit)
+    cur = conn.execute(
+        "SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
+        "WHERE ai_id = ? " + type_filter + exclude_filter +
+        "ORDER BY "
+        "  CASE chat_type "
+        "    WHEN 'private' THEN 0 "
+        "    WHEN 'small_group' THEN 1 "
+        "    WHEN 'big_group' THEN 2 "
+        "    ELSE 1 "
+        "  END, "
+        "  created_at DESC "
+        "LIMIT ?",
+        tuple(params),
+    )
     results = [dict(r) for r in cur]
     conn.close()
     return results
