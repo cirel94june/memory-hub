@@ -21,6 +21,7 @@ import gateway as gateway_mod
 import daemon
 import corridor
 import activity_log
+import safety_export
 from mcp_server import mcp as mcp_server
 
 
@@ -1374,6 +1375,17 @@ async def api_export(authorization: str = Header(default="")):
     return JSONResponse(content=data)
 
 
+@app.post("/api/export/obsidian")
+async def api_export_obsidian(
+    authorization: str = Header(default=""),
+    dry_run: bool = Query(default=False),
+    force: bool = Query(default=False),
+):
+    """Generate the readable GitHub/Obsidian safety export."""
+    verify_secret(authorization)
+    return await safety_export.export_obsidian(dry_run=dry_run, force=force)
+
+
 # ── Pulse State（9 维度情绪面板）──
 
 @app.get("/api/pulse/{ai_id}")
@@ -1939,3 +1951,5 @@ asgi_app = MCPGateway(app)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
+
+

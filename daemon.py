@@ -801,6 +801,13 @@ async def run_full_maintenance() -> dict:
     except Exception as e:
         log.warning(f"  Dreams failed: {e}")
 
+    # 10.9 Memory Safety Kit：可读 Markdown + 安全报告导出到 GitHub/Obsidian
+    try:
+        from safety_export import export_obsidian
+        await run_step("memory_safety_export", "Export Obsidian safety kit", lambda: export_obsidian(dry_run=False))
+    except Exception as e:
+        log.warning(f"  Memory safety export failed: {e}")
+
     # 11. 推送到 GitHub
     await run_step("github_push", "Push dirty store", store.push_dirty)
 
@@ -817,3 +824,4 @@ async def run_full_maintenance() -> dict:
         "results": results,
     })
     return results
+

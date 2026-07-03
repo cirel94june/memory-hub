@@ -27,6 +27,13 @@
 
 实现导出功能时，优先把导出结果推到 GitHub 云端，再让本地 Obsidian 作为阅读入口；不要把唯一副本保存在当前电脑。
 
+当前已实现轻量版 Memory Safety Kit：
+
+- 手动触发：`POST /api/export/obsidian?dry_run=false`（需要 `HUB_SECRET`）。
+- 后台触发：每次 12h daemon 完整整理时，会在梦境生成后自动运行一次。
+- 导出目录：`exports/obsidian/`，其中 `memories/` 是按 memory id 去重的 Markdown，`reports/` 是每日安全报告，`manifest.json` 记录每条记忆的文件路径和校验值。
+- 打开方法：把 GitHub 仓库 clone 到本地，用 Obsidian 的 “Open folder as vault” 打开仓库里的 `exports/obsidian` 文件夹。
+
 ## 接入方式
 
 | 入口 | 方式 | 记忆注入 | 状态 |
@@ -291,3 +298,4 @@ python main.py
 ```
 
 服务启动在 `http://localhost:8888`，前端 `/app/`，MCP `/mcp`，代理 `/v1/chat/completions`。
+
