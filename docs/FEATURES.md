@@ -16,6 +16,12 @@
 - **event_date**：区分"事件发生时间"和"记忆创建时间"
 - **source_context**：自动保存对话原文前 1500 字，recall 时随记忆返回
 
+### Gateway 省 token 注入策略
+
+- `build_context()` 默认 `compact=True`：普通对话只注入少量高置信记忆，通常 3 条左右，单条裁短。
+- 用户问“原话 / 当时 / 细节 / 具体 / 为什么 / 来源 / 上下文”等问题时自动进入 `detail_mode`，才附带短原文片段。
+- `/api/gateway/context` 支持 `compact`、`max_memories`，并返回 `estimated_tokens`、`memory_count`、`detail_mode`，方便看这次记忆注入是否过胖。
+
 ## 记忆搜索
 
 - **混合搜索 + RRF 融合**：

@@ -152,7 +152,40 @@ def _relative_time(iso_str: str) -> str:
 
 # cloudy(TG) 和 claude(MCP/Web) 是同一个小克，共享私有房间和走廊
 
-async def build_context(user_message: str, ai_id: str, recent_messages: list[dict] = None, chat_id: str = "") -> dict:
+def _wants_detail(text: str) -> bool:
+    if not text:
+        return False
+    detail_cues = (
+        "原话", "当时", "细节", "具体", "怎么说", "说过什么", "发生了什么", "为什么",
+        "证据", "来源", "上下文", "回忆一下", "详细", "quote", "source", "context",
+    )
+    return any(cue in text.lower() for cue in detail_cues)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _rough_tokens(text: str) -> int:
+    if not text:
+        return 0
+    ascii_count = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii = len(text) - ascii_count
+    return int(ascii_count / 4 + non_ascii * 0.8)
+
+
+async def build_context(
+    user_message: str,
+    ai_id: str,
+    recent_messages: list[dict] = None,
+    chat_id: str = "",
+    chat_type: str = "",
+    compact: bool = True,
+    max_memories: int | None = None,
+) -> dict:
     """
     核心功能：在 AI 回复之前，自动组装要注入的记忆 context。
 
@@ -167,6 +200,10 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     parts = []
     recalled_ids = []
     rooms_checked = ["living_room"]
+    detail_mode = _wants_detail(user_message)
+    memory_limit = max_memories or (3 if compact and not detail_mode else 5)
+    content_limit = 180 if compact and not detail_mode else 360
+    source_limit = 0 if compact and not detail_mode else 140
 
     # 1. 注入走廊（已经包含客厅精华 + 关系 + 跨端动态）
     corridor_text = await get_corridor(ai_id)
@@ -188,19 +225,22 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
-        top_k=12,
+        top_k=10 if compact else 12,
         exclude_isolated=True,
     )
     if recalled:
-        recalled = recalled[:5]
+        strong = [r for r in recalled if r.get("confidence") in ("high", "medium") or r.get("resolved") == False]
+        if len(strong) >= 2:
+            recalled = strong
+        recalled = recalled[:memory_limit]
         recalled_ids = [r["id"] for r in recalled]
         # L3: 压缩 — 每条 ≤400 字，附带原始语境帮助回忆细节
         lines = []
         for r in recalled:
-            content = r["content"]
-            if len(content) > 400:
-                content = content[:380] + "..."
+            content = _clip_text(r["content"], content_limit)
             room_tag = r["room"]
+            if r.get("confidence"):
+                room_tag += f"/{r['confidence']}"
             src_ai = r.get("source_ai", "")
             if src_ai and src_ai != ai_id:
                 room_tag += f"/来自{src_ai}"
@@ -211,8 +251,8 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
                 room_tag += f"/{time_label}"
             line = f"- [{room_tag}] {content}"
             src = r.get("source_context", "")
-            if src:
-                preview = src.replace("\n", " ")[:120]
+            if src and source_limit:
+                preview = _clip_text(src.replace("\n", " "), source_limit)
                 line += f"\n  ↳ 当时聊的: {preview}"
             lines.append(line)
         parts.append("【相关记忆】\n" + "\n".join(lines))
@@ -238,6 +278,10 @@ async def build_context(user_message: str, ai_id: str, recent_messages: list[dic
         "recalled_ids": recalled_ids,
         "rooms_checked": list(set(rooms_checked)),
         "recall_summary": recall_summary,
+        "compact": compact,
+        "detail_mode": detail_mode,
+        "memory_count": len(recalled or []),
+        "estimated_tokens": _rough_tokens(inject_text),
     }
 
 

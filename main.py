@@ -327,6 +327,8 @@ class ContextRequest(BaseModel):
     recent_messages: list[dict] = []
     chat_id: str = ""
     chat_type: str = ""
+    compact: bool = True
+    max_memories: Optional[int] = None
 
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
@@ -336,6 +338,9 @@ async def api_build_context(body: ContextRequest, authorization: str = Header(de
         ai_id=body.ai_id,
         recent_messages=body.recent_messages,
         chat_id=body.chat_id,
+        chat_type=body.chat_type,
+        compact=body.compact,
+        max_memories=body.max_memories,
     )
 
 
