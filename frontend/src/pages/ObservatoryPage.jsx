@@ -1,8 +1,30 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, Archive, Gauge, RefreshCw, Shield, Timer, TrendingDown } from "lucide-react";
+import {
+  Activity,
+  AlertTriangle,
+  Archive,
+  Gauge,
+  RefreshCw,
+  Shield,
+  Timer,
+  TrendingDown,
+} from "lucide-react";
+import MemoriesHubPage from "./MemoriesHubPage";
+import MemoryDetailModal from "../components/MemoryDetailModal";
 
-const LANE_LABELS = { protected: "保护中", long_term: "长期", short_term: "短期池", watch: "观察中" };
-const HEALTH_LABELS = { healthy: "稳定", decaying: "衰减中", critical: "临近归档" };
+const LANE_LABELS = {
+  protected: "保护中",
+  long_term: "长期",
+  short_term: "短期池",
+  watch: "观察中",
+};
+
+const HEALTH_LABELS = {
+  healthy: "稳定",
+  decaying: "衰减中",
+  critical: "临近归档",
+};
+
 const REASON_LABELS = {
   anchored: "锚点",
   living_room: "客厅",
@@ -27,11 +49,18 @@ function StatusPill({ children, tone = "neutral" }) {
     bad: ["rgba(239,68,68,0.12)", "#b91c1c"],
     neutral: ["var(--bg-hover)", "var(--text-secondary)"],
   }[tone];
+
   return (
     <span style={{
-      display: "inline-flex", alignItems: "center", height: 22,
-      padding: "0 8px", borderRadius: 999, fontSize: 11, fontWeight: 600,
-      background: styles[0], color: styles[1],
+      display: "inline-flex",
+      alignItems: "center",
+      height: 22,
+      padding: "0 8px",
+      borderRadius: 999,
+      fontSize: 11,
+      fontWeight: 600,
+      background: styles[0],
+      color: styles[1],
     }}>
       {children}
     </span>
@@ -45,14 +74,18 @@ function Metric({ icon: Icon, label, value, tone = "neutral" }) {
       <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text-muted)", fontSize: 12 }}>
         <Icon size={15} style={{ color }} /> {label}
       </div>
-      <div style={{ marginTop: 8, fontSize: 24, fontWeight: 750, color: "var(--text-primary)" }}>{value}</div>
+      <div style={{ marginTop: 8, fontSize: 24, fontWeight: 750, color: "var(--text-primary)" }}>
+        {value}
+      </div>
     </div>
   );
 }
 
 function StepSummary({ steps = [] }) {
   const recent = steps.slice(-8).reverse();
-  if (!recent.length) return <div style={{ color: "var(--text-muted)", fontSize: 13 }}>还没有后台整理记录</div>;
+  if (!recent.length) {
+    return <div style={{ color: "var(--text-muted)", fontSize: 13 }}>还没有后台整理记录</div>;
+  }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {recent.map((step) => (
@@ -79,11 +112,20 @@ function StepSummary({ steps = [] }) {
   );
 }
 
-function MemoryRow({ item }) {
+function MemoryRow({ item, onOpen }) {
   const laneTone = item.lane === "protected" || item.lane === "long_term" ? "good" : item.lane === "short_term" ? "warn" : "neutral";
   const healthTone = item.health === "critical" ? "bad" : item.health === "decaying" ? "warn" : "good";
   return (
-    <div style={{ border: "1px solid var(--glass-border)", borderRadius: "var(--radius-sm)", padding: "10px 12px", background: "var(--bg-card)" }}>
+    <div
+      onClick={() => onOpen?.(item.id)}
+      style={{
+        border: "1px solid var(--glass-border)",
+        borderRadius: "var(--radius-sm)",
+        padding: "10px 12px",
+        background: "var(--bg-card)",
+        cursor: onOpen ? "pointer" : "default",
+      }}
+    >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ fontSize: 13, color: "var(--text-primary)", lineHeight: 1.45 }}>{item.content}</div>
@@ -115,7 +157,7 @@ function MemoryRow({ item }) {
   );
 }
 
-function PanelList({ icon: Icon, title, items, empty }) {
+function PanelList({ icon: Icon, title, items, empty, onOpen }) {
   return (
     <div className="glass" style={{ padding: "var(--space-md)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
@@ -123,7 +165,7 @@ function PanelList({ icon: Icon, title, items, empty }) {
       </div>
       {items.length ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {items.map((item) => <MemoryRow key={item.id} item={item} />)}
+          {items.map((item) => <MemoryRow key={item.id} item={item} onOpen={onOpen} />)}
         </div>
       ) : (
         <div style={{ color: "var(--text-muted)", fontSize: 13, padding: "10px 0" }}>{empty}</div>
@@ -136,6 +178,8 @@ export default function ObservatoryPage() {
   const [daemon, setDaemon] = useState(null);
   const [decay, setDecay] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [tab, setTab] = useState("overview");
+  const [detailId, setDetailId] = useState(null);
   const secret = localStorage.getItem("mh-secret") || "";
   const auth = { Authorization: `Bearer ${secret}` };
 
@@ -157,6 +201,7 @@ export default function ObservatoryPage() {
   useEffect(() => { load(); }, []);
 
   const memories = decay?.memories || [];
+  const protectedMemories = useMemo(() => memories.filter((m) => m.lane === "protected").slice(0, 10), [memories]);
   const critical = useMemo(() => memories.filter((m) => m.health === "critical").slice(0, 8), [memories]);
   const shortTerm = useMemo(() => memories.filter((m) => m.lane === "short_term").slice(0, 8), [memories]);
   const watch = useMemo(() => memories.filter((m) => m.lane === "watch").slice(0, 8), [memories]);
@@ -167,60 +212,106 @@ export default function ObservatoryPage() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: "var(--space-md)" }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 21, fontWeight: 760, color: "var(--text-primary)" }}>观测台</h2>
-          <div style={{ marginTop: 4, fontSize: 12, color: "var(--text-muted)" }}>后台整理、衰减分层、短期池和待观察记忆</div>
+          <div style={{ marginTop: 4, fontSize: 12, color: "var(--text-muted)" }}>后台整理、衰减分层、时间线、热力图和记忆编辑</div>
         </div>
         <button className="btn btn-primary" onClick={load} disabled={loading} style={{ flexShrink: 0 }}>
           <RefreshCw size={14} /> {loading ? "刷新中" : "刷新"}
         </button>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
-        <Metric icon={Gauge} label="活跃记忆" value={summary.total ?? "—"} />
-        <Metric icon={Shield} label="保护中" value={summary.protected ?? 0} tone="good" />
-        <Metric icon={Timer} label="短期池" value={summary.short_term ?? 0} tone="warn" />
-        <Metric icon={AlertTriangle} label="临近归档" value={summary.critical ?? 0} tone="bad" />
+      <div className="glass" style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(3, 1fr)",
+        gap: 4,
+        padding: 4,
+        marginBottom: "var(--space-md)",
+      }}>
+        {[
+          ["overview", "总览"],
+          ["timeline", "时间线"],
+          ["edit", "记忆编辑"],
+        ].map(([key, title]) => (
+          <button
+            key={key}
+            className={`btn ${tab === key ? "btn-primary" : "btn-ghost"}`}
+            onClick={() => setTab(key)}
+            style={{ justifyContent: "center" }}
+          >
+            {title}
+          </button>
+        ))}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "var(--space-md)", alignItems: "start" }}>
-        <section className="glass" style={{ padding: "var(--space-md)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
-            <Activity size={16} /> 后台整理
+      {tab === "timeline" && <MemoriesHubPage initialView="timeline" />}
+      {tab === "edit" && <MemoriesHubPage />}
+      {tab === "overview" && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
+            <Metric icon={Gauge} label="活跃记忆" value={summary.total ?? "—"} />
+            <Metric icon={Shield} label="保护中" value={summary.protected ?? 0} tone="good" />
+            <Metric icon={Timer} label="短期池" value={summary.short_term ?? 0} tone="warn" />
+            <Metric icon={AlertTriangle} label="临近归档" value={summary.critical ?? 0} tone="bad" />
           </div>
-          <div style={{ display: "grid", gap: 6, marginBottom: 12, fontSize: 12, color: "var(--text-muted)" }}>
-            <div>状态：<b style={{ color: "var(--text-primary)" }}>{daemon?.status || "unknown"}</b></div>
-            <div>更新：{daemon?.updated_at || "还没有记录"}</div>
-            {daemon?.finished_at && <div>完成：{daemon.finished_at}</div>}
-          </div>
-          <StepSummary steps={daemon?.steps || []} />
-        </section>
 
-        <section className="glass" style={{ padding: "var(--space-md)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
-            <TrendingDown size={16} /> 衰减分层
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            {[
-              ["long_term", "长期", summary.long_term || 0, "good"],
-              ["watch", "观察中", summary.watch || 0, "neutral"],
-              ["short_term", "短期池", summary.short_term || 0, "warn"],
-              ["critical", "临近归档", summary.critical || 0, "bad"],
-            ].map(([key, title, count, tone]) => (
-              <div key={key} style={{ padding: 10, borderRadius: "var(--radius-sm)", background: "var(--bg-card)", border: "1px solid var(--glass-border)" }}>
-                <StatusPill tone={tone}>{title}</StatusPill>
-                <div style={{ marginTop: 8, fontSize: 22, fontWeight: 750, color: "var(--text-primary)" }}>{count}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "var(--space-md)", alignItems: "start" }}>
+            <section className="glass" style={{ padding: "var(--space-md)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
+                <Activity size={16} /> 后台整理
               </div>
-            ))}
-          </div>
-        </section>
-      </div>
+              <div style={{ display: "grid", gap: 6, marginBottom: 12, fontSize: 12, color: "var(--text-muted)" }}>
+                <div>状态：<b style={{ color: "var(--text-primary)" }}>{daemon?.status || "unknown"}</b></div>
+                <div>更新：{daemon?.updated_at || "还没有记录"}</div>
+                {daemon?.finished_at && <div>完成：{daemon.finished_at}</div>}
+              </div>
+              <StepSummary steps={daemon?.steps || []} />
+            </section>
 
-      <section style={{ marginTop: "var(--space-md)" }}>
-        <PanelList icon={AlertTriangle} title="临近归档" items={critical} empty="暂时没有临近归档的记忆" />
-      </section>
-      <section style={{ marginTop: "var(--space-md)", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "var(--space-md)" }}>
-        <PanelList icon={Archive} title="短期池" items={shortTerm} empty="短期池暂时为空" />
-        <PanelList icon={Gauge} title="观察中" items={watch} empty="没有需要观察的记忆" />
-      </section>
+            <section className="glass" style={{ padding: "var(--space-md)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>
+                <TrendingDown size={16} /> 衰减分层
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {[
+                  ["long_term", "长期", summary.long_term || 0, "good"],
+                  ["watch", "观察中", summary.watch || 0, "neutral"],
+                  ["short_term", "短期池", summary.short_term || 0, "warn"],
+                  ["critical", "临近归档", summary.critical || 0, "bad"],
+                ].map(([key, title, count, tone]) => (
+                  <div key={key} style={{ padding: 10, borderRadius: "var(--radius-sm)", background: "var(--bg-card)", border: "1px solid var(--glass-border)" }}>
+                    <StatusPill tone={tone}>{title}</StatusPill>
+                    <div style={{ marginTop: 8, fontSize: 22, fontWeight: 750, color: "var(--text-primary)" }}>{count}</div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+
+          <section style={{ marginTop: "var(--space-md)" }}>
+            <PanelList icon={Shield} title="保护中" items={protectedMemories} empty="暂时没有被保护的记忆" onOpen={setDetailId} />
+          </section>
+          <section style={{ marginTop: "var(--space-md)" }}>
+            <PanelList icon={AlertTriangle} title="临近归档" items={critical} empty="暂时没有临近归档的记忆" onOpen={setDetailId} />
+          </section>
+          <section style={{ marginTop: "var(--space-md)", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "var(--space-md)" }}>
+            <PanelList icon={Archive} title="短期池" items={shortTerm} empty="短期池暂时为空" onOpen={setDetailId} />
+            <PanelList icon={Gauge} title="观察中" items={watch} empty="没有需要观察的记忆" onOpen={setDetailId} />
+          </section>
+        </>
+      )}
+
+      {detailId && (
+        <MemoryDetailModal
+          memoryId={detailId}
+          onClose={() => setDetailId(null)}
+          onNavigate={(target) => {
+            if (target.startsWith("memory:")) {
+              setDetailId(target.slice(7));
+            } else {
+              setDetailId(null);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
