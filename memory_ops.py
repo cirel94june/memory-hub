@@ -1061,6 +1061,105 @@ async def fix_private_capture_layers(dry_run: bool = True) -> dict:
 
 # ── 记忆衰减（含情感维度） ──
 
+def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
+    """Explain why a memory is kept, watched, or allowed to decay."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    try:
+        created = datetime.fromisoformat(mem.get("created_at", ""))
+        days = max(0.0, (now_dt - created).total_seconds() / 86400)
+    except Exception:
+        days = 0.0
+
+    importance = _safe_float(mem.get("importance"), 0.5)
+    arousal = _safe_float(mem.get("emotion_arousal"), 0.3)
+    activations = int(_safe_float(mem.get("activation_count"), 0))
+    room = mem.get("room", "")
+    room_cfg = get_room(room) or {}
+    source_platform = mem.get("source_platform") or ""
+    anchored = bool(mem.get("anchored"))
+
+    lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+    is_auto = "auto_capture" in source_platform
+    auto_accelerated = bool(is_auto and activations == 0 and days > 3)
+    if auto_accelerated:
+        lam *= 2.0
+
+    activation_factor = max(activations, 1) ** 0.3
+    emotion_weight = 1.0 + (arousal * 0.8)
+    base_score = importance * activation_factor * emotion_weight
+    score = min(1.0, base_score * math.exp(-lam * days))
+
+    protections = []
+    pressures = []
+    if anchored:
+        protections.append("anchored")
+    if room == "living_room":
+        protections.append("living_room")
+    if importance >= 0.8:
+        protections.append("high_importance")
+    if activations >= 3:
+        protections.append("often_recalled")
+    if arousal >= 0.65:
+        protections.append("emotionally_strong")
+
+    if importance < 0.5:
+        pressures.append("low_importance")
+    if activations == 0:
+        pressures.append("never_recalled")
+    if room_cfg.get("fast_decay"):
+        pressures.append("fast_decay_room")
+    if auto_accelerated:
+        pressures.append("auto_capture_unrecalled")
+    if days >= 30:
+        pressures.append("old")
+
+    if anchored or room == "living_room":
+        lane = "protected"
+        recommendation = "keep"
+        will_archive = False
+    elif room_cfg.get("fast_decay") or (is_auto and importance < 0.65 and activations == 0):
+        lane = "short_term"
+        recommendation = "archive_soon" if score < DECAY_THRESHOLD else "let_decay"
+        will_archive = score < DECAY_THRESHOLD
+    elif importance >= 0.75 or activations >= 2:
+        lane = "long_term"
+        recommendation = "keep"
+        will_archive = False
+    else:
+        lane = "watch"
+        recommendation = "review" if score < DECAY_THRESHOLD * 1.5 else "let_decay"
+        will_archive = score < DECAY_THRESHOLD
+
+    days_to_archive = None
+    if not anchored and room != "living_room" and score > DECAY_THRESHOLD and lam > 0 and base_score > 0:
+        target_days = math.log(max(base_score, 0.0001) / DECAY_THRESHOLD) / lam
+        days_to_archive = max(0.0, target_days - days)
+
+    health = "healthy" if score >= 0.6 else "decaying" if score >= DECAY_THRESHOLD else "critical"
+    return {
+        "current_score": round(score, 4),
+        "threshold": DECAY_THRESHOLD,
+        "days_alive": round(days, 1),
+        "days_to_archive": None if days_to_archive is None else round(days_to_archive, 1),
+        "will_archive": will_archive,
+        "health": health,
+        "lane": lane,
+        "recommendation": recommendation,
+        "protections": protections,
+        "pressures": pressures,
+        "factors": {
+            "importance": round(importance, 3),
+            "activation_count": activations,
+            "activation_factor": round(activation_factor, 3),
+            "emotion_arousal": round(arousal, 3),
+            "emotion_weight": round(emotion_weight, 3),
+            "lambda": round(lam, 4),
+            "auto_accelerated": auto_accelerated,
+            "fast_decay_room": bool(room_cfg.get("fast_decay")),
+        },
+    }
+
+
 async def run_decay() -> dict:
     now_dt = datetime.now(timezone.utc)
     archived = 0

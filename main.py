@@ -989,32 +989,13 @@ async def api_memory_detail(memory_id: str, authorization: str = Header(default=
         related.sort(key=lambda x: x["shared_count"], reverse=True)
         related = related[:8]
 
-    from datetime import datetime, timezone
-    import math
-    from config import DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD, ROOMS
-    try:
-        created = datetime.fromisoformat(mem["created_at"])
-        days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
-    except Exception:
-        days = 0
-    importance = float(mem.get("importance") or 0.5)
-    arousal = float(mem.get("emotion_arousal") or 0.3)
-    activations = int(float(mem.get("activation_count") or 0))
-    room_cfg = ROOMS.get(mem.get("room", ""), {})
-    lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
-    emotion_weight = 1.0 + (arousal * 0.8)
-    current_decay = min(1.0, importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight)
+    decay = memory_ops.explain_decay(mem)
 
     return {
         "memory": mem,
         "supersede_chain": supersede_chain,
         "related_memories": related,
-        "decay": {
-            "current_score": round(current_decay, 4),
-            "threshold": DECAY_THRESHOLD,
-            "days_alive": round(days, 1),
-            "will_archive": current_decay < DECAY_THRESHOLD and mem.get("room") != "living_room",
-        },
+        "decay": decay,
     }
 
 
@@ -1264,16 +1245,22 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
         else:
             health = "critical"
 
+        decay = memory_ops.explain_decay(m)
         results.append({
             "id": m["id"],
             "content": m["content"][:60],
             "room": m.get("room", ""),
-            "decay_score": round(score, 4),
-            "health": health,
-            "days_alive": round(days, 1),
-            "activation_count": activations,
+            "decay_score": decay["current_score"],
+            "health": decay["health"],
+            "lane": decay["lane"],
+            "recommendation": decay["recommendation"],
+            "protections": decay["protections"],
+            "pressures": decay["pressures"],
+            "days_alive": decay["days_alive"],
+            "days_to_archive": decay["days_to_archive"],
+            "activation_count": decay["factors"]["activation_count"],
             "last_activated": m.get("last_activated", ""),
-            "importance": importance,
+            "importance": decay["factors"]["importance"],
         })
 
     results.sort(key=lambda x: x["decay_score"])
@@ -1284,6 +1271,10 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "healthy": sum(1 for r in results if r["health"] == "healthy"),
             "decaying": sum(1 for r in results if r["health"] == "decaying"),
             "critical": sum(1 for r in results if r["health"] == "critical"),
+            "protected": sum(1 for r in results if r["lane"] == "protected"),
+            "long_term": sum(1 for r in results if r["lane"] == "long_term"),
+            "short_term": sum(1 for r in results if r["lane"] == "short_term"),
+            "watch": sum(1 for r in results if r["lane"] == "watch"),
             "threshold": DECAY_THRESHOLD,
         },
     }

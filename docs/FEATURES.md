@@ -22,6 +22,13 @@
 - 用户问“原话 / 当时 / 细节 / 具体 / 为什么 / 来源 / 上下文”等问题时自动进入 `detail_mode`，才附带短原文片段。
 - `/api/gateway/context` 支持 `compact`、`max_memories`，并返回 `estimated_tokens`、`memory_count`、`detail_mode`，方便看这次记忆注入是否过胖。
 
+### Ombre-style 衰减解释
+
+- `memory_ops.explain_decay()` 会给每条记忆算出 `lane`：`protected` / `long_term` / `short_term` / `watch`。
+- 诊断结果包含 `protections`（锚点、客厅、高重要度、常被召回、强情绪）和 `pressures`（低重要度、从未召回、快衰房间、自动捕获未召回、久远）。
+- `/api/memory/{id}/detail` 和 `/api/memory/decay-scores` 会返回同一套解释字段，便于以后做衰减诊断台。
+- 这不是硬拦截写入：可疑内容先进库，但低重要度、短期池、未召回的自动捕获会更自然地滑向归档线。
+
 ## 记忆搜索
 
 - **混合搜索 + RRF 融合**：
