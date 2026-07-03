@@ -13,6 +13,7 @@ import AiProfilesPage from "./pages/AiProfilesPage";
 import ThemePage from "./pages/ThemePage";
 import SettingsPage from "./pages/SettingsPage";
 import PulsePage from "./pages/PulsePage";
+import ObservatoryPage from "./pages/ObservatoryPage";
 
 import "./styles/theme.css";
 import "./styles/layout.css";
@@ -29,6 +30,7 @@ export default function App() {
               <Route path="memories" element={<MemoriesHubPage />} />
               <Route path="timeline" element={<MemoriesHubPage initialView="timeline" />} />
               <Route path="pulse" element={<PulsePage />} />
+              <Route path="observatory" element={<ObservatoryPage />} />
               <Route path="checkin" element={<CheckInPage />} />
               <Route path="moments" element={<MomentsPage />} />
               <Route path="group" element={<GroupChatPage />} />

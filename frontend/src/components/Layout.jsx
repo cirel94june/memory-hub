@@ -1,7 +1,8 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Home, MessageCircle, Brain, Settings, Palette, CalendarCheck, Heart, Users, MessageSquare, Bot, HeartPulse } from "lucide-react";
+import { Home, MessageCircle, Brain, Settings, Palette, CalendarCheck, Heart, Users, MessageSquare, Bot, HeartPulse, Gauge } from "lucide-react";
 
 const NAV = [
+  { to: "/observatory", icon: Gauge,       label: "观测台" },
   { to: "/",         icon: Home,           label: "首页" },
   { to: "/chat",     icon: MessageCircle,  label: "对话" },
   { to: "/memories", icon: Brain,          label: "记忆" },
