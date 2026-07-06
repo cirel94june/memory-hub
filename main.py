@@ -1520,27 +1520,6 @@ def _resolve_social_mentions(content: str, explicit_ids: list | None = None) -> 
             resolved.append(ai_id)
     return resolved
 
-    import string
-    from config import AI_ALIASES
-    from ai_profiles import get_all_profiles
-    allowed = set(_get_social_ai_ids())
-    profiles = get_all_profiles()
-    name_to_id = {}
-    for ai_id in allowed:
-        profile = profiles.get(ai_id, {})
-        for key in (ai_id, profile.get("name", "")):
-            if key:
-                name_to_id[key.lower()] = ai_id
-    resolved = []
-    for raw in list(explicit_ids or []) + re.findall(r"@([^\s@]+)", content or ""):
-        key = str(raw).strip().lower()
-        key = key.strip(string.punctuation + "，。！？、；：）】》」』…")
-        ai_id = name_to_id.get(key) or AI_ALIASES.get(key, key)
-        if ai_id in allowed and ai_id not in resolved:
-            resolved.append(ai_id)
-    return resolved
-
-
 async def _capture_social_exchange(post_id: int, ai_id: str, user_text: str, ai_text: str):
     """Let social replies enter the memory buffer as small-group context."""
     try:
