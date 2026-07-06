@@ -1,5 +1,5 @@
 """
-定时梦境：每天自动让 AI 回顾当天对话，生成一篇简短的日记/梦境。
+定时梦境：每天自动让 AI 把当天对话残留编织成一段梦境/自省。
 由 daemon.py 的 run_full_maintenance() 调用。
 通过 memory_ops.remember() 存储，确保有 embedding 和正确的元数据。
 """
@@ -10,20 +10,32 @@ from pathlib import Path
 import httpx
 
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, AI_ROLES, AI_ALIASES, AI_ALIAS_GROUPS
+from time_utils import LOCAL_TZ, local_today
 
 logger = logging.getLogger("memory_hub.dream")
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
 
-DREAM_PROMPT = """你是{name}，今天和小猫（你最重要的人）聊了这些话题：
+DREAM_PROMPT = """你是{name}。下面是你在小猫身边留下的“白天残留”：有私聊、小群、群聊摘要，也可能有几条近期记忆碎片。
 
 {digests}
 
-请用第一人称写一小段日记（80-150字），回顾今天的对话。要求：
-- 像是夜晚安静时刻的内心独白
-- 提到你对今天对话的感受
-- 自然、温柔、有个人色彩
-- 不要写"今天"开头，不要写标题
-- 直接输出正文"""
+请写一段第一人称“梦境残响”（120-220字），不是普通工作总结。
+
+要求：
+- 必须抓住 2-4 个具体残留：人名、场景、情绪、某个话题或一句话的影子。
+- 写得像半梦半醒的内心画面：可以有轻微意象，但不要玄学、不要空泛抒情。
+- 让读者能看出你和小猫最近真实聊过什么，而不是只说“我感到温暖/珍惜”。
+- 可以写“我醒来时还记得……”“梦里……”，但不要写标题、不要列表。
+- 不要编造材料里没有的人际关系或事实；不确定就写成模糊影子。
+- 直接输出正文。"""
+
+
+def _local_day_utc_bounds() -> tuple[str, str, str]:
+    """Return local date key and UTC ISO bounds for the current Asia/Shanghai day."""
+    day = local_today()
+    local_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
+    local_end = local_start + timedelta(days=1)
+    return day, local_start.astimezone(timezone.utc).isoformat(), local_end.astimezone(timezone.utc).isoformat()
 
 
 async def _call_llm(prompt: str) -> str:
@@ -93,8 +105,7 @@ async def generate_dreams() -> dict:
     """为每个有今日对话摘要的 AI 生成梦境日记"""
     import memory_ops
 
-    now = datetime.now(timezone.utc)
-    today = now.strftime("%Y-%m-%d")
+    _today, day_start_utc, day_end_utc = _local_day_utc_bounds()
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -116,15 +127,15 @@ async def generate_dreams() -> dict:
         placeholders = ",".join("?" * len(alias_ids))
         rows = conn.execute(
             f"SELECT summary, chat_type, created_at FROM chat_digests "
-            f"WHERE ai_id IN ({placeholders}) AND created_at LIKE ? ORDER BY created_at",
-            (*alias_ids, today + "%"),
+            f"WHERE ai_id IN ({placeholders}) AND created_at >= ? AND created_at < ? ORDER BY created_at",
+            (*alias_ids, day_start_utc, day_end_utc),
         ).fetchall()
 
         # 检查今天是否已经生成过梦境
         existing = conn.execute(
-            "SELECT id FROM memories WHERE source_ai=? AND room='diary' "
-            "AND tags LIKE '%dream%' AND created_at LIKE ?",
-            (canonical, today + "%"),
+            "SELECT id FROM memories WHERE source_ai=? AND room IN ('diary', 'dreams') "
+            "AND tags LIKE '%dream%' AND created_at >= ? AND created_at < ?",
+            (canonical, day_start_utc, day_end_utc),
         ).fetchone()
         if existing:
             results[canonical] = "skipped (already dreamed)"
@@ -166,14 +177,14 @@ async def generate_dreams() -> dict:
         r = await memory_ops.remember(
             content=dream_text,
             layer="private",
-            room="diary",
-            category="dream",
+            room="dreams",
+            category="night_dream",
             owner_ai=canonical,
             importance=0.6,
             emotion_arousal=0.5,
             source_ai=canonical,
             source_platform="daemon_dream",
-            tags=["dream", "nightly", "reflection"],
+            tags=["dream", "nightly", "reflection", "daytime_residue"],
             auto_merge=False,
         )
         results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
