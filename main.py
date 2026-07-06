@@ -344,6 +344,14 @@ class ContextRequest(BaseModel):
     max_memories: Optional[int] = None
     force_corridor: bool = False
 
+@app.get("/api/chat-digests/threads")
+async def api_chat_digest_threads(authorization: str = Header(default="")):
+    """Recent chats with digests; used by observatory wake preview."""
+    verify_secret(authorization)
+    from chat_digest import list_recent_digest_threads
+    return {"threads": list_recent_digest_threads(limit=30, include_types=["small_group", "big_group", "private_group", "group"])}
+
+
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)

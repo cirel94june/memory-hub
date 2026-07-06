@@ -176,11 +176,13 @@ function WakePreview({ auth }) {
   const [message, setMessage] = useState("我今天想让你回忆一下最近我们聊过什么");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [chatThreads, setChatThreads] = useState([]);
+  const [selectedChatId, setSelectedChatId] = useState("");
 
   const surfaceMap = {
     private: { label: "私聊", chatType: "private", chatId: `preview:private:${aiId}` },
     social: { label: "朋友圈/论坛", chatType: "private_group", chatId: `social:${aiId}` },
-    group: { label: "群聊", chatType: "private_group", chatId: "preview:group" },
+    group: { label: "群聊", chatType: "private_group", chatId: selectedChatId || "preview:group" },
     mcp: { label: "MCP 唤醒", chatType: "private", chatId: `mcp:${aiId}` },
   };
 
@@ -208,7 +210,18 @@ function WakePreview({ auth }) {
     setLoading(false);
   };
 
-  useEffect(() => { preview(); }, [aiId, surface]);
+  useEffect(() => {
+    fetch("/api/chat-digests/threads", { headers: auth })
+      .then((r) => r.ok ? r.json() : { threads: [] })
+      .then((data) => {
+        const threads = data.threads || [];
+        setChatThreads(threads);
+        if (!selectedChatId && threads.length) setSelectedChatId(threads[0].chat_id);
+      })
+      .catch(() => setChatThreads([]));
+  }, []);
+
+  useEffect(() => { preview(); }, [aiId, surface, selectedChatId]);
 
   return (
     <div className="glass" style={{ padding: "var(--space-md)" }}>
@@ -222,6 +235,14 @@ function WakePreview({ auth }) {
         <select className="input" value={surface} onChange={(e) => { setSurface(e.target.value); setResult(null); }}>
           {Object.entries(surfaceMap).map(([key, cfg]) => <option key={key} value={key}>{cfg.label}</option>)}
         </select>
+        {surface === "group" && (
+          <select className="input" value={selectedChatId} onChange={(e) => { setSelectedChatId(e.target.value); setResult(null); }}>
+            {chatThreads.length === 0 && <option value="">没有最近群聊摘要</option>}
+            {chatThreads.map((t) => (
+              <option key={`${t.chat_id}:${t.chat_type}`} value={t.chat_id}>{t.chat_id} · {t.digest_count || 0}条摘要</option>
+            ))}
+          </select>
+        )}
         <button className="btn btn-primary" onClick={preview} disabled={loading}>
           <RefreshCw size={14} /> {loading ? "读取中" : "预览"}
         </button>
@@ -241,6 +262,7 @@ function WakePreview({ auth }) {
             <StatusPill>{result.chat_type || surfaceMap[surface]?.chatType}</StatusPill>
             <StatusPill>{result.chat_id || surfaceMap[surface]?.chatId}</StatusPill>
             {result.corridor_forced && <StatusPill tone="warn">强制刷新走廊</StatusPill>}
+            {surface === "group" && <StatusPill>{result.group_activity_count || 0} 条群内AI摘要</StatusPill>}
             <StatusPill>{result.memory_count || 0} 条相关记忆</StatusPill>
             <StatusPill>{result.estimated_tokens || 0} token 估算</StatusPill>
             {result.detail_mode && <StatusPill tone="warn">细节模式</StatusPill>}
@@ -266,7 +288,7 @@ function WakePreview({ auth }) {
   );
 }
 
-function LivingRoomRefresh({ auth, onOpenMemories }) {
+function LivingRoomRefresh({ auth }) {
   const [suggestions, setSuggestions] = useState([]);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -302,8 +324,11 @@ function LivingRoomRefresh({ auth, onOpenMemories }) {
           <Sparkles size={16} /> 客厅画像
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button className="btn btn-ghost" onClick={onOpenMemories}>
-            <Pencil size={14} /> 编辑客厅
+          <button className="btn btn-ghost" onClick={() => { window.location.href = "/app/memories?room=living_room"; }}>
+            <Pencil size={14} /> 编辑用户画像
+          </button>
+          <button className="btn btn-ghost" onClick={() => { window.location.href = "/app/memories?room=relationships"; }}>
+            <Pencil size={14} /> 编辑人物关系
           </button>
           <button className="btn btn-primary" onClick={() => refresh(true)} disabled={loading || writing}>
             <RefreshCw size={14} /> {loading ? "生成中" : "生成建议"}
@@ -435,7 +460,7 @@ export default function ObservatoryPage() {
       {tab === "memories" && <MemoriesHubPage />}
       {tab === "overview" && (
         <>
-          <LivingRoomRefresh auth={auth} onOpenMemories={() => { window.location.href = "/app/memories?room=living_room"; }} />
+          <LivingRoomRefresh auth={auth} />
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
             <Metric icon={Gauge} label="活跃记忆" value={summary.total ?? "—"} />
             <Metric icon={Shield} label="保护中" value={summary.protected ?? 0} tone="good" />

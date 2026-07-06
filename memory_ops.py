@@ -1062,7 +1062,7 @@ async def fix_private_capture_layers(dry_run: bool = True) -> dict:
 # ── 记忆衰减（含情感维度） ──
 PROTECTION_REASON_TEXT = {
     "anchored": "你手动设为了锚点：它不参与衰减，和重要度高低无关。",
-    "living_room": "它在客厅：客厅是核心身份和当前状态，默认给最高保护。",
+    "living_room": "它在客厅：这是核心身份或当前状态，会优先注入，但仍应随新信息更新。",
     "high_importance": "重要度达到 80% 以上：系统把它当作长期重要记忆。",
     "often_recalled": "它已经被召回至少 3 次：说明 AI 经常用到它。",
     "emotionally_strong": "情绪唤醒度较高：强情绪记忆会衰减更慢。",
@@ -1145,9 +1145,13 @@ def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
     if days >= 30:
         pressures.append("old")
 
-    if anchored or room == "living_room":
+    if anchored:
         lane = "protected"
         recommendation = "keep"
+        will_archive = False
+    elif room == "living_room":
+        lane = "long_term"
+        recommendation = "refresh_if_outdated" if "old" in pressures else "keep"
         will_archive = False
     elif room_cfg.get("fast_decay") or (is_auto and importance < 0.65 and activations == 0):
         lane = "short_term"

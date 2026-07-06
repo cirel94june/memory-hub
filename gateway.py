@@ -37,11 +37,11 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
-async def _tag_pulse(user_message: str, ai_id: str):
+async def _tag_pulse(user_message: str, ai_id: str, ai_response: str = ""):
     """用小模型给用户消息打 9 维度情绪 delta，fire-and-forget"""
     if not LLM_API_KEY or not user_message.strip():
         return
-    prompt = f"""你是情绪状态打标器。给一句用户发给 AI 的话，输出它对 9 个内在维度的影响。只输出 JSON，不要解释。
+    prompt = f"""你是情绪状态打标器。给一轮用户和 AI 的对话，输出它对该 AI 的 9 个内在维度的影响。只输出 JSON，不要解释。
 
 9 维度：活力, 疲惫, 思慕, 亲密, 守护, 渴求, 醋意, 焦虑, 温柔
 
@@ -68,6 +68,9 @@ async def _tag_pulse(user_message: str, ai_id: str):
     try:
         url = f"{LLM_BASE_URL}/chat/completions"
         async with httpx.AsyncClient(timeout=15) as client:
+            dialogue = f"用户: {user_message[:500]}"
+            if ai_response:
+                dialogue += f"\nAI: {ai_response[:500]}"
             resp = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {LLM_API_KEY}"},
@@ -75,7 +78,7 @@ async def _tag_pulse(user_message: str, ai_id: str):
                     "model": LLM_MODEL,
                     "messages": [
                         {"role": "system", "content": prompt},
-                        {"role": "user", "content": user_message[:500]},
+                        {"role": "user", "content": dialogue},
                     ],
                     "temperature": 0.3,
                     "max_tokens": 120,
@@ -203,6 +206,7 @@ async def build_context(
     parts = []
     recalled_ids = []
     rooms_checked = ["living_room"]
+    group_activity = []
     detail_mode = _wants_detail(user_message)
     memory_limit = max_memories or (3 if compact and not detail_mode else 5)
     content_limit = 180 if compact and not detail_mode else 360
@@ -220,11 +224,31 @@ async def build_context(
         try:
             from chat_digest import get_recent_chat_activity
             group_digests = get_recent_chat_activity(chat_id, exclude_ai_id=ai_id, limit=4)
+            group_activity = group_digests
             if group_digests:
                 lines = [f"· {d.get('ai_id', 'AI')}: {d['summary']}" for d in group_digests]
                 parts.append("【这个群里其他AI最近在聊】\n" + "\n".join(lines))
         except Exception:
             pass
+    # Fresh unresolved items are read live, so task reminders do not wait for corridor rebuilds.
+    try:
+        import database
+        unresolved = []
+        for mem in database.iter_memories(status="active"):
+            if mem.get("resolved") is not False:
+                continue
+            if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
+                continue
+            if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
+                continue
+            unresolved.append(mem)
+        unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
+        if unresolved:
+            lines = [f"· {m.get('content','')[:180]}" for m in unresolved[:3]]
+            parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
+    except Exception:
+        pass
+
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
@@ -283,6 +307,7 @@ async def build_context(
         "chat_id": chat_id,
         "chat_type": chat_type,
         "corridor_forced": force_corridor,
+        "group_activity_count": len(group_activity),
         "recalled_ids": recalled_ids,
         "rooms_checked": list(set(rooms_checked)),
         "recall_summary": recall_summary,
@@ -521,7 +546,7 @@ AI回复：{ai_response[:1500]}
         pass
 
     # 9 维度情绪打标（fire-and-forget，不阻塞返回）
-    asyncio.ensure_future(_tag_pulse(user_message, ai_id))
+    asyncio.ensure_future(_tag_pulse(user_message, ai_id, ai_response))
 
     # 生成简要的存储摘要（供前端展示）
     store_summary = ""

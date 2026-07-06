@@ -56,7 +56,7 @@ def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
         from gateway import _tag_pulse
 
         canonical = AI_ALIASES.get(ai_id, ai_id)
-        asyncio.create_task(_tag_pulse(user_message, canonical))
+        asyncio.create_task(_tag_pulse(user_message, canonical, ai_response))
         logger.info(f"[Pulse] queued update for {canonical} from capture/log")
     except Exception as e:
         logger.warning(f"[Pulse] capture update skipped: {e}")

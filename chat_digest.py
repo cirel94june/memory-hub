@@ -211,3 +211,25 @@ def get_recent_chat_activity(
     results = [dict(r) for r in cur]
     conn.close()
     return results
+
+
+def list_recent_digest_threads(limit: int = 20, include_types: list[str] | None = None) -> list[dict]:
+    """List recent chat ids that have digests, for wake-preview selection."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    params: list = []
+    type_filter = ""
+    if include_types:
+        placeholders = ", ".join(["?"] * len(include_types))
+        type_filter = f"WHERE chat_type IN ({placeholders})"
+        params.extend(include_types)
+    params.append(limit)
+    cur = conn.execute(
+        "SELECT chat_id, chat_type, MAX(created_at) AS last_at, COUNT(*) AS digest_count "
+        "FROM chat_digests " + type_filter +
+        " GROUP BY chat_id, chat_type ORDER BY last_at DESC LIMIT ?",
+        tuple(params),
+    )
+    rows = [dict(r) for r in cur if r["chat_id"]]
+    conn.close()
+    return rows
