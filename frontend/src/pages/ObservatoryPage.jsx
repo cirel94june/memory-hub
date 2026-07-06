@@ -5,6 +5,9 @@ import {
   Archive,
   Eye,
   Gauge,
+  CheckCircle,
+  Pencil,
+  Sparkles,
   RefreshCw,
   Shield,
   Timer,
@@ -262,6 +265,87 @@ function WakePreview({ auth }) {
     </div>
   );
 }
+
+function LivingRoomRefresh({ auth, onOpenMemories }) {
+  const [suggestions, setSuggestions] = useState([]);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [writing, setWriting] = useState(false);
+
+  const refresh = async (dryRun = true) => {
+    if (dryRun) setLoading(true);
+    else setWriting(true);
+    setResult(null);
+    try {
+      const res = await fetch("/api/memory/living-room/refresh", {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ dry_run: dryRun, source_ai: "observatory" }),
+      });
+      const data = res.ok ? await res.json() : { error: await res.text() };
+      if (dryRun) setSuggestions(data.actions || []);
+      else {
+        setResult(data);
+        setSuggestions([]);
+      }
+    } catch (e) {
+      setResult({ error: String(e) });
+    }
+    setLoading(false);
+    setWriting(false);
+  };
+
+  return (
+    <section className="glass" style={{ padding: "var(--space-md)", marginBottom: "var(--space-md)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--text-primary)", fontWeight: 700 }}>
+          <Sparkles size={16} /> 客厅画像
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="btn btn-ghost" onClick={onOpenMemories}>
+            <Pencil size={14} /> 编辑客厅
+          </button>
+          <button className="btn btn-primary" onClick={() => refresh(true)} disabled={loading || writing}>
+            <RefreshCw size={14} /> {loading ? "生成中" : "生成建议"}
+          </button>
+          <button className="btn btn-ghost" onClick={() => refresh(false)} disabled={loading || writing || !suggestions.length}>
+            <CheckCircle size={14} /> {writing ? "写入中" : "写入建议"}
+          </button>
+        </div>
+      </div>
+
+      {result?.error && <div style={{ color: "#b91c1c", fontSize: 13 }}>{result.error}</div>}
+      {result && !result.error && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          <StatusPill tone="good">已写入 {result.count || 0} 条</StatusPill>
+          <StatusPill>走廊已刷新</StatusPill>
+        </div>
+      )}
+      {suggestions.length > 0 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {suggestions.map((item, index) => (
+            <div key={`${item.content}-${index}`} style={{
+              border: "1px solid var(--glass-border)",
+              borderRadius: "var(--radius-sm)",
+              padding: "9px 10px",
+              background: "var(--bg-card)",
+            }}>
+              <div style={{ fontSize: 13, lineHeight: 1.5, color: "var(--text-primary)" }}>{item.content}</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 7 }}>
+                <StatusPill>{item.category || "profile"}</StatusPill>
+                <StatusPill>{Math.round((item.importance || 0) * 100)}% 重要度</StatusPill>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
+          用后台模型从近期稳定记忆里整理用户画像、重要人物和当前状态；写入前会先在这里显示建议。
+        </div>
+      )}
+    </section>
+  );
+}
 function PanelList({ icon: Icon, title, items, empty, onOpen }) {
   return (
     <div className="glass" style={{ padding: "var(--space-md)" }}>
@@ -317,7 +401,7 @@ export default function ObservatoryPage() {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: "var(--space-md)" }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 21, fontWeight: 760, color: "var(--text-primary)" }}>观测台</h2>
-          <div style={{ marginTop: 4, fontSize: 12, color: "var(--text-muted)" }}>后台整理、衰减分层、时间线、热力图和记忆编辑</div>
+          <div style={{ marginTop: 4, fontSize: 12, color: "var(--text-muted)" }}>后台整理、衰减分层、醒来预览和记忆库</div>
         </div>
         <button className="btn btn-primary" onClick={load} disabled={loading} style={{ flexShrink: 0 }}>
           <RefreshCw size={14} /> {loading ? "刷新中" : "刷新"}
@@ -326,7 +410,7 @@ export default function ObservatoryPage() {
 
       <div className="glass" style={{
         display: "grid",
-        gridTemplateColumns: "repeat(4, 1fr)",
+        gridTemplateColumns: "repeat(3, 1fr)",
         gap: 4,
         padding: 4,
         marginBottom: "var(--space-md)",
@@ -334,8 +418,7 @@ export default function ObservatoryPage() {
         {[
           ["overview", "总览"],
           ["wake", "醒来预览"],
-          ["timeline", "时间线"],
-          ["edit", "记忆编辑"],
+          ["memories", "记忆库"],
         ].map(([key, title]) => (
           <button
             key={key}
@@ -349,10 +432,10 @@ export default function ObservatoryPage() {
       </div>
 
       {tab === "wake" && <WakePreview auth={auth} />}
-      {tab === "timeline" && <MemoriesHubPage initialView="timeline" />}
-      {tab === "edit" && <MemoriesHubPage />}
+      {tab === "memories" && <MemoriesHubPage />}
       {tab === "overview" && (
         <>
+          <LivingRoomRefresh auth={auth} onOpenMemories={() => { window.location.href = "/app/memories?room=living_room"; }} />
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
             <Metric icon={Gauge} label="活跃记忆" value={summary.total ?? "—"} />
             <Metric icon={Shield} label="保护中" value={summary.protected ?? 0} tone="good" />
