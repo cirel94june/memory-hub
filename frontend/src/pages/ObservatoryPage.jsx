@@ -195,6 +195,7 @@ function WakePreview({ auth }) {
           chat_type: cfg.chatType,
           compact: false,
           max_memories: 5,
+          force_corridor: true,
         }),
       });
       setResult(res.ok ? await res.json() : { error: await res.text() });
@@ -204,7 +205,7 @@ function WakePreview({ auth }) {
     setLoading(false);
   };
 
-  useEffect(() => { preview(); }, []);
+  useEffect(() => { preview(); }, [aiId, surface]);
 
   return (
     <div className="glass" style={{ padding: "var(--space-md)" }}>
@@ -212,10 +213,10 @@ function WakePreview({ auth }) {
         <Eye size={16} /> 醒来预览
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginBottom: 10 }}>
-        <select className="input" value={aiId} onChange={(e) => setAiId(e.target.value)}>
+        <select className="input" value={aiId} onChange={(e) => { setAiId(e.target.value); setResult(null); }}>
           {socialProfiles.map((p) => <option key={p.ai_id} value={p.ai_id}>{p.name || p.ai_id}</option>)}
         </select>
-        <select className="input" value={surface} onChange={(e) => setSurface(e.target.value)}>
+        <select className="input" value={surface} onChange={(e) => { setSurface(e.target.value); setResult(null); }}>
           {Object.entries(surfaceMap).map(([key, cfg]) => <option key={key} value={key}>{cfg.label}</option>)}
         </select>
         <button className="btn btn-primary" onClick={preview} disabled={loading}>
@@ -233,6 +234,10 @@ function WakePreview({ auth }) {
       {result && !result.error && (
         <>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+            <StatusPill>{result.requested_ai_id || aiId} → {result.ai_id || aiId}</StatusPill>
+            <StatusPill>{result.chat_type || surfaceMap[surface]?.chatType}</StatusPill>
+            <StatusPill>{result.chat_id || surfaceMap[surface]?.chatId}</StatusPill>
+            {result.corridor_forced && <StatusPill tone="warn">强制刷新走廊</StatusPill>}
             <StatusPill>{result.memory_count || 0} 条相关记忆</StatusPill>
             <StatusPill>{result.estimated_tokens || 0} token 估算</StatusPill>
             {result.detail_mode && <StatusPill tone="warn">细节模式</StatusPill>}
