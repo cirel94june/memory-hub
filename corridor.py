@@ -17,6 +17,7 @@ from config import AI_ROLES
 import github_store as store
 
 log = logging.getLogger("corridor")
+CORRIDOR_CACHE_TTL_MINUTES = 5
 
 
 async def build_corridor(ai_id: str) -> str:
@@ -126,17 +127,17 @@ async def build_corridor(ai_id: str) -> str:
     return corridor_text
 
 
-async def get_corridor(ai_id: str) -> str:
-    """获取走廊文档（优先从缓存读，超过6小时自动重建）"""
+async def get_corridor(ai_id: str, force: bool = False) -> str:
+    """获取走廊文档（短缓存；force=True 时立即重建）。"""
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
-    cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
+    cached = None if force else await store._read_github_file(f"private/{ai_id}/_corridor.json")
     if cached and isinstance(cached, dict) and cached.get("text"):
         try:
             compiled = datetime.fromisoformat(cached.get("compiled_at", ""))
-            age_hours = (datetime.now(timezone.utc) - compiled).total_seconds() / 3600
-            if age_hours <= 1:
+            age_minutes = (datetime.now(timezone.utc) - compiled).total_seconds() / 60
+            if age_minutes <= CORRIDOR_CACHE_TTL_MINUTES:
                 return cached["text"]
-            log.info(f"Corridor for {ai_id} is {age_hours:.1f}h old, rebuilding")
+            log.info(f"Corridor for {ai_id} is {age_minutes:.1f}m old, rebuilding")
         except Exception:
             pass
     return await build_corridor(ai_id)
