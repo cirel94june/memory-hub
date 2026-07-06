@@ -186,6 +186,7 @@ async def build_context(
     chat_type: str = "",
     compact: bool = True,
     max_memories: int | None = None,
+    force_corridor: bool = False,
 ) -> dict:
     """
     核心功能：在 AI 回复之前，自动组装要注入的记忆 context。
@@ -197,6 +198,7 @@ async def build_context(
         "rooms_checked": ["检查了哪些房间"]
     }
     """
+    requested_ai_id = ai_id
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     parts = []
     recalled_ids = []
@@ -207,7 +209,7 @@ async def build_context(
     source_limit = 0 if compact and not detail_mode else 140
 
     # 1. 注入走廊（已经包含客厅精华 + 关系 + 跨端动态）
-    corridor_text = await get_corridor(ai_id)
+    corridor_text = await get_corridor(ai_id, force=force_corridor)
     if corridor_text:
         parts.append(corridor_text)
 
@@ -276,6 +278,11 @@ async def build_context(
 
     return {
         "inject_text": inject_text,
+        "requested_ai_id": requested_ai_id,
+        "ai_id": ai_id,
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "corridor_forced": force_corridor,
         "recalled_ids": recalled_ids,
         "rooms_checked": list(set(rooms_checked)),
         "recall_summary": recall_summary,
@@ -447,7 +454,7 @@ AI回复：{ai_response[:1500]}
 
     # 执行提取到的动作（importance < 0.4 的直接丢弃，与 prompt 一致）
     executed = []
-    _refusal_kw = ["i can't", "i cannot", "as an ai", "作为ai", "我是ai", "作为语言模型", "无法扮演"]
+    _refusal_kw = ["i can't", "i cannot", "as an ai", "作为ai", "我是ai", "我是一个ai", "作为语言模型", "无法扮演"]
     valid_rooms = set(ROOMS.keys())
     valid_about = {"user", "interaction", "ai"}
 
@@ -540,3 +547,96 @@ AI回复：{ai_response[:1500]}
     return {"actions": executed, "store_summary": store_summary}
 
 
+
+async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "system") -> dict:
+    """Suggest or write fresh living-room profile memories from active shared memories."""
+    import database
+    import corridor as corridor_mod
+
+    profile_rooms = {"living_room", "relationships", "career", "health", "psychology", "preferences", "learning"}
+    candidates = []
+    for mem in database.iter_memories(status="active"):
+        if mem.get("layer", "shared") != "shared":
+            continue
+        if mem.get("room") not in profile_rooms:
+            continue
+        candidates.append(mem)
+    candidates.sort(key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
+
+    living = await get_living_room()
+    current_text = "\n".join(f"- {m.get('content','')[:220]}" for m in living[:30])
+    evidence_text = "\n".join(
+        f"- [{m.get('room','')}/{m.get('category','')}] {m.get('content','')[:220]}"
+        for m in candidates[:80]
+    )
+    if not evidence_text.strip():
+        return {"dry_run": dry_run, "actions": [], "message": "没有足够材料刷新客厅画像"}
+
+    prompt = f"""你是 Memory Hub 的客厅画像维护器。请根据现有记忆，提出需要写入或更新到 living_room 的核心画像。
+
+客厅只放会长期帮助 AI 认识用户和重要人物的内容：
+- 用户当前基本情况、身份、长期状态
+- 最近已经稳定下来的状态变化
+- 用户反复提到的重要人物/关系画像
+- 明确偏好、雷区、照护方式
+
+不要写：普通聊天、一次性情绪、未经证实推测、AI 自己的感受、过时信息。
+如果同一事实已在当前客厅里表达清楚，不要重复。
+每条 <=120 字，写成可直接进入记忆库的中文事实。
+
+【当前客厅】
+{current_text or '（空）'}
+
+【可参考的近期/高相关记忆】
+{evidence_text}
+
+只输出 JSON：
+{{"actions":[{{"content":"...","category":"profile/person/relationship/preference/status","importance":0.75}}]}}
+"""
+    raw = await _call_llm(prompt)
+    data = {"actions": []}
+    if raw:
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            data = json.loads(cleaned)
+        except Exception:
+            data = {"actions": []}
+
+    actions = []
+    for item in data.get("actions", []):
+        content = (item.get("content") or "").strip()
+        if len(content) < 8:
+            continue
+        actions.append({
+            "content": content[:160],
+            "category": item.get("category", "profile") or "profile",
+            "importance": max(0.7, min(1.0, float(item.get("importance", 0.8)))),
+        })
+
+    if dry_run:
+        return {"dry_run": True, "actions": actions, "count": len(actions)}
+
+    written = []
+    for item in actions[:12]:
+        result = await remember(
+            content=item["content"],
+            layer="shared",
+            room="living_room",
+            category=item["category"],
+            importance=item["importance"],
+            emotion_arousal=0.35,
+            source_ai=source_ai,
+            source_platform="living_room_refresh",
+            auto_analyze=False,
+            quick=False,
+        )
+        written.append({**item, "result": result})
+
+    if written:
+        try:
+            await corridor_mod.rebuild_all_corridors()
+        except Exception:
+            pass
+    return {"dry_run": False, "written": written, "count": len(written)}
