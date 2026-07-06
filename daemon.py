@@ -755,6 +755,16 @@ async def run_full_maintenance() -> dict:
 
     # 4. 客厅整理
     await run_step("living_room", "Tidy living room", tidy_living_room)
+    # 4.5. 自动刷新客厅/人物画像（前台仍保留 dry_run 建议按钮）
+    try:
+        from gateway import refresh_living_room_profile
+        await run_step(
+            "living_room_profile",
+            "Refresh living room profiles",
+            lambda: refresh_living_room_profile(dry_run=False, source_ai="daemon"),
+        )
+    except Exception as e:
+        log.warning(f"  Living room profile refresh failed: {e}")
 
     # 5. 心理感悟蒸馏
     await run_step("psychology", "Distill psychology", distill_psychology)

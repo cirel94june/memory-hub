@@ -37,6 +37,14 @@ async def build_corridor(ai_id: str) -> str:
                     if m.get("room") == "relationship" and m.get("owner_ai") == ai_id
                     and m.get("status") == "active"]
 
+    # 2.5. 共享人物/关系画像（常被提到的人、AI、昵称、关系边界）
+    shared_relationships = sorted(
+        [m for m in all_mems.values()
+         if m.get("room") == "relationships" and m.get("status") == "active"
+         and m.get("layer", "shared") == "shared"],
+        key=lambda x: (float(x.get("importance", 0) or 0), x.get("updated_at") or x.get("created_at") or ""),
+        reverse=True,
+    )[:8]
     # 3. 该 AI 最近的日记/周记（最新3条）
     diary = sorted(
         [m for m in all_mems.values()
@@ -73,6 +81,8 @@ async def build_corridor(ai_id: str) -> str:
     if living:
         sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in living[:8]))
 
+    if shared_relationships:
+        sections.append("【重要人物/关系索引】\n" + "\n".join(f"· {m['content'][:180]}" for m in shared_relationships))
     if relationship:
         sections.append("【你和主人之间】\n" + "\n".join(f"· {x}" for x in relationship[:5]))
 

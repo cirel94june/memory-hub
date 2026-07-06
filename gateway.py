@@ -213,18 +213,7 @@ async def build_context(
     if corridor_text:
         parts.append(corridor_text)
 
-    # 1.5. 跨窗口摘要（让当前聊天知道其他窗口最近聊了什么）
-    if chat_id:
-        try:
-            from chat_digest import get_recent_digests
-            digests = get_recent_digests(ai_id, exclude_chat_id=chat_id, limit=3)
-            if digests:
-                lines = [f"· {d['summary']}" for d in digests]
-                parts.append("【其他聊天窗口最近在聊】\n" + "\n".join(lines))
-        except Exception:
-            pass
-
-    # 直接搜全部房间（RRF + reranker 自然筛选，省掉 LLM room judge 的延迟）
+    # Cross-window digests are already included in the corridor; avoid duplicating them here.
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
@@ -549,49 +538,67 @@ AI回复：{ai_response[:1500]}
 
 
 async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "system") -> dict:
-    """Suggest or write fresh living-room profile memories from active shared memories."""
+    """Suggest or write fresh shared profile memories from active memories."""
     import database
     import corridor as corridor_mod
 
-    profile_rooms = {"living_room", "relationships", "career", "health", "psychology", "preferences", "learning"}
+    profile_rooms = {
+        "living_room", "relationships", "career", "health", "psychology",
+        "preferences", "learning", "social",
+    }
     candidates = []
     for mem in database.iter_memories(status="active"):
         if mem.get("layer", "shared") != "shared":
             continue
-        if mem.get("room") not in profile_rooms:
+        room = mem.get("room")
+        if room not in profile_rooms:
+            continue
+        # Social memories are useful for named people, but keep low-signal chatter out.
+        if room == "social" and float(mem.get("importance", 0.0) or 0.0) < 0.45:
             continue
         candidates.append(mem)
     candidates.sort(key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
 
     living = await get_living_room()
     current_text = "\n".join(f"- {m.get('content','')[:220]}" for m in living[:30])
+    relationship_text = "\n".join(
+        f"- {m.get('content','')[:220]}"
+        for m in candidates
+        if m.get("room") == "relationships"
+    )[:5000]
     evidence_text = "\n".join(
         f"- [{m.get('room','')}/{m.get('category','')}] {m.get('content','')[:220]}"
-        for m in candidates[:80]
+        for m in candidates[:90]
     )
     if not evidence_text.strip():
-        return {"dry_run": dry_run, "actions": [], "message": "没有足够材料刷新客厅画像"}
+        return {"dry_run": dry_run, "actions": [], "message": "没有足够材料刷新画像"}
 
-    prompt = f"""你是 Memory Hub 的客厅画像维护器。请根据现有记忆，提出需要写入或更新到 living_room 的核心画像。
+    prompt = f"""你是 Memory Hub 的画像维护器。请根据现有记忆，提出需要写入或更新的共享画像。
 
-客厅只放会长期帮助 AI 认识用户和重要人物的内容：
-- 用户当前基本情况、身份、长期状态
-- 最近已经稳定下来的状态变化
-- 用户反复提到的重要人物/关系画像
-- 明确偏好、雷区、照护方式
+目标：让 AI 每次醒来时能快速知道“用户是谁、最近稳定状态是什么、常被提到的人是谁、这些人和用户/AI 的关系是什么”，避免把人名、AI 名、关系搞混。
 
-不要写：普通聊天、一次性情绪、未经证实推测、AI 自己的感受、过时信息。
-如果同一事实已在当前客厅里表达清楚，不要重复。
-每条 <=120 字，写成可直接进入记忆库的中文事实。
+写入位置：
+- room="living_room"：只放用户核心画像、稳定状态、长期偏好/雷区、照护方式。
+- room="relationships"：放经常被提到的人、AI、昵称、关系、不要混淆的身份说明。例如“狗蛋是谁”“Lucien/Jasper/小克分别是谁”“某人与用户是什么关系”。
+
+规则：
+- 只写有记忆依据的内容，不要脑补。
+- 如果只知道名字但不知道细节，可以写成“用户经常提到X，但系统目前缺少更具体画像”，importance 不要太高。
+- 如果同一事实已在当前客厅或关系画像里表达清楚，不要重复。
+- 每条 <=140 字，写成可直接进入记忆库的中文事实。
+- 优先输出最近反复出现、容易混淆、或对 AI 回复很重要的人物/关系。
 
 【当前客厅】
 {current_text or '（空）'}
+
+【现有关系统画像】
+{relationship_text or '（空）'}
 
 【可参考的近期/高相关记忆】
 {evidence_text}
 
 只输出 JSON：
-{{"actions":[{{"content":"...","category":"profile/person/relationship/preference/status","importance":0.75}}]}}
+{{"actions":[{{"content":"...","room":"living_room 或 relationships","category":"profile/person/relationship/preference/status","importance":0.65}}]}}
 """
     raw = await _call_llm(prompt)
     data = {"actions": []}
@@ -604,15 +611,26 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
         except Exception:
             data = {"actions": []}
 
+    valid_rooms = {"living_room", "relationships"}
+    person_categories = {"person", "relationship"}
     actions = []
     for item in data.get("actions", []):
         content = (item.get("content") or "").strip()
         if len(content) < 8:
             continue
+        category = item.get("category", "profile") or "profile"
+        room = item.get("room") or ("relationships" if category in person_categories else "living_room")
+        if room not in valid_rooms:
+            room = "relationships" if category in person_categories else "living_room"
+        try:
+            importance = float(item.get("importance", 0.75))
+        except (TypeError, ValueError):
+            importance = 0.75
         actions.append({
-            "content": content[:160],
-            "category": item.get("category", "profile") or "profile",
-            "importance": max(0.7, min(1.0, float(item.get("importance", 0.8)))),
+            "content": content[:180],
+            "room": room,
+            "category": category,
+            "importance": max(0.55, min(1.0, importance)),
         })
 
     if dry_run:
@@ -623,7 +641,7 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
         result = await remember(
             content=item["content"],
             layer="shared",
-            room="living_room",
+            room=item["room"],
             category=item["category"],
             importance=item["importance"],
             emotion_arousal=0.35,
