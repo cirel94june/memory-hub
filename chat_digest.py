@@ -166,3 +166,48 @@ def get_recent_digests(
     results = [dict(r) for r in cur]
     conn.close()
     return results
+
+
+def get_recent_chat_activity(
+    chat_id: str,
+    exclude_ai_id: str = "",
+    limit: int = 5,
+    include_types: list[str] | None = None,
+) -> list[dict]:
+    """Get recent digests from other AIs in the same chat."""
+    if not chat_id:
+        return []
+
+    excluded = {exclude_ai_id}
+    if exclude_ai_id == "claude":
+        excluded.add("cloudy")
+    elif exclude_ai_id == "cloudy":
+        excluded.add("claude")
+    excluded.discard("")
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    params: list = [chat_id]
+    type_filter = ""
+    if include_types:
+        placeholders = ", ".join(["?"] * len(include_types))
+        type_filter = f" AND chat_type IN ({placeholders}) "
+        params.extend(include_types)
+
+    exclude_filter = ""
+    if excluded:
+        placeholders = ", ".join(["?"] * len(excluded))
+        exclude_filter = f" AND ai_id NOT IN ({placeholders}) "
+        params.extend(sorted(excluded))
+
+    params.append(limit)
+    cur = conn.execute(
+        "SELECT ai_id, chat_id, chat_type, summary, created_at FROM chat_digests "
+        "WHERE chat_id = ? " + type_filter + exclude_filter +
+        "ORDER BY created_at DESC LIMIT ?",
+        tuple(params),
+    )
+    results = [dict(r) for r in cur]
+    conn.close()
+    return results

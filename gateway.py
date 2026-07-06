@@ -214,6 +214,17 @@ async def build_context(
         parts.append(corridor_text)
 
     # Cross-window digests are already included in the corridor; avoid duplicating them here.
+    # In group chats, also show what other AIs in this chat recently talked about.
+    group_chat_types = {"private_group", "small_group", "big_group", "group"}
+    if chat_id and chat_type in group_chat_types:
+        try:
+            from chat_digest import get_recent_chat_activity
+            group_digests = get_recent_chat_activity(chat_id, exclude_ai_id=ai_id, limit=4)
+            if group_digests:
+                lines = [f"· {d.get('ai_id', 'AI')}: {d['summary']}" for d in group_digests]
+                parts.append("【这个群里其他AI最近在聊】\n" + "\n".join(lines))
+        except Exception:
+            pass
     recalled = await recall(
         query=user_message,
         ai_id=ai_id,
