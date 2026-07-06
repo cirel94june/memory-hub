@@ -344,9 +344,9 @@ async def get_memory_detail(memory_id: str) -> str:
 
 
 @mcp.tool()
-async def get_corridor() -> str:
-    """获取 Claude 的走廊文档 - AI醒来时读的第一份记忆上下文快照。"""
-    text = await corridor_mod.get_corridor("claude")
+async def get_corridor(source_ai: str = "claude", force: bool = False) -> str:
+    """获取指定 AI 的走廊文档 - AI醒来时读的第一份记忆上下文快照。"""
+    text = await corridor_mod.get_corridor(source_ai, force=force)
     return text or "（走廊为空）"
 
 
@@ -388,7 +388,7 @@ async def dream(content: str, source_ai: str = "claude") -> str:
 
 
 @mcp.tool()
-async def pulse(message: str = "", source_ai: str = "claude") -> str:
+async def pulse(message: str = "", source_ai: str = "claude", force_corridor: bool = False) -> str:
     """获取完整记忆上下文（走廊 + 与当前话题相关的记忆）。
     建议在对话开头调用一次，让你快速了解"我面对的是谁、她最近怎么样"。
 
@@ -401,6 +401,7 @@ async def pulse(message: str = "", source_ai: str = "claude") -> str:
     ctx = await gateway_mod.build_context(
         user_message=message or "",
         ai_id=source_ai,
+        force_corridor=force_corridor,
     )
     return ctx.get("inject_text", "") or "（暂无记忆上下文）"
 
