@@ -223,6 +223,8 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
         owner_ai=body.owner_ai, source_ai=body.source_ai,
         layer=body.layer, changed_by=body.changed_by,
     )
+    if not result.get("error"):
+        asyncio.create_task(corridor.rebuild_all_corridors())
     return result
 
 
@@ -267,6 +269,16 @@ async def api_living_room(authorization: str = Header(default="")):
     verify_secret(authorization)
     items = await memory_ops.get_living_room()
     return {"items": items}
+
+
+class LivingRoomRefreshRequest(BaseModel):
+    dry_run: bool = True
+    source_ai: str = "system"
+
+@app.post("/api/memory/living-room/refresh")
+async def api_refresh_living_room(body: LivingRoomRefreshRequest, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return await gateway_mod.refresh_living_room_profile(dry_run=body.dry_run, source_ai=body.source_ai)
 
 
 @app.post("/api/memory/deduplicate-public")
@@ -330,6 +342,7 @@ class ContextRequest(BaseModel):
     chat_type: str = ""
     compact: bool = True
     max_memories: Optional[int] = None
+    force_corridor: bool = False
 
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
@@ -342,6 +355,7 @@ async def api_build_context(body: ContextRequest, authorization: str = Header(de
         chat_type=body.chat_type,
         compact=body.compact,
         max_memories=body.max_memories,
+        force_corridor=body.force_corridor,
     )
 
 
@@ -489,11 +503,11 @@ async def api_test_llm(authorization: str = Header(default="")):
 # ── 走廊 ──
 
 @app.get("/api/corridor/{ai_id}")
-async def api_corridor(ai_id: str, authorization: str = Header(default="")):
+async def api_corridor(ai_id: str, force: bool = False, authorization: str = Header(default="")):
     """获取 AI 的走廊文档（醒来时读的第一份记忆）"""
     verify_secret(authorization)
-    text = await corridor.get_corridor(ai_id)
-    return {"ai_id": ai_id, "corridor": text}
+    text = await corridor.get_corridor(ai_id, force=force)
+    return {"ai_id": ai_id, "force": force, "corridor": text}
 
 
 @app.post("/api/corridor/{ai_id}/rebuild")
@@ -1725,6 +1739,7 @@ async def _social_call_llm(ai_id: str, prompt: str, max_tokens: int = 300) -> st
             ai_id=ai_id,
             recent_messages=[],
             chat_id=f"social:{ai_id}",
+            chat_type="private_group",
         )
         memory_text = ctx.get("inject_text", "")
         if memory_text:
