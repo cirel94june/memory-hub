@@ -312,3 +312,10 @@ python main.py
 - 新增 `POST /api/dream/run`：只触发夜梦生成，不必跑完整 daemon 维护，方便在观测台临时补跑。
 - 观测台总览新增“梦境诊断”卡片：能看到“今天已经做过梦 / 材料不足 / 小模型失败 / 已生成”，并可一键单独补跑。
 - `dream.py` 会写入 `data/dream_status.json`，让梦境 skip 不再只藏在后台日志里。
+
+### 2026-07-07 MCP 连接诊断与安全写入
+Memory Hub 的 MCP 入口现在会在启动时打印稳定身份信息：server name、version、/mcp path、工具数量和 tool schema hash。也可以用带 HUB_SECRET 的 /api/mcp/health?include_audit=true 查看同一份 identity 与最近 MCP 到达日志。
+
+如果 ChatGPT 网页端反复要求批准连接，优先对比这几个值是否变化：公网 URL 是否换了、工具列表/hash 是否换了、连接器配置是否重建。当前仓库的 MCP 是 FastMCP stateless HTTP，没有自建 OAuth/cookie/session；所以 cookie / OAuth 持久化问题通常在 ChatGPT 连接器或隧道层排查。
+
+记忆写入新增 safe_remember，普通 remember 和 batch_remember 也会走安全包装：长文本会先压缩；后端写入失败时只重试一次中性摘要；失败原文会写入 data/mcp_audit.jsonl 供排查，但不会无限原样重试。batch_remember 会逐条写入并返回每条 status，区分 created / merged / skipped / blocked / failed。若 ChatGPT 显示 工具调用被安全检查屏蔽但审计日志没有 tool_reached，说明请求没有到达 Memory Hub，是平台侧提前拦截。

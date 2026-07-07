@@ -50,7 +50,12 @@ async def lifespan(app: FastAPI):
     _mcp_inst.streamable_http_app()  # 确保 _session_manager 被创建
     _mcp_session_manager = _mcp_inst._session_manager
     async with _mcp_session_manager.run():
-        print("[Memory Hub] MCP server ready at /mcp")
+        try:
+            from mcp_server import get_mcp_identity
+            mcp_identity = get_mcp_identity()
+            print(f"[Memory Hub] MCP server ready at /mcp name={mcp_identity.get('name')} version={mcp_identity.get('version')} tools={len(mcp_identity.get('tools', []))} hash={mcp_identity.get('tool_schema_hash', '')[:12]}")
+        except Exception as exc:
+            print(f"[Memory Hub] MCP server ready at /mcp (identity unavailable: {exc})")
 
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
@@ -117,6 +122,19 @@ async def index():
 
 
 # ── 元信息 ──
+
+
+
+@app.get("/api/mcp/health")
+async def api_mcp_health(include_audit: bool = False, authorization: str = Header(default="")):
+    """查看 MCP server identity/hash 和最近到达日志，排查 ChatGPT 反复授权或平台侧拦截。"""
+    verify_secret(authorization)
+    from mcp_server import get_mcp_identity, _read_recent_audit
+    data = {"ok": True, "identity": get_mcp_identity()}
+    if include_audit:
+        data["recent_audit"] = _read_recent_audit(30)
+    return data
+
 
 @app.get("/api/info")
 async def info():
