@@ -51,9 +51,9 @@ async def lifespan(app: FastAPI):
     _mcp_session_manager = _mcp_inst._session_manager
     async with _mcp_session_manager.run():
         try:
-            from mcp_server import get_mcp_identity
-            mcp_identity = get_mcp_identity()
-            print(f"[Memory Hub] MCP server ready at /mcp name={mcp_identity.get('name')} version={mcp_identity.get('version')} tools={len(mcp_identity.get('tools', []))} hash={mcp_identity.get('tool_schema_hash', '')[:12]}")
+            from mcp_server import get_mcp_identity_async
+            mcp_identity = await get_mcp_identity_async()
+            print(f"[Memory Hub] MCP server ready at /mcp name={mcp_identity.get('name')} version={mcp_identity.get('version')} tools={mcp_identity.get('tool_count', len(mcp_identity.get('tools', [])))} hash={mcp_identity.get('tool_schema_hash', '')[:12]}")
         except Exception as exc:
             print(f"[Memory Hub] MCP server ready at /mcp (identity unavailable: {exc})")
 
@@ -129,8 +129,8 @@ async def index():
 async def api_mcp_health(include_audit: bool = False, authorization: str = Header(default="")):
     """查看 MCP server identity/hash 和最近到达日志，排查 ChatGPT 反复授权或平台侧拦截。"""
     verify_secret(authorization)
-    from mcp_server import get_mcp_identity, _read_recent_audit
-    data = {"ok": True, "identity": get_mcp_identity()}
+    from mcp_server import get_mcp_identity_async, _read_recent_audit
+    data = {"ok": True, "identity": await get_mcp_identity_async()}
     if include_audit:
         data["recent_audit"] = _read_recent_audit(30)
     return data

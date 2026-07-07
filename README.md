@@ -319,3 +319,8 @@ Memory Hub 的 MCP 入口现在会在启动时打印稳定身份信息：server 
 如果 ChatGPT 网页端反复要求批准连接，优先对比这几个值是否变化：公网 URL 是否换了、工具列表/hash 是否换了、连接器配置是否重建。当前仓库的 MCP 是 FastMCP stateless HTTP，没有自建 OAuth/cookie/session；所以 cookie / OAuth 持久化问题通常在 ChatGPT 连接器或隧道层排查。
 
 记忆写入新增 safe_remember，普通 remember 和 batch_remember 也会走安全包装：长文本会先压缩；后端写入失败时只重试一次中性摘要；失败原文会写入 data/mcp_audit.jsonl 供排查，但不会无限原样重试。batch_remember 会逐条写入并返回每条 status，区分 created / merged / skipped / blocked / failed。若 ChatGPT 显示 工具调用被安全检查屏蔽但审计日志没有 tool_reached，说明请求没有到达 Memory Hub，是平台侧提前拦截。
+
+### 2026-07-07 MCP 工具列表缓存排查
+已确认 FastMCP 真实注册表会导出 28 个工具，包含 safe_remember、mcp_health、mcp_debug_log。/api/mcp/health 和 hub_info 现在都使用 FastMCP 自己的 list_tools 生成 tool_count 与 tool_schema_hash，不再只扫描 Python 函数名。
+
+如果 ChatGPT 侧仍只看到 25 个工具，但 batch_remember 已经是新版逐条写入，说明后端代码已更新，ChatGPT 端仍在使用旧 schema。处理方式是断开 Memory Hub MCP 连接后重新连接；重连后可先调用 hub_info，查看 mcp_identity.tool_count 是否为 28，以及 tools 里是否包含 safe_remember、mcp_health、mcp_debug_log。

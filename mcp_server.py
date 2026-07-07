@@ -18,7 +18,7 @@ import github_store as store
 from config import AI_ROLES, ROOMS, list_rooms
 
 MCP_SERVER_NAME = "Memory Hub"
-MCP_SERVER_VERSION = "2026-07-07.safe-write"
+MCP_SERVER_VERSION = "2026-07-07.safe-write.2"
 MCP_PUBLIC_PATH = "/mcp"
 MCP_AUDIT_PATH = Path(__file__).parent / "data" / "mcp_audit.jsonl"
 
@@ -133,6 +133,25 @@ def _mcp_identity() -> dict:
 def get_mcp_identity() -> dict:
     return _mcp_identity()
 
+
+async def get_mcp_identity_async(include_schema: bool = False) -> dict:
+    tools = await mcp.list_tools()
+    tool_defs = [tool.model_dump(mode="json", exclude_none=True) for tool in tools]
+    tool_defs = sorted(tool_defs, key=lambda item: item.get("name", ""))
+    material = {
+        "name": MCP_SERVER_NAME,
+        "version": MCP_SERVER_VERSION,
+        "path": MCP_PUBLIC_PATH,
+        "instructions_sha256": hashlib.sha256(MCP_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        "tools": [item.get("name", "") for item in tool_defs],
+        "tool_count": len(tool_defs),
+    }
+    material["tool_schema_hash"] = hashlib.sha256(
+        json.dumps(tool_defs, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    if include_schema:
+        material["tool_schemas"] = tool_defs
+    return material
 
 def _audit(event: str, **payload) -> None:
     MCP_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -592,7 +611,7 @@ async def mcp_health(include_audit: bool = False) -> str:
     """
     data = {
         "ok": True,
-        "identity": _mcp_identity(),
+        "identity": await get_mcp_identity_async(),
         "audit_path": str(MCP_AUDIT_PATH),
     }
     if include_audit:
@@ -613,6 +632,7 @@ async def hub_info() -> str:
     data = {
         "roles": AI_ROLES,
         "rooms": {k: {"name": v["name"], "icon": v.get("icon", ""), "type": v.get("type", "")} for k, v in rooms.items()},
+        "mcp_identity": await get_mcp_identity_async(),
     }
     return json.dumps(data, ensure_ascii=False, indent=2)
 
@@ -859,3 +879,5 @@ async def batch_remember(
     output["summary"] = f"{output['total']}条|新{created}合{merged}跳{skipped}拦{blocked}败{failed}"
     _audit("batch_remember_result", source_ai=source_ai, **{k: output[k] for k in ("total", "created", "merged", "skipped", "blocked", "failed")})
     return json.dumps(output, ensure_ascii=False, indent=2)
+
+
