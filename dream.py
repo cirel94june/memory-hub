@@ -62,6 +62,45 @@ def read_dream_status() -> dict:
         return {"status": "invalid", "updated_at": "", "error": str(exc)}
 
 
+def get_recent_dreams_for_ai(ai_id: str, limit: int = 1, max_chars: int = 220) -> list[dict]:
+    """Return recent private dreams for one AI, using canonical id and aliases."""
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    alias_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
+    if ai_id not in alias_ids:
+        alias_ids = [*alias_ids, ai_id]
+    if not DB_PATH.exists():
+        return []
+    placeholders = ",".join("?" * len(alias_ids))
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, content, source_ai, owner_ai, room, category, created_at, source_platform
+            FROM memories
+            WHERE status='active'
+              AND room IN ('diary', 'dreams')
+              AND (tags LIKE '%dream%' OR category LIKE '%dream%')
+              AND (source_ai IN ({placeholders}) OR owner_ai IN ({placeholders}))
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (*alias_ids, *alias_ids, limit),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    dreams = []
+    for row in rows:
+        item = dict(row)
+        content = (item.get("content") or "").strip()
+        if max_chars and len(content) > max_chars:
+            content = content[: max_chars - 3].rstrip() + "..."
+        item["content"] = content
+        dreams.append(item)
+    return dreams
+
+
 def _recent_dreams(conn: sqlite3.Connection, limit: int = 8) -> list[dict]:
     rows = conn.execute(
         """

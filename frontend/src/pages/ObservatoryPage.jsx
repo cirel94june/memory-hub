@@ -130,8 +130,21 @@ function DreamDiagnostics({ dream, onRun, running }) {
         <div style={{ color: "var(--text-muted)", fontSize: 13 }}>还没有梦境诊断记录。可以点“单独补跑”测试一次。</div>
       )}
       {(dream?.recent_dreams || []).length > 0 && (
-        <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.55 }}>
-          最近梦境：{dream.recent_dreams.slice(0, 2).map((d) => `${d.source_ai || d.owner_ai || "AI"}: ${(d.content || "").slice(0, 42)}`).join(" / ")}
+        <div style={{ marginTop: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8 }}>最近梦境</div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {dream.recent_dreams.slice(0, 6).map((d) => (
+              <div key={d.id || `${d.source_ai}-${d.created_at}`} style={{ border: "1px solid var(--glass-border)", borderRadius: "var(--radius-sm)", padding: "10px 11px", background: "var(--bg-card)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6, fontSize: 11, color: "var(--text-muted)" }}>
+                  <span>{d.source_ai || d.owner_ai || "AI"}</span>
+                  <span>{(d.created_at || "").slice(0, 16).replace("T", " ")}</span>
+                </div>
+                <div style={{ fontSize: 13, color: "var(--text-primary)", lineHeight: 1.65, whiteSpace: "pre-wrap" }}>
+                  {d.content || "（梦境内容为空）"}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </section>

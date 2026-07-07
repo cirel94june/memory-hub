@@ -217,6 +217,22 @@ async def build_context(
     if corridor_text:
         parts.append(corridor_text)
 
+    # Light Dream Context: one recent private dream, so the AI can tell the user
+    # what it dreamed without bloating every wake-up prompt.
+    try:
+        from dream import get_recent_dreams_for_ai
+        recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=220)
+        if recent_dreams:
+            lines = []
+            for d in recent_dreams:
+                day = (d.get("created_at") or "")[:10]
+                prefix = f"{day} " if day else ""
+                lines.append(f"· {prefix}{d.get('content', '')}")
+            parts.append("【最近的梦境残响】\n这是你最近做过的梦/自省。合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气；不要生硬复述。\n" + "\n".join(lines))
+            rooms_checked.append("dreams")
+    except Exception:
+        pass
+
     # Cross-window digests are already included in the corridor; avoid duplicating them here.
     # In group chats, also show what other AIs in this chat recently talked about.
     group_chat_types = {"private_group", "small_group", "big_group", "group"}

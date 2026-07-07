@@ -12,6 +12,19 @@ import corridor
 import github_store as store
 
 
+def _dream_section(ai_id: str, metadata: dict) -> str:
+    try:
+        from dream import get_recent_dreams_for_ai
+        dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=220)
+    except Exception:
+        return ""
+    if not dreams:
+        return ""
+    metadata["dream_count"] = len(dreams)
+    lines = [f"· {(d.get('created_at') or '')[:10]} {d.get('content', '')}" for d in dreams]
+    return "【最近的梦境残响】\n合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气。\n" + "\n".join(lines)
+
+
 async def get_smart_context(
     ai_id: str,
     user_message: str = "",
@@ -27,6 +40,9 @@ async def get_smart_context(
     if not has_base_context:
         corridor_text = await corridor.get_corridor(ai_id)
         sections.append(corridor_text)
+        dream_text = _dream_section(ai_id, metadata)
+        if dream_text:
+            sections.append(dream_text)
 
         if user_message:
             recalled = await memory_ops.recall(
@@ -72,6 +88,10 @@ async def get_smart_context(
             room_label = m.get("room", "")
             lines.append(f"· [{room_label}] {m['content'][:200]}")
         sections.append("【最近动态】\n" + "\n".join(lines))
+
+    dream_text = _dream_section(ai_id, metadata)
+    if dream_text:
+        sections.append(dream_text)
 
     # 2. 未解决的待办
     unresolved = [

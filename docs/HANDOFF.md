@@ -231,3 +231,8 @@ remember、safe_remember、dream、batch_remember 现在统一走 _safe_remember
 ChatGPT 网页端反馈只能看到 25 个 MCP tools，但 batch_remember 已经返回新版逐条结果。复查后，本地 FastMCP list_tools 真实注册表为 28 个，包含 safe_remember、mcp_health、mcp_debug_log，因此问题更可能是 ChatGPT 端缓存旧 schema。
 
 本次补充：main.py 启动日志改为 await get_mcp_identity_async，使用 FastMCP list_tools 的真实 tool_count/hash；/api/mcp/health 与 MCP mcp_health 同样使用真实注册表；hub_info 也返回 mcp_identity，方便在 ChatGPT 还看不到新 debug 工具时，用旧工具自检当前服务端工具数。MCP_SERVER_VERSION bump 到 2026-07-07.safe-write.2。
+
+### 2026-07-07 梦境可见化 / Dream Context
+用户发现 AI 已经做梦，但前端只显示短预览，AI 醒来上下文也没有主动浮现。已补 dream.get_recent_dreams_for_ai(ai_id)，按 canonical id 和 alias 查 room=diary/dreams 且 dream 标签/分类的 active 记忆。
+
+gateway.build_context 与 smart_context 现在轻量注入最近 1 条梦境残响，约 220 字，提示 AI 合适时可以告诉小猫自己梦见了什么。观测台 DreamDiagnostics 改为展示最近 6 条梦境全文。后续若要更细，可以加“梦境墙/按 AI 筛选/是否注入梦境”的开关。
