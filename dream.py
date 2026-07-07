@@ -21,7 +21,7 @@ DREAM_PROMPT = """你是{name}。下面是你在小猫身边留下的“白天�
 
 {digests}
 
-请写一段第一人称“梦境残响”（120-220字），不是普通工作总结。
+请写一段第一人称“梦境残响”（180-420字），不是普通工作总结。
 
 要求：
 - 必须抓住 2-4 个具体残留：人名、场景、情绪、某个话题或一句话的影子。
@@ -62,7 +62,7 @@ def read_dream_status() -> dict:
         return {"status": "invalid", "updated_at": "", "error": str(exc)}
 
 
-def get_recent_dreams_for_ai(ai_id: str, limit: int = 1, max_chars: int = 220) -> list[dict]:
+def get_recent_dreams_for_ai(ai_id: str, limit: int = 1, max_chars: int = 800) -> list[dict]:
     """Return recent private dreams for one AI, using canonical id and aliases."""
     canonical = AI_ALIASES.get(ai_id, ai_id)
     alias_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
@@ -129,7 +129,7 @@ async def _call_llm(prompt: str) -> str:
                     "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 300,
+                    "max_tokens": 700,
                 },
             )
             resp.raise_for_status()
@@ -139,8 +139,8 @@ async def _call_llm(prompt: str) -> str:
         return ""
 
 
-def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 6) -> list[sqlite3.Row]:
-    """Pick recent active private/small-group material when chat digests are sparse.
+def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> list[sqlite3.Row]:
+    """Pick recent active private/group material when chat digests are sparse.
 
     This mirrors Ombre's "daytime residue" idea: dreams may use recent memories that
     survived extraction/decay, but should not use archived items, low-value chatter,
@@ -150,7 +150,8 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     placeholders = ",".join("?" * len(alias_ids))
     social_platform_filter = (
         "(source_platform LIKE '%:private' OR source_platform LIKE '%:private_group' "
-        "OR source_platform LIKE '%:small_group')"
+        "OR source_platform LIKE '%:small_group' OR source_platform LIKE '%:big_group' "
+        "OR source_platform LIKE '%:public_group' OR source_platform LIKE '%:group')"
     )
     rows = conn.execute(
         f"""
@@ -178,7 +179,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     return rows
 
 
-async def generate_dreams() -> dict:
+async def generate_dreams(force: bool = False) -> dict:
     """为每个有今日对话摘要的 AI 生成梦境日记"""
     import memory_ops
 
@@ -198,6 +199,7 @@ async def generate_dreams() -> dict:
         "day_end_utc": day_end_utc,
         "results": results,
         "diagnostics": diagnostics,
+        "force": force,
     })
 
     # 去重：只处理 canonical ID（跳过别名如 cloudy）
@@ -225,7 +227,7 @@ async def generate_dreams() -> dict:
             "AND tags LIKE '%dream%' AND created_at >= ? AND created_at < ?",
             (canonical, day_start_utc, day_end_utc),
         ).fetchone()
-        if existing:
+        if existing and not force:
             results[canonical] = "skipped (already dreamed)"
             diagnostics[canonical] = {
                 "status": "skipped",
@@ -237,7 +239,7 @@ async def generate_dreams() -> dict:
             continue
 
         # 组装摘要
-        type_labels = {"private": "私聊", "small_group": "小群", "big_group": "大群"}
+        type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
         digest_lines = []
         for r in rows:
             ts = r["created_at"][11:16] if len(r["created_at"]) > 16 else ""
@@ -278,8 +280,10 @@ async def generate_dreams() -> dict:
             }
             continue
 
-        if len(dream_text) > 300:
-            dream_text = dream_text[:297] + "..."
+        # Keep the full dream. The prompt controls length; hard truncation made
+        # the observatory and Dream Context look broken.
+        if len(dream_text) > 1200:
+            dream_text = dream_text[:1197].rstrip() + "..."
 
         # 通过 memory_ops 存储（自动生成 embedding + 正确元数据）
         r = await memory_ops.remember(
@@ -317,6 +321,7 @@ async def generate_dreams() -> dict:
         "results": results,
         "diagnostics": diagnostics,
         "recent_dreams": recent,
+        "force": force,
     })
     conn.close()
     return results

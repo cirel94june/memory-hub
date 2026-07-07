@@ -236,3 +236,9 @@ ChatGPT 网页端反馈只能看到 25 个 MCP tools，但 batch_remember 已经
 用户发现 AI 已经做梦，但前端只显示短预览，AI 醒来上下文也没有主动浮现。已补 dream.get_recent_dreams_for_ai(ai_id)，按 canonical id 和 alias 查 room=diary/dreams 且 dream 标签/分类的 active 记忆。
 
 gateway.build_context 与 smart_context 现在轻量注入最近 1 条梦境残响，约 220 字，提示 AI 合适时可以告诉小猫自己梦见了什么。观测台 DreamDiagnostics 改为展示最近 6 条梦境全文。后续若要更细，可以加“梦境墙/按 AI 筛选/是否注入梦境”的开关。
+
+### 2026-07-07 梦境截断与群聊材料修正
+用户反馈观测台和 AI 醒来看到的梦都被截断。原因包括 dream.py 生成后硬截到 300 字，以及 gateway/smart_context 注入时只取 220 字。已改为：prompt 180-420 字、LLM max_tokens 700、落库安全上限 1200 字、Dream Context 注入 600 字。
+
+用户主要在私密群玩，私聊较少。已让 dream.py 的 memory residue 兜底池纳入 private_group / small_group / big_group / public_group / group 来源，并提高 chat_digest 群聊保留条数。后续如果仍觉得群聊没进梦，优先查 /api/capture/log 是否传对 chat_type，以及 public_group 的抽取阈值是否过高。
+补充 force rerun：dream.generate_dreams(force=False) 默认仍跳过当天已梦；/api/dream/run?force=true 和观测台“强制重做”会忽略 already_dreamed，方便重做被旧逻辑截断的当天梦境。

@@ -102,9 +102,14 @@ function DreamDiagnostics({ dream, onRun, running }) {
         <div style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--text-primary)", fontWeight: 700 }}>
           <Sparkles size={16} /> 梦境诊断
         </div>
-        <button className="btn btn-ghost" onClick={onRun} disabled={running}>
-          <RefreshCw size={14} /> {running ? "触发中" : "单独补跑"}
-        </button>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <button className="btn btn-ghost" onClick={() => onRun(false)} disabled={running}>
+            <RefreshCw size={14} /> {running ? "触发中" : "单独补跑"}
+          </button>
+          <button className="btn btn-ghost" onClick={() => onRun(true)} disabled={running} title="忽略今天已做梦限制，重新生成当天梦境">
+            <Sparkles size={14} /> 强制重做
+          </button>
+        </div>
       </div>
       <div style={{ display: "grid", gap: 6, marginBottom: 12, fontSize: 12, color: "var(--text-muted)" }}>
         <div>状态：<b style={{ color: "var(--text-primary)" }}>{dream?.status || "unknown"}</b></div>
@@ -483,10 +488,11 @@ export default function ObservatoryPage() {
 
   useEffect(() => { load(); }, []);
 
-  const runDream = async () => {
+  const runDream = async (force = false) => {
     setDreamRunning(true);
     try {
-      await fetch("/api/dream/run", { method: "POST", headers: auth });
+      const suffix = force ? "?force=true" : "";
+      await fetch(`/api/dream/run${suffix}`, { method: "POST", headers: auth });
       setTimeout(load, 1200);
     } finally {
       setDreamRunning(false);

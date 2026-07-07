@@ -19,8 +19,11 @@ DB_PATH = Path(__file__).parent / "data" / "memories.db"
 # 按窗口类型分别限制保留条数
 RETENTION_LIMITS = {
     "private": 25,
-    "small_group": 25,
-    "big_group": 5,
+    "small_group": 35,
+    "private_group": 35,
+    "big_group": 15,
+    "public_group": 15,
+    "group": 20,
 }
 RETENTION_DEFAULT = 30
 

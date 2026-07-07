@@ -509,22 +509,22 @@ async def api_daemon_status(authorization: str = Header(default="")):
 
 
 
-async def _run_dreams_background():
+async def _run_dreams_background(force: bool = False):
     """Run dream generation alone so the observatory can diagnose skips quickly."""
     try:
         from dream import generate_dreams
-        result = await generate_dreams()
+        result = await generate_dreams(force=force)
         logging.getLogger("daemon").info(f"Manual dreams done: {json.dumps(result, ensure_ascii=False)}")
     except Exception as e:
         logging.getLogger("daemon").exception(f"Manual dreams failed: {e}")
 
 
 @app.post("/api/dream/run", status_code=202)
-async def api_run_dreams(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
-    """单独触发夜梦生成，用于观测台诊断。"""
+async def api_run_dreams(background_tasks: BackgroundTasks, force: bool = False, authorization: str = Header(default="")):
+    """单独触发夜梦生成，用于观测台诊断。force=true 时忽略当天已做梦限制。"""
     verify_secret(authorization)
-    background_tasks.add_task(_run_dreams_background)
-    return {"status": "accepted", "message": "dream generation started"}
+    background_tasks.add_task(_run_dreams_background, force)
+    return {"status": "accepted", "message": "dream generation started", "force": force}
 
 
 @app.get("/api/dream/status")

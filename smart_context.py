@@ -15,7 +15,7 @@ import github_store as store
 def _dream_section(ai_id: str, metadata: dict) -> str:
     try:
         from dream import get_recent_dreams_for_ai
-        dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=220)
+        dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
     except Exception:
         return ""
     if not dreams:

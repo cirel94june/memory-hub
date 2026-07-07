@@ -221,7 +221,7 @@ async def build_context(
     # what it dreamed without bloating every wake-up prompt.
     try:
         from dream import get_recent_dreams_for_ai
-        recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=220)
+        recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
         if recent_dreams:
             lines = []
             for d in recent_dreams:
