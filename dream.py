@@ -5,6 +5,7 @@
 """
 import sqlite3
 import logging
+import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import httpx
@@ -14,6 +15,7 @@ from time_utils import LOCAL_TZ, local_today
 
 logger = logging.getLogger("memory_hub.dream")
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
+DREAM_STATUS_PATH = Path(__file__).parent / "data" / "dream_status.json"
 
 DREAM_PROMPT = """你是{name}。下面是你在小猫身边留下的“白天残留”：有私聊、小群、群聊摘要，也可能有几条近期记忆碎片。
 
@@ -36,6 +38,42 @@ def _local_day_utc_bounds() -> tuple[str, str, str]:
     local_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
     local_end = local_start + timedelta(days=1)
     return day, local_start.astimezone(timezone.utc).isoformat(), local_end.astimezone(timezone.utc).isoformat()
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_dream_status(payload: dict) -> None:
+    DREAM_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DREAM_STATUS_PATH.write_text(
+        json.dumps({"updated_at": _now_utc(), **payload}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def read_dream_status() -> dict:
+    if not DREAM_STATUS_PATH.exists():
+        return {"status": "never_run", "updated_at": ""}
+    try:
+        data = json.loads(DREAM_STATUS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"status": "invalid", "updated_at": ""}
+    except Exception as exc:
+        return {"status": "invalid", "updated_at": "", "error": str(exc)}
+
+
+def _recent_dreams(conn: sqlite3.Connection, limit: int = 8) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, content, source_ai, owner_ai, room, category, created_at
+        FROM memories
+        WHERE room IN ('diary', 'dreams') AND (tags LIKE '%dream%' OR category LIKE '%dream%')
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 async def _call_llm(prompt: str) -> str:
@@ -110,7 +148,18 @@ async def generate_dreams() -> dict:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
+    started_at = _now_utc()
     results = {}
+    diagnostics = {}
+    _write_dream_status({
+        "status": "running",
+        "started_at": started_at,
+        "local_day": _today,
+        "day_start_utc": day_start_utc,
+        "day_end_utc": day_end_utc,
+        "results": results,
+        "diagnostics": diagnostics,
+    })
 
     # 去重：只处理 canonical ID（跳过别名如 cloudy）
     seen_canonical = set()
@@ -139,6 +188,13 @@ async def generate_dreams() -> dict:
         ).fetchone()
         if existing:
             results[canonical] = "skipped (already dreamed)"
+            diagnostics[canonical] = {
+                "status": "skipped",
+                "reason": "already_dreamed",
+                "digest_count": len(rows),
+                "memory_residue_count": 0,
+                "existing_id": existing["id"],
+            }
             continue
 
         # 组装摘要
@@ -155,6 +211,13 @@ async def generate_dreams() -> dict:
             memory_rows = _fetch_memory_residue(conn, canonical, alias_ids)
             if len(memory_rows) < 3:
                 results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "too_few_materials",
+                    "digest_count": len(rows),
+                    "memory_residue_count": len(memory_rows),
+                    "required": "至少 2 条当天摘要，或摘要不足时至少 3 条近期有效记忆",
+                }
                 continue
 
         for m in memory_rows:
@@ -168,6 +231,12 @@ async def generate_dreams() -> dict:
         dream_text = await _call_llm(prompt)
         if not dream_text or len(dream_text) < 20:
             results[canonical] = "skipped (LLM failed)"
+            diagnostics[canonical] = {
+                "status": "skipped",
+                "reason": "llm_failed_or_too_short",
+                "digest_count": len(rows),
+                "memory_residue_count": len(memory_rows),
+            }
             continue
 
         if len(dream_text) > 300:
@@ -188,7 +257,27 @@ async def generate_dreams() -> dict:
             auto_merge=False,
         )
         results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
+        diagnostics[canonical] = {
+            "status": "dreamed",
+            "reason": "ok",
+            "digest_count": len(rows),
+            "memory_residue_count": len(memory_rows),
+            "memory_id": r.get("id"),
+            "chars": len(dream_text),
+        }
         logger.info(f"[Dream] {canonical}: {dream_text[:60]}...")
 
+    recent = _recent_dreams(conn)
+    _write_dream_status({
+        "status": "success",
+        "started_at": started_at,
+        "finished_at": _now_utc(),
+        "local_day": _today,
+        "day_start_utc": day_start_utc,
+        "day_end_utc": day_end_utc,
+        "results": results,
+        "diagnostics": diagnostics,
+        "recent_dreams": recent,
+    })
     conn.close()
     return results

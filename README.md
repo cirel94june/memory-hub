@@ -305,3 +305,10 @@ python main.py
 - daemon 夜梦从 `room=diary/category=dream` 改为写入 `room=dreams/category=night_dream`，和 MCP `dream()` 自省工具统一到梦境房间。
 - 当天去重会同时检查旧的 `diary` 梦和新的 `dreams` 梦，迁移期间不会重复生成。
 - 夜梦 prompt 改为“梦境残响”：要求抓住人名、场景、情绪、话题等具体残留，减少只有抽象抒情的日记感。
+
+### 2026-07-07 梦境诊断入口
+
+- 新增 `GET /api/dream/status`：读取最近一次夜梦生成诊断，包含每个 AI 的结果、跳过原因、当天摘要数量、近期记忆补充数量和最近梦境。
+- 新增 `POST /api/dream/run`：只触发夜梦生成，不必跑完整 daemon 维护，方便在观测台临时补跑。
+- 观测台总览新增“梦境诊断”卡片：能看到“今天已经做过梦 / 材料不足 / 小模型失败 / 已生成”，并可一键单独补跑。
+- `dream.py` 会写入 `data/dream_status.json`，让梦境 skip 不再只藏在后台日志里。

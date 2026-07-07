@@ -86,6 +86,58 @@ function Metric({ icon: Icon, label, value, tone = "neutral" }) {
   );
 }
 
+
+function DreamDiagnostics({ dream, onRun, running }) {
+  const diagnostics = dream?.diagnostics || {};
+  const entries = Object.entries(diagnostics);
+  const reasonLabel = {
+    already_dreamed: "今天已经做过梦",
+    too_few_materials: "材料不足",
+    llm_failed_or_too_short: "小模型失败或输出太短",
+    ok: "已生成",
+  };
+  return (
+    <section className="glass" style={{ padding: "var(--space-md)" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, color: "var(--text-primary)", fontWeight: 700 }}>
+          <Sparkles size={16} /> 梦境诊断
+        </div>
+        <button className="btn btn-ghost" onClick={onRun} disabled={running}>
+          <RefreshCw size={14} /> {running ? "触发中" : "单独补跑"}
+        </button>
+      </div>
+      <div style={{ display: "grid", gap: 6, marginBottom: 12, fontSize: 12, color: "var(--text-muted)" }}>
+        <div>状态：<b style={{ color: "var(--text-primary)" }}>{dream?.status || "unknown"}</b></div>
+        <div>更新：{dream?.updated_at || "还没有记录"}</div>
+        {dream?.local_day && <div>本地日期：{dream.local_day}</div>}
+      </div>
+      {entries.length ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {entries.map(([ai, info]) => (
+            <div key={ai} style={{ border: "1px solid var(--glass-border)", borderRadius: "var(--radius-sm)", padding: "9px 10px", background: "var(--bg-card)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                <span style={{ fontSize: 12, fontWeight: 650, color: "var(--text-primary)" }}>{ai}</span>
+                <StatusPill tone={info.status === "dreamed" ? "good" : "warn"}>{reasonLabel[info.reason] || info.reason || info.status}</StatusPill>
+              </div>
+              <div style={{ marginTop: 5, fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                摘要 {info.digest_count ?? 0} 条 · 近期记忆 {info.memory_residue_count ?? 0} 条
+                {info.required ? ` · ${info.required}` : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ color: "var(--text-muted)", fontSize: 13 }}>还没有梦境诊断记录。可以点“单独补跑”测试一次。</div>
+      )}
+      {(dream?.recent_dreams || []).length > 0 && (
+        <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.55 }}>
+          最近梦境：{dream.recent_dreams.slice(0, 2).map((d) => `${d.source_ai || d.owner_ai || "AI"}: ${(d.content || "").slice(0, 42)}`).join(" / ")}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function StepSummary({ steps = [] }) {
   const recent = steps.slice(-8).reverse();
   if (!recent.length) {
@@ -390,8 +442,10 @@ function PanelList({ icon: Icon, title, items, empty, onOpen }) {
 
 export default function ObservatoryPage() {
   const [daemon, setDaemon] = useState(null);
+  const [dream, setDream] = useState(null);
   const [decay, setDecay] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [dreamRunning, setDreamRunning] = useState(false);
   const [tab, setTab] = useState("overview");
   const [detailId, setDetailId] = useState(null);
   const secret = localStorage.getItem("mh-secret") || "";
@@ -400,11 +454,13 @@ export default function ObservatoryPage() {
   const load = async () => {
     setLoading(true);
     try {
-      const [daemonRes, decayRes] = await Promise.all([
+      const [daemonRes, dreamRes, decayRes] = await Promise.all([
         fetch("/api/daemon/status", { headers: auth }),
+        fetch("/api/dream/status", { headers: auth }),
         fetch("/api/memory/decay-scores", { headers: auth }),
       ]);
       if (daemonRes.ok) setDaemon(await daemonRes.json());
+      if (dreamRes.ok) setDream(await dreamRes.json());
       if (decayRes.ok) setDecay(await decayRes.json());
     } catch {
       // keep last visible state
@@ -413,6 +469,16 @@ export default function ObservatoryPage() {
   };
 
   useEffect(() => { load(); }, []);
+
+  const runDream = async () => {
+    setDreamRunning(true);
+    try {
+      await fetch("/api/dream/run", { method: "POST", headers: auth });
+      setTimeout(load, 1200);
+    } finally {
+      setDreamRunning(false);
+    }
+  };
 
   const memories = decay?.memories || [];
   const protectedMemories = useMemo(() => memories.filter((m) => m.lane === "protected").slice(0, 10), [memories]);
@@ -480,6 +546,8 @@ export default function ObservatoryPage() {
               </div>
               <StepSummary steps={daemon?.steps || []} />
             </section>
+
+            <DreamDiagnostics dream={dream} onRun={runDream} running={dreamRunning} />
 
             <section className="glass" style={{ padding: "var(--space-md)" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, color: "var(--text-primary)", fontWeight: 700 }}>

@@ -489,6 +489,34 @@ async def api_daemon_status(authorization: str = Header(default="")):
     return daemon_status.read_status()
 
 
+
+
+async def _run_dreams_background():
+    """Run dream generation alone so the observatory can diagnose skips quickly."""
+    try:
+        from dream import generate_dreams
+        result = await generate_dreams()
+        logging.getLogger("daemon").info(f"Manual dreams done: {json.dumps(result, ensure_ascii=False)}")
+    except Exception as e:
+        logging.getLogger("daemon").exception(f"Manual dreams failed: {e}")
+
+
+@app.post("/api/dream/run", status_code=202)
+async def api_run_dreams(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
+    """单独触发夜梦生成，用于观测台诊断。"""
+    verify_secret(authorization)
+    background_tasks.add_task(_run_dreams_background)
+    return {"status": "accepted", "message": "dream generation started"}
+
+
+@app.get("/api/dream/status")
+async def api_dream_status(authorization: str = Header(default="")):
+    """查看最近一次梦境生成诊断。"""
+    verify_secret(authorization)
+    from dream import read_dream_status
+    return read_dream_status()
+
+
 @app.get("/api/daemon/test-llm")
 async def api_test_llm(authorization: str = Header(default="")):
     """测试 daemon 小模型是否连通"""
