@@ -96,10 +96,14 @@ async def generate_and_save(
         logger.info(f"[Digest] skip big_group random: {ai_id}@{chat_id}")
         return
 
+    speaker_label = "对方消息" if chat_type == "private" else "群内消息/触发消息"
     prompt = (
         "用一句话（20-50字）概括这段对话的核心话题。"
-        "不要加前缀，直接输出。\n\n"
-        f"用户: {user_message[:300]}\nAI: {ai_response[:300]}"
+        "不要加前缀，直接输出；如果是群聊，不要把群内其他人的话概括成用户本人说的。"
+        + chr(10) + chr(10)
+        + f"{speaker_label}: {user_message[:300]}"
+        + chr(10)
+        + f"AI: {ai_response[:300]}"
     )
     summary = await _call_llm(prompt)
     if not summary or len(summary) < 5:

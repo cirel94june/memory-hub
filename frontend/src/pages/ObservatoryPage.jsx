@@ -115,6 +115,7 @@ function DreamDiagnostics({ dream, onRun, running }) {
         <div>状态：<b style={{ color: "var(--text-primary)" }}>{dream?.status || "unknown"}</b></div>
         <div>更新：{dream?.updated_at || "还没有记录"}</div>
         {dream?.local_day && <div>本地日期：{dream.local_day}</div>}
+        <div>只显示夜梦；旧逻辑生成的截断梦需要点“强制重做”重新生成。</div>
       </div>
       {entries.length ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
