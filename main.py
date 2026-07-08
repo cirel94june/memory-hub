@@ -1289,6 +1289,11 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
 
     for m in db.iter_memories(status="active"):
         decay = memory_ops.explain_decay(m)
+        near_archive = bool(decay.get("will_archive")) or (
+            decay.get("lane") in ("short_term", "watch")
+            and decay.get("days_to_archive") is not None
+            and decay.get("days_to_archive") <= 7
+        )
         results.append({
             "id": m["id"],
             "content": m["content"][:60],
@@ -1298,6 +1303,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "lane": decay["lane"],
             "recommendation": decay["recommendation"],
             "will_archive": decay.get("will_archive", False),
+            "near_archive": near_archive,
             "protections": decay["protections"],
             "pressures": decay["pressures"],
             "protection_reasons": decay.get("protection_reasons", []),
@@ -1317,7 +1323,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "total": len(results),
             "healthy": sum(1 for r in results if r["health"] == "healthy"),
             "decaying": sum(1 for r in results if r["health"] == "decaying"),
-            "critical": sum(1 for r in results if r.get("will_archive")),
+            "critical": sum(1 for r in results if r.get("near_archive")),
             "protected": sum(1 for r in results if r["lane"] == "protected" or r.get("protections")),
             "long_term": sum(1 for r in results if r["lane"] == "long_term"),
             "short_term": sum(1 for r in results if r["lane"] == "short_term"),
