@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Archive,
+  Clock,
   Eye,
   Gauge,
   CheckCircle,
@@ -503,7 +504,7 @@ export default function ObservatoryPage() {
   const memories = decay?.memories || [];
   const protectedMemories = useMemo(() => memories.filter((m) => m.lane === "protected" || (m.protections || []).length > 0).slice(0, 10), [memories]);
   const longTerm = useMemo(() => memories.filter((m) => m.lane === "long_term").slice(0, 10), [memories]);
-  const critical = useMemo(() => memories.filter((m) => m.will_archive).slice(0, 8), [memories]);
+  const critical = useMemo(() => memories.filter((m) => m.near_archive).slice(0, 8), [memories]);
   const shortTerm = useMemo(() => memories.filter((m) => m.lane === "short_term").slice(0, 8), [memories]);
   const watch = useMemo(() => memories.filter((m) => m.lane === "watch").slice(0, 8), [memories]);
   const summary = decay?.summary || {};
