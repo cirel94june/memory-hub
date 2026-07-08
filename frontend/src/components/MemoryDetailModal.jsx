@@ -131,6 +131,8 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [commentText, setCommentText] = useState("");
+  const [savingComment, setSavingComment] = useState(false);
   const [editForm, setEditForm] = useState({
     content: "",
     importance: 0.5,
@@ -186,6 +188,7 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const chain = data?.supersede_chain || [];
   const tags = parseTags(mem.tags);
   const history = Array.isArray(mem.history) ? mem.history : [];
+  const comments = Array.isArray(mem.comments) ? mem.comments : [];
 
   const createdAt = mem.created_at ? new Date(mem.created_at).toLocaleString("zh-CN") : "";
   const eventDate = mem.event_date || "";
@@ -197,6 +200,26 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const ownerLabel = ownerInfo?.name || mem.owner_ai || "";
   const ownerEmoji = ownerInfo?.emoji || "🤖";
   const layerLabel = mem.layer === "private" ? "私有记忆" : "公用记忆";
+
+  const addWheelComment = async () => {
+    const content = commentText.trim();
+    if (!content) return;
+    setSavingComment(true);
+    try {
+      const res = await fetch(`/api/memory/${mem.id}/comment`, {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ content, author: "user", kind: "comment" }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setCommentText("");
+      await loadDetail();
+    } catch (err) {
+      alert(`追加年轮失败：${err.message}`);
+    } finally {
+      setSavingComment(false);
+    }
+  };
 
   const saveEdit = async () => {
     const importance = Math.max(0, Math.min(1, Number(editForm.importance) || 0));
@@ -431,8 +454,43 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
               </Section>
             )}
 
+            {mem.status === "active" && (
+              <Section icon={Clock} title="追加年轮" defaultOpen={false}>
+                <div style={{ display: "grid", gap: 8 }}>
+                  <textarea
+                    value={commentText}
+                    onChange={(e) => setCommentText(e.target.value)}
+                    rows={3}
+                    placeholder="补充新的理解、修正、回看感受……不会改写原记忆。"
+                    style={{ ...inputStyle, resize: "vertical", lineHeight: 1.55 }}
+                  />
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <button className="btn btn-primary" onClick={addWheelComment} disabled={savingComment || !commentText.trim()}>
+                      <Save size={13} /> {savingComment ? "追加中..." : "追加年轮"}
+                    </button>
+                  </div>
+                </div>
+              </Section>
+            )}
+
+            {comments.length > 0 && (
+              <Section icon={Clock} title={`年轮评论 (${comments.length})`} defaultOpen={false}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {comments.slice().reverse().map((c, i) => (
+                    <div key={c.id || i} style={{ fontSize: 12, padding: "8px 10px", borderRadius: "var(--radius-sm)", background: "var(--bg-hover)", color: "var(--text-secondary)" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 4 }}>
+                        <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{c.kind || "comment"} · {c.author || "system"}</span>
+                        {c.date && <span style={{ color: "var(--text-muted)", fontSize: 10 }}>{new Date(c.date).toLocaleString("zh-CN")}</span>}
+                      </div>
+                      <div style={{ color: "var(--text-primary)", lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{c.content || ""}</div>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
             {history.length > 0 && (
-              <Section icon={Clock} title={`历史年轮 (${history.length})`} defaultOpen={false}>
+              <Section icon={Clock} title={`版本历史 (${history.length})`} defaultOpen={false}>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                   {history.map((h, i) => (
                     <div key={i} style={{ fontSize: 11, padding: "6px 10px", borderRadius: "var(--radius-sm)", background: "var(--bg-hover)", color: "var(--text-secondary)" }}>

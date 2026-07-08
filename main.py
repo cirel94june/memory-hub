@@ -1285,35 +1285,9 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
     """每条记忆的当前衰减分数 + 健康状态"""
     verify_secret(authorization)
     import database as db
-    from datetime import datetime, timezone
-    import math
-    from config import DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD, ROOMS
-
-    now_dt = datetime.now(timezone.utc)
     results = []
 
     for m in db.iter_memories(status="active"):
-        try:
-            created = datetime.fromisoformat(m["created_at"])
-            days = (now_dt - created).total_seconds() / 86400
-        except Exception:
-            days = 0
-
-        importance = float(m.get("importance") or 0.5)
-        arousal = float(m.get("emotion_arousal") or 0.3)
-        activations = int(float(m.get("activation_count") or 0))
-        room_cfg = ROOMS.get(m.get("room", ""), {})
-        lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
-        emotion_weight = 1.0 + (arousal * 0.8)
-        score = min(1.0, importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight)
-
-        if score >= 0.6:
-            health = "healthy"
-        elif score >= DECAY_THRESHOLD:
-            health = "decaying"
-        else:
-            health = "critical"
-
         decay = memory_ops.explain_decay(m)
         results.append({
             "id": m["id"],
@@ -1323,6 +1297,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "health": decay["health"],
             "lane": decay["lane"],
             "recommendation": decay["recommendation"],
+            "will_archive": decay.get("will_archive", False),
             "protections": decay["protections"],
             "pressures": decay["pressures"],
             "protection_reasons": decay.get("protection_reasons", []),
@@ -1342,7 +1317,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "total": len(results),
             "healthy": sum(1 for r in results if r["health"] == "healthy"),
             "decaying": sum(1 for r in results if r["health"] == "decaying"),
-            "critical": sum(1 for r in results if r["health"] == "critical"),
+            "critical": sum(1 for r in results if r.get("will_archive")),
             "protected": sum(1 for r in results if r["lane"] == "protected"),
             "long_term": sum(1 for r in results if r["lane"] == "long_term"),
             "short_term": sum(1 for r in results if r["lane"] == "short_term"),

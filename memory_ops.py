@@ -1167,7 +1167,9 @@ def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
         will_archive = score < DECAY_THRESHOLD
 
     days_to_archive = None
-    if not anchored and room != "living_room" and score > DECAY_THRESHOLD and lam > 0 and base_score > 0:
+    if will_archive:
+        days_to_archive = 0.0
+    elif lane in ("short_term", "watch") and not anchored and room != "living_room" and score > DECAY_THRESHOLD and lam > 0 and base_score > 0:
         target_days = math.log(max(base_score, 0.0001) / DECAY_THRESHOLD) / lam
         days_to_archive = max(0.0, target_days - days)
 
@@ -1231,7 +1233,8 @@ async def run_decay() -> dict:
         new_score = importance * (max(activations, 1) ** 0.3) * math.exp(-lam * days) * emotion_weight
         new_score = min(new_score, 1.0)
 
-        if new_score < DECAY_THRESHOLD and mem.get("room") != "living_room":
+        decay = explain_decay(mem, now_dt=now_dt)
+        if decay.get("will_archive"):
             mem["status"] = "archived"
             mem["decay_score"] = new_score
             mem["updated_at"] = _now()
