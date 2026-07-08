@@ -1318,7 +1318,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
             "healthy": sum(1 for r in results if r["health"] == "healthy"),
             "decaying": sum(1 for r in results if r["health"] == "decaying"),
             "critical": sum(1 for r in results if r.get("will_archive")),
-            "protected": sum(1 for r in results if r["lane"] == "protected"),
+            "protected": sum(1 for r in results if r["lane"] == "protected" or r.get("protections")),
             "long_term": sum(1 for r in results if r["lane"] == "long_term"),
             "short_term": sum(1 for r in results if r["lane"] == "short_term"),
             "watch": sum(1 for r in results if r["lane"] == "watch"),
