@@ -1285,6 +1285,7 @@ async def api_memory_decay_scores(authorization: str = Header(default="")):
     """每条记忆的当前衰减分数 + 健康状态"""
     verify_secret(authorization)
     import database as db
+    from config import DECAY_THRESHOLD
     results = []
 
     for m in db.iter_memories(status="active"):
