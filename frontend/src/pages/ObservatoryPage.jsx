@@ -501,7 +501,8 @@ export default function ObservatoryPage() {
   };
 
   const memories = decay?.memories || [];
-  const protectedMemories = useMemo(() => memories.filter((m) => m.lane === "protected").slice(0, 10), [memories]);
+  const protectedMemories = useMemo(() => memories.filter((m) => m.lane === "protected" || (m.protections || []).length > 0).slice(0, 10), [memories]);
+  const longTerm = useMemo(() => memories.filter((m) => m.lane === "long_term").slice(0, 10), [memories]);
   const critical = useMemo(() => memories.filter((m) => m.will_archive).slice(0, 8), [memories]);
   const shortTerm = useMemo(() => memories.filter((m) => m.lane === "short_term").slice(0, 8), [memories]);
   const watch = useMemo(() => memories.filter((m) => m.lane === "watch").slice(0, 8), [memories]);
@@ -550,6 +551,7 @@ export default function ObservatoryPage() {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "var(--space-sm)", marginBottom: "var(--space-md)" }}>
             <Metric icon={Gauge} label="活跃记忆" value={summary.total ?? "—"} />
             <Metric icon={Shield} label="保护中" value={summary.protected ?? 0} tone="good" />
+            <Metric icon={Clock} label="长期保留" value={summary.long_term ?? 0} tone="good" />
             <Metric icon={Timer} label="短期池" value={summary.short_term ?? 0} tone="warn" />
             <Metric icon={AlertTriangle} label="临近归档" value={summary.critical ?? 0} tone="bad" />
           </div>
@@ -590,7 +592,10 @@ export default function ObservatoryPage() {
           </div>
 
           <section style={{ marginTop: "var(--space-md)" }}>
-            <PanelList icon={Shield} title="保护中" items={protectedMemories} empty="暂时没有被保护的记忆" onOpen={setDetailId} />
+            <PanelList icon={Shield} title="保护中" items={protectedMemories} empty="暂时没有带保护原因的记忆" onOpen={setDetailId} />
+          </section>
+          <section style={{ marginTop: "var(--space-md)" }}>
+            <PanelList icon={Clock} title="长期保留" items={longTerm} empty="暂时没有长期保留的记忆" onOpen={setDetailId} />
           </section>
           <section style={{ marginTop: "var(--space-md)" }}>
             <PanelList icon={AlertTriangle} title="临近归档" items={critical} empty="暂时没有临近归档的记忆" onOpen={setDetailId} />
