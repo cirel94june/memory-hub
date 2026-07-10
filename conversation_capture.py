@@ -224,6 +224,14 @@ async def log_conversation(
     })
     _touch_pulse(user_message, ai_response, ai_id)
 
+    # 原文保险箱：不加工的原始对话留档，记忆漂移时可以找回原话
+    try:
+        import raw_vault
+        raw_vault.log_turn(user_message, ai_response, ai_id=ai_id,
+                           platform=platform, chat_id=chat_id, chat_type=chat_type)
+    except Exception:
+        pass
+
     # 防止内存爆
     if len(_conversation_buffers[key]) > MAX_BUFFER_SIZE:
         _conversation_buffers[key] = _conversation_buffers[key][-MAX_BUFFER_SIZE:]

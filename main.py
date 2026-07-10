@@ -841,6 +841,44 @@ async def api_refresh_current_status(background_tasks: BackgroundTasks, authoriz
     return {"status": "accepted"}
 
 
+# ── 记忆医生 / 原文保险箱 API ──
+
+@app.get("/api/doctor/report")
+async def api_doctor_report(authorization: str = Header(default="")):
+    """最近一次记忆体检报告（结构化 + 人话版）"""
+    verify_secret(authorization)
+    import memory_doctor
+    return {"report": memory_doctor.read_report(), "text": memory_doctor.report_text()}
+
+
+@app.post("/api/doctor/run", status_code=202)
+async def api_doctor_run(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
+    """手动触发一次记忆体检（不用等 daemon）"""
+    verify_secret(authorization)
+    import memory_doctor
+
+    async def _run():
+        try:
+            result = await memory_doctor.run_checkup()
+            logging.getLogger("memory_doctor").info(
+                f"Manual checkup: {len(result.get('auto_fixed', []))} fixed, {len(result.get('issues', []))} issues")
+        except Exception as e:
+            logging.getLogger("memory_doctor").exception(f"Manual checkup failed: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "accepted"}
+
+
+@app.get("/api/raw/search")
+async def api_raw_search(q: str = Query(...), ai_id: str = Query(default=""),
+                         limit: int = Query(default=10, le=50),
+                         authorization: str = Header(default="")):
+    """在原文保险箱里查当时的原话（记忆漂移时用来对照）"""
+    verify_secret(authorization)
+    import raw_vault
+    return {"results": raw_vault.search(q, ai_id=ai_id, limit=limit), "stats": raw_vault.stats()}
+
+
 # ── Agent 能力 API ──
 
 @app.get("/api/capabilities")

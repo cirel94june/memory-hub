@@ -1044,6 +1044,18 @@ async def _run_full_maintenance_inner() -> dict:
     from memory_ops import fix_private_capture_layers
     await run_step("private_layer_fix", "Fix private capture layers", lambda: fix_private_capture_layers(dry_run=False))
 
+    # 10.75 记忆体检（身份冲突自动修，矛盾/张冠李戴写报告）+ 原文保险箱清理
+    try:
+        import memory_doctor
+        await run_step("doctor", "Memory doctor checkup", memory_doctor.run_checkup)
+    except Exception as e:
+        log.warning(f"  Doctor checkup failed: {e}")
+    try:
+        import raw_vault
+        raw_vault.prune(keep_days=120)
+    except Exception as e:
+        log.warning(f"  Raw vault prune failed: {e}")
+
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:
         from dream import generate_dreams

@@ -217,3 +217,43 @@ register(
     hint="[忘记:描述] — 归档一条不再需要的记忆（用关键词描述要忘记的内容）",
     handler=_handle_forget,
 )
+
+
+# ── 能力：体检报告 ──
+
+async def _handle_checkup_report(content: str, ai_id: str) -> dict:
+    import memory_doctor
+    return {"status": "ok", "replacement": memory_doctor.report_text()}
+
+
+register(
+    tag="体检报告",
+    label="记忆体检报告",
+    hint="[体检报告:] — 用户问记忆系统最近怎么样/有没有问题/体检结果时，用这个标签把最新体检报告念出来",
+    handler=_handle_checkup_report,
+)
+
+
+# ── 能力：查原话 ──
+
+async def _handle_raw_search(content: str, ai_id: str) -> dict:
+    import raw_vault
+    hits = raw_vault.search(content, limit=3)
+    if not hits:
+        return {"status": "ok", "replacement": f"（原文保险箱里没找到关于「{content}」的原话）"}
+    lines = []
+    for h in hits:
+        date = h["created_at"][:10]
+        if h.get("user_text"):
+            lines.append(f"{date} 用户说：「{h['user_text'][:100]}」")
+        if h.get("ai_text"):
+            lines.append(f"{date} AI 回：「{h['ai_text'][:100]}」")
+    return {"status": "ok", "replacement": "\n".join(lines[:4])}
+
+
+register(
+    tag="查原话",
+    label="查原话",
+    hint="[查原话:关键词] — 记忆存疑或用户问「当时到底怎么说的」时，从原文保险箱调出当时的原始对话",
+    handler=_handle_raw_search,
+)

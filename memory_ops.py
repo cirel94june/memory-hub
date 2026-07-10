@@ -159,6 +159,16 @@ async def remember(
 
     if quick:
         auto_merge = False
+        # 写入门卫：自动提取路径先过一道检查，明显的垃圾碎片不入库
+        # （人工写入 quick=False，不走门卫）
+        try:
+            import write_gate
+            allowed, gate_reason = write_gate.check(content, room=room, source=source_platform)
+            if not allowed:
+                logger.info(f"Write gate blocked ({gate_reason}): {content[:60]}")
+                return {"id": "", "status": "gated", "reason": gate_reason}
+        except Exception as e:
+            logger.warning(f"Write gate check failed (allowing): {e}")
         # 轻量去重：只查 embedding 相似度，不调 LLM
         try:
             qv = await get_embedding(content)
