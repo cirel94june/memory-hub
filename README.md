@@ -280,7 +280,10 @@ memory-hub/
 ├── analyzer.py              # 小模型打标/合并/关系分类
 ├── gateway.py               # 记忆注入 + 提取
 ├── proxy.py                 # OpenAI 兼容代理
-├── capabilities.py          # Agent 能力标签（记住/更新状态/这是谁/忘记/画图）
+├── capabilities.py          # Agent 能力标签（记住/更新状态/这是谁/忘记/画图/体检报告/查原话）
+├── write_gate.py            # 写入门卫（自动提取的垃圾碎片不入库）
+├── raw_vault.py             # 原文保险箱（原始对话留档，记忆漂移时找回原话）
+├── memory_doctor.py         # 记忆医生（12h 体检：自动修 + 体检报告）
 ├── corridor.py              # 走廊系统
 ├── chat_digest.py           # 跨窗口对话摘要
 ├── database.py              # SQLite 数据库

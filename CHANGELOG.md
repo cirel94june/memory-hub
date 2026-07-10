@@ -3,6 +3,15 @@
 > 按日期倒序的改动与排查记录。工程规范和"不要做的事"见 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
 
+## 2026-07-10 记忆自愈系统（写入门卫 + 原文保险箱 + 记忆医生）
+
+让记忆系统自查自愈，用户不用总操心。四层结构：
+
+- **第一层 写入门卫** `write_gate.py`（参考 Ombre 二改 memory_write_gate）：自动提取的记忆（`remember(quick=True)` 路径）写入前过检查——太短、纯情绪/口头禅、易逝内容（"刚才/等一下"类）、与现有记忆逐字重复的不入库。被拦内容记 `data/write_gate.jsonl` 可追溯。人工写入（MCP/能力标签/前端）不走门卫。
+- **原文保险箱** `raw_vault.py`（参考 Ombre 二改 raw_events）：`data/raw_events.db` 只存原始对话文本，永不加工，保留 120 天。挂在 `conversation_capture.log_conversation`，所有入口的对话都留档。记忆漂移时可找回原话。`GET /api/raw/search?q=...`。
+- **第二、三层 记忆医生** `memory_doctor.py`：daemon 每 12h 体检——①身份冲突（人/AI 被打宠物标签）自动修；②同房间中等相似度（0.60-0.75）事实记忆对用小模型扫矛盾/张冠李戴，配原文保险箱证据写进报告，不自动动；③门卫拦截统计。报告存 `data/doctor_report.json`。`GET /api/doctor/report`、`POST /api/doctor/run`。
+- **第四层 TG 一句话闭环**：新能力标签 `[体检报告:]`（bot 把报告念给用户）和 `[查原话:关键词]`（从保险箱调原始对话）。用户在 TG 里问"记忆最近怎么样"→ bot 念报告 → 用户回一句哪条对 → bot 用 [忘记:]/[记住:] 等标签执行修复。
+
 ## 2026-07-10 Agent 能力标签系统
 
 AI 现在可以在聊天中通过标签直接操作后端状态。新增 `capabilities.py`：统一标签注册、prompt hint 注入、响应后处理执行。
