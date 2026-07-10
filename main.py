@@ -388,7 +388,7 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    return await gateway_mod.build_context(
+    result = await gateway_mod.build_context(
         user_message=body.user_message,
         ai_id=body.ai_id,
         recent_messages=body.recent_messages,
@@ -398,6 +398,18 @@ async def api_build_context(body: ContextRequest, authorization: str = Header(de
         max_memories=body.max_memories,
         force_corridor=body.force_corridor,
     )
+    # 附上能力标签说明：TG bot 等外部入口把 inject_text 放进 system prompt，
+    # AI 就知道自己可以用 [记住:]/[更新状态:] 等标签；执行仍在 Hub 侧
+    # （bot 回复后调 /api/capabilities/process）。proxy 走的是 build_context
+    # 直调路径，不经过这个端点，hints 由 proxy 自己注入，不会重复。
+    try:
+        import capabilities
+        hints = capabilities.capability_hints()
+        if hints:
+            result["inject_text"] = ((result.get("inject_text") or "") + "\n\n" + hints).strip()
+    except Exception:
+        pass
+    return result
 
 
 class PostProcessRequest(BaseModel):
@@ -842,9 +854,25 @@ async def api_list_capabilities(authorization: str = Header(default="")):
     return {"capabilities": caps, "hint_text": capabilities.capability_hints()}
 
 
+@app.post("/api/capabilities/process")
+async def api_process_capabilities(request: Request, authorization: str = Header(default="")):
+    """执行文本里的能力标签并返回清理后的文本。
+
+    TG bot 等自己调模型的入口，在把 AI 回复发给用户之前调这个端点：
+    标签被执行（记忆写入/状态更新/人物登记等），返回的 cleaned_text 不含标签。
+    """
+    verify_secret(authorization)
+    import capabilities
+    body = await request.json()
+    text = body.get("text", "")
+    ai_id = body.get("ai_id", "cloudy")
+    cleaned, results = await capabilities.process(text, ai_id=ai_id)
+    return {"cleaned_text": cleaned, "results": results}
+
+
 @app.post("/api/capabilities/test")
 async def api_test_capability(request: Request, authorization: str = Header(default="")):
-    """手动测试一个能力标签（调试用）"""
+    """手动测试一个能力标签（调试用，行为同 /api/capabilities/process）"""
     verify_secret(authorization)
     import capabilities
     body = await request.json()
