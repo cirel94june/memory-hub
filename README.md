@@ -54,6 +54,22 @@ API Key:       {HUB_SECRET}:{AI身份}    例如 mysecret:rikkahub
 
 如果客户端的 `/v1` 已经要直连中转站，就不要把 Memory Hub 填到 API Base URL 里；这种场景应该把 Memory Hub 作为 MCP 记忆工具接入。只有在客户端可以把 Memory Hub 当作 OpenAI 兼容代理时，才走 `/v1`。
 
+### Agent 能力标签
+
+AI 在聊天中可以通过标签直接操作后端——用户说一句话，AI 判断后写标签，系统自动执行并从用户可见的回复中清除标签。
+
+| 标签 | 作用 | 示例 |
+|------|------|------|
+| `[记住:内容]` | 存入记忆 | `[记住:小猫下周要去面试]` |
+| `[更新状态:分类=内容]` | 更新当前状态画像（职业/健康/生活） | `[更新状态:职业=在XX公司做运营]` |
+| `[这是谁:昵称=说明]` | 登记新人物到注册表 | `[这是谁:小王=用户的同事]` |
+| `[忘记:描述]` | 归档不再需要的记忆 | `[忘记:之前在YY公司的信息]` |
+| `[draw:描述]` | 画图 | `[draw:a cute penguin]` |
+
+工作原理：proxy 在 AI 回复后扫描标签 → 执行 → 清除 → 返回干净文本。能力提示自动注入 system prompt，AI 知道自己有什么能力。流式和非流式回复都支持。
+
+API：`GET /api/capabilities` 列出所有能力，`POST /api/capabilities/test` 手动测试。
+
 ## 前端 App
 
 React SPA，路由在 `/app/`，奶油紫色系，玻璃拟态卡片风。
@@ -174,6 +190,7 @@ API Key: {HUB_SECRET}:{AI身份}
 | 存储 | SQLite + GitHub 备份 |
 | Embedding | 硅基流动 API (BAAI/bge-large-zh-v1.5, 1024维) |
 | 提取/整理模型 | deepseek-v4-flash (DeepSeek 官方 API) |
+| Agent 能力 | capabilities.py（标签注册 + 后处理执行） |
 | 部署 | VPS + systemd + GitHub Actions 自动部署 |
 | TG Bot | 三个独立 bot，部署在 Render |
 
@@ -263,6 +280,7 @@ memory-hub/
 ├── analyzer.py              # 小模型打标/合并/关系分类
 ├── gateway.py               # 记忆注入 + 提取
 ├── proxy.py                 # OpenAI 兼容代理
+├── capabilities.py          # Agent 能力标签（记住/更新状态/这是谁/忘记/画图）
 ├── corridor.py              # 走廊系统
 ├── chat_digest.py           # 跨窗口对话摘要
 ├── database.py              # SQLite 数据库
