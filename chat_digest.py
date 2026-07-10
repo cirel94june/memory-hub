@@ -104,9 +104,16 @@ async def generate_and_save(
         return
 
     speaker_label = "对方消息" if chat_type == "private" else "群内消息/触发消息"
+    try:
+        import identity_registry
+        glossary = identity_registry.glossary_text() + chr(10) + chr(10)
+    except Exception:
+        glossary = ""
     prompt = (
-        "用一句话（20-50字）概括这段对话的核心话题。"
-        "不要加前缀，直接输出；如果是群聊，不要把群内其他人的话概括成用户本人说的。"
+        glossary
+        + "用一句话（20-50字）概括这段对话的核心话题。"
+        "不要加前缀，直接输出；如果是群聊，不要把群内其他人的话概括成用户本人说的；"
+        "人物速查里同一个人的不同称呼不要写成两个人。"
         + chr(10) + chr(10)
         + f"{speaker_label}: {user_message[:300]}"
         + chr(10)

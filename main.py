@@ -75,6 +75,11 @@ async def lifespan(app: FastAPI):
         from image_gen import load_config as load_image_config
         await load_image_config()
         print("[Memory Hub] Image API config loaded")
+        import identity_registry
+        await identity_registry.load_registry()
+        import current_status
+        await current_status.load_status()
+        print("[Memory Hub] Identity registry + current status loaded")
         from persona_state import load_state as load_pulse_state
         load_pulse_state()
         print("[Memory Hub] Pulse state loaded")
@@ -778,6 +783,50 @@ async def api_ai_aliases():
     """返回 AI 别名映射，前端用于解析 cloudy→claude 等"""
     from config import AI_ALIASES
     return {"aliases": AI_ALIASES}
+
+
+# ── 人物注册表 + 当前状态画像 ──
+
+@app.get("/api/identity-registry")
+async def api_get_identity_registry(authorization: str = Header(default="")):
+    """人物注册表：用户本人 + 常见人物的称呼归一。daemon 自动收编，人工可修正。"""
+    verify_secret(authorization)
+    import identity_registry
+    return identity_registry.get_registry()
+
+
+@app.put("/api/identity-registry")
+async def api_update_identity_registry(request: Request, authorization: str = Header(default="")):
+    """人工修正人物注册表（整体替换 user / people 字段）"""
+    verify_secret(authorization)
+    import identity_registry
+    body = await request.json()
+    return await identity_registry.update_registry(body)
+
+
+@app.get("/api/current-status")
+async def api_get_current_status(authorization: str = Header(default="")):
+    """当前状态画像（职业/健康/生活近况，daemon 每 12h 重写）"""
+    verify_secret(authorization)
+    import current_status
+    return current_status.get_status()
+
+
+@app.post("/api/current-status/refresh", status_code=202)
+async def api_refresh_current_status(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
+    """手动触发画像重写（不用等 daemon）"""
+    verify_secret(authorization)
+    from daemon import refresh_current_status
+
+    async def _run():
+        try:
+            result = await refresh_current_status()
+            logging.getLogger("daemon").info(f"Manual current-status refresh: {result}")
+        except Exception as e:
+            logging.getLogger("daemon").exception(f"Manual current-status refresh failed: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "accepted"}
 
 
 @app.get("/api/ai-profiles")

@@ -251,12 +251,22 @@ def _parse_json(text: str):
         raise
 
 
+def _glossary_suffix() -> str:
+    """人物速查：防止打标模型把"小猫/狗蛋"等人名当成宠物或动物话题。"""
+    try:
+        import identity_registry
+        return "\n\n" + identity_registry.glossary_text() + \
+            "\n注意：以上人名即使字面像动物（如小猫、狗蛋），也都是**人**，domain/tags 不要打成宠物、动物类。"
+    except Exception:
+        return ""
+
+
 async def analyze(content: str) -> dict:
     """自动分析内容，返回 domain/valence/arousal/tags/category"""
     t0 = time.time()
     cfg = get_llm_config()
     try:
-        raw = await _call_llm(ANALYZE_PROMPT, content)
+        raw = await _call_llm(ANALYZE_PROMPT + _glossary_suffix(), content)
         if not raw:
             return {"domain": [], "valence": 0.5, "arousal": 0.3, "tags": [], "suggested_category": ""}
         result = _parse_json(raw)

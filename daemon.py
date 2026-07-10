@@ -469,6 +469,184 @@ async def distill_psychology() -> dict:
 
 # ── 6. 过时记忆自动检测 ──
 
+async def refresh_current_status() -> dict:
+    """重写"当前状态"画像（职业/健康/生活近况各一段）。
+
+    借鉴 Ombre portrait_engine：现状靠整段重写维护，旧信息在重写时被新信息替换，
+    不依赖旧记忆碎片互相取代。材料只取近 90 天，按新旧排序交给小模型。
+    """
+    import current_status
+    import identity_registry
+
+    all_mems = store.get_all_memories()
+    now = datetime.now(timezone.utc)
+    user_name = identity_registry.get_registry().get("user", {}).get("canonical", "小猫")
+    prev_sections = current_status.get_status().get("sections", {})
+    new_sections = {}
+
+    for key, meta in current_status.SECTIONS.items():
+        mems = []
+        for m in all_mems.values():
+            if m.get("status") != "active" or m.get("room") not in meta["rooms"]:
+                continue
+            if m.get("layer") == "private":
+                continue
+            try:
+                created = datetime.fromisoformat(m["created_at"])
+            except Exception:
+                continue
+            if (now - created).days > 90:
+                continue
+            mems.append((created, m))
+
+        mems.sort(key=lambda x: x[0], reverse=True)
+        evidence = "\n".join(
+            f"- [{c.strftime('%Y-%m-%d')}] {m['content'][:180]}"
+            for c, m in mems[:25]
+        )
+        prev_text = (prev_sections.get(key) or {}).get("text", "")
+
+        if not evidence and not prev_text:
+            continue
+
+        prompt = f"""你在维护{user_name}的「{meta['label']}」当前状态画像。这段画像会作为"现在的情况"注入给 AI，必须只反映**最新**状态。
+
+{identity_registry.glossary_text()}
+
+上一版画像：
+{prev_text or '（无）'}
+
+近 90 天记忆材料（按时间从新到旧）：
+{evidence or '（无新材料）'}
+
+重写规则：
+- 输出一段 ≤150 字的当前状态描述，以**最新日期**的信息为准。
+- 如果新材料显示状态已变化（如换了工作、身体好转），旧状态**不能再出现**，只写新状态；有必要时可加一句"此前是X，现已变为Y"。
+- 材料只是"提到过"的话题不算状态变化（聊到某职业≠换了职业）。
+- 没有新材料时保留上一版原文。
+- 不确定的信息不要写成确定事实。
+
+只输出画像正文，不要解释。"""
+
+        text = await _call_llm(prompt)
+        text = (text or "").strip()
+        if not text:
+            text = prev_text
+        if len(text) > 400:
+            text = text[:397] + "..."
+        if text:
+            new_sections[key] = {
+                "text": text,
+                "updated_at": now.isoformat(timespec="seconds"),
+                "evidence_count": len(mems),
+            }
+
+    if new_sections:
+        await current_status.save_status(new_sections)
+    return {k: v["text"][:60] for k, v in new_sections.items()}
+
+
+async def refresh_identity_registry() -> dict:
+    """从近期记忆里收编新出现的人物称呼，维护人物注册表。
+
+    保守策略：只在有明确证据时新增别名/人物；不删除已有条目（人工条目更不动）。
+    """
+    import identity_registry
+
+    all_mems = store.get_all_memories()
+    now = datetime.now(timezone.utc)
+    snippets = []
+    for m in all_mems.values():
+        if m.get("status") != "active":
+            continue
+        if m.get("room") not in ("relationships", "social", "living_room", "preferences"):
+            continue
+        try:
+            created = datetime.fromisoformat(m["created_at"])
+        except Exception:
+            continue
+        if (now - created).days > 21:
+            continue
+        snippets.append(f"- {m['content'][:150]}")
+    if not snippets:
+        return {"skipped": "no recent material"}
+
+    reg = identity_registry.get_registry()
+    current = identity_registry.glossary_text()
+
+    prompt = f"""你在维护一份人物注册表，防止 AI 把同一个人的不同称呼当成不同的人，或把人名误认成宠物。
+
+当前注册表：
+{current}
+
+近期记忆片段：
+{chr(10).join(snippets[:40])}
+
+任务：找出记忆片段中出现、但注册表没覆盖的**人的称呼**。
+- 如果某称呼有明确证据指向注册表里已有的人（比如"XX就是小猫"、同一语境明显同指）→ 作为别名归入那个人。
+- 如果是一个新的人（有名字、和用户有互动）→ 新增条目，写清关系。
+- AI 角色（注册表里已列出的）不要重复添加。
+- 宠物、虚构角色、路人一次性提及的不收。
+- 没有把握就不要输出，宁缺勿滥。
+
+输出纯 JSON：
+{{
+  "add_user_aliases": ["确认是用户本人的新称呼"],
+  "add_people": [{{"canonical": "名字", "aliases": [], "relation": "和用户的关系", "note": "一句备注"}}],
+  "add_aliases_to": [{{"canonical": "注册表里已有的名字", "aliases": ["新发现的别名"]}}]
+}}
+没有新发现就输出 {{}}。只输出 JSON。"""
+
+    raw = await _call_llm(prompt)
+    if not raw:
+        return {"skipped": "llm failed"}
+    try:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+        updates = json.loads(raw)
+    except Exception as e:
+        return {"skipped": f"parse error: {e}"}
+
+    changed = 0
+    user = reg.setdefault("user", {"canonical": "小猫", "aliases": [], "note": ""})
+    for alias in updates.get("add_user_aliases", []) or []:
+        alias = str(alias).strip()
+        if alias and alias != user.get("canonical") and alias not in user.get("aliases", []):
+            user.setdefault("aliases", []).append(alias)
+            changed += 1
+
+    existing = {p["canonical"]: p for p in reg.get("people", [])}
+    for item in updates.get("add_aliases_to", []) or []:
+        target = existing.get(str(item.get("canonical", "")).strip())
+        if not target:
+            continue
+        for alias in item.get("aliases", []) or []:
+            alias = str(alias).strip()
+            if alias and alias not in target.get("aliases", []):
+                target.setdefault("aliases", []).append(alias)
+                changed += 1
+
+    known_names = {user.get("canonical", "")} | set(user.get("aliases", [])) | set(existing)
+    for p in updates.get("add_people", []) or []:
+        name = str(p.get("canonical", "")).strip()
+        if not name or name in known_names:
+            continue
+        reg.setdefault("people", []).append({
+            "canonical": name,
+            "aliases": [str(a).strip() for a in p.get("aliases", []) if str(a).strip()],
+            "relation": str(p.get("relation", "")).strip(),
+            "note": str(p.get("note", "")).strip(),
+            "source": "daemon",
+        })
+        known_names.add(name)
+        changed += 1
+
+    if changed:
+        await identity_registry.save_registry(f"daemon folded {changed} identity updates")
+    return {"changed": changed}
+
+
 async def detect_stale_memories() -> dict:
     """扫描活跃记忆，用小模型判断是否已过时。
 
@@ -525,18 +703,24 @@ async def detect_stale_memories() -> dict:
 
     now_str = now.isoformat()
 
+    import current_status
+
     for old_mem in candidates:
         room = old_mem.get("room", "living_room")
         recent = recent_by_room.get(room, [])
+        # 当前状态画像作为额外参考：即使该房间没有近期记忆，
+        # 只要画像明确显示状态已变，旧记忆也能被判过时
+        portrait_ref = current_status.section_reference(room)
 
-        # 如果该房间没有近期记忆，跳过（无法判断是否过时）
-        if not recent:
+        # 既没有近期记忆也没有画像参考，跳过（无法判断是否过时）
+        if not recent and not portrait_ref:
             continue
 
         recent_text = "\n".join([
             f"- [{r['created_at'][:10]}] {r['content'][:100]}"
             for r in sorted(recent, key=lambda x: x.get("created_at", ""), reverse=True)[:8]
-        ])
+        ]) or "（无）"
+        portrait_text = f"\n\n当前状态画像（后台定期重写的最新状态，可作为判断依据）：\n{portrait_ref}" if portrait_ref else ""
 
         prompt = f"""你是一个记忆审核助手。请判断以下旧记忆是否已过时。
 
@@ -544,7 +728,7 @@ async def detect_stale_memories() -> dict:
 {old_mem['content']}
 
 同领域的近期记忆：
-{recent_text}
+{recent_text}{portrait_text}
 
 判断规则：
 - 如果近期记忆中有内容直接矛盾或更新了旧记忆的信息 → 过时
@@ -805,10 +989,16 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Living room profile refresh failed: {e}")
 
+    # 4.6. 人物注册表收编（新外号/新人物归一，供所有小模型 prompt 使用）
+    await run_step("identity_registry", "Refresh identity registry", refresh_identity_registry)
+
+    # 4.7. 当前状态画像重写（职业/健康/近况——旧状态在重写中被替换）
+    await run_step("current_status", "Refresh current status portrait", refresh_current_status)
+
     # 5. 心理感悟蒸馏
     await run_step("psychology", "Distill psychology", distill_psychology)
 
-    # 6. 过时记忆检测
+    # 6. 过时记忆检测（会参考当前状态画像判断旧记忆是否过时）
     await run_step("stale", "Detect stale memories", detect_stale_memories)
 
     # 8. 刷新对话捕获缓冲区（确保残留对话不丢）

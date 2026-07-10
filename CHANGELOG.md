@@ -2,6 +2,17 @@
 
 > 按日期倒序的改动与排查记录。工程规范和"不要做的事"见 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
+
+## 2026-07-10 身份系统与当前状态画像（参考 Ombre Brain 二改）
+
+针对三个记忆逻辑问题：旧职业被当成现状、AI 做梦时身份混淆、小猫/ceci/狗蛋等称呼被认成不同的人（甚至被打标成宠物）。
+
+- **人物注册表** `identity_registry.py`（参考 Ombre `identity.py`/`identity_semantics.py`）：用户本人 + 常见人物的称呼归一表，存 `_config/identity_registry.json`。daemon 每 12h 从近期记忆自动收编新称呼/新人物（保守策略，宁缺勿滥）；`GET/PUT /api/identity-registry` 可人工修正。人物速查块注入到 analyzer 打标、chat_digest 摘要、gateway 提取、dream 做梦的所有小模型 prompt——并明确"人名字面像动物也是人，不打宠物类标签"。
+- **自我锚点**（参考 Ombre `self_anchor.py`）：走廊顶部新增【你是谁】——我是谁（名字+人设）、同伴是谁（独立 AI，不是你）、用户是谁（所有称呼同指一人）。dream prompt 同步加身份规则：梦的主角是自己，同伴的言行不能带入成自己的。
+- **当前状态画像** `current_status.py`（参考 Ombre `portrait_engine.py`）：daemon 每 12h 用近 90 天材料**整段重写**职业/健康/生活近况三段画像（旧状态在重写中被新状态替换，不再依赖旧碎片互相取代），存 `_config/current_status.json`。走廊注入【当前状态】并声明"与碎片矛盾时以画像为准"。`GET /api/current-status`、`POST /api/current-status/refresh`。
+- **过时检测增强**：`detect_stale_memories` 现在把当前画像作为参考——即使房间里没有近期新记忆，画像显示状态已变时旧记忆也能被判过时（此前旧职业永远不会被标 stale 的根因）。
+- daemon 新增步骤：`identity_registry` → `current_status`（在心理蒸馏/过时检测之前）。
+
 ## 2026-07-10 数据安全与工程加固
 
 - **修复部署数据丢失风险**：社交库 `memory_hub.db` 曾被 git 跟踪在仓库根目录，deploy 的 `git reset --hard` 每次都会把线上社交数据（朋友圈/群聊）回滚到旧快照。现已迁移到 `data/memory_hub.db`（gitignore 保护区），deploy.yml 在 reset 前自动抢救旧位置的线上数据，social.py 启动时也会做兜底迁移。

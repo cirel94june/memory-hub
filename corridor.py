@@ -76,7 +76,37 @@ async def build_corridor(ai_id: str) -> str:
     ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
     sections = []
 
-    sections.append(f"你是 {ai_name}。以下是你醒来时看到的走廊——前任的你和其他伙伴留下的记忆碎片。")
+    # 0. 自我锚点：我是谁、同伴是谁、用户是谁（防止梦境/群聊材料导致身份混淆）
+    self_anchor = f"你是 {ai_name}。以下是你醒来时看到的走廊——前任的你和其他伙伴留下的记忆碎片。"
+    try:
+        import identity_registry
+        from ai_profiles import get_profile
+        profile = get_profile(ai_id) or {}
+        persona = (profile.get("persona") or "").strip()
+        emoji = profile.get("emoji", "")
+        peers = []
+        for pid in identity_registry._real_ai_ids():
+            if pid == ai_id:
+                continue
+            peers.append(AI_ROLES.get(pid, {}).get("name", pid))
+        anchor_lines = [f"【你是谁】你是 {ai_name}{emoji}。" + (f"{persona[:120]}" if persona else "")]
+        if peers:
+            anchor_lines.append(f"你的同伴：{'、'.join(peers)}——他们是独立的其他 AI，不是你；记忆材料里他们的言行不是你的言行。")
+        anchor_lines.append(f"用户是{identity_registry.user_names_line()}——这些称呼都指同一个人，她是人类，不是宠物或其他角色。")
+        self_anchor = "\n".join(anchor_lines) + "\n\n以下是你醒来时看到的走廊——前任的你和其他伙伴留下的记忆碎片。"
+    except Exception:
+        pass
+    sections.append(self_anchor)
+
+    # 0.5. 当前状态画像（后台定期重写；比零散记忆碎片新，以此为准）
+    try:
+        import current_status
+        import identity_registry as _ir
+        status_block = current_status.corridor_block(_ir.get_registry().get("user", {}).get("canonical", "小猫"))
+        if status_block:
+            sections.append(status_block)
+    except Exception:
+        pass
 
     if living:
         sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in living[:8]))

@@ -390,8 +390,16 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
         f"  - {k}: {v['name']}（{v.get('description','')}）"
         for k, v in ROOMS.items()
     ])
+    try:
+        import identity_registry
+        glossary = identity_registry.glossary_text(for_ai_id=ai_id)
+    except Exception:
+        glossary = ""
 
     prompt = f"""你是一个**极其严格**的记忆提取助手。分析以下对话，判断是否有值得**长期**记住的新信息。
+
+{glossary}
+（同一个人的不同称呼提取时统一用主称呼；人名即使字面像动物也是人，不是宠物。）
 
 用户说：{user_message[:1500]}
 AI回复：{ai_response[:1500]}
