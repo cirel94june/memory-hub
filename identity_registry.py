@@ -20,22 +20,19 @@ REGISTRY_PATH = "_config/identity_registry.json"
 # 基座模型 id，不是真实社交角色，不进人物速查
 BASE_MODEL_IDS = {"gemini", "gpt"}
 
-# 初始种子：只包含从现有记忆/文档中能确认的事实，其余靠 daemon 收编 + 人工修正
+# 初始种子：只放用户本人确认过的信息，不猜测其他人物（猜错反而制造混乱）。
+# 其余人物靠 daemon 从记忆收编 + 前端人工修正。
+# ai_nicknames：用户给 AI 起的绰号（如把 Jasper 叫"狗蛋"），避免被当成第三个人。
 DEFAULT_REGISTRY = {
     "user": {
         "canonical": "小猫",
         "aliases": ["ceci", "Ceci"],
         "note": "用户本人（人类女性）。所有 AI 服务的对象。",
     },
-    "people": [
-        {
-            "canonical": "狗蛋",
-            "aliases": [],
-            "relation": "用户的朋友",
-            "note": "人类朋友，不是宠物。常出现在群聊里。",
-            "source": "seed",
-        },
-    ],
+    "people": [],
+    "ai_nicknames": {
+        "jasper": ["狗蛋"],
+    },
     "updated_at": "",
 }
 
@@ -48,10 +45,43 @@ async def load_registry():
     data = await store._read_github_file(REGISTRY_PATH)
     if data and isinstance(data, dict) and data.get("user"):
         _registry = data
+        migrated = _migrate_registry(_registry)
         log.info(f"Loaded identity registry: {len(data.get('people', []))} people")
+        if migrated:
+            await save_registry("migrate identity registry (clean bad seeds / add ai_nicknames)")
     else:
         _registry = dict(DEFAULT_REGISTRY)
         await save_registry("seed identity registry")
+
+
+def _migrate_registry(reg: dict) -> bool:
+    """就地迁移旧数据，返回是否有改动。
+
+    - 补上 ai_nicknames 字段。
+    - 清理"被误当成人类"的 AI 绰号：任何 canonical/别名命中 ai_nicknames 的 people 条目删掉。
+      （修复早期把"狗蛋"当人类朋友的错误种子。）
+    """
+    changed = False
+    if "ai_nicknames" not in reg or not isinstance(reg.get("ai_nicknames"), dict):
+        reg["ai_nicknames"] = dict(DEFAULT_REGISTRY["ai_nicknames"])
+        changed = True
+
+    nickname_set = set()
+    for nicks in reg.get("ai_nicknames", {}).values():
+        nickname_set.update(str(n).strip() for n in nicks if str(n).strip())
+
+    people = reg.get("people", [])
+    if isinstance(people, list) and nickname_set:
+        kept = []
+        for p in people:
+            names = {str(p.get("canonical", "")).strip()} | {str(a).strip() for a in p.get("aliases", [])}
+            if names & nickname_set:
+                log.info(f"Migration: removed people entry '{p.get('canonical')}' (it's an AI nickname)")
+                changed = True
+                continue
+            kept.append(p)
+        reg["people"] = kept
+    return changed
 
 
 def get_registry() -> dict:
@@ -86,6 +116,12 @@ async def update_registry(data: dict):
                 "source": p.get("source", "manual"),
             })
         reg["people"] = people
+    if isinstance(data.get("ai_nicknames"), dict):
+        reg["ai_nicknames"] = {
+            str(k).strip(): [str(n).strip() for n in v if str(n).strip()]
+            for k, v in data["ai_nicknames"].items() if str(k).strip()
+        }
+    _migrate_registry(reg)  # 防止人工把 AI 绰号又写进 people
     _registry = reg
     await save_registry("manual identity registry update")
     return reg
@@ -126,15 +162,18 @@ def glossary_text(for_ai_id: str = "") -> str:
         lines.append(f"- {p['canonical']}{alias_part}：{rel}。{note}".rstrip())
 
     canonical_for = AI_ALIASES.get(for_ai_id, for_ai_id) if for_ai_id else ""
+    ai_nicknames = reg.get("ai_nicknames", {})
     for ai_id in _real_ai_ids():
         role = AI_ROLES.get(ai_id, {})
         name = role.get("name", ai_id)
         alias_ids = [a for a, c in AI_ALIASES.items() if c == ai_id]
-        alias_part = f"（id: {ai_id}" + (f"，也叫 {'、'.join(alias_ids)}" if alias_ids else "") + "）"
+        nicks = [str(n).strip() for n in ai_nicknames.get(ai_id, []) if str(n).strip()]
+        alias_bits = alias_ids + nicks
+        alias_part = f"（id: {ai_id}" + (f"，也叫 {'、'.join(alias_bits)}" if alias_bits else "") + "）"
         if canonical_for and ai_id == canonical_for:
             lines.append(f"- {name}{alias_part}：**这是你自己**。")
         else:
             suffix = "你的 AI 同伴，独立的另一个 AI，不是你。" if canonical_for else "AI 伙伴之一。"
-            lines.append(f"- {name}{alias_part}：{suffix}")
+            lines.append(f"- {name}{alias_part}：{suffix}这是一个 AI，不是人类。")
 
     return "人物速查（正确理解人名用，不要输出）：\n" + "\n".join(lines)
