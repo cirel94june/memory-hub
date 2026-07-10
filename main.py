@@ -27,6 +27,16 @@ from mcp_server import mcp as mcp_server
 
 # ── 鉴权 ──
 
+# 用默认密钥跑服务等于所有 /api 端点向全网敞开，直接拒绝启动。
+# 本地开发想跳过：设置环境变量 ALLOW_DEFAULT_HUB_SECRET=1（绝不要在 VPS 上设）。
+import os as _os
+if HUB_SECRET == "change-me-in-production" and _os.getenv("ALLOW_DEFAULT_HUB_SECRET") != "1":
+    raise RuntimeError(
+        "HUB_SECRET is still the default value. Set HUB_SECRET in .env before starting, "
+        "or set ALLOW_DEFAULT_HUB_SECRET=1 for local development only."
+    )
+
+
 def verify_secret(authorization: str = Header(default="")):
     token = authorization.replace("Bearer ", "").strip()
     if token != HUB_SECRET:
@@ -482,21 +492,25 @@ async def api_decay(authorization: str = Header(default="")):
     return await memory_ops.run_decay()
 
 
-async def _run_maintenance_background():
+async def _run_maintenance_background(force: bool = False):
     """Run maintenance outside the HTTP request so proxies do not time out."""
     try:
-        result = await daemon.run_full_maintenance()
+        result = await daemon.run_full_maintenance(force=force)
         logging.getLogger("daemon").info(f"Manual maintenance done: {json.dumps(result, ensure_ascii=False)}")
     except Exception as e:
         logging.getLogger("daemon").exception(f"Manual maintenance failed: {e}")
 
 
 @app.post("/api/daemon/maintain", status_code=202)
-async def api_maintain(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
-    """一键执行完整记忆整理（合并+压缩+归档+衰减+走廊重建）"""
+async def api_maintain(background_tasks: BackgroundTasks, force: bool = False, authorization: str = Header(default="")):
+    """一键执行完整记忆整理（合并+压缩+归档+衰减+走廊重建）
+
+    6 小时内已成功跑过会自动跳过（防止进程内定时器和 GitHub Actions 重复触发）；
+    带 ?force=true 强制立即重跑。
+    """
     verify_secret(authorization)
-    background_tasks.add_task(_run_maintenance_background)
-    return {"status": "accepted", "message": "maintenance started"}
+    background_tasks.add_task(_run_maintenance_background, force)
+    return {"status": "accepted", "message": "maintenance started (skips if last success <6h ago; use ?force=true to override)"}
 
 
 @app.get("/api/daemon/status")
@@ -616,7 +630,7 @@ async def proxy_chat_completions(request: Request):
 
     【简单模式】适合 RikkaHub 等只能设 URL + Key 的客户端：
       API Base URL: http://172.245.180.158:8888/v1
-      API Key: {HUB_SECRET}:{AI身份}   例如 xiaoke588887:rikkahub
+      API Key: {HUB_SECRET}:{AI身份}   例如 你的HUB_SECRET:rikkahub
       服务端自动用 .env 里的 LLM_BASE_URL 和 LLM_API_KEY 转发
 
     【完整模式】通过自定义请求头控制转发目标：
@@ -637,10 +651,11 @@ async def proxy_chat_completions(request: Request):
             is_simple = True
 
     if not is_simple:
-        # 完整模式鉴权
-        if hub_secret != HUB_SECRET:
-            if auth_raw != HUB_SECRET and not request.headers.get("x-hub-target-key"):
-                raise HTTPException(status_code=401, detail="Invalid Hub Secret. Use 'secret:ai_id' as API key, or set X-Hub-Secret header.")
+        # 完整模式鉴权：必须提供正确的 Hub Secret（X-Hub-Secret 头或 Authorization）。
+        # 注意：不能因为带了 x-hub-target-key 就放行——那会让任何人免密使用代理，
+        # 并把记忆注入后的完整上下文转发到他指定的任意地址（记忆外泄）。
+        if hub_secret != HUB_SECRET and auth_raw != HUB_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid Hub Secret. Use 'secret:ai_id' as API key, or set X-Hub-Secret header.")
 
     body = await request.json()
     return await proxy_mod.handle_chat_completions(request, body)

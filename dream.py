@@ -17,6 +17,13 @@ logger = logging.getLogger("memory_hub.dream")
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
 DREAM_STATUS_PATH = Path(__file__).parent / "data" / "dream_status.json"
 
+
+def _connect() -> sqlite3.Connection:
+    """独立连接（主连接在 database.py）；加 busy_timeout 防并发写时 database is locked。"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
 DREAM_PROMPT = """你是{name}。下面是你在小猫身边留下的“白天残留”：有私聊、私密群、小群、大群摘要，也可能有几条近期记忆碎片。
 
 重要：材料里的“某人说/有人说/对方说/群里说”不一定是小猫说的，也可能是狗蛋、其他 AI、群友或系统摘要。只有材料明确标注“小猫/用户/她”时，才能写成“小猫说”。不确定是谁说的，就写“有人说”“群里有人说”“我听见一句话的影子”，不要把话误归给小猫。
@@ -68,7 +75,7 @@ def read_dream_status() -> dict:
     # Refresh the visible dream list from the live DB. The status file is only
     # the latest run report and can otherwise keep showing stale/truncated rows.
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         conn.row_factory = sqlite3.Row
         data["recent_dreams"] = _recent_dreams(conn, limit=8)
         conn.close()
@@ -87,7 +94,7 @@ def get_recent_dreams_for_ai(ai_id: str, limit: int = 1, max_chars: int = 800) -
         return []
     placeholders = ",".join("?" * len(alias_ids))
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _connect()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""
@@ -202,7 +209,7 @@ async def generate_dreams(force: bool = False) -> dict:
 
     _today, day_start_utc, day_end_utc = _local_day_utc_bounds()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
 
     started_at = _now_utc()

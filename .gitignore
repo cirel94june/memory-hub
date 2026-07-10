@@ -6,5 +6,10 @@ __pycache__/
 memories.db
 uploads/
 
-# memory_hub.db 是社交模块(social.py)的活数据库，不要删除！
-# 它存储 social_posts / group_messages / ai_profiles 等表
+
+# memory_hub.db 是社交模块(social.py)的活数据库，现在存放在 data/memory_hub.db。
+# 活数据库绝不能进 git，否则 deploy 的 git reset --hard 每次都会把线上数据回滚。
+memory_hub.db
+
+# 前端构建产物由部署时 npm run build 生成，不进 git
+static-app/

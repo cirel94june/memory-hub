@@ -6,7 +6,7 @@ import json, os
 import httpx
 
 BASE = "http://localhost:8888"
-SECRET = os.environ.get("HUB_SECRET", "588887pa")
+SECRET = os.environ.get("HUB_SECRET", "")
 HEADERS = {"Authorization": f"Bearer {SECRET}", "Content-Type": "application/json"}
 
 

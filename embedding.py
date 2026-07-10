@@ -3,14 +3,12 @@
 模型：BAAI/bge-large-zh-v1.5（中文优化，1024维）
 """
 import math
-import os
 import struct
 
 import httpx
 
-EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1")
-EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+# 单一配置来源在 config.py，避免多处默认值漂移
+from config import EMBEDDING_BASE_URL, EMBEDDING_API_KEY, EMBEDDING_MODEL
 
 
 def pack_embedding(values: list[float]) -> bytes:

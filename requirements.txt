@@ -4,4 +4,5 @@ httpx
 pydantic
 mcp
 sqlite-vec
-fastembed
+# 不要加回 fastembed：embedding 已改走硅基流动 API（embedding.py），
+# 本地 ONNX 模型在 1G 内存 VPS 上撑不住（见 docs/HANDOFF.md 踩坑记录）

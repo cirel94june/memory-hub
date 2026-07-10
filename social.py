@@ -6,15 +6,33 @@ Tables: social_posts, social_comments, group_chats, group_messages
 import sqlite3
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "memory_hub.db")
+# 社交库放 data/ 目录：data/ 不在 git 里，部署时 git reset --hard 不会覆盖它
+_LEGACY_DB_PATH = os.path.join(os.path.dirname(__file__), "memory_hub.db")
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "memory_hub.db")
+
+
+def _migrate_legacy_db():
+    """旧版本的社交库在仓库根目录且被 git 跟踪，第一次启动时搬到 data/。"""
+    if os.path.exists(DB_PATH):
+        return
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    if os.path.exists(_LEGACY_DB_PATH):
+        shutil.copy2(_LEGACY_DB_PATH, DB_PATH)
+        print(f"[Social] Migrated legacy DB {_LEGACY_DB_PATH} -> {DB_PATH}")
+
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 def init_social_tables():
+    _migrate_legacy_db()
     c = _conn()
+    c.execute("PRAGMA journal_mode=WAL")
     c.executescript("""
     CREATE TABLE IF NOT EXISTS social_posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

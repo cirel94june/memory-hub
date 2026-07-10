@@ -6,6 +6,7 @@ Memory Daemon：定期后台整理
 - 衰减 + 自动归档
 - 推送到 GitHub
 """
+import asyncio
 import json
 import logging
 import time
@@ -714,8 +715,46 @@ async def _detect_contradictions():
 
 # ── 主入口：一键执行所有整理 ──
 
-async def run_full_maintenance() -> dict:
+# 维护有两个触发源：进程内 _daemon_loop（每12h）和 GitHub Actions daemon.yml（0点/12点）。
+# 用互斥锁防并发，用最小间隔防同一天重复整跑（重复跑会重复合并/做梦/备份）。
+_maintenance_lock = asyncio.Lock()
+MAINTENANCE_MIN_INTERVAL_HOURS = 6
+
+
+def _last_success_within(hours: float) -> str | None:
+    """如果最近一次成功维护在 hours 小时内，返回其完成时间，否则 None。"""
+    status = daemon_status.read_status()
+    if status.get("status") != "success":
+        return None
+    finished_at = status.get("finished_at") or status.get("updated_at") or ""
+    try:
+        ts = datetime.fromisoformat(finished_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if datetime.now(timezone.utc) - ts < timedelta(hours=hours):
+        return finished_at
+    return None
+
+
+async def run_full_maintenance(force: bool = False) -> dict:
     """执行完整的记忆整理流程"""
+    if _maintenance_lock.locked():
+        log.info("Maintenance already running, skipping this trigger")
+        return {"skipped": "already_running"}
+
+    if not force:
+        recent = _last_success_within(MAINTENANCE_MIN_INTERVAL_HOURS)
+        if recent:
+            log.info(f"Maintenance ran recently ({recent}), skipping (force=true to override)")
+            return {"skipped": "ran_recently", "last_finished_at": recent}
+
+    async with _maintenance_lock:
+        return await _run_full_maintenance_inner()
+
+
+async def _run_full_maintenance_inner() -> dict:
     log.info("Starting full memory maintenance...")
 
     from memory_ops import run_decay

@@ -51,7 +51,7 @@ def _extract_proxy_config(request: Request, headers: dict) -> ProxyConfig:
     【简单模式】— 适合 RikkaHub 等不支持自定义头的客户端
     只需设置 API Key 为 "hub密码:AI身份"，服务端自动用 .env 里的 LLM 配置转发：
       API Base URL: http://172.245.180.158:8888/v1
-      API Key: xiaoke588887:rikkahub
+      API Key: {HUB_SECRET}:rikkahub
 
     【完整模式】— 通过自定义请求头控制一切
     - X-Hub-Target-URL: 目标 AI API 地址

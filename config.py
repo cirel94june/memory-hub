@@ -15,11 +15,12 @@ HUB_SECRET = os.getenv("HUB_SECRET", "change-me-in-production")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── 小模型配置（analyzer / daemon / gateway 统一使用） ──
-# 全部走 OpenAI 兼容格式的中转站，改 .env 即可换模型
-# 推荐便宜快速的模型：deepseek-v4-flash, deepseek-chat, kimi-* 等
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://relay-cache.sharkielab.com/v1")
+# OpenAI 兼容格式，改 .env 即可换模型。
+# 默认走 DeepSeek 官方 API（HANDOFF 踩坑记录：不要用 Haiku——会拒绝恋爱场景+中文输出英文；
+# 不要用中转站——不稳定超时严重；不要用 Qwen 72B via SiliconFlow——太贵）
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "[kiro量低缓]claude-haiku-4-5")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 
 # 兼容旧配置（如果 .env 里还是旧变量名）
 if not LLM_API_KEY:
@@ -218,4 +219,10 @@ SEARCH_WEIGHTS = {
 SEARCH_THRESHOLD = 0.01  # RRF 融合后的最低分（RRF分值范围约0~0.05）
 
 # ── Embedding ──
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
+# 单一配置来源：embedding.py / database.py 都从这里读。
+# 模型和维度必须配套：bge-large-zh-v1.5 是 1024 维，bge-small-zh-v1.5 是 512 维。
+# 换模型时必须同时改 EMBEDDING_DIM，且已有向量需要重建。
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))

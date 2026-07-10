@@ -19,6 +19,15 @@ jobs:
             set -euo pipefail
 
             cd /opt/memory-hub
+
+            # 迁移保护：旧版社交库 memory_hub.db 曾被 git 跟踪在仓库根目录，
+            # git reset --hard 会把它删掉/回滚。先把线上数据抢救到 data/（不在 git 里）。
+            mkdir -p data
+            if [ -f memory_hub.db ] && [ ! -f data/memory_hub.db ]; then
+              cp memory_hub.db data/memory_hub.db
+              echo "Migrated live social DB to data/memory_hub.db"
+            fi
+
             git fetch origin main
             git reset --hard origin/main
 

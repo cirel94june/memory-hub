@@ -16,6 +16,13 @@ logger = logging.getLogger("memory_hub.chat_digest")
 
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
 
+
+def _connect() -> sqlite3.Connection:
+    """独立连接（主连接在 database.py）；加 busy_timeout 防并发写时 database is locked。"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
 # 按窗口类型分别限制保留条数
 RETENTION_LIMITS = {
     "private": 25,
@@ -29,7 +36,7 @@ RETENTION_DEFAULT = 30
 
 
 def _init_table():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_digests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,7 +121,7 @@ async def generate_and_save(
         summary = summary[:97] + "..."
 
     now = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -140,7 +147,7 @@ def get_recent_digests(
     include_types: list[str] | None = None,
 ) -> list[dict]:
     """获取最近的对话摘要，可按聊天类型过滤。"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
 
     params: list = [ai_id]
@@ -192,7 +199,7 @@ def get_recent_chat_activity(
         excluded.add("claude")
     excluded.discard("")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
 
     params: list = [chat_id]
@@ -222,7 +229,7 @@ def get_recent_chat_activity(
 
 def list_recent_digest_threads(limit: int = 20, include_types: list[str] | None = None) -> list[dict]:
     """List recent chat ids that have digests, for wake-preview selection."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.row_factory = sqlite3.Row
     params: list = []
     type_filter = ""

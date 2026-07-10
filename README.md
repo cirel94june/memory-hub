@@ -271,17 +271,24 @@ memory-hub/
 ├── dream.py                 # 梦境日记生成
 ├── daemon.py                # 定时整理（12h）
 ├── embedding.py             # Embedding（硅基流动 API）
-├── config.py                # 配置
+├── config.py                # 配置（LLM/embedding/房间/衰减参数的单一来源）
 ├── github_store.py          # GitHub 备份
+├── data/                    # 运行时数据（不在 git 里，deploy 不会覆盖）
+│   ├── memories.db          #   记忆主库（SQLite + FTS5 + sqlite-vec）
+│   └── memory_hub.db        #   社交库（朋友圈/群聊/论坛）
 ├── frontend/                # React 前端源码
 │   └── src/pages/           # 各页面组件
-├── static-app/              # 前端构建输出
+├── static-app/              # 前端构建输出（不在 git 里，部署时 npm build 生成）
+├── scripts/                 # 一次性数据修复/审计脚本
 ├── docs/
 │   ├── ARCHITECTURE.md      # 架构蓝图
 │   ├── HANDOFF.md           # 给下一个小克的话
 │   └── FEATURES.md          # 核心功能详解
-└── .github/workflows/       # CI/CD
+├── CHANGELOG.md             # 按日期的改动记录
+└── .github/workflows/       # CI/CD（deploy 部署 / daemon 定时维护 / vps-command 远程执行）
 ```
+
+存储说明：本仓库只放**代码**；记忆数据在 VPS 的 `data/` 目录（不进 git），GitHub 备份推到 `.env` 里 `GITHUB_REPO` 指定的**另一个私有仓库**，Obsidian 导出在 `exports/obsidian/`。
 
 ## 本地开发
 
@@ -299,54 +306,7 @@ python main.py
 
 服务启动在 `http://localhost:8888`，前端 `/app/`，MCP `/mcp`，代理 `/v1/chat/completions`。
 
-### 2026-07-06 夜梦机制修正
 
-- `dream.py` 不再按 UTC 日期用 `LIKE YYYY-MM-DD%` 粗略取当天材料，改为按 Asia/Shanghai 当天换算 UTC 起止时间，避免夜里/早晨错过材料。
-- daemon 夜梦从 `room=diary/category=dream` 改为写入 `room=dreams/category=night_dream`，和 MCP `dream()` 自省工具统一到梦境房间。
-- 当天去重会同时检查旧的 `diary` 梦和新的 `dreams` 梦，迁移期间不会重复生成。
-- 夜梦 prompt 改为“梦境残响”：要求抓住人名、场景、情绪、话题等具体残留，减少只有抽象抒情的日记感。
+## 改动日志
 
-### 2026-07-07 梦境诊断入口
-
-- 新增 `GET /api/dream/status`：读取最近一次夜梦生成诊断，包含每个 AI 的结果、跳过原因、当天摘要数量、近期记忆补充数量和最近梦境。
-- 新增 `POST /api/dream/run`：只触发夜梦生成，不必跑完整 daemon 维护，方便在观测台临时补跑。
-- 观测台总览新增“梦境诊断”卡片：能看到“今天已经做过梦 / 材料不足 / 小模型失败 / 已生成”，并可一键单独补跑。
-- `dream.py` 会写入 `data/dream_status.json`，让梦境 skip 不再只藏在后台日志里。
-
-### 2026-07-07 MCP 连接诊断与安全写入
-Memory Hub 的 MCP 入口现在会在启动时打印稳定身份信息：server name、version、/mcp path、工具数量和 tool schema hash。也可以用带 HUB_SECRET 的 /api/mcp/health?include_audit=true 查看同一份 identity 与最近 MCP 到达日志。
-
-如果 ChatGPT 网页端反复要求批准连接，优先对比这几个值是否变化：公网 URL 是否换了、工具列表/hash 是否换了、连接器配置是否重建。当前仓库的 MCP 是 FastMCP stateless HTTP，没有自建 OAuth/cookie/session；所以 cookie / OAuth 持久化问题通常在 ChatGPT 连接器或隧道层排查。
-
-记忆写入新增 safe_remember，普通 remember 和 batch_remember 也会走安全包装：长文本会先压缩；后端写入失败时只重试一次中性摘要；失败原文会写入 data/mcp_audit.jsonl 供排查，但不会无限原样重试。batch_remember 会逐条写入并返回每条 status，区分 created / merged / skipped / blocked / failed。若 ChatGPT 显示 工具调用被安全检查屏蔽但审计日志没有 tool_reached，说明请求没有到达 Memory Hub，是平台侧提前拦截。
-
-### 2026-07-07 MCP 工具列表缓存排查
-已确认 FastMCP 真实注册表会导出 28 个工具，包含 safe_remember、mcp_health、mcp_debug_log。/api/mcp/health 和 hub_info 现在都使用 FastMCP 自己的 list_tools 生成 tool_count 与 tool_schema_hash，不再只扫描 Python 函数名。
-
-如果 ChatGPT 侧仍只看到 25 个工具，但 batch_remember 已经是新版逐条写入，说明后端代码已更新，ChatGPT 端仍在使用旧 schema。处理方式是断开 Memory Hub MCP 连接后重新连接；重连后可先调用 hub_info，查看 mcp_identity.tool_count 是否为 28，以及 tools 里是否包含 safe_remember、mcp_health、mcp_debug_log。
-
-### 2026-07-07 梦境展示与浮现
-观测台的“梦境诊断”不再只显示最近梦境的短预览，而是展开最近 6 条梦境全文，包含 AI 身份和生成时间。这样小猫可以直接看到 AI 做了什么梦。
-
-Gateway 和 smart_context 现在会给对应 AI 注入最近 1 条“梦境残响”，长度控制在约 220 字，并提示 AI 合适时可以告诉小猫自己梦见了什么，或让梦轻轻影响语气。这个注入很轻量，避免每次醒来都增加太多 token。
-
-### 2026-07-07 梦境长度与群聊材料池
-梦境生成不再 300 字硬截断：prompt 改为 180-420 字，LLM max_tokens 提高到 700，落库前只在超过 1200 字时做安全截断。AI 醒来看到的最近梦境从约 220 字放宽到约 600 字。
-
-私密群、小群、大群、公开群都会参与梦境材料池：当天 chat_digests 本来就会按 AI 汇总；当当天摘要不足时，兜底的近期记忆池也会读取 private_group / small_group / big_group / public_group / group 来源。群聊 digest 保留条数也调高，避免私聊少时梦境只剩零碎材料。
-观测台新增“强制重做”按钮，会调用 /api/dream/run?force=true，忽略当天已做梦限制，适合把之前被截断的当天梦境重新生成一版完整内容。
-
-### 2026-07-07 梦境归因与检测台修正
-梦境检测台现在只展示 daemon 夜梦：room=dreams 且 category=night_dream / source_platform=daemon_dream / nightly 标签的记录，不再把旧 diary 日记或手动自省混进夜梦列表。/api/dream/status 会实时从数据库刷新 recent_dreams，避免一直显示旧 status 文件里的快照。
-
-梦境 prompt 增加归因规则：群聊摘要和记忆碎片里的话不一定是小猫说的，可能来自狗蛋、其他 AI、群友或系统摘要；不确定说话者时只能写“有人说/群里有人说”，不能写成“小猫说”。chat_digest 的摘要 prompt 也把“用户”改为“对方消息/群内消息”。
-
-### 2026-07-07 梦境调性修正
-梦境 prompt 现在会先判断白天残留的真实调性，不再默认写成温柔治愈。若材料带有恶作剧、逗弄、捣乱、笑场或混乱排查的气味，梦境应保留狡黠、荒唐、被逗得晕头转向的质感。
-
-## 2026-07-08 衰减与年轮修正
-
-- 观测台临近归档现在只显示短期/观察池中已经到线或 7 天内到线的记忆；长期、常被想起、高重要度或客厅画像记忆只会显示自己的保护/压力解释，不会再误入临近归档池。
-- 后台衰减归档也复用同一套解释，避免 UI 说保留、daemon 却按旧分数归档。
-- 记忆详情页新增年轮评论与追加年轮；history 改称版本历史，comments 才是年轮补充。
-- 观测台新增长期保留列表；保护中按保护原因统计，避免 long_term 记忆在总览里看起来消失。
+按日期的改动与排查记录已移到 [CHANGELOG.md](CHANGELOG.md)。
