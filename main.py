@@ -829,6 +829,31 @@ async def api_refresh_current_status(background_tasks: BackgroundTasks, authoriz
     return {"status": "accepted"}
 
 
+# ── Agent 能力 API ──
+
+@app.get("/api/capabilities")
+async def api_list_capabilities(authorization: str = Header(default="")):
+    """列出 AI 可用的 agent 能力标签"""
+    verify_secret(authorization)
+    import capabilities
+    caps = []
+    for tag, cap in capabilities._capabilities.items():
+        caps.append({"tag": tag, "label": cap.label, "hint": cap.hint})
+    return {"capabilities": caps, "hint_text": capabilities.capability_hints()}
+
+
+@app.post("/api/capabilities/test")
+async def api_test_capability(request: Request, authorization: str = Header(default="")):
+    """手动测试一个能力标签（调试用）"""
+    verify_secret(authorization)
+    import capabilities
+    body = await request.json()
+    text = body.get("text", "")
+    ai_id = body.get("ai_id", "cloudy")
+    cleaned, results = await capabilities.process(text, ai_id=ai_id)
+    return {"cleaned_text": cleaned, "results": results}
+
+
 @app.get("/api/ai-profiles")
 async def api_list_profiles(authorization: str = Header(default="")):
     """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""

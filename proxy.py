@@ -27,6 +27,7 @@ from config import HUB_SECRET, LLM_BASE_URL, LLM_API_KEY
 from ai_profiles import get_llm_config_for_ai
 import gateway as gateway_mod
 import conversation_capture
+import capabilities
 
 logger = logging.getLogger("memory_hub.proxy")
 
@@ -135,9 +136,9 @@ def _inject_memory_into_messages(messages: list[dict], memory_text: str) -> list
     if not memory_text:
         return messages
 
-    from image_gen import DRAW_HINT, get_config as get_img_config
-    draw_hint = DRAW_HINT if get_img_config()["base_url"] else ""
-    memory_block = f"\n\n--- 记忆上下文（自动注入，请参考但不要提及来源） ---\n{memory_text}\n--- 记忆上下文结束 ---{draw_hint}"
+    cap_hints = capabilities.capability_hints()
+    cap_block = f"\n\n{cap_hints}" if cap_hints else ""
+    memory_block = f"\n\n--- 记忆上下文（自动注入，请参考但不要提及来源） ---\n{memory_text}\n--- 记忆上下文结束 ---{cap_block}"
 
     new_messages = []
     system_found = False
@@ -179,15 +180,14 @@ def _inject_profile_and_memory_into_messages(messages: list[dict], memory_text: 
     if not memory_text and not profile_block:
         return messages
 
-    from image_gen import DRAW_HINT, get_config as get_img_config
-    draw_hint = DRAW_HINT if get_img_config()["base_url"] else ""
+    cap_hints = capabilities.capability_hints()
     blocks = []
     if profile_block:
         blocks.append("--- AI 档案（自动注入，请严格遵守）---\n" + profile_block)
     if memory_text:
         blocks.append("--- 记忆上下文（自动注入，请参考但不要提及来源）---\n" + memory_text + "\n--- 记忆上下文结束 ---")
-    if draw_hint:
-        blocks.append(draw_hint)
+    if cap_hints:
+        blocks.append(cap_hints)
     injected = "\n\n" + "\n\n".join(blocks)
 
     new_messages = []
@@ -384,20 +384,23 @@ async def handle_chat_completions(request: Request, body: dict):
         forward_body["stream"] = True
 
         async def _on_stream_complete(full_text: str):
-            if config.extract_memory and user_message and full_text:
+            cleaned, cap_results = await capabilities.process(full_text, ai_id=config.ai_id)
+            if cap_results:
+                logger.info(f"[Proxy] Stream capabilities executed: {[r['tag'] for r in cap_results]}")
+            if config.extract_memory and user_message and cleaned:
                 await _background_extract(
                     user_message=user_message,
-                    ai_response=full_text,
+                    ai_response=cleaned,
                     ai_id=config.ai_id,
                     platform=config.platform,
                     chat_id=config.chat_id,
                     chat_type=config.chat_type,
                 )
-            if config.chat_id and user_message and full_text:
+            if config.chat_id and user_message and cleaned:
                 try:
                     from chat_digest import generate_and_save
                     await generate_and_save(
-                        user_message=user_message, ai_response=full_text,
+                        user_message=user_message, ai_response=cleaned,
                         ai_id=config.ai_id, chat_id=config.chat_id,
                         chat_type=config.chat_type or "private",
                     )
@@ -434,8 +437,16 @@ async def handle_chat_completions(request: Request, body: dict):
 
     response_data = resp.json()
 
-    # Step 3: 后台提取记忆 + 跨窗口摘要
+    # Step 3: 执行能力标签 + 后台提取记忆 + 跨窗口摘要
     ai_response = await _extract_response_text(response_data)
+    if ai_response:
+        cleaned, cap_results = await capabilities.process(ai_response, ai_id=config.ai_id)
+        if cap_results:
+            logger.info(f"[Proxy] Capabilities executed: {[r['tag'] for r in cap_results]}")
+            response_data["capability_results"] = cap_results
+            if response_data.get("choices") and cleaned != ai_response:
+                response_data["choices"][0]["message"]["content"] = cleaned
+            ai_response = cleaned
     if config.extract_memory and user_message and ai_response:
         asyncio.create_task(_background_extract(
             user_message=user_message,

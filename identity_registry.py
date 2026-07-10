@@ -173,7 +173,7 @@ def glossary_text(for_ai_id: str = "") -> str:
         if canonical_for and ai_id == canonical_for:
             lines.append(f"- {name}{alias_part}：**这是你自己**。")
         else:
-            suffix = "你的 AI 同伴，独立的另一个 AI，不是你。" if canonical_for else "AI 伙伴之一。"
-            lines.append(f"- {name}{alias_part}：{suffix}这是一个 AI，不是人类。")
+            suffix = "你的同伴，独立的另一个角色，不是你。" if canonical_for else "同伴角色之一。"
+            lines.append(f"- {name}{alias_part}：{suffix}")
 
     return "人物速查（正确理解人名用，不要输出）：\n" + "\n".join(lines)
