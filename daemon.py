@@ -92,11 +92,17 @@ async def merge_similar() -> dict:
             if sim < MERGE_SIMILARITY:
                 continue
 
-            # 让小模型合并
-            prompt = f"""将以下两条记忆合并成一条简洁的陈述句，保留所有重要信息：
+            # 让小模型合并（带人物速查防止张冠李戴）
+            try:
+                import identity_registry
+                _glossary = identity_registry.glossary_text() + "\n\n"
+            except Exception:
+                _glossary = ""
+            prompt = f"""{_glossary}将以下两条记忆合并成一条简洁的陈述句。
+⚠️ 归属保护：谁的东西/行为/特征，合并后必须保留主语。不要把A的特征写到B身上。
 记忆1：{a['content']}
 记忆2：{b['content']}
-只输出合并后的一句话。"""
+只输出合并后的一句话，保留所有重要信息和归属关系。"""
             merged = await _call_llm(prompt)
             if not merged or _is_refusal(merged):
                 continue
@@ -343,7 +349,12 @@ async def tidy_living_room() -> dict:
                 if len(mems_to_merge) < 2:
                     continue
                 texts = "\n".join([m["content"] for m in mems_to_merge])
-                merged = await _call_llm(f"合并以下信息为一句简洁的陈述：\n{texts}\n只输出一句话。")
+                try:
+                    import identity_registry
+                    _g = identity_registry.glossary_text() + "\n\n"
+                except Exception:
+                    _g = ""
+                merged = await _call_llm(f"{_g}合并以下信息为一句简洁的陈述。⚠️ 保留主语归属，不要把A的特征/行为写到B身上：\n{texts}\n只输出一句话。")
                 if not merged or _is_refusal(merged):
                     continue
                 merged = merged.strip().strip('"')

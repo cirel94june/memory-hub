@@ -19,6 +19,29 @@ import github_store as store
 log = logging.getLogger("corridor")
 CORRIDOR_CACHE_TTL_MINUTES = 5
 
+_DEDUP_SIM_THRESHOLD = 0.75
+
+
+def _dedup_texts(texts: list[str], max_items: int = 0) -> list[str]:
+    """去除内容高度重复的文本（基于字符重叠比）。"""
+    if not texts:
+        return texts
+    kept: list[str] = []
+    for t in texts:
+        t_set = set(t)
+        is_dup = False
+        for k in kept:
+            k_set = set(k)
+            overlap = len(t_set & k_set) / max(len(t_set | k_set), 1)
+            if overlap > _DEDUP_SIM_THRESHOLD:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(t)
+    if max_items and len(kept) > max_items:
+        kept = kept[:max_items]
+    return kept
+
 
 async def build_corridor(ai_id: str) -> str:
     """
@@ -109,10 +132,13 @@ async def build_corridor(ai_id: str) -> str:
         pass
 
     if living:
-        sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in living[:8]))
+        deduped_living = _dedup_texts(living, max_items=8)
+        sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in deduped_living))
 
     if shared_relationships:
-        sections.append("【重要人物/关系索引】\n" + "\n".join(f"· {m['content'][:180]}" for m in shared_relationships))
+        rel_texts = [m['content'][:180] for m in shared_relationships]
+        deduped_rels = _dedup_texts(rel_texts)
+        sections.append("【重要人物/关系索引】\n" + "\n".join(f"· {x}" for x in deduped_rels))
     if relationship:
         sections.append("【你和主人之间】\n" + "\n".join(f"· {x}" for x in relationship[:5]))
 
