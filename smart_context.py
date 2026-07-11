@@ -46,7 +46,7 @@ async def get_smart_context(
 
         if user_message:
             recalled = await memory_ops.recall(
-                query=user_message, ai_id=ai_id, top_k=5, compact=True
+                query=user_message, ai_id=ai_id, top_k=5
             )
             if recalled:
                 recall_lines = [f"· {r['content'][:200]}" for r in recalled]
@@ -108,7 +108,7 @@ async def get_smart_context(
     # 3. 与当前消息相关的记忆
     if user_message:
         recalled = await memory_ops.recall(
-            query=user_message, ai_id=ai_id, top_k=5, compact=True
+            query=user_message, ai_id=ai_id, top_k=5
         )
         if recalled:
             recent_ids = {m["id"] for m in recent}
