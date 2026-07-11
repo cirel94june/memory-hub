@@ -385,23 +385,31 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
     return {"threads": list_recent_digest_threads(limit=30, include_types=["small_group", "big_group", "private_group", "group"])}
 
 
+GATEWAY_TIMEOUT = 8  # 秒：任何情况下都要在这个时间内返回响应
+
+
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    result = await gateway_mod.build_context(
-        user_message=body.user_message,
-        ai_id=body.ai_id,
-        recent_messages=body.recent_messages,
-        chat_id=body.chat_id,
-        chat_type=body.chat_type,
-        compact=body.compact,
-        max_memories=body.max_memories,
-        force_corridor=body.force_corridor,
-    )
-    # 附上能力标签说明：TG bot 等外部入口把 inject_text 放进 system prompt，
-    # AI 就知道自己可以用 [记住:]/[更新状态:] 等标签；执行仍在 Hub 侧
-    # （bot 回复后调 /api/capabilities/process）。proxy 走的是 build_context
-    # 直调路径，不经过这个端点，hints 由 proxy 自己注入，不会重复。
+    try:
+        result = await asyncio.wait_for(
+            gateway_mod.build_context(
+                user_message=body.user_message,
+                ai_id=body.ai_id,
+                recent_messages=body.recent_messages,
+                chat_id=body.chat_id,
+                chat_type=body.chat_type,
+                compact=body.compact,
+                max_memories=body.max_memories,
+                force_corridor=body.force_corridor,
+            ),
+            timeout=GATEWAY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger("main").warning(
+            f"gateway/context timeout ({GATEWAY_TIMEOUT}s) for ai={body.ai_id} chat={body.chat_id}"
+        )
+        result = {"inject_text": None, "recalled_ids": [], "rooms_checked": [], "timeout": True}
     try:
         import capabilities
         hints = capabilities.capability_hints()
@@ -424,13 +432,22 @@ class PostProcessRequest(BaseModel):
 @app.post("/api/gateway/post-process")
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    result = await gateway_mod.post_process(
-        user_message=body.user_message,
-        ai_response=body.ai_response,
-        ai_id=body.ai_id,
-        platform=body.platform,
-        chat_type=body.chat_type,
-    )
+    try:
+        result = await asyncio.wait_for(
+            gateway_mod.post_process(
+                user_message=body.user_message,
+                ai_response=body.ai_response,
+                ai_id=body.ai_id,
+                platform=body.platform,
+                chat_type=body.chat_type,
+            ),
+            timeout=GATEWAY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger("main").warning(
+            f"gateway/post-process timeout ({GATEWAY_TIMEOUT}s) for ai={body.ai_id}"
+        )
+        result = {"extracted": [], "timeout": True}
     if body.chat_id:
         try:
             from chat_digest import generate_and_save
