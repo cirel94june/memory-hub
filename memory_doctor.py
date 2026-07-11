@@ -44,6 +44,23 @@ async def run_checkup() -> dict:
     active = [m for m in all_mems.values() if m.get("status") == "active"]
     report["stats"]["active_memories"] = len(active)
 
+    # 记忆池仪表：各状态数量 + 数据库体积，让"池子越来越大"看得见
+    try:
+        status_counts: dict = {}
+        for m in all_mems.values():
+            s = m.get("status") or "unknown"
+            status_counts[s] = status_counts.get(s, 0) + 1
+        report["stats"]["pool"] = status_counts
+        db_dir = Path(__file__).parent / "data"
+        sizes = {}
+        for f in ("memories.db", "memory_hub.db", "raw_events.db"):
+            p = db_dir / f
+            if p.exists():
+                sizes[f] = f"{p.stat().st_size / 1024 / 1024:.1f}MB"
+        report["stats"]["db_sizes"] = sizes
+    except Exception:
+        pass
+
     # ── 1. 身份冲突：人/AI 被打成宠物 ──
     try:
         import identity_registry
@@ -273,4 +290,10 @@ def report_text() -> str:
     gate = stats.get("gate_recent_blocked")
     if gate:
         lines.append(f"· 写入门卫最近拦下 {gate} 条低价值碎片")
+    pool = stats.get("pool") or {}
+    if pool:
+        parts = "、".join(f"{k} {v} 条" for k, v in pool.items())
+        sizes = stats.get("db_sizes") or {}
+        size_part = f"（记忆库 {sizes.get('memories.db', '?')}）" if sizes else ""
+        lines.append(f"· 记忆池：{parts}{size_part}")
     return "\n".join(lines)

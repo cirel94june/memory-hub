@@ -18,7 +18,7 @@ import github_store as store
 from config import AI_ROLES, ROOMS, list_rooms
 
 MCP_SERVER_NAME = "Memory Hub"
-MCP_SERVER_VERSION = "2026-07-07.safe-write.2"
+MCP_SERVER_VERSION = "2026-07-11.doctor-tools.1"
 MCP_PUBLIC_PATH = "/mcp"
 MCP_AUDIT_PATH = Path(__file__).parent / "data" / "mcp_audit.jsonl"
 
@@ -348,19 +348,28 @@ async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source
         top_k: 返回数量（默认5）
         with_corridor: 是否同时返回走廊上下文（对话开头建议开启）
         source_ai: AI身份（影响私有房间可见性）
-        compact: 精简模式。为 true 时只返回 id/content/room/score/created_at，减少上下文消耗。适合 MCP 调用场景。
+        compact: 精简模式。为 true 时只返回 id/content/room/confidence/created_at，减少上下文消耗。适合 MCP 调用场景。
     """
     results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k)
     if compact:
         results = [
-            {k: item[k] for k in ("id", "content", "room", "score", "created_at") if k in item}
+            {k: item[k] for k in ("id", "content", "room", "confidence", "created_at") if k in item}
             for item in results
         ]
+    else:
+        # score 是内部 RRF 融合值（0.01~0.05 量级），对调用者没有解释意义；
+        # confidence（high/medium/low/weak）才是"这条相关吗"的答案
+        for item in results:
+            item.pop("score", None)
     output = {"results": results}
     if with_corridor:
         corridor_text = await corridor_mod.get_corridor(source_ai)
         output["corridor"] = corridor_text or ""
     return json.dumps(output, ensure_ascii=False, indent=2)
+
+
+_LIST_COMPACT_FIELDS = ("id", "content", "layer", "room", "category", "importance",
+                        "status", "resolved", "anchored", "created_at", "updated_at")
 
 
 @mcp.tool()
@@ -369,6 +378,7 @@ async def list_memories(
     status: str = "active",
     page: int = 1,
     per_page: int = 20,
+    compact: bool = True,
 ) -> str:
     """列出记忆。可按房间、状态筛选。
 
@@ -377,10 +387,17 @@ async def list_memories(
         status: 状态筛选：active/archived/decayed
         page: 页码
         per_page: 每页数量
+        compact: 精简模式（默认开）。只返回核心字段，不带原始对话全文/标签/年轮；
+                 需要完整详情时用 get_memory_detail 单条查看。
     """
     result = await memory_ops.list_memories(
         room=room or None, status=status, page=page, per_page=per_page,
     )
+    if compact and isinstance(result, dict) and isinstance(result.get("items"), list):
+        result["items"] = [
+            {k: m.get(k) for k in _LIST_COMPACT_FIELDS if k in m}
+            for m in result["items"]
+        ]
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -554,6 +571,37 @@ async def maintain() -> str:
     """执行记忆整理：合并相似记忆、压缩日记、衰减遗忘、重建走廊。"""
     result = await daemon.run_full_maintenance()
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def doctor_report() -> str:
+    """查看最近一次记忆体检报告：自动修复了什么、有哪些存疑记忆待确认、记忆池大小。
+    用户问"记忆系统最近怎么样/有没有问题/池子多大了"时用这个。
+    """
+    import memory_doctor
+    report = memory_doctor.read_report()
+    return json.dumps({
+        "text": memory_doctor.report_text(),
+        "auto_fixed": report.get("auto_fixed", []),
+        "issues": report.get("issues", []),
+        "stats": report.get("stats", {}),
+        "generated_at": report.get("generated_at", ""),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def search_raw(query: str, ai_id: str = "", limit: int = 5) -> str:
+    """在原文保险箱里查当时的原始对话（未经加工的原话）。
+    记忆内容存疑、或用户问"当时到底怎么说的"时用这个对照原文。
+
+    Args:
+        query: 关键词
+        ai_id: 限定某个 AI 的对话（留空=全部）
+        limit: 最多返回条数
+    """
+    import raw_vault
+    hits = raw_vault.search(query, ai_id=ai_id, limit=limit)
+    return json.dumps({"results": hits, "stats": raw_vault.stats()}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
