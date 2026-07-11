@@ -908,6 +908,57 @@ async def _detect_contradictions():
     return {"deduped": len(contradiction_pairs), "pairs": [(a, b, f"{s:.2f}") for a, b, s in contradiction_pairs[:10]]}
 
 
+async def expire_dated_tasks() -> dict:
+    """过期任务自动清理：带 event_date 的限时记忆（约定/安排/待办），
+    日期过去 2 天还活跃的自动归档——"今天下午喝咖啡"不该在下周还被推给 AI。
+
+    保护规则：锚点、人生章节、高重要度（>0.65）不动；只清理任务类轻记忆。
+    """
+    from time_utils import local_now
+    today = local_now().date()
+    expired = []
+
+    for m in store.get_all_memories().values():
+        if m.get("status") != "active":
+            continue
+        if m.get("anchored"):
+            continue
+        if m.get("category") == "life_chapter":
+            continue
+        event_date = str(m.get("event_date") or "").strip()[:10]
+        if not event_date:
+            continue
+        try:
+            from datetime import date
+            edate = date.fromisoformat(event_date)
+        except Exception:
+            continue
+        days_past = (today - edate).days
+        if days_past < 2:
+            continue
+        if float(m.get("importance", 0.5) or 0.5) > 0.65:
+            continue
+
+        m["status"] = "archived"
+        if m.get("resolved") is False:
+            m["resolved"] = True
+        comments = m.get("comments") if isinstance(m.get("comments"), list) else []
+        comments.append({
+            "date": datetime.now(timezone.utc).isoformat(),
+            "author": "daemon",
+            "kind": "expire_note",
+            "content": f"限时任务过期自动归档（event_date={event_date}，已过 {days_past} 天）",
+        })
+        m["comments"] = comments
+        store.set_memory(m)
+        expired.append(m["id"])
+        log.info(f"  Expired dated task: [{m['content'][:40]}] ({event_date})")
+
+    if expired:
+        await store.push_dirty()
+    return {"expired": len(expired)}
+
+
 # ── 主入口：一键执行所有整理 ──
 
 # 维护有两个触发源：进程内 _daemon_loop（每12h）和 GitHub Actions daemon.yml（0点/12点）。
@@ -1011,6 +1062,9 @@ async def _run_full_maintenance_inner() -> dict:
 
     # 6. 过时记忆检测（会参考当前状态画像判断旧记忆是否过时）
     await run_step("stale", "Detect stale memories", detect_stale_memories)
+
+    # 7.5 限时任务过期清理（event_date 过了 2 天的轻记忆自动归档）
+    await run_step("expire_dated", "Expire dated tasks", expire_dated_tasks)
 
     # 8. 刷新对话捕获缓冲区（确保残留对话不丢）
     try:

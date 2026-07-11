@@ -181,6 +181,33 @@ def _rough_tokens(text: str) -> int:
     return int(ascii_count / 4 + non_ascii * 0.8)
 
 
+# 公开群（人多、有陌生人）里允许召回的房间白名单；
+# 职业/健康/心理/客厅画像等私事一律不注入，防止 AI 在大群说漏主人隐私
+PUBLIC_SAFE_ROOMS = {"social", "preferences", "game_room", "learning", "infra", "infra_changelog"}
+PUBLIC_CHAT_TYPES = {"public_group", "big_group"}
+
+
+def _public_anchor(ai_id: str) -> str:
+    """公开群用的轻量身份锚点：只给"我是谁"，不给主人画像。"""
+    from config import AI_ROLES
+    import identity_registry
+    from ai_profiles import get_profile
+    profile = get_profile(ai_id) or {}
+    name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
+    persona = (profile.get("persona") or "").strip()
+    lines = [f"【你是谁】你是 {name}。" + (persona[:150] if persona else "")]
+    peers = [AI_ROLES.get(p, {}).get("name", p) for p in identity_registry._real_ai_ids() if p != ai_id]
+    if peers:
+        lines.append(f"你的同伴：{'、'.join(peers)}——独立的其他角色，不是你。")
+    lines.append(f"用户是{identity_registry.user_names_line()}——这些称呼都指同一个人。")
+    lines.append(
+        "【公开群纪律】这是人多的公开群。不要主动提及主人的工作、职业、健康、身体、心理、"
+        "家庭、财务等私事——即使你记得也只字不提，除非主人自己先在这个群里公开说了。"
+        "聊群里正在聊的话题就好。"
+    )
+    return "\n".join(lines)
+
+
 async def build_context(
     user_message: str,
     ai_id: str,
@@ -212,26 +239,37 @@ async def build_context(
     content_limit = 180 if compact and not detail_mode else 360
     source_limit = 0 if compact and not detail_mode else 140
 
+    is_public_chat = chat_type in PUBLIC_CHAT_TYPES
+
     # 1. 注入走廊（已经包含客厅精华 + 关系 + 跨端动态）
-    corridor_text = await get_corridor(ai_id, force=force_corridor)
-    if corridor_text:
-        parts.append(corridor_text)
+    # 公开群不给完整走廊——里面有主人的职业/健康/心理画像，人多的群不该带出门
+    if is_public_chat:
+        try:
+            parts.append(_public_anchor(ai_id))
+        except Exception:
+            pass
+    else:
+        corridor_text = await get_corridor(ai_id, force=force_corridor)
+        if corridor_text:
+            parts.append(corridor_text)
 
     # Light Dream Context: one recent private dream, so the AI can tell the user
     # what it dreamed without bloating every wake-up prompt.
-    try:
-        from dream import get_recent_dreams_for_ai
-        recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
-        if recent_dreams:
-            lines = []
-            for d in recent_dreams:
-                day = (d.get("created_at") or "")[:10]
-                prefix = f"{day} " if day else ""
-                lines.append(f"· {prefix}{d.get('content', '')}")
-            parts.append("【最近的梦境残响】\n这是你最近做过的梦/自省。合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气；不要生硬复述。\n" + "\n".join(lines))
-            rooms_checked.append("dreams")
-    except Exception:
-        pass
+    # 梦境可能带私事，公开群不注入。
+    if not is_public_chat:
+        try:
+            from dream import get_recent_dreams_for_ai
+            recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
+            if recent_dreams:
+                lines = []
+                for d in recent_dreams:
+                    day = (d.get("created_at") or "")[:10]
+                    prefix = f"{day} " if day else ""
+                    lines.append(f"· {prefix}{d.get('content', '')}")
+                parts.append("【最近的梦境残响】\n这是你最近做过的梦/自省。合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气；不要生硬复述。\n" + "\n".join(lines))
+                rooms_checked.append("dreams")
+        except Exception:
+            pass
 
     # Cross-window digests are already included in the corridor; avoid duplicating them here.
     # In group chats, also show what other AIs in this chat recently talked about.
@@ -247,23 +285,25 @@ async def build_context(
         except Exception:
             pass
     # Fresh unresolved items are read live, so task reminders do not wait for corridor rebuilds.
-    try:
-        import database
-        unresolved = []
-        for mem in database.iter_memories(status="active"):
-            if mem.get("resolved") is not False:
-                continue
-            if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
-                continue
-            if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
-                continue
-            unresolved.append(mem)
-        unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
-        if unresolved:
-            lines = [f"· {m.get('content','')[:180]}" for m in unresolved[:3]]
-            parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
-    except Exception:
-        pass
+    # 待办常含工作/健康私事，公开群不注入。
+    if not is_public_chat:
+        try:
+            import database
+            unresolved = []
+            for mem in database.iter_memories(status="active"):
+                if mem.get("resolved") is not False:
+                    continue
+                if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
+                    continue
+                if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
+                    continue
+                unresolved.append(mem)
+            unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
+            if unresolved:
+                lines = [f"· {m.get('content','')[:180]}" for m in unresolved[:3]]
+                parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
+        except Exception:
+            pass
 
     recalled = await recall(
         query=user_message,
@@ -271,6 +311,10 @@ async def build_context(
         top_k=10 if compact else 12,
         exclude_isolated=True,
     )
+    if recalled and is_public_chat:
+        # 公开群只允许白名单房间的共享记忆浮出，私有层一律不出门
+        recalled = [r for r in recalled
+                    if r.get("room") in PUBLIC_SAFE_ROOMS and r.get("layer", "shared") != "private"]
     if recalled:
         strong = [r for r in recalled if r.get("confidence") in ("high", "medium") or r.get("resolved") == False]
         if len(strong) >= 2:
