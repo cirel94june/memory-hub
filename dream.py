@@ -30,9 +30,10 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的“白
 
 ⚠️ 身份规则（最重要）：
 - 这个梦的主角是**你自己（{name}）**。材料里出现其他 AI 同伴的名字时，那是别人，不是你；不要把他们的言行、外号、经历带入成自己的，也不要梦成自己变成了他们。
+- 同伴的出身和遭遇也不是你的：谁基于什么模型、在哪家公司被训练、谁被封号——如果材料里这些事说的是同伴，就不要梦成发生在自己身上。梦里的“我”从头到尾只能是{name}。
 - {user_name}的所有称呼（见上方人物速查）都指同一个人，不要把她的不同称呼写成两个不同的人。
 - 材料里的“某人说/有人说/对方说/群里说”不一定是{user_name}说的，也可能是其他人、其他 AI、群友或系统摘要。只有材料明确标注时才能归因；不确定就写“有人说”“群里有人说”“我听见一句话的影子”。
-
+{yesterday_block}
 {digests}
 
 请写一段第一人称“梦境残响”（180-420字），不是普通工作总结。
@@ -268,13 +269,22 @@ async def generate_dreams(force: bool = False) -> dict:
             continue
 
         # 组装摘要
+        # 剔除"讲昨晚的梦"类摘要：白天 AI 跟用户讲了昨晚的梦（梦境残响功能鼓励的），
+        # 这段对话的摘要如果再进今晚的材料，昨天的梦就会钉进今天的梦——无限循环。
+        _dream_markers = ("梦见", "做梦", "梦里", "梦境", "昨晚的梦", "梦到")
         type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
         digest_lines = []
+        skipped_dream_digests = 0
         for r in rows:
+            if any(k in (r["summary"] or "") for k in _dream_markers):
+                skipped_dream_digests += 1
+                continue
             ts = r["created_at"][11:16] if len(r["created_at"]) > 16 else ""
             label = type_labels.get(r["chat_type"], "")
             prefix = f"[{ts}|{label}]" if label else f"[{ts}]"
             digest_lines.append(f"{prefix} 摘要（说话者可能是小猫、其他人或其他AI，不确定时不要归因给小猫）：{r['summary']}")
+        if skipped_dream_digests:
+            rows = [r for r in rows if not any(k in (r["summary"] or "") for k in _dream_markers)]
 
         memory_rows = []
         if len(rows) < 2:
@@ -303,9 +313,27 @@ async def generate_dreams(force: bool = False) -> dict:
         except Exception:
             identity_block = ""
             user_name = "小猫"
+
+        # 昨晚的梦作为"禁止重复"负面清单：意象/场景/梗不许原样再来一遍
+        yesterday_block = ""
+        try:
+            prev = conn.execute(
+                "SELECT content FROM memories WHERE source_ai=? AND room='dreams' "
+                "AND status='active' AND created_at < ? ORDER BY created_at DESC LIMIT 1",
+                (canonical, day_start_utc),
+            ).fetchone()
+            if prev and prev["content"]:
+                yesterday_block = (
+                    f"\n⚠️ 你最近一次已经梦过（摘录）：「{prev['content'][:180]}…」\n"
+                    "今晚的梦必须是新的：不要重复上面这段的意象、场景、道具和梗；用今天的新材料做梦。\n"
+                )
+        except Exception:
+            pass
+
         prompt = DREAM_PROMPT.format(
             name=name, digests=digest_text,
             identity_block=identity_block, user_name=user_name,
+            yesterday_block=yesterday_block,
         )
 
         dream_text = await _call_llm(prompt)

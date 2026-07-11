@@ -702,11 +702,30 @@ async def recall(
     kw_scored.sort(key=lambda x: x[1], reverse=True)
     kw_results = [_build_result(m, s) for m, s in kw_scored[:50]]
 
-    # ── 路径 3：精确匹配（post-filter on candidates from paths 1+2） ──
-    # Collect all unique candidate mems from vector + FTS paths
+    # ── 路径 2.5：中文子串搜索（LIKE 路） ──
+    # FTS5 默认分词器不切中文，纯中文 query 在关键词路上是盲的；
+    # cjk_like_search 用 2 字滑窗 LIKE 补上这条路，"提到妈妈"才能召回含"母亲/妈妈"原文的记忆。
+    like_results = []
+    try:
+        like_raw = database.cjk_like_search(query, top_k=50, status="active")
+        like_scored = []
+        for mem in like_raw:
+            if not _passes_private_filter(mem):
+                continue
+            room = mem.get("room", "")
+            if exclude_isolated and room in isolated_rooms:
+                continue
+            if include_rooms and room not in include_rooms:
+                continue
+            like_scored.append((mem, min(1.0, mem.pop("like_hits", 1) / 5.0)))
+        like_results = [_build_result(m, s) for m, s in like_scored[:50]]
+    except Exception as e:
+        logger.warning(f"cjk_like_search path failed: {e}")
+
+    # ── 路径 3：精确匹配（post-filter on candidates from all paths） ──
     seen_ids = set()
     exact_candidates = []
-    for result_list in (vec_results, kw_results):
+    for result_list in (vec_results, kw_results, like_results):
         for item in result_list:
             mid = item["id"]
             if mid not in seen_ids:
@@ -714,10 +733,6 @@ async def recall(
                 mem = store.get_memory(mid)
                 if mem:
                     exact_candidates.append(mem)
-
-    # Note: exact match scoring runs on candidates already gathered from vec+FTS paths.
-    # FTS5 should catch most content-matching memories. If needed, a SQL LIKE query
-    # could be added to database.py in the future for truly exact substring matches.
 
     exact_scored = []
     for mem in exact_candidates:
@@ -728,8 +743,8 @@ async def recall(
     exact_scored.sort(key=lambda x: x[1], reverse=True)
     exact_results = [_build_result(m, s) for m, s in exact_scored[:50]]
 
-    # ── RRF 融合三路结果 ──
-    merged = _rrf_merge(vec_results, kw_results, exact_results)
+    # ── RRF 融合四路结果 ──
+    merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
 
     # ── Unresolved 优先浮现（最多 2 条插到最前面）──
     unresolved = []

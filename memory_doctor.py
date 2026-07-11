@@ -152,6 +152,58 @@ async def run_checkup() -> dict:
     except Exception as e:
         log.warning(f"doctor contradiction scan failed: {e}")
 
+    # ── 2.5 待办复审：让"未解决"流动起来，不再是写死的钉子 ──
+    # 挂了 14 天以上的待办，用小模型对照当前画像判断是否还成立；
+    # 明确过时的自动摘牌（记忆保留，只是不再天天置顶推给 AI）。
+    try:
+        from datetime import timedelta
+        from gateway import _call_llm as _llm
+        import current_status
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        stale_unresolved = [
+            m for m in active
+            if m.get("resolved") is False
+            and (m.get("updated_at") or m.get("created_at") or "") < cutoff
+        ]
+        status_text = "\n".join(
+            f"{v.get('text', '')}" for v in
+            (current_status.get_status().get("sections", {}) or {}).values() if v.get("text")
+        )[:600]
+        for m in stale_unresolved[:6]:
+            prompt = (
+                f"用户当前状态画像：\n{status_text or '（暂无画像）'}\n\n"
+                f"下面这条记忆被标记为'未解决待办'，已挂了 14 天以上：\n{m['content'][:300]}\n\n"
+                "判断它现在是否仍然是一个**进行中的、需要每天提醒的待办**。\n"
+                "注意：情绪描述、状态描述、已经过时的旧情况都不算待办。\n"
+                '只输出 JSON：{"still_open": true/false, "reason": "一句话"}'
+            )
+            result = await _llm(prompt)
+            try:
+                result = result.strip()
+                if result.startswith("```"):
+                    result = result.split("\n", 1)[-1].rsplit("```", 1)[0]
+                verdict = json.loads(result)
+            except Exception:
+                continue
+            if verdict.get("still_open"):
+                continue
+            m["resolved"] = True
+            comments = m.get("comments") if isinstance(m.get("comments"), list) else []
+            comments.append({
+                "date": report["generated_at"],
+                "author": "memory_doctor",
+                "kind": "auto_fix",
+                "content": f"体检自动摘牌：不再是进行中的待办（{str(verdict.get('reason', ''))[:80]}）",
+            })
+            m["comments"] = comments
+            store.set_memory(m)
+            report["auto_fixed"].append({
+                "id": m.get("id"), "type": "stale_todo",
+                "detail": f"过期待办已摘牌：{m['content'][:50]}…",
+            })
+    except Exception as e:
+        log.warning(f"doctor unresolved review failed: {e}")
+
     # ── 3. 门卫统计 ──
     try:
         import write_gate

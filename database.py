@@ -6,6 +6,7 @@ SQLite 数据库引擎（替代内存 dict + GitHub 存储）
 - 同步 sqlite3（够快，避免 async 复杂度）
 """
 import json
+import re
 import struct
 import sqlite3
 import logging
@@ -679,6 +680,55 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
         mem["rank"] = row["rank"]
         results.append(mem)
 
+    return results
+
+
+_CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
+
+
+def cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+    """中文子串搜索（LIKE 路）。
+
+    FTS5 默认分词器不切中文——整段中文被当成一个 token，"妈妈"永远匹配不上
+    包含"我妈妈说"的记忆。这里把 query 里的中文段切成 2 字滑窗（我妈/妈妈/妈说），
+    用 LIKE 找包含这些片段的记忆，按命中片段数排序。作为混合召回的关键词路补充。
+    """
+    runs = _CJK_RUN_RE.findall(query or "")
+    grams: list[str] = []
+    seen: set[str] = set()
+    for run in runs:
+        for i in range(len(run) - 1):
+            g = run[i:i + 2]
+            if g not in seen:
+                seen.add(g)
+                grams.append(g)
+    grams = grams[:20]
+    if not grams:
+        return []
+
+    conn = _get_conn()
+    conds = " OR ".join(["content LIKE ?"] * len(grams))
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
+            (status, *[f"%{g}%" for g in grams]),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        logger.exception("cjk_like_search failed")
+        return []
+
+    scored = []
+    for row in rows:
+        mem = _row_to_dict_no_embedding(row)
+        text = f"{mem.get('content', '')} {mem.get('tags', '')} {mem.get('category', '')}"
+        hits = sum(1 for g in grams if g in text)
+        if hits:
+            scored.append((hits, mem))
+    scored.sort(key=lambda x: -x[0])
+    results = []
+    for hits, mem in scored[:top_k]:
+        mem["like_hits"] = hits
+        results.append(mem)
     return results
 
 

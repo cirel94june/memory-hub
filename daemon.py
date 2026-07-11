@@ -908,6 +908,36 @@ async def _detect_contradictions():
     return {"deduped": len(contradiction_pairs), "pairs": [(a, b, f"{s:.2f}") for a, b, s in contradiction_pairs[:10]]}
 
 
+async def backfill_embeddings(batch: int = 40) -> dict:
+    """给缺失向量的活跃记忆补 embedding。
+
+    没有向量的记忆在语义召回里永远隐形（补打标不补向量是历史遗留）。
+    每轮最多补 batch 条，控制 API 用量；几轮 daemon 后即可全量覆盖。
+    """
+    from embedding import get_embedding, pack_embedding
+    todo = [m for m in store.get_all_memories().values()
+            if m.get("status") == "active" and not m.get("embedding")]
+    if not todo:
+        return {"backfilled": 0, "remaining": 0}
+
+    done = 0
+    for m in todo[:batch]:
+        try:
+            vec = await get_embedding(m.get("content", ""))
+            if not vec:
+                continue
+            m["embedding"] = pack_embedding(vec)
+            store.set_memory(m)
+            done += 1
+        except Exception as e:
+            log.warning(f"  Embedding backfill failed for {m.get('id')}: {e}")
+    if done:
+        await store.push_dirty()
+    remaining = len(todo) - done
+    log.info(f"  Embedding backfill: {done} done, {remaining} remaining")
+    return {"backfilled": done, "remaining": remaining}
+
+
 async def expire_dated_tasks() -> dict:
     """过期任务自动清理：带 event_date 的限时记忆（约定/安排/待办），
     日期过去 2 天还活跃的自动归档——"今天下午喝咖啡"不该在下周还被推给 AI。
@@ -1087,6 +1117,9 @@ async def _run_full_maintenance_inner() -> dict:
 
     # 10.5 补分析 quick 模式存入的记忆
     await run_step("backfill_analysis", "Backfill analysis", _backfill_analysis)
+
+    # 10.55 补缺失的向量（没向量的记忆在语义召回里隐形）
+    await run_step("backfill_embeddings", "Backfill embeddings", backfill_embeddings)
 
     # 10.6 自动补 about 前缀
     await run_step("fix_about", "Fix about prefixes", _auto_fix_about_prefix)
