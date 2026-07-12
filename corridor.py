@@ -19,6 +19,9 @@ import github_store as store
 log = logging.getLogger("corridor")
 CORRIDOR_CACHE_TTL_MINUTES = 5
 
+# In-memory corridor cache: avoids GitHub API reads on every request
+_mem_cache: dict[str, dict] = {}  # ai_id -> {"text": str, "compiled_at": datetime}
+
 _DEDUP_SIM_THRESHOLD = 0.75
 
 
@@ -203,19 +206,32 @@ async def build_corridor(ai_id: str) -> str:
 
 
 async def get_corridor(ai_id: str, force: bool = False) -> str:
-    """获取走廊文档（短缓存；force=True 时立即重建）。"""
+    """获取走廊文档。优先用进程内存缓存（0 网络开销），TTL 内直接返回。"""
     ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
-    cached = None if force else await store._read_github_file(f"private/{ai_id}/_corridor.json")
-    if cached and isinstance(cached, dict) and cached.get("text"):
-        try:
-            compiled = datetime.fromisoformat(cached.get("compiled_at", ""))
-            age_minutes = (datetime.now(timezone.utc) - compiled).total_seconds() / 60
+
+    if not force:
+        entry = _mem_cache.get(ai_id)
+        if entry and entry.get("text"):
+            age_minutes = (datetime.now(timezone.utc) - entry["compiled_at"]).total_seconds() / 60
             if age_minutes <= CORRIDOR_CACHE_TTL_MINUTES:
-                return cached["text"]
-            log.info(f"Corridor for {ai_id} is {age_minutes:.1f}m old, rebuilding")
-        except Exception:
-            pass
-    return await build_corridor(ai_id)
+                return entry["text"]
+
+        # 内存冷启动：从 GitHub 加载一次（进程重启后第一次请求）
+        if not entry:
+            try:
+                cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
+                if cached and isinstance(cached, dict) and cached.get("text"):
+                    compiled = datetime.fromisoformat(cached.get("compiled_at", ""))
+                    age_minutes = (datetime.now(timezone.utc) - compiled).total_seconds() / 60
+                    _mem_cache[ai_id] = {"text": cached["text"], "compiled_at": compiled}
+                    if age_minutes <= CORRIDOR_CACHE_TTL_MINUTES:
+                        return cached["text"]
+            except Exception:
+                pass
+
+    text = await build_corridor(ai_id)
+    _mem_cache[ai_id] = {"text": text, "compiled_at": datetime.now(timezone.utc)}
+    return text
 
 
 async def rebuild_all_corridors():

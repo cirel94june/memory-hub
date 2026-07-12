@@ -246,15 +246,22 @@ async def log_conversation(
         last_ts = _last_extract_time.get(key, 0)
         if now_ts - last_ts < EXTRACT_COOLDOWN:
             return {"status": "buffered", "buffer_size": buffer_size, "cooldown": True}
-        # 用锁防止同一 buffer 被并发提取多次
         if key not in _extract_locks:
             _extract_locks[key] = asyncio.Lock()
         if _extract_locks[key].locked():
             return {"status": "buffered", "buffer_size": buffer_size, "extracting": True}
-        async with _extract_locks[key]:
-            _last_extract_time[key] = now_ts
-            extracted = await _extract_and_remember(key)
-        return {"status": "extracted", "memories": extracted, "buffer_size": 0}
+        # 提取放后台，接口立即返回（不阻塞 bot 回消息）
+        _last_extract_time[key] = now_ts
+
+        async def _bg_extract():
+            try:
+                async with _extract_locks[key]:
+                    await _extract_and_remember(key)
+            except Exception as e:
+                logger.warning(f"background extraction failed for {key}: {e}")
+
+        asyncio.create_task(_bg_extract())
+        return {"status": "extracting_async", "buffer_size": buffer_size}
 
     return {"status": "buffered", "buffer_size": buffer_size}
 

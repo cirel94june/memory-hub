@@ -385,7 +385,7 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
     return {"threads": list_recent_digest_threads(limit=30, include_types=["small_group", "big_group", "private_group", "group"])}
 
 
-GATEWAY_TIMEOUT = 8  # 秒：任何情况下都要在这个时间内返回响应
+GATEWAY_TIMEOUT = 3  # 秒：context 端点整体超时（各源 1.8s 并行 + 组装开销）
 
 
 @app.post("/api/gateway/context")
@@ -428,43 +428,59 @@ class PostProcessRequest(BaseModel):
     chat_id: str = ""
     chat_type: str = ""
     reply_reason: str = ""
+    message_id: str = ""
 
-@app.post("/api/gateway/post-process")
+@app.post("/api/gateway/post-process", status_code=202)
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    try:
-        result = await asyncio.wait_for(
-            gateway_mod.post_process(
+    if body.message_id:
+        key = _idemp_key(body.platform, body.ai_id, body.chat_id, body.message_id)
+        if key in _idempotency_cache:
+            return {"status": "duplicate", "message": "already processed"}
+        _idempotency_cache[key] = True
+        if len(_idempotency_cache) > _IDEMP_MAX:
+            _idempotency_cache.popitem(last=False)
+
+    async def _do_post_process():
+        try:
+            await gateway_mod.post_process(
                 user_message=body.user_message,
                 ai_response=body.ai_response,
                 ai_id=body.ai_id,
                 platform=body.platform,
                 chat_type=body.chat_type,
-            ),
-            timeout=GATEWAY_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logging.getLogger("main").warning(
-            f"gateway/post-process timeout ({GATEWAY_TIMEOUT}s) for ai={body.ai_id}"
-        )
-        result = {"extracted": [], "timeout": True}
-    if body.chat_id:
-        try:
-            from chat_digest import generate_and_save
-            await generate_and_save(
-                user_message=body.user_message, ai_response=body.ai_response,
-                ai_id=body.ai_id, chat_id=body.chat_id,
-                chat_type=body.chat_type or "private",
-                reply_reason=body.reply_reason,
             )
-        except Exception:
-            pass
-    return result
+        except Exception as e:
+            logging.getLogger("main").warning(f"post-process background failed: {e}")
+        if body.chat_id:
+            try:
+                from chat_digest import generate_and_save
+                await generate_and_save(
+                    user_message=body.user_message, ai_response=body.ai_response,
+                    ai_id=body.ai_id, chat_id=body.chat_id,
+                    chat_type=body.chat_type or "private",
+                    reply_reason=body.reply_reason,
+                )
+            except Exception:
+                pass
+
+    asyncio.create_task(_do_post_process())
+    return {"status": "accepted", "message": "post-process queued"}
 
 
 # ── 对话自动捕获 ──
 
 import conversation_capture
+from collections import OrderedDict
+
+# 幂等缓存：防止 bot 重试导致重复写入（保留最近 500 条）
+_idempotency_cache: OrderedDict = OrderedDict()
+_IDEMP_MAX = 500
+
+
+def _idemp_key(platform: str, ai_id: str, chat_id: str, msg_id: str) -> str:
+    return f"{platform}:{ai_id}:{chat_id}:{msg_id}"
+
 
 class ConversationLogRequest(BaseModel):
     user_message: str
@@ -473,11 +489,21 @@ class ConversationLogRequest(BaseModel):
     platform: str = ""
     chat_id: str = ""
     chat_type: str = "private"
+    message_id: str = ""  # 幂等键：platform + ai_id + chat_id + message_id
+
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
-    """记录一轮对话，缓冲区满时自动提取记忆"""
+    """记录一轮对话，缓冲区满时自动提取（后台）。接口只做缓冲，立即返回。"""
     verify_secret(authorization)
+    # 幂等去重
+    if body.message_id:
+        key = _idemp_key(body.platform, body.ai_id, body.chat_id, body.message_id)
+        if key in _idempotency_cache:
+            return {"status": "duplicate", "message": "already processed"}
+        _idempotency_cache[key] = True
+        if len(_idempotency_cache) > _IDEMP_MAX:
+            _idempotency_cache.popitem(last=False)
     result = await conversation_capture.log_conversation(
         user_message=body.user_message,
         ai_response=body.ai_response,
@@ -487,22 +513,21 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         chat_type=body.chat_type,
     )
     if body.chat_id:
-        try:
-            from chat_digest import generate_and_save
-            digest_type = {
-                "private_group": "small_group",
-                "public_group": "big_group",
-            }.get(body.chat_type, body.chat_type or "private")
-            await generate_and_save(
-                user_message=body.user_message,
-                ai_response=body.ai_response,
-                ai_id=body.ai_id,
-                chat_id=body.chat_id,
-                chat_type=digest_type,
-                reply_reason="capture_log",
-            )
-        except Exception:
-            pass
+        async def _bg_digest():
+            try:
+                from chat_digest import generate_and_save
+                digest_type = {
+                    "private_group": "small_group",
+                    "public_group": "big_group",
+                }.get(body.chat_type, body.chat_type or "private")
+                await generate_and_save(
+                    user_message=body.user_message, ai_response=body.ai_response,
+                    ai_id=body.ai_id, chat_id=body.chat_id,
+                    chat_type=digest_type, reply_reason="capture_log",
+                )
+            except Exception:
+                pass
+        asyncio.create_task(_bg_digest())
     return result
 
 @app.post("/api/capture/extract")
@@ -2155,7 +2180,8 @@ asgi_app = MCPGateway(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
+    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on",
+                limit_concurrency=50, timeout_keep_alive=10)
 
 
 

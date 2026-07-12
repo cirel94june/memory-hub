@@ -6,11 +6,27 @@ Memory Gateway：小模型预处理层
 import json
 import math
 import asyncio
+import logging
 import httpx
 from datetime import datetime, timezone
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS, AI_ALIASES
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
+
+log = logging.getLogger("gateway")
+
+# 共享 HTTP 客户端池：复用 TCP 连接，避免每次请求重新握手
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5, read=25, write=10, pool=5),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
 
 
 async def _call_llm(prompt: str) -> str:
@@ -19,21 +35,21 @@ async def _call_llm(prompt: str) -> str:
         return ""
     url = f"{LLM_BASE_URL}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                url,
-                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                json={
-                    "model": LLM_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 2048,
-                },
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+        client = _get_http_client()
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            json={
+                "model": LLM_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 2048,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"[Gateway] LLM error: {e}")
+        log.warning(f"LLM call failed: {e}")
         return ""
 
 
@@ -208,6 +224,27 @@ def _public_anchor(ai_id: str) -> str:
     return "\n".join(lines)
 
 
+_SOURCE_TIMEOUT = 1.8  # 每个数据源的独立超时（秒）
+
+
+async def _safe(coro, label: str, timings: dict):
+    """Run a coroutine with per-source timeout; on failure return None and log."""
+    import time as _time
+    t0 = _time.perf_counter()
+    try:
+        result = await asyncio.wait_for(coro, timeout=_SOURCE_TIMEOUT)
+        timings[label] = round((_time.perf_counter() - t0) * 1000)
+        return result
+    except asyncio.TimeoutError:
+        timings[label] = f"TIMEOUT({_SOURCE_TIMEOUT}s)"
+        log.warning(f"[context] source '{label}' timed out after {_SOURCE_TIMEOUT}s")
+        return None
+    except Exception as e:
+        timings[label] = f"ERROR({e.__class__.__name__})"
+        log.warning(f"[context] source '{label}' failed: {e}")
+        return None
+
+
 async def build_context(
     user_message: str,
     ai_id: str,
@@ -220,14 +257,12 @@ async def build_context(
 ) -> dict:
     """
     核心功能：在 AI 回复之前，自动组装要注入的记忆 context。
-
-    返回:
-    {
-        "inject_text": "要注入到 system prompt 的记忆文本",
-        "recalled_ids": ["被召回的记忆ID列表"],
-        "rooms_checked": ["检查了哪些房间"]
-    }
+    目标延迟 <2s：各数据源并行获取，单源超时 1.8s，跳过慢源返回已有结果。
     """
+    import time as _time
+    t_start = _time.perf_counter()
+    timings: dict = {}
+
     requested_ai_id = ai_id
     ai_id = AI_ALIASES.get(ai_id, ai_id)
     parts = []
@@ -241,87 +276,88 @@ async def build_context(
 
     is_public_chat = chat_type in PUBLIC_CHAT_TYPES
 
-    # 1. 注入走廊（已经包含客厅精华 + 关系 + 跨端动态）
-    # 公开群不给完整走廊——里面有主人的职业/健康/心理画像，人多的群不该带出门
-    if is_public_chat:
-        try:
-            parts.append(_public_anchor(ai_id))
-        except Exception:
-            pass
-    else:
-        corridor_text = await get_corridor(ai_id, force=force_corridor)
-        if corridor_text:
-            parts.append(corridor_text)
+    # ── 并行获取所有数据源 ──
+    async def _fetch_corridor():
+        if is_public_chat:
+            return _public_anchor(ai_id)
+        return await get_corridor(ai_id, force=force_corridor)
 
-    # Light Dream Context: one recent private dream, so the AI can tell the user
-    # what it dreamed without bloating every wake-up prompt.
-    # 梦境可能带私事，公开群不注入。
-    if not is_public_chat:
-        try:
-            from dream import get_recent_dreams_for_ai
-            recent_dreams = get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
-            if recent_dreams:
-                lines = []
-                for d in recent_dreams:
-                    day = (d.get("created_at") or "")[:10]
-                    prefix = f"{day} " if day else ""
-                    lines.append(f"· {prefix}{d.get('content', '')}")
-                parts.append("【最近的梦境残响】\n这是你最近做过的梦/自省。合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气；不要生硬复述。\n" + "\n".join(lines))
-                rooms_checked.append("dreams")
-        except Exception:
-            pass
+    async def _fetch_recall():
+        return await recall(
+            query=user_message,
+            ai_id=ai_id,
+            top_k=10 if compact else 12,
+            exclude_isolated=True,
+            skip_analyze=True,
+        )
 
-    # Cross-window digests are already included in the corridor; avoid duplicating them here.
-    # In group chats, also show what other AIs in this chat recently talked about.
-    group_chat_types = {"private_group", "small_group", "big_group", "group"}
-    if chat_id and chat_type in group_chat_types:
-        try:
-            from chat_digest import get_recent_chat_activity
-            group_digests = get_recent_chat_activity(chat_id, exclude_ai_id=ai_id, limit=4)
-            group_activity = group_digests
-            if group_digests:
-                lines = [f"· {d.get('ai_id', 'AI')}: {d['summary']}" for d in group_digests]
-                parts.append("【这个群里其他AI最近在聊】\n" + "\n".join(lines))
-        except Exception:
-            pass
-    # Fresh unresolved items are read live, so task reminders do not wait for corridor rebuilds.
-    # 待办常含工作/健康私事，公开群不注入。
-    if not is_public_chat:
-        try:
-            import database
-            unresolved = []
-            for mem in database.iter_memories(status="active"):
-                if mem.get("resolved") is not False:
-                    continue
-                if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
-                    continue
-                if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
-                    continue
-                unresolved.append(mem)
-            unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
-            if unresolved:
-                lines = [f"· {m.get('content','')[:180]}" for m in unresolved[:3]]
-                parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
-        except Exception:
-            pass
+    async def _fetch_dreams():
+        if is_public_chat:
+            return None
+        from dream import get_recent_dreams_for_ai
+        return get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
 
-    recalled = await recall(
-        query=user_message,
-        ai_id=ai_id,
-        top_k=10 if compact else 12,
-        exclude_isolated=True,
+    async def _fetch_unresolved():
+        if is_public_chat:
+            return []
+        import database
+        unresolved = []
+        for mem in database.iter_memories(status="active"):
+            if mem.get("resolved") is not False:
+                continue
+            if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
+                continue
+            if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
+                continue
+            unresolved.append(mem)
+        unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
+        return unresolved[:3]
+
+    async def _fetch_group_activity():
+        if not chat_id or chat_type not in {"private_group", "small_group", "big_group", "group"}:
+            return []
+        from chat_digest import get_recent_chat_activity
+        return get_recent_chat_activity(chat_id, exclude_ai_id=ai_id, limit=4)
+
+    corridor_result, recalled, dreams, unresolved, group_digests = await asyncio.gather(
+        _safe(_fetch_corridor(), "corridor", timings),
+        _safe(_fetch_recall(), "recall", timings),
+        _safe(_fetch_dreams(), "dreams", timings),
+        _safe(_fetch_unresolved(), "unresolved", timings),
+        _safe(_fetch_group_activity(), "group_activity", timings),
     )
-    if recalled and is_public_chat:
-        # 公开群只允许白名单房间的共享记忆浮出，私有层一律不出门
-        recalled = [r for r in recalled
-                    if r.get("room") in PUBLIC_SAFE_ROOMS and r.get("layer", "shared") != "private"]
+
+    # ── 组装结果（各源独立，缺失就跳过）──
+    if corridor_result:
+        parts.append(corridor_result)
+
+    if dreams:
+        lines = []
+        for d in dreams:
+            day = (d.get("created_at") or "")[:10]
+            prefix = f"{day} " if day else ""
+            lines.append(f"· {prefix}{d.get('content', '')}")
+        parts.append("【最近的梦境残响】\n这是你最近做过的梦/自省。合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气；不要生硬复述。\n" + "\n".join(lines))
+        rooms_checked.append("dreams")
+
+    if group_digests:
+        group_activity = group_digests
+        lines = [f"· {d.get('ai_id', 'AI')}: {d['summary']}" for d in group_digests]
+        parts.append("【这个群里其他AI最近在聊】\n" + "\n".join(lines))
+
+    if unresolved:
+        lines = [f"· {m.get('content','')[:180]}" for m in unresolved]
+        parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
+
     if recalled:
+        if is_public_chat:
+            recalled = [r for r in recalled
+                        if r.get("room") in PUBLIC_SAFE_ROOMS and r.get("layer", "shared") != "private"]
         strong = [r for r in recalled if r.get("confidence") in ("high", "medium") or r.get("resolved") == False]
         if len(strong) >= 2:
             recalled = strong
         recalled = recalled[:memory_limit]
         recalled_ids = [r["id"] for r in recalled]
-        # L3: 压缩 — 每条 ≤400 字，附带原始语境帮助回忆细节
         lines = []
         for r in recalled:
             content = _clip_text(r["content"], content_limit)
@@ -346,19 +382,21 @@ async def build_context(
 
     inject_text = "\n\n".join(parts) if parts else ""
 
-    # 生成简要的记忆活动摘要（供前端展示）
     recall_summary = ""
     if recalled:
         snippets = []
         for r in recalled[:3]:
             c = r["content"]
-            # 去掉 [用户]/[互动]/[AI] 前缀
             for prefix in ["[用户] ", "[互动] ", "[AI] "]:
                 if c.startswith(prefix):
                     c = c[len(prefix):]
                     break
             snippets.append(c[:30].rstrip("，。、") + ("…" if len(c) > 30 else ""))
         recall_summary = "🔍 " + " | ".join(snippets)
+
+    total_ms = round((_time.perf_counter() - t_start) * 1000)
+    timings["total"] = total_ms
+    log.info(f"[context] ai={ai_id} chat={chat_id[:8] if chat_id else '-'} {total_ms}ms | {timings}")
 
     return {
         "inject_text": inject_text,
@@ -375,6 +413,7 @@ async def build_context(
         "detail_mode": detail_mode,
         "memory_count": len(recalled or []),
         "estimated_tokens": _rough_tokens(inject_text),
+        "timings_ms": timings,
     }
 
 

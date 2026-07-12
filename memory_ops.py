@@ -570,6 +570,7 @@ async def recall(
     query_domain: list[str] = None,
     query_valence: float = -1,
     query_arousal: float = -1,
+    skip_analyze: bool = False,
 ) -> list[dict]:
     """混合搜索召回记忆（向量 + BM25 FTS + 精确匹配，RRF 融合）
 
@@ -579,12 +580,14 @@ async def recall(
     3. 精确路：SQL LIKE + Python post-filter（最强信号）
 
     + unresolved 记忆优先浮现（最多 2 条）
+
+    skip_analyze=True: 跳过 LLM analyzer 调用（用于 TG context 快速路径），
+    仅用向量+关键词+LIKE 搜索，不做 emotion/domain 加权。
     """
     ai_ids = _identity_ids(ai_id)
     query_vec = await get_embedding(query)
 
-    # 如果没指定 domain，用 analyzer 快速分析 query
-    if not query_domain:
+    if not query_domain and not skip_analyze:
         try:
             q_analysis = await analyzer.analyze(query)
             query_domain = q_analysis.get("domain", [])

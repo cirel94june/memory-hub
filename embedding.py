@@ -31,23 +31,36 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+_embed_client: httpx.AsyncClient | None = None
+
+
+def _get_embed_client() -> httpx.AsyncClient:
+    global _embed_client
+    if _embed_client is None or _embed_client.is_closed:
+        _embed_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3, read=10, write=5, pool=3),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _embed_client
+
+
 async def get_embedding(text: str) -> list[float] | None:
     if not text or not text.strip():
         return None
     if not EMBEDDING_API_KEY:
-        print("[Embedding] no API key configured")
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"{EMBEDDING_BASE_URL}/embeddings",
-                headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": EMBEDDING_MODEL, "input": text[:2000]},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
+        client = _get_embed_client()
+        resp = await client.post(
+            f"{EMBEDDING_BASE_URL}/embeddings",
+            headers={"Authorization": f"Bearer {EMBEDDING_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": EMBEDDING_MODEL, "input": text[:2000]},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["data"][0]["embedding"]
     except Exception as e:
-        print(f"[Embedding] error: {e}")
+        import logging
+        logging.getLogger("embedding").warning(f"get_embedding failed: {e}")
         return None
