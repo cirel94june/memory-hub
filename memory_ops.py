@@ -647,72 +647,48 @@ async def recall(
                 return False
         return True
 
-    # ── 路径 1：向量搜索（语义匹配）──
-    vec_results = []
-    if query_vec:
-        raw_vec = database.vector_search(query_vec, top_k=50, status="active", **db_kwargs)
+    # ── 纯 DB 搜索逻辑（可在线程中运行）──
+    def _db_search_all():
+        """同步函数：执行所有 DB 搜索路径，返回四路原始结果。
+        skip_analyze=True 时此函数在 to_thread 中运行，使用只读连接。"""
+        use_ro = skip_analyze  # context hot path → 用只读连接
 
-        vec_scored = []
-        for mem in raw_vec:
-            if not _passes_private_filter(mem):
-                continue
+        # 路径 1：向量搜索
+        vec_results = []
+        if query_vec:
+            search_fn = database.ro_vector_search if use_ro else database.vector_search
+            raw_vec = search_fn(query_vec, top_k=50, status="active", **db_kwargs)
+            vec_scored = []
+            for mem in raw_vec:
+                if not _passes_private_filter(mem):
+                    continue
+                distance = mem.pop("distance", 0.0)
+                vec_sim = _distance_to_cosine(distance)
+                embed_score = max(0, vec_sim)
+                if query_valence >= 0 and query_arousal >= 0:
+                    mv = _safe_float(mem.get("valence"), 0.5)
+                    ma = _safe_float(mem.get("emotion_arousal"), 0.3)
+                    emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
+                else:
+                    emotion_score = 0.5
+                try:
+                    created = datetime.fromisoformat(mem["created_at"])
+                    days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
+                    time_score = math.exp(-0.02 * days)
+                except Exception:
+                    time_score = 0.5
+                importance_score = _safe_float(mem.get("importance"), 0.5)
+                final = (embed_score * 0.6 + emotion_score * 0.15 +
+                         time_score * 0.1 + importance_score * 0.15)
+                vec_scored.append((mem, final))
+            vec_scored.sort(key=lambda x: x[1], reverse=True)
+            vec_results = [_build_result(m, s) for m, s in vec_scored[:50]]
 
-            distance = mem.pop("distance", 0.0)
-            vec_sim = _distance_to_cosine(distance)
-
-            # 多维加权：向量为主，emotion/time/importance 辅助
-            embed_score = max(0, vec_sim)
-            if query_valence >= 0 and query_arousal >= 0:
-                mv = _safe_float(mem.get("valence"), 0.5)
-                ma = _safe_float(mem.get("emotion_arousal"), 0.3)
-                emotion_score = 1.0 - math.sqrt(((query_valence - mv)**2 + (query_arousal - ma)**2) / 2)
-            else:
-                emotion_score = 0.5
-            try:
-                created = datetime.fromisoformat(mem["created_at"])
-                days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
-                time_score = math.exp(-0.02 * days)
-            except Exception:
-                time_score = 0.5
-            importance_score = _safe_float(mem.get("importance"), 0.5)
-
-            final = (embed_score * 0.6 + emotion_score * 0.15 +
-                     time_score * 0.1 + importance_score * 0.15)
-            vec_scored.append((mem, final))
-
-        vec_scored.sort(key=lambda x: x[1], reverse=True)
-        vec_results = [_build_result(m, s) for m, s in vec_scored[:50]]
-
-    # ── 路径 2：全文搜索（FTS5 BM25）──
-    raw_fts = database.fts_search(query, top_k=50, status="active")
-    kw_scored = []
-    for mem in raw_fts:
-        if not _passes_private_filter(mem):
-            continue
-        # Apply room filters in Python (FTS doesn't support room filters)
-        room = mem.get("room", "")
-        if exclude_isolated and room in isolated_rooms:
-            continue
-        if include_rooms and room not in include_rooms:
-            continue
-
-        rank = mem.pop("rank", 0.0)
-        # FTS5 rank is negative (lower = better match); normalize to 0..1
-        bm25 = min(1.0, abs(rank) / 10.0) if rank else 0.0
-        if bm25 > 0.01:
-            kw_scored.append((mem, bm25))
-
-    kw_scored.sort(key=lambda x: x[1], reverse=True)
-    kw_results = [_build_result(m, s) for m, s in kw_scored[:50]]
-
-    # ── 路径 2.5：中文子串搜索（LIKE 路） ──
-    # FTS5 默认分词器不切中文，纯中文 query 在关键词路上是盲的；
-    # cjk_like_search 用 2 字滑窗 LIKE 补上这条路，"提到妈妈"才能召回含"母亲/妈妈"原文的记忆。
-    like_results = []
-    try:
-        like_raw = database.cjk_like_search(query, top_k=50, status="active")
-        like_scored = []
-        for mem in like_raw:
+        # 路径 2：FTS5
+        fts_fn = database.ro_fts_search if use_ro else database.fts_search
+        raw_fts = fts_fn(query, top_k=50, status="active")
+        kw_scored = []
+        for mem in raw_fts:
             if not _passes_private_filter(mem):
                 continue
             room = mem.get("room", "")
@@ -720,49 +696,75 @@ async def recall(
                 continue
             if include_rooms and room not in include_rooms:
                 continue
-            like_scored.append((mem, min(1.0, mem.pop("like_hits", 1) / 5.0)))
-        like_results = [_build_result(m, s) for m, s in like_scored[:50]]
-    except Exception as e:
-        logger.warning(f"cjk_like_search path failed: {e}")
+            rank = mem.pop("rank", 0.0)
+            bm25 = min(1.0, abs(rank) / 10.0) if rank else 0.0
+            if bm25 > 0.01:
+                kw_scored.append((mem, bm25))
+        kw_scored.sort(key=lambda x: x[1], reverse=True)
+        kw_results = [_build_result(m, s) for m, s in kw_scored[:50]]
 
-    # ── 路径 3：精确匹配（post-filter on candidates from all paths） ──
-    seen_ids = set()
-    exact_candidates = []
-    for result_list in (vec_results, kw_results, like_results):
-        for item in result_list:
-            mid = item["id"]
-            if mid not in seen_ids:
-                seen_ids.add(mid)
-                mem = store.get_memory(mid)
-                if mem:
-                    exact_candidates.append(mem)
+        # 路径 2.5：CJK LIKE
+        like_results = []
+        try:
+            like_fn = database.ro_cjk_like_search if use_ro else database.cjk_like_search
+            like_raw = like_fn(query, top_k=50, status="active")
+            like_scored = []
+            for mem in like_raw:
+                if not _passes_private_filter(mem):
+                    continue
+                room = mem.get("room", "")
+                if exclude_isolated and room in isolated_rooms:
+                    continue
+                if include_rooms and room not in include_rooms:
+                    continue
+                like_scored.append((mem, min(1.0, mem.pop("like_hits", 1) / 5.0)))
+            like_results = [_build_result(m, s) for m, s in like_scored[:50]]
+        except Exception as e:
+            logger.warning(f"cjk_like_search path failed: {e}")
 
-    exact_scored = []
-    for mem in exact_candidates:
-        exact = _exact_match_score(query, mem)
-        if exact > 0.3:
-            exact_scored.append((mem, exact))
+        # 路径 3：精确匹配
+        get_fn = database.ro_get_memory if use_ro else store.get_memory
+        seen_ids = set()
+        exact_candidates = []
+        for result_list in (vec_results, kw_results, like_results):
+            for item in result_list:
+                mid = item["id"]
+                if mid not in seen_ids:
+                    seen_ids.add(mid)
+                    mem = get_fn(mid)
+                    if mem:
+                        exact_candidates.append(mem)
+        exact_scored = []
+        for mem in exact_candidates:
+            exact = _exact_match_score(query, mem)
+            if exact > 0.3:
+                exact_scored.append((mem, exact))
+        exact_scored.sort(key=lambda x: x[1], reverse=True)
+        exact_results = [_build_result(m, s) for m, s in exact_scored[:50]]
 
-    exact_scored.sort(key=lambda x: x[1], reverse=True)
-    exact_results = [_build_result(m, s) for m, s in exact_scored[:50]]
+        # RRF 融合
+        merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
 
-    # ── RRF 融合四路结果 ──
-    merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
+        # Unresolved 优先浮现
+        unresolved_items = []
+        normal_items = []
+        for item in merged:
+            mem = get_fn(item["id"])
+            if mem and mem.get("resolved") == False and len(unresolved_items) < 2:
+                item["_unresolved"] = True
+                unresolved_items.append(item)
+            else:
+                normal_items.append(item)
 
-    # ── Unresolved 优先浮现（最多 2 条插到最前面）──
-    unresolved = []
-    normal = []
-    for item in merged:
-        mem = store.get_memory(item["id"])
-        if mem and mem.get("resolved") == False and len(unresolved) < 2:
-            item["_unresolved"] = True
-            unresolved.append(item)
-        else:
-            normal.append(item)
+        return (unresolved_items + normal_items)[:top_k]
 
-    results = (unresolved + normal)[:top_k]
+    # skip_analyze=True → context hot path：在线程中跑 DB 搜索，不阻塞事件循环
+    if skip_analyze:
+        results = await asyncio.to_thread(_db_search_all)
+    else:
+        results = _db_search_all()
 
-    # ── Touch：更新 activation_count + 时间涟漪 ──
+    # ── Touch：更新 activation_count（写操作留在主线程） ──
     now = _now()
     for r in results:
         m = store.get_memory(r["id"])
@@ -786,9 +788,7 @@ async def recall(
                     r["superseded_from"] = m["id"]
             else:
                 continue
-        # 清理内部标记
         r.pop("_unresolved", None)
-        # RRF 分数区间约 0~0.05，映射为可读置信度
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
         filtered_results.append(r)

@@ -295,29 +295,37 @@ async def build_context(
         if is_public_chat:
             return None
         from dream import get_recent_dreams_for_ai
-        return get_recent_dreams_for_ai(ai_id, limit=1, max_chars=600)
+        return await asyncio.to_thread(get_recent_dreams_for_ai, ai_id, 1, 600)
 
     async def _fetch_unresolved():
         if is_public_chat:
             return []
         import database
-        unresolved = []
-        for mem in database.iter_memories(status="active"):
-            if mem.get("resolved") is not False:
-                continue
-            if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
-                continue
-            if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
-                continue
-            unresolved.append(mem)
-        unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
-        return unresolved[:3]
+
+        def _query():
+            mems = database.ro_iter_memories(status="active")
+            unresolved = []
+            for mem in mems:
+                if mem.get("resolved") is not False:
+                    continue
+                if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
+                    continue
+                if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
+                    continue
+                unresolved.append(mem)
+            unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
+            return unresolved[:3]
+
+        return await asyncio.to_thread(_query)
 
     async def _fetch_group_activity():
         if not chat_id or chat_type not in {"private_group", "small_group", "big_group", "group"}:
             return []
         from chat_digest import get_recent_chat_activity
-        return get_recent_chat_activity(chat_id, exclude_ai_id=ai_id, limit=4)
+        import functools
+        return await asyncio.to_thread(
+            functools.partial(get_recent_chat_activity, chat_id, exclude_ai_id=ai_id, limit=4)
+        )
 
     corridor_result, recalled, dreams, unresolved, group_digests = await asyncio.gather(
         _safe(_fetch_corridor(), "corridor", timings),

@@ -260,7 +260,11 @@ async def log_conversation(
             except Exception as e:
                 logger.warning(f"background extraction failed for {key}: {e}")
 
-        asyncio.create_task(_bg_extract())
+        try:
+            from main import enqueue_background
+            enqueue_background(_bg_extract(), f"extract/{key}")
+        except ImportError:
+            asyncio.create_task(_bg_extract())
         return {"status": "extracting_async", "buffer_size": buffer_size}
 
     return {"status": "buffered", "buffer_size": buffer_size}

@@ -70,6 +70,11 @@ async def lifespan(app: FastAPI):
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
+        # 事件循环延迟监控
+        lag_task = asyncio.create_task(_event_loop_lag_monitor())
+        print("[Memory Hub] Event-loop lag monitor started")
+        # 有界后台任务队列
+        bg_worker_task = asyncio.create_task(_bg_worker())
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -87,6 +92,63 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             daemon_task.cancel()
+            lag_task.cancel()
+            bg_worker_task.cancel()
+
+
+async def _event_loop_lag_monitor():
+    """每秒测一次事件循环调度延迟，超 200ms 打警告。"""
+    lag_log = logging.getLogger("event_loop_lag")
+    while True:
+        t0 = asyncio.get_event_loop().time()
+        await asyncio.sleep(1)
+        lag_ms = (asyncio.get_event_loop().time() - t0 - 1.0) * 1000
+        if lag_ms > 200:
+            all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
+            lag_log.warning(f"event loop lag {lag_ms:.0f}ms | active_tasks={len(all_tasks)}")
+
+
+# ── 有界后台任务队列 ──
+# 防止无限 create_task 堆积：post-process / digest / extraction 统一排队
+_bg_queue: asyncio.Queue | None = None
+_BG_QUEUE_MAX = 20
+_BG_WORKERS = 2
+
+
+async def _bg_worker():
+    """从有界队列消费后台任务。"""
+    global _bg_queue
+    _bg_queue = asyncio.Queue(maxsize=_BG_QUEUE_MAX)
+    workers = [asyncio.create_task(_bg_consumer(i)) for i in range(_BG_WORKERS)]
+    try:
+        await asyncio.gather(*workers)
+    except asyncio.CancelledError:
+        for w in workers:
+            w.cancel()
+
+
+async def _bg_consumer(worker_id: int):
+    bg_log = logging.getLogger("bg_worker")
+    while True:
+        coro = await _bg_queue.get()
+        try:
+            await coro
+        except Exception as e:
+            bg_log.warning(f"bg_worker[{worker_id}] task failed: {e}")
+        finally:
+            _bg_queue.task_done()
+
+
+def enqueue_background(coro, label: str = ""):
+    """向有界队列提交后台任务。队列满时丢弃并记日志。"""
+    if _bg_queue is None:
+        asyncio.create_task(coro)
+        return
+    try:
+        _bg_queue.put_nowait(coro)
+    except asyncio.QueueFull:
+        logging.getLogger("bg_worker").warning(f"bg queue full, dropping: {label}")
+        coro.close()
 
 
 async def _daemon_loop():
@@ -388,6 +450,22 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
 GATEWAY_TIMEOUT = 3  # 秒：context 端点整体超时（各源 1.8s 并行 + 组装开销）
 
 
+@app.get("/api/debug/metrics")
+async def api_debug_metrics(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    await asyncio.sleep(0)
+    lag_ms = (loop.time() - t0) * 1000
+    all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
+    return {
+        "event_loop_lag_ms": round(lag_ms, 1),
+        "active_tasks": len(all_tasks),
+        "bg_queue_size": _bg_queue.qsize() if _bg_queue else -1,
+        "bg_queue_max": _BG_QUEUE_MAX,
+    }
+
+
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
@@ -464,7 +542,7 @@ async def api_post_process(body: PostProcessRequest, authorization: str = Header
             except Exception:
                 pass
 
-    asyncio.create_task(_do_post_process())
+    enqueue_background(_do_post_process(), f"post-process/{body.ai_id}")
     return {"status": "accepted", "message": "post-process queued"}
 
 
@@ -527,7 +605,7 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
                 )
             except Exception:
                 pass
-        asyncio.create_task(_bg_digest())
+        enqueue_background(_bg_digest(), f"digest/{body.ai_id}")
     return result
 
 @app.post("/api/capture/extract")

@@ -3,25 +3,59 @@ SQLite 数据库引擎（替代内存 dict + GitHub 存储）
 - sqlite-vec 向量搜索
 - FTS5 全文搜索
 - WAL 模式并发读
-- 同步 sqlite3（够快，避免 async 复杂度）
+- 同步 sqlite3，hot-path 读操作通过 to_thread 离开事件循环
 """
 import json
 import re
 import struct
 import sqlite3
+import asyncio
 import logging
+import threading
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Callable, TypeVar
 
 from config import DATA_DIR, EMBEDDING_DIM
 
 logger = logging.getLogger("memory_hub.db")
 
+T = TypeVar("T")
+
 # ── 默认数据库路径 ──
 DB_PATH: Path = DATA_DIR / "memories.db"
 
-# ── 模块级连接 ──
+# ── 模块级主连接（写入用） ──
 _conn: sqlite3.Connection | None = None
+
+# ── 线程局部只读连接池（to_thread 里的读操作用） ──
+_local = threading.local()
+
+
+def _get_read_conn() -> sqlite3.Connection:
+    """每个线程独立的只读连接，WAL 模式下不会被写锁阻塞。"""
+    conn = getattr(_local, "read_conn", None)
+    if conn is not None:
+        return conn
+    path = str(DB_PATH)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=200")  # 读连接只等 200ms，不要等 5s
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+    except Exception:
+        pass
+    _local.read_conn = conn
+    return conn
+
+
+async def read_in_thread(fn: Callable[..., T], *args, **kwargs) -> T:
+    """在独立线程里执行同步 DB 读操作，不阻塞事件循环。"""
+    import functools
+    return await asyncio.to_thread(functools.partial(fn, *args, **kwargs))
 
 
 # ════════════════════════════════════════════
@@ -820,3 +854,165 @@ def iter_memories(
             break
         for row in rows:
             yield _row_to_dict_no_embedding(row)
+
+
+# ════════════════════════════════════════════
+#  Thread-safe read variants (for asyncio.to_thread)
+#  使用线程局部只读连接，不阻塞事件循环，不被写锁卡住
+# ════════════════════════════════════════════
+
+def ro_iter_memories(
+    room: str = None,
+    status: str = "active",
+    owner_ai: str = None,
+) -> list[dict]:
+    """线程安全版 iter_memories，返回 list 而非 generator（跨线程传递用）。"""
+    conn = _get_read_conn()
+    clauses: list[str] = []
+    params: list = []
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if room is not None:
+        clauses.append("room = ?")
+        params.append(room)
+    if owner_ai is not None:
+        clauses.append("owner_ai = ?")
+        params.append(owner_ai)
+    where = " AND ".join(clauses) if clauses else "1=1"
+    rows = conn.execute(
+        f"SELECT * FROM memories WHERE {where} ORDER BY updated_at DESC",
+        params,
+    ).fetchall()
+    return [_row_to_dict_no_embedding(r) for r in rows]
+
+
+def ro_vector_search(
+    query_vec: list[float],
+    top_k: int = 50,
+    status: str = "active",
+    include_rooms: list[str] = None,
+    exclude_rooms: list[str] = None,
+    **kwargs,
+) -> list[dict]:
+    """线程安全版 vector_search。"""
+    conn = _get_read_conn()
+    if len(query_vec) != EMBEDDING_DIM:
+        return []
+    query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
+    fetch_k = top_k * 4
+    try:
+        vec_rows = conn.execute(
+            "SELECT rowid, distance FROM memories_vec "
+            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (query_blob, fetch_k),
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"ro_vector_search vec query failed: {e}")
+        return []
+    if not vec_rows:
+        return []
+    rowid_dist = {r[0]: r[1] for r in vec_rows}
+    placeholders = ", ".join(["?"] * len(rowid_dist))
+    rowids = list(rowid_dist.keys())
+    id_rows = conn.execute(
+        f"SELECT vec_rowid, memory_id FROM vec_id_map WHERE vec_rowid IN ({placeholders})",
+        rowids,
+    ).fetchall()
+    id_map = {r[0]: r[1] for r in id_rows}
+    mem_ids = [id_map[rid] for rid in rowids if rid in id_map]
+    if not mem_ids:
+        return []
+    ph2 = ", ".join(["?"] * len(mem_ids))
+    clauses = [f"id IN ({ph2})"]
+    params: list = list(mem_ids)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if include_rooms:
+        rph = ", ".join(["?"] * len(include_rooms))
+        clauses.append(f"room IN ({rph})")
+        params.extend(include_rooms)
+    if exclude_rooms:
+        rph = ", ".join(["?"] * len(exclude_rooms))
+        clauses.append(f"room NOT IN ({rph})")
+        params.extend(exclude_rooms)
+    where = " AND ".join(clauses)
+    mem_rows = conn.execute(f"SELECT * FROM memories WHERE {where}", params).fetchall()
+    results = []
+    for row in mem_rows:
+        d = _row_to_dict(row)
+        vec_rowid = next((rid for rid, mid in id_map.items() if mid == d["id"]), None)
+        if vec_rowid and vec_rowid in rowid_dist:
+            d["distance"] = rowid_dist[vec_rowid]
+        results.append(d)
+    results.sort(key=lambda x: x.get("distance", 999))
+    return results[:top_k]
+
+
+def ro_fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+    """线程安全版 fts_search。"""
+    conn = _get_read_conn()
+    if not query or not query.strip():
+        return []
+    safe = re.sub(r'[^\w\s一-鿿]', ' ', query).strip()
+    if not safe:
+        return []
+    terms = safe.split()
+    if not terms:
+        return []
+    fts_query = " OR ".join(f'"{t}"' for t in terms[:10])
+    try:
+        rows = conn.execute(
+            "SELECT m.*, f.rank FROM memories_fts f "
+            "JOIN memories m ON m.rowid = f.rowid "
+            "WHERE memories_fts MATCH ? AND m.status = ? "
+            "ORDER BY f.rank LIMIT ?",
+            (fts_query, status, top_k * 2),
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"ro_fts_search failed: {e}")
+        return []
+    return [_row_to_dict_no_embedding(r) for r in rows[:top_k]]
+
+
+def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+    """线程安全版 cjk_like_search。"""
+    conn = _get_read_conn()
+    CJK_RE = re.compile(r'[一-鿿㐀-䶿]+')
+    runs = CJK_RE.findall(query)
+    grams = []
+    for run in runs:
+        for i in range(len(run) - 1):
+            g = run[i:i+2]
+            if g not in grams:
+                grams.append(g)
+    if not grams:
+        return []
+    grams = grams[:8]
+    conds = " OR ".join(["content LIKE ?"] * len(grams))
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
+            (status, *[f"%{g}%" for g in grams]),
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"ro_cjk_like_search failed: {e}")
+        return []
+    results = []
+    for row in rows:
+        d = _row_to_dict_no_embedding(row)
+        hits = sum(1 for g in grams if g in d.get("content", ""))
+        d["like_hits"] = hits
+        results.append(d)
+    results.sort(key=lambda x: x.get("like_hits", 0), reverse=True)
+    return results[:top_k]
+
+
+def ro_get_memory(mem_id: str) -> dict | None:
+    """线程安全版 get_memory。"""
+    conn = _get_read_conn()
+    row = conn.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
+    if row is None:
+        return None
+    return _row_to_dict(row)
