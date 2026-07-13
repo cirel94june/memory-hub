@@ -27,16 +27,6 @@ from mcp_server import mcp as mcp_server
 
 # ── 鉴权 ──
 
-# 用默认密钥跑服务等于所有 /api 端点向全网敞开，直接拒绝启动。
-# 本地开发想跳过：设置环境变量 ALLOW_DEFAULT_HUB_SECRET=1（绝不要在 VPS 上设）。
-import os as _os
-if HUB_SECRET == "change-me-in-production" and _os.getenv("ALLOW_DEFAULT_HUB_SECRET") != "1":
-    raise RuntimeError(
-        "HUB_SECRET is still the default value. Set HUB_SECRET in .env before starting, "
-        "or set ALLOW_DEFAULT_HUB_SECRET=1 for local development only."
-    )
-
-
 def verify_secret(authorization: str = Header(default="")):
     token = authorization.replace("Bearer ", "").strip()
     if token != HUB_SECRET:
@@ -70,21 +60,11 @@ async def lifespan(app: FastAPI):
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
-        # 事件循环延迟监控
-        lag_task = asyncio.create_task(_event_loop_lag_monitor())
-        print("[Memory Hub] Event-loop lag monitor started")
-        # 有界后台任务队列
-        bg_worker_task = asyncio.create_task(_bg_worker())
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
         await load_image_config()
         print("[Memory Hub] Image API config loaded")
-        import identity_registry
-        await identity_registry.load_registry()
-        import current_status
-        await current_status.load_status()
-        print("[Memory Hub] Identity registry + current status loaded")
         from persona_state import load_state as load_pulse_state
         load_pulse_state()
         print("[Memory Hub] Pulse state loaded")
@@ -92,63 +72,6 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             daemon_task.cancel()
-            lag_task.cancel()
-            bg_worker_task.cancel()
-
-
-async def _event_loop_lag_monitor():
-    """每秒测一次事件循环调度延迟，超 200ms 打警告。"""
-    lag_log = logging.getLogger("event_loop_lag")
-    while True:
-        t0 = asyncio.get_event_loop().time()
-        await asyncio.sleep(1)
-        lag_ms = (asyncio.get_event_loop().time() - t0 - 1.0) * 1000
-        if lag_ms > 200:
-            all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
-            lag_log.warning(f"event loop lag {lag_ms:.0f}ms | active_tasks={len(all_tasks)}")
-
-
-# ── 有界后台任务队列 ──
-# 防止无限 create_task 堆积：post-process / digest / extraction 统一排队
-_bg_queue: asyncio.Queue | None = None
-_BG_QUEUE_MAX = 20
-_BG_WORKERS = 2
-
-
-async def _bg_worker():
-    """从有界队列消费后台任务。"""
-    global _bg_queue
-    _bg_queue = asyncio.Queue(maxsize=_BG_QUEUE_MAX)
-    workers = [asyncio.create_task(_bg_consumer(i)) for i in range(_BG_WORKERS)]
-    try:
-        await asyncio.gather(*workers)
-    except asyncio.CancelledError:
-        for w in workers:
-            w.cancel()
-
-
-async def _bg_consumer(worker_id: int):
-    bg_log = logging.getLogger("bg_worker")
-    while True:
-        coro = await _bg_queue.get()
-        try:
-            await coro
-        except Exception as e:
-            bg_log.warning(f"bg_worker[{worker_id}] task failed: {e}")
-        finally:
-            _bg_queue.task_done()
-
-
-def enqueue_background(coro, label: str = ""):
-    """向有界队列提交后台任务。队列满时丢弃并记日志。"""
-    if _bg_queue is None:
-        asyncio.create_task(coro)
-        return
-    try:
-        _bg_queue.put_nowait(coro)
-    except asyncio.QueueFull:
-        logging.getLogger("bg_worker").warning(f"bg queue full, dropping: {label}")
-        coro.close()
 
 
 async def _daemon_loop():
@@ -447,55 +370,19 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
     return {"threads": list_recent_digest_threads(limit=30, include_types=["small_group", "big_group", "private_group", "group"])}
 
 
-GATEWAY_TIMEOUT = 3  # 秒：context 端点整体超时（各源 1.8s 并行 + 组装开销）
-
-
-@app.get("/api/debug/metrics")
-async def api_debug_metrics(authorization: str = Header(default="")):
-    verify_secret(authorization)
-    loop = asyncio.get_event_loop()
-    t0 = loop.time()
-    await asyncio.sleep(0)
-    lag_ms = (loop.time() - t0) * 1000
-    all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
-    return {
-        "event_loop_lag_ms": round(lag_ms, 1),
-        "active_tasks": len(all_tasks),
-        "bg_queue_size": _bg_queue.qsize() if _bg_queue else -1,
-        "bg_queue_max": _BG_QUEUE_MAX,
-    }
-
-
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    try:
-        result = await asyncio.wait_for(
-            gateway_mod.build_context(
-                user_message=body.user_message,
-                ai_id=body.ai_id,
-                recent_messages=body.recent_messages,
-                chat_id=body.chat_id,
-                chat_type=body.chat_type,
-                compact=body.compact,
-                max_memories=body.max_memories,
-                force_corridor=body.force_corridor,
-            ),
-            timeout=GATEWAY_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logging.getLogger("main").warning(
-            f"gateway/context timeout ({GATEWAY_TIMEOUT}s) for ai={body.ai_id} chat={body.chat_id}"
-        )
-        result = {"inject_text": None, "recalled_ids": [], "rooms_checked": [], "timeout": True}
-    try:
-        import capabilities
-        hints = capabilities.capability_hints()
-        if hints:
-            result["inject_text"] = ((result.get("inject_text") or "") + "\n\n" + hints).strip()
-    except Exception:
-        pass
-    return result
+    return await gateway_mod.build_context(
+        user_message=body.user_message,
+        ai_id=body.ai_id,
+        recent_messages=body.recent_messages,
+        chat_id=body.chat_id,
+        chat_type=body.chat_type,
+        compact=body.compact,
+        max_memories=body.max_memories,
+        force_corridor=body.force_corridor,
+    )
 
 
 class PostProcessRequest(BaseModel):
@@ -506,59 +393,34 @@ class PostProcessRequest(BaseModel):
     chat_id: str = ""
     chat_type: str = ""
     reply_reason: str = ""
-    message_id: str = ""
 
-@app.post("/api/gateway/post-process", status_code=202)
+@app.post("/api/gateway/post-process")
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    if body.message_id:
-        key = _idemp_key(body.platform, body.ai_id, body.chat_id, body.message_id)
-        if key in _idempotency_cache:
-            return {"status": "duplicate", "message": "already processed"}
-        _idempotency_cache[key] = True
-        if len(_idempotency_cache) > _IDEMP_MAX:
-            _idempotency_cache.popitem(last=False)
-
-    async def _do_post_process():
+    result = await gateway_mod.post_process(
+        user_message=body.user_message,
+        ai_response=body.ai_response,
+        ai_id=body.ai_id,
+        platform=body.platform,
+        chat_type=body.chat_type,
+    )
+    if body.chat_id:
         try:
-            await gateway_mod.post_process(
-                user_message=body.user_message,
-                ai_response=body.ai_response,
-                ai_id=body.ai_id,
-                platform=body.platform,
-                chat_type=body.chat_type,
+            from chat_digest import generate_and_save
+            await generate_and_save(
+                user_message=body.user_message, ai_response=body.ai_response,
+                ai_id=body.ai_id, chat_id=body.chat_id,
+                chat_type=body.chat_type or "private",
+                reply_reason=body.reply_reason,
             )
-        except Exception as e:
-            logging.getLogger("main").warning(f"post-process background failed: {e}")
-        if body.chat_id:
-            try:
-                from chat_digest import generate_and_save
-                await generate_and_save(
-                    user_message=body.user_message, ai_response=body.ai_response,
-                    ai_id=body.ai_id, chat_id=body.chat_id,
-                    chat_type=body.chat_type or "private",
-                    reply_reason=body.reply_reason,
-                )
-            except Exception:
-                pass
-
-    enqueue_background(_do_post_process(), f"post-process/{body.ai_id}")
-    return {"status": "accepted", "message": "post-process queued"}
+        except Exception:
+            pass
+    return result
 
 
 # ── 对话自动捕获 ──
 
 import conversation_capture
-from collections import OrderedDict
-
-# 幂等缓存：防止 bot 重试导致重复写入（保留最近 500 条）
-_idempotency_cache: OrderedDict = OrderedDict()
-_IDEMP_MAX = 500
-
-
-def _idemp_key(platform: str, ai_id: str, chat_id: str, msg_id: str) -> str:
-    return f"{platform}:{ai_id}:{chat_id}:{msg_id}"
-
 
 class ConversationLogRequest(BaseModel):
     user_message: str
@@ -567,21 +429,11 @@ class ConversationLogRequest(BaseModel):
     platform: str = ""
     chat_id: str = ""
     chat_type: str = "private"
-    message_id: str = ""  # 幂等键：platform + ai_id + chat_id + message_id
-
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
-    """记录一轮对话，缓冲区满时自动提取（后台）。接口只做缓冲，立即返回。"""
+    """记录一轮对话，缓冲区满时自动提取记忆"""
     verify_secret(authorization)
-    # 幂等去重
-    if body.message_id:
-        key = _idemp_key(body.platform, body.ai_id, body.chat_id, body.message_id)
-        if key in _idempotency_cache:
-            return {"status": "duplicate", "message": "already processed"}
-        _idempotency_cache[key] = True
-        if len(_idempotency_cache) > _IDEMP_MAX:
-            _idempotency_cache.popitem(last=False)
     result = await conversation_capture.log_conversation(
         user_message=body.user_message,
         ai_response=body.ai_response,
@@ -591,21 +443,22 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         chat_type=body.chat_type,
     )
     if body.chat_id:
-        async def _bg_digest():
-            try:
-                from chat_digest import generate_and_save
-                digest_type = {
-                    "private_group": "small_group",
-                    "public_group": "big_group",
-                }.get(body.chat_type, body.chat_type or "private")
-                await generate_and_save(
-                    user_message=body.user_message, ai_response=body.ai_response,
-                    ai_id=body.ai_id, chat_id=body.chat_id,
-                    chat_type=digest_type, reply_reason="capture_log",
-                )
-            except Exception:
-                pass
-        enqueue_background(_bg_digest(), f"digest/{body.ai_id}")
+        try:
+            from chat_digest import generate_and_save
+            digest_type = {
+                "private_group": "small_group",
+                "public_group": "big_group",
+            }.get(body.chat_type, body.chat_type or "private")
+            await generate_and_save(
+                user_message=body.user_message,
+                ai_response=body.ai_response,
+                ai_id=body.ai_id,
+                chat_id=body.chat_id,
+                chat_type=digest_type,
+                reply_reason="capture_log",
+            )
+        except Exception:
+            pass
     return result
 
 @app.post("/api/capture/extract")
@@ -629,25 +482,21 @@ async def api_decay(authorization: str = Header(default="")):
     return await memory_ops.run_decay()
 
 
-async def _run_maintenance_background(force: bool = False):
+async def _run_maintenance_background():
     """Run maintenance outside the HTTP request so proxies do not time out."""
     try:
-        result = await daemon.run_full_maintenance(force=force)
+        result = await daemon.run_full_maintenance()
         logging.getLogger("daemon").info(f"Manual maintenance done: {json.dumps(result, ensure_ascii=False)}")
     except Exception as e:
         logging.getLogger("daemon").exception(f"Manual maintenance failed: {e}")
 
 
 @app.post("/api/daemon/maintain", status_code=202)
-async def api_maintain(background_tasks: BackgroundTasks, force: bool = False, authorization: str = Header(default="")):
-    """一键执行完整记忆整理（合并+压缩+归档+衰减+走廊重建）
-
-    6 小时内已成功跑过会自动跳过（防止进程内定时器和 GitHub Actions 重复触发）；
-    带 ?force=true 强制立即重跑。
-    """
+async def api_maintain(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
+    """一键执行完整记忆整理（合并+压缩+归档+衰减+走廊重建）"""
     verify_secret(authorization)
-    background_tasks.add_task(_run_maintenance_background, force)
-    return {"status": "accepted", "message": "maintenance started (skips if last success <6h ago; use ?force=true to override)"}
+    background_tasks.add_task(_run_maintenance_background)
+    return {"status": "accepted", "message": "maintenance started"}
 
 
 @app.get("/api/daemon/status")
@@ -767,7 +616,7 @@ async def proxy_chat_completions(request: Request):
 
     【简单模式】适合 RikkaHub 等只能设 URL + Key 的客户端：
       API Base URL: http://172.245.180.158:8888/v1
-      API Key: {HUB_SECRET}:{AI身份}   例如 你的HUB_SECRET:rikkahub
+      API Key: {HUB_SECRET}:{AI身份}   例如 xiaoke588887:rikkahub
       服务端自动用 .env 里的 LLM_BASE_URL 和 LLM_API_KEY 转发
 
     【完整模式】通过自定义请求头控制转发目标：
@@ -788,11 +637,10 @@ async def proxy_chat_completions(request: Request):
             is_simple = True
 
     if not is_simple:
-        # 完整模式鉴权：必须提供正确的 Hub Secret（X-Hub-Secret 头或 Authorization）。
-        # 注意：不能因为带了 x-hub-target-key 就放行——那会让任何人免密使用代理，
-        # 并把记忆注入后的完整上下文转发到他指定的任意地址（记忆外泄）。
-        if hub_secret != HUB_SECRET and auth_raw != HUB_SECRET:
-            raise HTTPException(status_code=401, detail="Invalid Hub Secret. Use 'secret:ai_id' as API key, or set X-Hub-Secret header.")
+        # 完整模式鉴权
+        if hub_secret != HUB_SECRET:
+            if auth_raw != HUB_SECRET and not request.headers.get("x-hub-target-key"):
+                raise HTTPException(status_code=401, detail="Invalid Hub Secret. Use 'secret:ai_id' as API key, or set X-Hub-Secret header.")
 
     body = await request.json()
     return await proxy_mod.handle_chat_completions(request, body)
@@ -915,129 +763,6 @@ async def api_ai_aliases():
     """返回 AI 别名映射，前端用于解析 cloudy→claude 等"""
     from config import AI_ALIASES
     return {"aliases": AI_ALIASES}
-
-
-# ── 人物注册表 + 当前状态画像 ──
-
-@app.get("/api/identity-registry")
-async def api_get_identity_registry(authorization: str = Header(default="")):
-    """人物注册表：用户本人 + 常见人物的称呼归一。daemon 自动收编，人工可修正。"""
-    verify_secret(authorization)
-    import identity_registry
-    return identity_registry.get_registry()
-
-
-@app.put("/api/identity-registry")
-async def api_update_identity_registry(request: Request, authorization: str = Header(default="")):
-    """人工修正人物注册表（整体替换 user / people 字段）"""
-    verify_secret(authorization)
-    import identity_registry
-    body = await request.json()
-    return await identity_registry.update_registry(body)
-
-
-@app.get("/api/current-status")
-async def api_get_current_status(authorization: str = Header(default="")):
-    """当前状态画像（职业/健康/生活近况，daemon 每 12h 重写）"""
-    verify_secret(authorization)
-    import current_status
-    return current_status.get_status()
-
-
-@app.post("/api/current-status/refresh", status_code=202)
-async def api_refresh_current_status(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
-    """手动触发画像重写（不用等 daemon）"""
-    verify_secret(authorization)
-    from daemon import refresh_current_status
-
-    async def _run():
-        try:
-            result = await refresh_current_status()
-            logging.getLogger("daemon").info(f"Manual current-status refresh: {result}")
-        except Exception as e:
-            logging.getLogger("daemon").exception(f"Manual current-status refresh failed: {e}")
-
-    background_tasks.add_task(_run)
-    return {"status": "accepted"}
-
-
-# ── 记忆医生 / 原文保险箱 API ──
-
-@app.get("/api/doctor/report")
-async def api_doctor_report(authorization: str = Header(default="")):
-    """最近一次记忆体检报告（结构化 + 人话版）"""
-    verify_secret(authorization)
-    import memory_doctor
-    return {"report": memory_doctor.read_report(), "text": memory_doctor.report_text()}
-
-
-@app.post("/api/doctor/run", status_code=202)
-async def api_doctor_run(background_tasks: BackgroundTasks, authorization: str = Header(default="")):
-    """手动触发一次记忆体检（不用等 daemon）"""
-    verify_secret(authorization)
-    import memory_doctor
-
-    async def _run():
-        try:
-            result = await memory_doctor.run_checkup()
-            logging.getLogger("memory_doctor").info(
-                f"Manual checkup: {len(result.get('auto_fixed', []))} fixed, {len(result.get('issues', []))} issues")
-        except Exception as e:
-            logging.getLogger("memory_doctor").exception(f"Manual checkup failed: {e}")
-
-    background_tasks.add_task(_run)
-    return {"status": "accepted"}
-
-
-@app.get("/api/raw/search")
-async def api_raw_search(q: str = Query(...), ai_id: str = Query(default=""),
-                         limit: int = Query(default=10, le=50),
-                         authorization: str = Header(default="")):
-    """在原文保险箱里查当时的原话（记忆漂移时用来对照）"""
-    verify_secret(authorization)
-    import raw_vault
-    return {"results": raw_vault.search(q, ai_id=ai_id, limit=limit), "stats": raw_vault.stats()}
-
-
-# ── Agent 能力 API ──
-
-@app.get("/api/capabilities")
-async def api_list_capabilities(authorization: str = Header(default="")):
-    """列出 AI 可用的 agent 能力标签"""
-    verify_secret(authorization)
-    import capabilities
-    caps = []
-    for tag, cap in capabilities._capabilities.items():
-        caps.append({"tag": tag, "label": cap.label, "hint": cap.hint})
-    return {"capabilities": caps, "hint_text": capabilities.capability_hints()}
-
-
-@app.post("/api/capabilities/process")
-async def api_process_capabilities(request: Request, authorization: str = Header(default="")):
-    """执行文本里的能力标签并返回清理后的文本。
-
-    TG bot 等自己调模型的入口，在把 AI 回复发给用户之前调这个端点：
-    标签被执行（记忆写入/状态更新/人物登记等），返回的 cleaned_text 不含标签。
-    """
-    verify_secret(authorization)
-    import capabilities
-    body = await request.json()
-    text = body.get("text", "")
-    ai_id = body.get("ai_id", "cloudy")
-    cleaned, results = await capabilities.process(text, ai_id=ai_id)
-    return {"cleaned_text": cleaned, "results": results}
-
-
-@app.post("/api/capabilities/test")
-async def api_test_capability(request: Request, authorization: str = Header(default="")):
-    """手动测试一个能力标签（调试用，行为同 /api/capabilities/process）"""
-    verify_secret(authorization)
-    import capabilities
-    body = await request.json()
-    text = body.get("text", "")
-    ai_id = body.get("ai_id", "cloudy")
-    cleaned, results = await capabilities.process(text, ai_id=ai_id)
-    return {"cleaned_text": cleaned, "results": results}
 
 
 @app.get("/api/ai-profiles")
@@ -2231,35 +1956,130 @@ async def spa_catchall(path: str = ""):
 # ── 启动 ──
 
 class MCPGateway:
-    """顶层 ASGI 应用：/mcp 走 MCP session manager，其他走 FastAPI"""
+    """顶层 ASGI 应用：/mcp 走 MCP session manager，其他走 FastAPI。"""
     def __init__(self, fastapi_app):
         self.fastapi_app = fastapi_app
 
+    async def _handle_mcp(self, scope, receive, send):
+        if _mcp_session_manager is None:
+            await send({"type": "http.response.start", "status": 503,
+                       "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"MCP not initialized"})
+            return
+
+        from mcp_server import _audit, get_mcp_identity_async
+
+        body_events = []
+        body = b""
+        while True:
+            event = await receive()
+            body_events.append(event)
+            if event.get("type") == "http.request":
+                body += event.get("body", b"")
+                if not event.get("more_body", False):
+                    break
+            else:
+                break
+
+        replay_index = 0
+        async def replay_receive():
+            nonlocal replay_index
+            if replay_index < len(body_events):
+                event = body_events[replay_index]
+                replay_index += 1
+                return event
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        headers = {
+            k.decode("latin1").lower(): v.decode("latin1", errors="replace")
+            for k, v in scope.get("headers", [])
+        }
+        methods = []
+        request_ids = []
+        try:
+            if body.strip():
+                request_payload = json.loads(body.decode("utf-8", errors="replace"))
+                items = request_payload if isinstance(request_payload, list) else [request_payload]
+                for item in items:
+                    if isinstance(item, dict):
+                        if item.get("method"):
+                            methods.append(item.get("method"))
+                        if "id" in item:
+                            request_ids.append(item.get("id"))
+        except Exception as exc:
+            methods.append("unparsed")
+            request_ids.append(f"parse_error:{type(exc).__name__}")
+
+        identity = await get_mcp_identity_async()
+        response_status = None
+        response_body = b""
+
+        async def audit_send(message):
+            nonlocal response_status, response_body
+            if message.get("type") == "http.response.start":
+                response_status = message.get("status")
+            elif message.get("type") == "http.response.body":
+                response_body += message.get("body", b"")
+            await send(message)
+
+        try:
+            await _mcp_session_manager.handle_request(scope, replay_receive, audit_send)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _audit(
+                "mcp_http_error",
+                methods=methods,
+                request_ids=request_ids,
+                error_type=type(e).__name__,
+                error=str(e),
+                tool_count=identity.get("tool_count"),
+                tool_schema_hash=identity.get("tool_schema_hash"),
+                user_agent=headers.get("user-agent", ""),
+                client=headers.get("x-forwarded-for", "") or headers.get("cf-connecting-ip", ""),
+            )
+            await send({"type": "http.response.start", "status": 500,
+                       "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": f"MCP Error: {e}".encode()})
+            return
+
+        response_tool_count = None
+        if "tools/list" in methods:
+            try:
+                response_payload = json.loads(response_body.decode("utf-8", errors="replace"))
+                response_items = response_payload if isinstance(response_payload, list) else [response_payload]
+                for item in response_items:
+                    if isinstance(item, dict):
+                        tools = (item.get("result") or {}).get("tools")
+                        if isinstance(tools, list):
+                            response_tool_count = len(tools)
+                            break
+            except Exception:
+                response_tool_count = None
+
+        _audit(
+            "mcp_http_request",
+            methods=methods,
+            request_ids=request_ids,
+            status=response_status,
+            service_tool_count=identity.get("tool_count"),
+            response_tool_count=response_tool_count,
+            tool_schema_hash=identity.get("tool_schema_hash"),
+            version=identity.get("version"),
+            user_agent=headers.get("user-agent", "")[:240],
+            client=headers.get("x-forwarded-for", "") or headers.get("cf-connecting-ip", ""),
+        )
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
-            if _mcp_session_manager is not None:
-                try:
-                    await _mcp_session_manager.handle_request(scope, receive, send)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    await send({"type": "http.response.start", "status": 500,
-                               "headers": [(b"content-type", b"text/plain")]})
-                    await send({"type": "http.response.body",
-                               "body": f"MCP Error: {e}".encode()})
-            else:
-                await send({"type": "http.response.start", "status": 503,
-                           "headers": [(b"content-type", b"text/plain")]})
-                await send({"type": "http.response.body", "body": b"MCP not initialized"})
+            await self._handle_mcp(scope, receive, send)
         else:
             await self.fastapi_app(scope, receive, send)
-
 asgi_app = MCPGateway(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on",
-                limit_concurrency=50, timeout_keep_alive=10)
+    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
 
 
 
