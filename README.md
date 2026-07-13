@@ -325,6 +325,8 @@ Memory Hub 的 MCP 入口现在会在启动时打印稳定身份信息：server 
 
 如果 ChatGPT 侧仍只看到 25 个工具，但 batch_remember 已经是新版逐条写入，说明后端代码已更新，ChatGPT 端仍在使用旧 schema。处理方式是断开 Memory Hub MCP 连接后重新连接；重连后可先调用 hub_info，查看 mcp_identity.tool_count 是否为 28，以及 tools 里是否包含 safe_remember、mcp_health、mcp_debug_log。
 
+MCP HTTP 层会把 /mcp JSON-RPC 请求写入 data/mcp_audit.jsonl；tools/list 会额外记录 response_tool_count。若重连后没有 tools/list 记录，说明客户端复用了旧连接/旧授权；若记录显示 service_tool_count=28 且 response_tool_count=28，但 ChatGPT UI 仍是 25，则可判定为 ChatGPT 端缓存旧 schema。
+
 ### 2026-07-07 梦境展示与浮现
 观测台的“梦境诊断”不再只显示最近梦境的短预览，而是展开最近 6 条梦境全文，包含 AI 身份和生成时间。这样小猫可以直接看到 AI 做了什么梦。
 

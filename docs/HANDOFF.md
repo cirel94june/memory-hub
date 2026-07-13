@@ -241,6 +241,8 @@ ChatGPT 网页端反馈只能看到 25 个 MCP tools，但 batch_remember 已经
 
 本次补充：main.py 启动日志改为 await get_mcp_identity_async，使用 FastMCP list_tools 的真实 tool_count/hash；/api/mcp/health 与 MCP mcp_health 同样使用真实注册表；hub_info 也返回 mcp_identity，方便在 ChatGPT 还看不到新 debug 工具时，用旧工具自检当前服务端工具数。MCP_SERVER_VERSION bump 到 2026-07-07.safe-write.2。
 
+2026-07-13 补充：MCPGateway 会审计所有 /mcp HTTP JSON-RPC 请求到 data/mcp_audit.jsonl，记录 methods、request_ids、status、service_tool_count、tool_schema_hash、user_agent/client；如果请求包含 tools/list，还会解析响应体里的 response_tool_count。用于证明 ChatGPT 重连时有没有真正发 tools/list，以及服务端是否返回 28 个工具。
+
 ### 2026-07-07 梦境可见化 / Dream Context
 用户发现 AI 已经做梦，但前端只显示短预览，AI 醒来上下文也没有主动浮现。已补 dream.get_recent_dreams_for_ai(ai_id)，按 canonical id 和 alias 查 room=diary/dreams 且 dream 标签/分类的 active 记忆。
 
