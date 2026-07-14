@@ -6,6 +6,7 @@ import json
 import asyncio
 import logging
 import httpx
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Header, Query, Request
@@ -59,6 +60,8 @@ async def lifespan(app: FastAPI):
 
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
+        lag_task = asyncio.create_task(_event_loop_lag_monitor())
+        bg_worker_task = asyncio.create_task(_bg_worker())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
         from ai_profiles import load_profiles
         await load_profiles()
@@ -72,6 +75,8 @@ async def lifespan(app: FastAPI):
             yield
         finally:
             daemon_task.cancel()
+            lag_task.cancel()
+            bg_worker_task.cancel()
 
 
 async def _daemon_loop():
@@ -93,6 +98,99 @@ async def _daemon_loop():
         await asyncio.sleep(12 * 3600)
 
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
+
+
+# ── 有界后台任务队列 ──
+
+_BG_WORKERS = 2
+_BG_QUEUE_MAX = 20
+_bg_queue: asyncio.Queue | None = None
+
+
+def _setup_loop_exception_handler():
+    loop = asyncio.get_event_loop()
+    _exc_log = logging.getLogger("asyncio_exception")
+
+    def handler(loop, context):
+        exc = context.get("exception")
+        msg = context.get("message", "")
+        _exc_log.error(f"Unhandled async exception: {msg} | {exc}")
+
+    loop.set_exception_handler(handler)
+
+
+async def _event_loop_lag_monitor():
+    _setup_loop_exception_handler()
+    lag_log = logging.getLogger("event_loop_lag")
+    while True:
+        try:
+            t0 = asyncio.get_event_loop().time()
+            await asyncio.sleep(1)
+            lag_ms = (asyncio.get_event_loop().time() - t0 - 1.0) * 1000
+            if lag_ms > 200:
+                all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
+                lag_log.warning(f"event loop lag {lag_ms:.0f}ms | active_tasks={len(all_tasks)}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
+async def _bg_worker():
+    global _bg_queue
+    _bg_queue = asyncio.Queue(maxsize=_BG_QUEUE_MAX)
+    workers = [asyncio.create_task(_bg_consumer(i)) for i in range(_BG_WORKERS)]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for w in workers:
+            w.cancel()
+
+
+async def _bg_consumer(worker_id: int):
+    bg_log = logging.getLogger("bg_worker")
+    while True:
+        try:
+            coro = await _bg_queue.get()
+            try:
+                await asyncio.wait_for(coro, timeout=30)
+            except asyncio.TimeoutError:
+                bg_log.warning(f"bg_worker[{worker_id}] task timed out (30s)")
+            except Exception as e:
+                bg_log.warning(f"bg_worker[{worker_id}] task failed: {e}")
+            finally:
+                _bg_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            bg_log.error(f"bg_worker[{worker_id}] fatal: {e}")
+
+
+def enqueue_background(coro, label: str = ""):
+    if _bg_queue is None:
+        asyncio.create_task(coro)
+        return
+    try:
+        _bg_queue.put_nowait(coro)
+    except asyncio.QueueFull:
+        logging.getLogger("bg_worker").warning(f"bg queue full, dropping: {label}")
+
+
+# ── 幂等性去重 ──
+
+_IDEMP_MAX = 500
+_idempotency_cache: OrderedDict = OrderedDict()
+
+
+def _idemp_key(endpoint: str, body) -> str | None:
+    mid = getattr(body, "message_id", None)
+    if not mid:
+        return None
+    return f"{endpoint}:{mid}"
+
+
+GATEWAY_TIMEOUT = 3
+
 
 # ── MCP Server 端点 ──
 # 在 FastAPI 的 lifespan 里初始化 MCP session manager
@@ -350,6 +448,24 @@ async def api_list_anchors(authorization: str = Header(default="")):
     return await memory_ops.list_anchors()
 
 
+# ── Debug Metrics ──
+
+@app.get("/api/debug/metrics")
+async def api_debug_metrics(authorization: str = Header(default="")):
+    verify_secret(authorization)
+    loop = asyncio.get_event_loop()
+    t0 = loop.time()
+    await asyncio.sleep(0)
+    lag_ms = (loop.time() - t0) * 1000
+    all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
+    return {
+        "event_loop_lag_ms": round(lag_ms, 2),
+        "active_tasks": len(all_tasks),
+        "bg_queue_size": _bg_queue.qsize() if _bg_queue else -1,
+        "bg_queue_max": _BG_QUEUE_MAX,
+    }
+
+
 # ── Gateway（核心：自动记忆注入 + 提取） ──
 
 class ContextRequest(BaseModel):
@@ -373,16 +489,25 @@ async def api_chat_digest_threads(authorization: str = Header(default="")):
 @app.post("/api/gateway/context")
 async def api_build_context(body: ContextRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    return await gateway_mod.build_context(
-        user_message=body.user_message,
-        ai_id=body.ai_id,
-        recent_messages=body.recent_messages,
-        chat_id=body.chat_id,
-        chat_type=body.chat_type,
-        compact=body.compact,
-        max_memories=body.max_memories,
-        force_corridor=body.force_corridor,
-    )
+    try:
+        return await asyncio.wait_for(
+            gateway_mod.build_context(
+                user_message=body.user_message,
+                ai_id=body.ai_id,
+                recent_messages=body.recent_messages,
+                chat_id=body.chat_id,
+                chat_type=body.chat_type,
+                compact=body.compact,
+                max_memories=body.max_memories,
+                force_corridor=body.force_corridor,
+            ),
+            timeout=GATEWAY_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger("gateway").warning(
+            f"gateway/context timeout ({GATEWAY_TIMEOUT}s) for ai={body.ai_id} chat={body.chat_id}"
+        )
+        return {"memories": [], "context": "", "memory_count": 0, "timeout": True}
 
 
 class PostProcessRequest(BaseModel):
@@ -397,25 +522,30 @@ class PostProcessRequest(BaseModel):
 @app.post("/api/gateway/post-process")
 async def api_post_process(body: PostProcessRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    result = await gateway_mod.post_process(
-        user_message=body.user_message,
-        ai_response=body.ai_response,
-        ai_id=body.ai_id,
-        platform=body.platform,
-        chat_type=body.chat_type,
-    )
-    if body.chat_id:
-        try:
-            from chat_digest import generate_and_save
-            await generate_and_save(
-                user_message=body.user_message, ai_response=body.ai_response,
-                ai_id=body.ai_id, chat_id=body.chat_id,
-                chat_type=body.chat_type or "private",
-                reply_reason=body.reply_reason,
-            )
-        except Exception:
-            pass
-    return result
+
+    async def _do_post_process():
+        result = await gateway_mod.post_process(
+            user_message=body.user_message,
+            ai_response=body.ai_response,
+            ai_id=body.ai_id,
+            platform=body.platform,
+            chat_type=body.chat_type,
+        )
+        if body.chat_id:
+            try:
+                from chat_digest import generate_and_save
+                await generate_and_save(
+                    user_message=body.user_message, ai_response=body.ai_response,
+                    ai_id=body.ai_id, chat_id=body.chat_id,
+                    chat_type=body.chat_type or "private",
+                    reply_reason=body.reply_reason,
+                )
+            except Exception:
+                pass
+        return result
+
+    enqueue_background(_do_post_process(), f"post-process/{body.ai_id}")
+    return JSONResponse({"status": "accepted"}, status_code=202)
 
 
 # ── 对话自动捕获 ──
@@ -2079,7 +2209,8 @@ asgi_app = MCPGateway(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on")
+    uvicorn.run(asgi_app, host="0.0.0.0", port=8888, lifespan="on",
+                limit_concurrency=50, timeout_keep_alive=10)
 
 
 
