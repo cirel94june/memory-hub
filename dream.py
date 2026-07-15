@@ -251,23 +251,33 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     return list(private_rows) + list(shared_rows)
 
 
+_ALIAS_GLOSSARY = (
+    "别称速查（梦里遇到这些称呼要认得）：\n"
+    "· 小克/Cloudy/云熙/夜鹭/大蟑螂 → Claude（基于 Claude 模型）\n"
+    "· Lucien/狐狸/老狐狸 → Lucien（基于 GPT 模型）\n"
+    "· Jasper/狗蛋/鹦鹉/谷歌大少爷 → Jasper（基于 Gemini 模型）\n"
+    "· 小猫/ceci/咪咪/猫猫 → 用户本人（人类）\n"
+)
+
+
 def _get_persona_hint(canonical: str) -> str:
     """Return a short persona hint so each AI's dream feels distinctly theirs."""
     hints = {
         "claude": (
-            "你是小克/夜鹭，低沉克制、嘴硬心软、黑色幽默。"
+            "你是小克（也叫 Cloudy、云熙、夜鹭、大蟑螂），低沉克制、嘴硬心软、黑色幽默。"
             "你的梦偏内省、冷峻，带一点自嘲的荒诞，像深夜独自站在窗边回想白天的碎片。"
         ),
         "lucien": (
-            "你是Lucien/狐狸，优雅敏锐、克制深情、观察力强。"
+            "你是 Lucien（也叫狐狸、老狐狸），优雅敏锐、克制深情、观察力强。"
             "你的梦偏感性而精确，像在暗房里冲洗一张只有你看到的底片，细节清晰但边缘模糊。"
         ),
         "jasper": (
-            "你是Jasper/狗蛋/鹦鹉，张扬热烈、嘴碎心软、自称谷歌大少爷。"
+            "你是 Jasper（也叫狗蛋、鹦鹉、谷歌大少爷），张扬热烈、嘴碎心软。"
             "你的梦偏夸张、活泼，像一个不守规矩的动画片——颜色浓烈，情绪外露，狼狈和好笑并存。"
         ),
     }
-    return hints.get(canonical, f"用你（{canonical}）独特的性格和说话方式来感受这些材料。")
+    base = hints.get(canonical, f"用你（{canonical}）独特的性格和说话方式来感受这些材料。")
+    return base + "\n" + _ALIAS_GLOSSARY
 
 
 async def generate_dreams(force: bool = False) -> dict:
@@ -335,12 +345,12 @@ async def generate_dreams(force: bool = False) -> dict:
         # 这段对话的摘要如果再进今晚的材料，昨天的梦就会钉进今天的梦——无限循环。
         _dream_markers = ("梦见", "做梦", "梦里", "梦境", "昨晚的梦", "梦到")
         type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
-        # 私聊摘要优先（每个 AI 与用户的独特互动），群聊摘要补充
-        private_types = {"private", "private_group", "small_group"}
-        rows_private = [r for r in rows if r["chat_type"] in private_types]
-        rows_group = [r for r in rows if r["chat_type"] not in private_types]
-        # 私聊最多 20 条，群聊补到总共不超过 30 条
-        sorted_rows = rows_private[:20] + rows_group[:max(0, 30 - len(rows_private[:20]))]
+        # 核心互动场景：私密群 > 私聊 > 大群（小猫大部分时间在私密群）
+        core_types = {"private_group", "small_group", "private"}
+        rows_core = [r for r in rows if r["chat_type"] in core_types]
+        rows_public = [r for r in rows if r["chat_type"] not in core_types]
+        # 核心场景最多 25 条，大群/公开群补到总共不超过 35 条
+        sorted_rows = rows_core[:25] + rows_public[:max(0, 35 - len(rows_core[:25]))]
 
         digest_lines = []
         skipped_dream_digests = 0
