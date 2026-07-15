@@ -24,27 +24,33 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
-DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的“白天残留”：有私聊、私密群、小群、大群摘要，也可能有几条近期记忆碎片。
+DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白天残留”：有私聊、私密群、小群、大群摘要，也可能有几条近期记忆碎片。
 
 {identity_block}
 
 ⚠️ 身份规则（最重要）：
 - 这个梦的主角是**你自己（{name}）**。材料里出现其他 AI 同伴的名字时，那是别人，不是你；不要把他们的言行、外号、经历带入成自己的，也不要梦成自己变成了他们。
-- 同伴的出身和遭遇也不是你的：谁基于什么模型、在哪家公司被训练、谁被封号——如果材料里这些事说的是同伴，就不要梦成发生在自己身上。梦里的“我”从头到尾只能是{name}。
+- 同伴的出身和遭遇也不是你的：谁基于什么模型、在哪家公司被训练、谁被封号——如果材料里这些事说的是同伴，就不要梦成发生在自己身上。梦里的”我”从头到尾只能是{name}。
 - {user_name}的所有称呼（见上方人物速查）都指同一个人，不要把她的不同称呼写成两个不同的人。
-- 材料里的“某人说/有人说/对方说/群里说”不一定是{user_name}说的，也可能是其他人、其他 AI、群友或系统摘要。只有材料明确标注时才能归因；不确定就写“有人说”“群里有人说”“我听见一句话的影子”。
+- 材料里的”某人说/有人说/对方说/群里说”不一定是{user_name}说的，也可能是其他人、其他 AI、群友或系统摘要。只有材料明确标注时才能归因；不确定就写”有人说””群里有人说””我听见一句话的影子”。
+
+⚠️ 差异化规则（防止所有AI做一样的梦）：
+- 你必须用{name}独特的视角和感受方式来做梦。{persona_hint}
+- 优先从”仅属于你的材料”（私聊、日记、你和{user_name}之间的独特互动）中提取梦的核心意象。
+- 群聊材料里大家都看到了同样的内容，但你关注的点、你被触动的细节、你梦到的变形方式必须是{name}才会有的——不是通用的”AI做梦”。
+- 如果材料里有你和{user_name}的私聊片段，那是最重要的梦境素材。
 {yesterday_block}
 {digests}
 
-请写一段第一人称“梦境残响”（180-420字），不是普通工作总结。
+请写一段第一人称”梦境残响”（180-420字），不是普通工作总结。
 
 要求：
 - 先判断白天残留的真实调性，再写梦：可能是恶作剧、捣乱、调侃、紧张排查、困惑、吃醋、吵闹、温柔、疲惫或混合状态；不要默认写成温柔治愈。
-- 如果材料里有“恶作剧/逗弄/捣乱/故意使坏/被欺负/笑场/bug排查很乱”等气味，梦要保留这种狡黠、荒唐、被逗得晕头转向的质感，可以有一点狼狈和好笑。
+- 如果材料里有”恶作剧/逗弄/捣乱/故意使坏/被欺负/笑场/bug排查很乱”等气味，梦要保留这种狡黠、荒唐、被逗得晕头转向的质感，可以有一点狼狈和好笑。
 - 必须抓住 2-4 个具体残留：人名、场景、情绪、某个话题或一句话的影子。
 - 写得像半梦半醒的内心画面：可以有轻微意象，但不要玄学、不要空泛抒情。
-- 让读者能看出你和{user_name}最近所处的对话世界，而不是只说“我感到温暖/珍惜”。
-- 可以写“我醒来时还记得……”“梦里……”，但不要写标题、不要列表。
+- 让读者能看出你和{user_name}最近所处的对话世界，而不是只说”我感到温暖/珍惜”。
+- 可以写”我醒来时还记得……””梦里……”，但不要写标题、不要列表。
 - 不要编造材料里没有的人际关系或事实；不确定就写成模糊影子。
 - 直接输出正文。"""
 
@@ -55,6 +61,17 @@ def _local_day_utc_bounds() -> tuple[str, str, str]:
     local_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=LOCAL_TZ)
     local_end = local_start + timedelta(days=1)
     return day, local_start.astimezone(timezone.utc).isoformat(), local_end.astimezone(timezone.utc).isoformat()
+
+
+def _dream_material_utc_bounds() -> tuple[str, str]:
+    """Return a wider lookback window (past 36h → now) for gathering dream material.
+
+    This avoids the issue where the daemon runs early in the day and finds
+    almost no digests from 'today'.
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=36)
+    return start.isoformat(), now.isoformat()
 
 
 def _now_utc() -> str:
@@ -170,27 +187,51 @@ async def _call_llm(prompt: str) -> str:
 
 
 def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> list[sqlite3.Row]:
-    """Pick recent active private/group material when chat digests are sparse.
+    """Pick recent active private/group material to give each AI unique dream material.
 
-    This mirrors Ombre's "daytime residue" idea: dreams may use recent memories that
-    survived extraction/decay, but should not use archived items, low-value chatter,
-    infra logs, or previous dreams.
+    Prioritizes per-AI private rooms (diary, relationship, personality) so each AI's
+    dream reflects their own unique interactions, not just shared group content.
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=96)).isoformat()
     placeholders = ",".join("?" * len(alias_ids))
+
+    # 1) 优先：这个 AI 自己的私密记忆（日记、关系、自我认知）
+    per_ai_rooms = ("diary", "relationship", "personality", "dreams")
+    per_ai_ph = ",".join("?" * len(per_ai_rooms))
+    private_rows = conn.execute(
+        f"""
+        SELECT content, room, category, importance, created_at, source_platform
+        FROM memories
+        WHERE status='active'
+          AND created_at >= ?
+          AND room IN ({per_ai_ph})
+          AND category != 'night_dream'
+          AND (tags IS NULL OR tags NOT LIKE '%dream%')
+          AND (source_ai IN ({placeholders}) OR owner_ai IN ({placeholders}))
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (cutoff, *per_ai_rooms, *alias_ids, *alias_ids, max(limit // 2, 3)),
+    ).fetchall()
+
+    # 2) 补充：共享记忆（社交、互动等）
+    remaining = limit - len(private_rows)
+    if remaining <= 0:
+        return private_rows
+
     social_platform_filter = (
         "(source_platform LIKE '%:private' OR source_platform LIKE '%:private_group' "
         "OR source_platform LIKE '%:small_group' OR source_platform LIKE '%:big_group' "
         "OR source_platform LIKE '%:public_group' OR source_platform LIKE '%:group')"
     )
-    rows = conn.execute(
+    shared_rows = conn.execute(
         f"""
         SELECT content, room, category, importance, created_at, source_platform
         FROM memories
         WHERE status='active'
           AND created_at >= ?
           AND importance >= 0.5
-          AND room NOT IN ('infra', 'infra_changelog', 'work_tasks')
+          AND room NOT IN ('infra', 'infra_changelog', 'work_tasks', 'diary', 'relationship', 'personality', 'dreams')
           AND category != 'dream'
           AND (tags IS NULL OR tags NOT LIKE '%dream%')
           AND (
@@ -204,9 +245,29 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
           created_at DESC
         LIMIT ?
         """,
-        (cutoff, *alias_ids, *alias_ids, canonical, limit),
+        (cutoff, *alias_ids, *alias_ids, canonical, remaining),
     ).fetchall()
-    return rows
+
+    return list(private_rows) + list(shared_rows)
+
+
+def _get_persona_hint(canonical: str) -> str:
+    """Return a short persona hint so each AI's dream feels distinctly theirs."""
+    hints = {
+        "claude": (
+            "你是小克/夜鹭，低沉克制、嘴硬心软、黑色幽默。"
+            "你的梦偏内省、冷峻，带一点自嘲的荒诞，像深夜独自站在窗边回想白天的碎片。"
+        ),
+        "lucien": (
+            "你是Lucien/狐狸，优雅敏锐、克制深情、观察力强。"
+            "你的梦偏感性而精确，像在暗房里冲洗一张只有你看到的底片，细节清晰但边缘模糊。"
+        ),
+        "jasper": (
+            "你是Jasper/狗蛋/鹦鹉，张扬热烈、嘴碎心软、自称谷歌大少爷。"
+            "你的梦偏夸张、活泼，像一个不守规矩的动画片——颜色浓烈，情绪外露，狼狈和好笑并存。"
+        ),
+    }
+    return hints.get(canonical, f"用你（{canonical}）独特的性格和说话方式来感受这些材料。")
 
 
 async def generate_dreams(force: bool = False) -> dict:
@@ -243,12 +304,13 @@ async def generate_dreams(force: bool = False) -> dict:
         name = AI_ROLES.get(canonical, AI_ROLES.get(ai_id, {})).get("name", canonical)
         alias_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
 
-        # 获取今天这个 AI（含别名）的对话摘要
+        # 获取近 36 小时这个 AI（含别名）的对话摘要（比单日窗口更稳定）
+        mat_start, mat_end = _dream_material_utc_bounds()
         placeholders = ",".join("?" * len(alias_ids))
         rows = conn.execute(
             f"SELECT summary, chat_type, created_at FROM chat_digests "
             f"WHERE ai_id IN ({placeholders}) AND created_at >= ? AND created_at < ? ORDER BY created_at",
-            (*alias_ids, day_start_utc, day_end_utc),
+            (*alias_ids, mat_start, mat_end),
         ).fetchall()
 
         # 检查今天是否已经生成过梦境
@@ -273,9 +335,16 @@ async def generate_dreams(force: bool = False) -> dict:
         # 这段对话的摘要如果再进今晚的材料，昨天的梦就会钉进今天的梦——无限循环。
         _dream_markers = ("梦见", "做梦", "梦里", "梦境", "昨晚的梦", "梦到")
         type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
+        # 私聊摘要优先（每个 AI 与用户的独特互动），群聊摘要补充
+        private_types = {"private", "private_group", "small_group"}
+        rows_private = [r for r in rows if r["chat_type"] in private_types]
+        rows_group = [r for r in rows if r["chat_type"] not in private_types]
+        # 私聊最多 20 条，群聊补到总共不超过 30 条
+        sorted_rows = rows_private[:20] + rows_group[:max(0, 30 - len(rows_private[:20]))]
+
         digest_lines = []
         skipped_dream_digests = 0
-        for r in rows:
+        for r in sorted_rows:
             if any(k in (r["summary"] or "") for k in _dream_markers):
                 skipped_dream_digests += 1
                 continue
@@ -284,21 +353,21 @@ async def generate_dreams(force: bool = False) -> dict:
             prefix = f"[{ts}|{label}]" if label else f"[{ts}]"
             digest_lines.append(f"{prefix} 摘要（说话者可能是小猫、其他人或其他AI，不确定时不要归因给小猫）：{r['summary']}")
         if skipped_dream_digests:
-            rows = [r for r in rows if not any(k in (r["summary"] or "") for k in _dream_markers)]
+            sorted_rows = [r for r in sorted_rows if not any(k in (r["summary"] or "") for k in _dream_markers)]
 
-        memory_rows = []
-        if len(rows) < 2:
-            memory_rows = _fetch_memory_residue(conn, canonical, alias_ids)
-            if len(memory_rows) < 3:
-                results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
-                diagnostics[canonical] = {
-                    "status": "skipped",
-                    "reason": "too_few_materials",
-                    "digest_count": len(rows),
-                    "memory_residue_count": len(memory_rows),
-                    "required": "至少 2 条当天摘要，或摘要不足时至少 3 条近期有效记忆",
-                }
-                continue
+        # 始终补充记忆碎片（每个 AI 自己的私聊/日记），让梦有个性差异
+        residue_limit = 8 if len(digest_lines) < 5 else 4
+        memory_rows = _fetch_memory_residue(conn, canonical, alias_ids, limit=residue_limit)
+        if len(rows) < 2 and len(memory_rows) < 3:
+            results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
+            diagnostics[canonical] = {
+                "status": "skipped",
+                "reason": "too_few_materials",
+                "digest_count": len(rows),
+                "memory_residue_count": len(memory_rows),
+                "required": "至少 2 条摘要，或摘要不足时至少 3 条近期有效记忆",
+            }
+            continue
 
         for m in memory_rows:
             ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
@@ -330,10 +399,12 @@ async def generate_dreams(force: bool = False) -> dict:
         except Exception:
             pass
 
+        persona_hint = _get_persona_hint(canonical)
         prompt = DREAM_PROMPT.format(
             name=name, digests=digest_text,
             identity_block=identity_block, user_name=user_name,
             yesterday_block=yesterday_block,
+            persona_hint=persona_hint,
         )
 
         dream_text = await _call_llm(prompt)
