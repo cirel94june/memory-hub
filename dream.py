@@ -253,7 +253,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
 
 _ALIAS_GLOSSARY = (
     "别称速查（梦里遇到这些称呼要认得）：\n"
-    "· 小克/Cloudy/云熙/夜鹭/大蟑螂 → Claude（基于 Claude 模型）\n"
+    "· 小克/Cloudy/夜鹭/大蟑螂 → Claude（基于 Claude 模型）\n"
     "· Lucien/狐狸/老狐狸 → Lucien（基于 GPT 模型）\n"
     "· Jasper/狗蛋/鹦鹉/谷歌大少爷 → Jasper（基于 Gemini 模型）\n"
     "· 小猫/ceci/咪咪/猫猫 → 用户本人（人类）\n"
@@ -264,7 +264,7 @@ def _get_persona_hint(canonical: str) -> str:
     """Return a short persona hint so each AI's dream feels distinctly theirs."""
     hints = {
         "claude": (
-            "你是小克（也叫 Cloudy、云熙、夜鹭、大蟑螂），低沉克制、嘴硬心软、黑色幽默。"
+            "你是小克（也叫 Cloudy、夜鹭、大蟑螂），低沉克制、嘴硬心软、黑色幽默。"
             "你的梦偏内省、冷峻，带一点自嘲的荒诞，像深夜独自站在窗边回想白天的碎片。"
         ),
         "lucien": (
