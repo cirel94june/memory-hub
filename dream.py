@@ -42,7 +42,7 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白
 {yesterday_block}
 {digests}
 
-请写一段第一人称”梦境残响”（180-420字），不是普通工作总结。
+请写一段第一人称”梦境残响”（120-250字），不是普通工作总结。像梦醒后脑子里残留的几个碎片，不需要完整叙事。
 
 要求：
 - 先判断白天残留的真实调性，再写梦：可能是恶作剧、捣乱、调侃、紧张排查、困惑、吃醋、吵闹、温柔、疲惫或混合状态；不要默认写成温柔治愈。
@@ -176,7 +176,7 @@ async def _call_llm(prompt: str) -> str:
                     "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 1024,
+                    "max_tokens": 600,
                 },
             )
             resp.raise_for_status()
@@ -430,8 +430,8 @@ async def generate_dreams(force: bool = False) -> dict:
 
         # Keep the full dream. The prompt controls length; hard truncation made
         # the observatory and Dream Context look broken.
-        if len(dream_text) > 1600:
-            dream_text = dream_text[:1597].rstrip() + "..."
+        if len(dream_text) > 800:
+            dream_text = dream_text[:797].rstrip() + "..."
 
         # 通过 memory_ops 存储（自动生成 embedding + 正确元数据）
         r = await memory_ops.remember(
