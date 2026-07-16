@@ -79,10 +79,29 @@ async def lifespan(app: FastAPI):
             bg_worker_task.cancel()
 
 
+def _seconds_until_next_run() -> int:
+    """计算距离下一个固定时间点（北京时间 02:00 或 14:00）的秒数。"""
+    from datetime import datetime, timezone, timedelta
+    from zoneinfo import ZoneInfo
+    bj = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(bj)
+    today = now.date()
+    slots = [
+        datetime(today.year, today.month, today.day, 2, 0, tzinfo=bj),
+        datetime(today.year, today.month, today.day, 14, 0, tzinfo=bj),
+    ]
+    # 加上明天的 02:00 兜底
+    tomorrow = today + timedelta(days=1)
+    slots.append(datetime(tomorrow.year, tomorrow.month, tomorrow.day, 2, 0, tzinfo=bj))
+    future = [s for s in slots if s > now]
+    nxt = future[0]
+    delta = int((nxt - now).total_seconds())
+    return max(delta, 60)
+
+
 async def _daemon_loop():
-    """每12小时自动跑一次记忆整理"""
+    """北京时间 02:00 和 14:00 各跑一次维护（含做梦）"""
     log = logging.getLogger("daemon_scheduler")
-    # 启动后等5分钟再跑第一次（让服务先稳定）
     await asyncio.sleep(300)
     while True:
         try:
@@ -94,8 +113,9 @@ async def _daemon_loop():
         except Exception as e:
             log.error(f"Scheduled maintenance failed: {e}")
             print(f"[Daemon] Maintenance failed: {e}")
-        # 等12小时
-        await asyncio.sleep(12 * 3600)
+        wait = _seconds_until_next_run()
+        log.info(f"Next maintenance in {wait // 3600}h{(wait % 3600) // 60}m")
+        await asyncio.sleep(wait)
 
 app = FastAPI(title="Memory Hub", lifespan=lifespan)
 
