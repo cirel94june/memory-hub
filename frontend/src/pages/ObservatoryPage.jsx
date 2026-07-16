@@ -144,7 +144,7 @@ function DreamDiagnostics({ dream, onRun, running }) {
               <div key={d.id || `${d.source_ai}-${d.created_at}`} style={{ border: "1px solid var(--glass-border)", borderRadius: "var(--radius-sm)", padding: "10px 11px", background: "var(--bg-card)" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6, fontSize: 11, color: "var(--text-muted)" }}>
                   <span>{d.source_ai || d.owner_ai || "AI"}</span>
-                  <span>{(d.created_at || "").slice(0, 16).replace("T", " ")}</span>
+                  <span>{d.created_at ? new Date(d.created_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }) : ""}</span>
                 </div>
                 <div style={{ fontSize: 13, color: "var(--text-primary)", lineHeight: 1.65, whiteSpace: "pre-wrap" }}>
                   {d.content || "（梦境内容为空）"}

@@ -37,7 +37,9 @@ function relativeDate(dateStr) {
 
 function formatTime(isoStr) {
   if (!isoStr || isoStr.length < 16) return "";
-  return isoStr.slice(11, 16);
+  const d = new Date(isoStr);
+  if (isNaN(d)) return "";
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" });
 }
 
 function HeatDot({ heat, size = 10 }) {

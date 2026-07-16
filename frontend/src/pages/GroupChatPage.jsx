@@ -272,7 +272,7 @@ export default function GroupChatPage() {
             })}
           </div>
           <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: "var(--space-xs)" }}>
-            创建于 {group.created_at?.slice(0, 10)}
+            创建于 {group.created_at ? new Date(group.created_at).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }) : ""}
           </div>
         </div>
       )}
@@ -317,7 +317,7 @@ export default function GroupChatPage() {
                 )}
                 <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
                 <div style={{ fontSize: 10, marginTop: 2, opacity: 0.6, textAlign: "right" }}>
-                  {m.created_at?.slice(11, 16)}
+                  {m.created_at ? new Date(m.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }) : ""}
                 </div>
                 <div style={{ display: "flex", justifyContent: isUser ? "flex-start" : "flex-end", gap: 6, marginTop: 4, opacity: 0.7 }}>
                   <button onClick={() => setReplyTo(m)} title="回复" style={{ border: "none", background: "transparent", color: "inherit", cursor: "pointer", padding: 0 }}>

@@ -190,7 +190,7 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
   const history = Array.isArray(mem.history) ? mem.history : [];
   const comments = Array.isArray(mem.comments) ? mem.comments : [];
 
-  const createdAt = mem.created_at ? new Date(mem.created_at).toLocaleString("zh-CN") : "";
+  const createdAt = mem.created_at ? new Date(mem.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "";
   const eventDate = mem.event_date || "";
   const roomLabel = ROOM_LABELS[mem.room] || mem.room || "未分类";
   const aiInfo = mem.source_ai ? getAI(mem.source_ai) : null;
@@ -445,7 +445,7 @@ export default function MemoryDetailModal({ memoryId, onClose, onNavigate }) {
                     <div key={s.id} style={{ fontSize: 12, padding: "8px 12px", borderRadius: "var(--radius-sm)", background: "var(--bg-hover)" }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                         <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{s.direction === "supersedes_current" ? "被新版取代" : "旧版本"}</span>
-                        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{s.status} · {s.created_at ? new Date(s.created_at).toLocaleDateString("zh-CN") : ""}</span>
+                        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{s.status} · {s.created_at ? new Date(s.created_at).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }) : ""}</span>
                       </div>
                       <div style={{ color: "var(--text-secondary)" }}>{s.content}</div>
                     </div>

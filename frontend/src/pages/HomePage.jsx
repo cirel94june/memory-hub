@@ -174,7 +174,7 @@ export default function HomePage() {
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {whispers.map((w) => {
               const ai = getAI(w.ai_id);
-              const time = w.created_at ? w.created_at.slice(11, 16) : "";
+              const time = w.created_at ? new Date(w.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Shanghai" }) : "";
               return (
                 <div key={w.id} style={{
                   padding: "8px 12px", borderRadius: "var(--radius-sm)",
