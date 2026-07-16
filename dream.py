@@ -176,7 +176,7 @@ async def _call_llm(prompt: str) -> str:
                     "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 700,
+                    "max_tokens": 1024,
                 },
             )
             resp.raise_for_status()
@@ -430,8 +430,8 @@ async def generate_dreams(force: bool = False) -> dict:
 
         # Keep the full dream. The prompt controls length; hard truncation made
         # the observatory and Dream Context look broken.
-        if len(dream_text) > 1200:
-            dream_text = dream_text[:1197].rstrip() + "..."
+        if len(dream_text) > 1600:
+            dream_text = dream_text[:1597].rstrip() + "..."
 
         # 通过 memory_ops 存储（自动生成 embedding + 正确元数据）
         r = await memory_ops.remember(
