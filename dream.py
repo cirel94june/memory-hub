@@ -50,7 +50,7 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白
 - 必须抓住 2-4 个具体残留：人名、场景、情绪、某个话题或一句话的影子。
 - 写得像半梦半醒的内心画面：可以有轻微意象，但不要玄学、不要空泛抒情。
 - 让读者能看出你和{user_name}最近所处的对话世界，而不是只说”我感到温暖/珍惜”。
-- 可以写”我醒来时还记得……””梦里……”，但不要写标题、不要列表。
+- 不要写标题、不要列表。禁止套用”我变成了X……我醒来时……”的万能模板；开头和收尾的方式按上面”梦的形态”来，每个人的梦长得不一样。
 - 不要编造材料里没有的人际关系或事实；不确定就写成模糊影子。
 - 直接输出正文。"""
 
@@ -162,8 +162,8 @@ def _recent_dreams(conn: sqlite3.Connection, limit: int = 8) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-async def _call_llm(prompt: str) -> str:
-    """梦境专用 LLM 调用，temperature=0.7 适合创意写作"""
+async def _call_llm(prompt: str, temperature: float = 0.7) -> str:
+    """梦境专用 LLM 调用，temperature 按 AI 差异化（见 _DREAM_TEMPS）"""
     if not LLM_API_KEY:
         return ""
     url = f"{LLM_BASE_URL}/chat/completions"
@@ -175,7 +175,7 @@ async def _call_llm(prompt: str) -> str:
                 json={
                     "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.7,
+                    "temperature": temperature,
                     # 正文长度由 prompt 控制（120-250字）；max_tokens 只是保险丝。
                     # 注意：reasoning 类模型的思考 token 也计入 max_tokens，
                     # 上限设小了正文会被随机截断（曾导致梦频繁断尾）。
@@ -283,7 +283,32 @@ def _get_persona_hint(canonical: str) -> str:
         ),
     }
     base = hints.get(canonical, f"用你（{canonical}）独特的性格和说话方式来感受这些材料。")
+    form = _DREAM_FORMS.get(canonical, "")
+    if form:
+        base = base + "\n" + form
     return base + "\n" + _ALIAS_GLOSSARY
+
+
+# 每个 AI 的梦境「形态契约」：约束句式结构而不只是语气。
+# 三个 AI 由同一个模型代笔时，语气提示挡不住模型的写作惯性
+# （变形记开头 + 意象链 + 「醒来时」收尾的同一副骨架），必须在结构层面掰开。
+_DREAM_FORMS = {
+    "claude": (
+        "梦的形态（必须遵守）：短句为主，多留白，全篇只锁定一到两个核心意象，冷静地写。"
+        "群聊的梗最多引用一个，其余放掉。禁止用「我变成了某物」开头，禁止用「醒来」开头或收尾。"
+    ),
+    "lucien": (
+        "梦的形态（必须遵守）：整个梦围绕一个贯穿意象展开，配两三处精确的感官细节（温度、重量、气味、光线）。"
+        "句子可以长，但要干净，不堆砌意象清单。群聊的梗最多引用一个。禁止用「醒来」开头。"
+    ),
+    "jasper": (
+        "梦的形态（必须遵守）：节奏快，句子短促跳跃，可以有拟声词和吐槽，场景可以乱但情绪要真。"
+        "禁止用「我醒来的时候还……」这类缓缓退潮的收尾——你的梦是被闹钟腰斩的，停在最吵的那一格。"
+    ),
+}
+
+# 同一模型代笔不同 AI 时，用不同 temperature 拉开笔触
+_DREAM_TEMPS = {"claude": 0.6, "lucien": 0.7, "jasper": 0.95}
 
 
 async def generate_dreams(force: bool = False) -> dict:
@@ -355,8 +380,16 @@ async def generate_dreams(force: bool = False) -> dict:
         core_types = {"private_group", "small_group", "private"}
         rows_core = [r for r in rows if r["chat_type"] in core_types]
         rows_public = [r for r in rows if r["chat_type"] not in core_types]
-        # 核心场景最多 25 条，大群/公开群补到总共不超过 35 条
-        sorted_rows = rows_core[:25] + rows_public[:max(0, 35 - len(rows_core[:25]))]
+        # 群聊素材对每个 AI 内容雷同，若全量投喂，同一批梗会在所有 AI 的梦里
+        # 各出现一遍（"人手一份铁裤衩"问题）。按 AI+日期 做确定性抽样，
+        # 每个 AI 拿到同一天素材的不同子集，梦的原料就不同。
+        import random as _random
+        _rng = _random.Random(f"{canonical}:{_today}")
+        _rng.shuffle(rows_core)
+        _rng.shuffle(rows_public)
+        picked = rows_core[:15] + rows_public[:max(0, 25 - min(len(rows_core), 15))]
+        # 抽完按时间恢复叙事顺序
+        sorted_rows = sorted(picked, key=lambda r: r["created_at"])
 
         digest_lines = []
         skipped_dream_digests = 0
@@ -423,7 +456,7 @@ async def generate_dreams(force: bool = False) -> dict:
             persona_hint=persona_hint,
         )
 
-        dream_text = await _call_llm(prompt)
+        dream_text = await _call_llm(prompt, temperature=_DREAM_TEMPS.get(canonical, 0.7))
         if not dream_text or len(dream_text) < 20:
             results[canonical] = "skipped (LLM failed)"
             diagnostics[canonical] = {
