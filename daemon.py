@@ -1143,6 +1143,14 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Raw vault prune failed: {e}")
 
+    # 10.75 Embedding 自愈：补齐向量索引缺口（失败的 embedding 从不自动重试，
+    # 会永久累积成"语义搜索盲区"，梦/日记召回失真的根源之一）
+    try:
+        from memory_ops import backfill_embeddings
+        await run_step("embedding_backfill", "Backfill missing embeddings", backfill_embeddings)
+    except Exception as e:
+        log.warning(f"  Embedding backfill failed: {e}")
+
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:
         from dream import generate_dreams

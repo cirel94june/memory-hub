@@ -1454,6 +1454,40 @@ async def list_anchors(ai_id: str = None) -> list[dict]:
     return anchors
 
 
+# ── Embedding 自愈 ──
+
+async def backfill_embeddings(limit: int = 300) -> dict:
+    """补齐缺失的向量索引。
+
+    get_embedding 失败时记忆会以 embedding=None 入库且从不重试，
+    失败会永久累积（曾达到 362/543 条对向量搜索隐形），
+    导致梦/日记等只能靠关键词命中、语义召回排序失真。
+    此函数由 daemon 每次维护调用，也可手动触发。"""
+    embedded = 0
+    failed = 0
+    skipped = 0
+    for mem in list(store.get_all_memories().values()):
+        if mem.get("status") != "active" or mem.get("embedding"):
+            continue
+        content = (mem.get("content") or "").strip()
+        if not content:
+            skipped += 1
+            continue
+        vec = await get_embedding(content)
+        if vec:
+            mem["embedding"] = pack_embedding(vec)
+            mem["updated_at"] = mem.get("updated_at") or _now()
+            store.set_memory(mem)
+            embedded += 1
+        else:
+            failed += 1
+        if embedded >= limit:
+            break
+    if embedded or failed:
+        logger.info(f"Embedding backfill: {embedded} embedded, {failed} failed, {skipped} empty")
+    return {"embedded": embedded, "failed": failed, "skipped_empty": skipped}
+
+
 # ── 用户纠正处理 ──
 
 async def apply_user_correction(
