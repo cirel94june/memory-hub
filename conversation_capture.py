@@ -524,6 +524,27 @@ async def extract_from_messages(
             content = f"[互动] {content}"
         elif about == "ai" and not content.startswith("[AI]"):
             content = f"[AI] {content}"
+
+        # 出处 + 纠错路由（与自动捕获管线一致）
+        valid_prov = {"user_statement", "user_correction", "user_quote",
+                      "ai_summary", "ai_speculation", "roleplay_meme"}
+        provenance = item.get("provenance", "")
+        if provenance not in valid_prov:
+            provenance = ""
+
+        if provenance == "user_correction":
+            result = await memory_ops.apply_user_correction(
+                corrected_value=content,
+                old_value=str(item.get("corrects_old_value", "")).strip(),
+                source_ai=ai_id,
+                room=item.get("room", "living_room"),
+                source_context=conversation_text[:1500],
+                layer="private" if chat_type == "private" else "shared",
+                owner_ai=ai_id if chat_type == "private" else "",
+            )
+            memories.append(result)
+            continue
+
         result = await memory_ops.remember(
             content=content,
             layer="private" if chat_type == "private" else "shared",
@@ -535,6 +556,7 @@ async def extract_from_messages(
             source_platform="mcp_extract",
             auto_analyze=False,
             quick=quick,
+            provenance_type=provenance,
         )
         memories.append(result)
 
