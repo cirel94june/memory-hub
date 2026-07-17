@@ -1143,13 +1143,10 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Raw vault prune failed: {e}")
 
-    # 10.75 Embedding 自愈：补齐向量索引缺口（失败的 embedding 从不自动重试，
-    # 会永久累积成"语义搜索盲区"，梦/日记召回失真的根源之一）
-    try:
-        from memory_ops import backfill_embeddings
-        await run_step("embedding_backfill", "Backfill missing embeddings", backfill_embeddings)
-    except Exception as e:
-        log.warning(f"  Embedding backfill failed: {e}")
+    # （embedding 自愈由上面 10.55 的 backfill_embeddings 负责——
+    #  不要在这里再 from memory_ops import backfill_embeddings：
+    #  函数内 import 会把该名字变成整个函数的局部变量，
+    #  导致 10.55 处 UnboundLocalError、整个维护中途崩掉。2026-07-18 事故。）
 
     # 10.76 正文完整性审计：标记存库前就残缺的内容（半句梦等），
     # 召回降权 + 不进最近动态，不自动补写

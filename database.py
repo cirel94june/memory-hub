@@ -353,7 +353,14 @@ def set_memory(mem: dict) -> None:
     values = [_prep(col) for col in _ALL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
     cols = ", ".join(_ALL_COLUMNS)
-    update_set = ", ".join(f"{c} = excluded.{c}" for c in _ALL_COLUMNS if c != "id")
+    # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
+    # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
+    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）
+    update_set = ", ".join(
+        f"{c} = COALESCE(excluded.{c}, memories.{c})" if c == "embedding"
+        else f"{c} = excluded.{c}"
+        for c in _ALL_COLUMNS if c != "id"
+    )
 
     sql = (
         f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "
