@@ -244,3 +244,41 @@ def test_incomplete_memory_skipped_in_recent(fake_store, monkeypatch):
         ai_id="lucien", has_base_context=True, max_chars=4000))
     assert "完整的记忆" in result["text"]
     assert "什么系统管" not in result["text"]
+
+
+def test_correction_fuzzy_old_value_match(fake_store):
+    """提取模型转述 old_value 差一两个字时也要能定位错误版（E2E 实测缺口）。"""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    fake_store["w2"] = {
+        "id": "w2", "content": "[互动] Jasper说狐狸的围巾是绿色的",
+        "layer": "shared", "room": "social", "owner_ai": "",
+        "source_ai": "jasper", "status": "active",
+        "provenance_type": "ai_summary", "tags": "[]", "comments": [],
+        "superseded_by": "", "updated_at": now, "created_at": now,
+    }
+    result = asyncio.run(memory_ops.apply_user_correction(
+        corrected_value="[用户] ceci纠正：狐狸的围巾是灰色的",
+        old_value="狐狸围巾是绿色的",  # 少了"的"，精确匹配会扑空
+        source_ai="jasper", room="social",
+    ))
+    assert "w2" in result["invalidated"]
+    assert fake_store["w2"]["status"] == "corrected_by_user"
+
+
+def test_correction_fuzzy_does_not_hit_unrelated(fake_store):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    fake_store["u9"] = {
+        "id": "u9", "content": "[用户] ceci喜欢在深夜听老歌，尤其是雨天的时候",
+        "layer": "shared", "room": "preferences", "owner_ai": "",
+        "source_ai": "claude", "status": "active",
+        "provenance_type": "user_statement", "tags": "[]", "comments": [],
+        "superseded_by": "", "updated_at": now, "created_at": now,
+    }
+    result = asyncio.run(memory_ops.apply_user_correction(
+        corrected_value="[用户] 狐狸的围巾是灰色的",
+        old_value="狐狸围巾是绿色的",
+    ))
+    assert "u9" not in result["invalidated"]
+    assert fake_store["u9"]["status"] == "active"

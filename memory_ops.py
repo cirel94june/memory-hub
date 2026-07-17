@@ -1565,6 +1565,22 @@ async def apply_user_correction(
     )
     new_id = result.get("id", "")
 
+    def _bigrams(s: str) -> set:
+        s = "".join(ch for ch in s if ch.isalnum())
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else {s} if s else set()
+
+    def _matches_old_value(content: str, old: str) -> bool:
+        if old in content:
+            return True
+        # 模糊兜底：提取模型转述 old_value 时可能差一两个字
+        # （实测："狐狸围巾是绿色的" vs 库里的"狐狸的围巾是绿色的"）。
+        # 用字符二元组重合度衡量，≥0.7 视为同一说法。
+        og = _bigrams(old)
+        if len(og) < 3:
+            return False  # 太短的 old_value 不做模糊匹配，避免误伤
+        cg = _bigrams(content)
+        return len(og & cg) / len(og) >= 0.7
+
     corrected_ids = []
     old_value = (old_value or "").strip()
     if old_value and new_id:
@@ -1572,8 +1588,10 @@ async def apply_user_correction(
         for mem in list(store.get_all_memories().values()):
             if mem.get("id") == new_id or mem.get("status") != "active":
                 continue
-            if old_value not in (mem.get("content") or ""):
+            if not _matches_old_value(mem.get("content") or "", old_value):
                 continue
+            if (mem.get("provenance_type") or "") == "user_correction":
+                continue  # 已有的用户纠正不被自动失效
             mem["status"] = "corrected_by_user"
             mem["superseded_by"] = new_id
             mem["updated_at"] = now
