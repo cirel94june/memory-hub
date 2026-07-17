@@ -1151,6 +1151,14 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Embedding backfill failed: {e}")
 
+    # 10.76 正文完整性审计：标记存库前就残缺的内容（半句梦等），
+    # 召回降权 + 不进最近动态，不自动补写
+    try:
+        from memory_ops import audit_content_integrity
+        await run_step("integrity_audit", "Audit content integrity", audit_content_integrity)
+    except Exception as e:
+        log.warning(f"  Integrity audit failed: {e}")
+
     # 10.8 梦境日记（每个AI回顾今天的对话，写一篇日记）
     try:
         from dream import generate_dreams

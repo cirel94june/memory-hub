@@ -157,6 +157,8 @@ async def get_smart_context(
             continue
         if mem["id"] in recalled_ids:
             continue
+        if memory_ops._has_tag(mem, "content_incomplete"):
+            continue  # 残缺正文不进最近动态，留在库里待审计
         recent.append(mem)
 
     recent.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
@@ -180,7 +182,8 @@ async def get_smart_context(
          if m.get("status") == "active"
          and (m.get("layer") or "shared") == "shared"
          and m.get("source_ai") and m.get("source_ai") != ai_id
-         and m.get("updated_at", "") > cutoff_48h.isoformat()],
+         and m.get("updated_at", "") > cutoff_48h.isoformat()
+         and not memory_ops._has_tag(m, "content_incomplete")],
         key=lambda x: x.get("updated_at", ""),
         reverse=True,
     )[:3]

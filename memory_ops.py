@@ -813,6 +813,12 @@ async def recall(
         # RRF 融合
         merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
 
+        # 残缺正文降权（content_incomplete 由完整性审计标记）
+        for item in merged:
+            mem = get_fn(item["id"])
+            if mem and _has_tag(mem, "content_incomplete"):
+                item["score"] = round(item.get("score", 0) * 0.6, 6)
+
         # owner=self 的 private 记忆加权：查询者自己的梦/日记等高匹配私有内容
         # 不能被 shared 高频梗（RRF 多路都命中）压到后排
         if ai_ids:
@@ -1486,6 +1492,43 @@ async def backfill_embeddings(limit: int = 300) -> dict:
     if embedded or failed:
         logger.info(f"Embedding backfill: {embedded} embedded, {failed} failed, {skipped} empty")
     return {"embedded": embedded, "failed": failed, "skipped_empty": skipped}
+
+
+# ── 正文完整性审计 ──
+
+async def audit_content_integrity(mark: bool = True) -> dict:
+    """扫描活跃记忆的正文完整性，残缺的打 content_incomplete 标签。
+    不自动补写；召回降权 + 最近动态跳过，原文保留待人工审计。
+    由 daemon 每次维护调用。"""
+    from integrity import looks_incomplete
+    flagged = []
+    already = 0
+    for mem in list(store.get_all_memories().values()):
+        if mem.get("status") != "active":
+            continue
+        tags = _parse_json_field(mem.get("tags", "[]"))
+        if "content_incomplete" in tags:
+            already += 1
+            continue
+        bad, reason = looks_incomplete(mem.get("content") or "")
+        if not bad:
+            continue
+        flagged.append({
+            "id": mem["id"],
+            "reason": reason,
+            "tail": (mem.get("content") or "")[-24:],
+        })
+        if mark:
+            tags.append("content_incomplete")
+            mem["tags"] = json.dumps(tags, ensure_ascii=False)
+            store.set_memory(mem)
+    if flagged:
+        logger.info(f"Content integrity audit: {len(flagged)} newly flagged, {already} already flagged")
+    return {"flagged": len(flagged), "already_flagged": already, "items": flagged[:50]}
+
+
+def _has_tag(mem: dict, tag: str) -> bool:
+    return tag in _parse_json_field(mem.get("tags", "[]"))
 
 
 # ── 用户纠正处理 ──

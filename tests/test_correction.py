@@ -195,3 +195,52 @@ def test_corrected_memory_excluded_from_smart_context(fake_store, monkeypatch):
         ai_id="lucien", has_base_context=True, max_chars=4000))
     assert "真丝羽毛" not in result["text"]
     assert "真丝裤衩" in result["text"]
+
+
+# ── 正文完整性 ──
+
+def test_looks_incomplete_detection():
+    from integrity import looks_incomplete
+    # 半句残缺（Lucien 复测发现的实际样式）
+    bad, reason = looks_incomplete("我梦见一条很长很长的走廊，走廊尽头有一扇发着微光的门，推开之后里面像是有个什么系统管")
+    assert bad and reason == "no_terminal_punctuation"
+    # 未闭合括号
+    bad, _ = looks_incomplete("Lucien（昵称狐狸曾经说过一句很长的话所以这条一定超过三十个字符了")
+    assert bad
+    # 正常内容不误伤
+    ok_cases = [
+        "这是一条完整的记忆，有头有尾，字数也足够长，最后以句号结束。",
+        "短标签",
+        "她说：“今天很开心。”",
+        "这条以感叹结尾的长记忆内容也是完整的，不应该被标记出来！",
+    ]
+    for t in ok_cases:
+        bad, reason = looks_incomplete(t)
+        assert not bad, f"{t} -> {reason}"
+
+
+def test_incomplete_memory_skipped_in_recent(fake_store, monkeypatch):
+    import json as _json
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    fake_store["半句"] = {
+        "id": "半句", "content": "这条记忆停在半句像是有个什么系统管",
+        "layer": "shared", "room": "living_room", "owner_ai": "",
+        "source_ai": "jasper", "status": "active", "importance": 0.9,
+        "tags": _json.dumps(["content_incomplete"]), "comments": [],
+        "superseded_by": "", "resolved": None,
+        "updated_at": now, "created_at": now,
+    }
+    fake_store["完整"] = {
+        "id": "完整", "content": "这条是完整的记忆。",
+        "layer": "shared", "room": "living_room", "owner_ai": "",
+        "source_ai": "jasper", "status": "active", "importance": 0.9,
+        "tags": "[]", "comments": [], "superseded_by": "", "resolved": None,
+        "updated_at": now, "created_at": now,
+    }
+    import smart_context
+    monkeypatch.setattr(smart_context, "_dream_section", lambda ai, md: "")
+    result = asyncio.run(smart_context.get_smart_context(
+        ai_id="lucien", has_base_context=True, max_chars=4000))
+    assert "完整的记忆" in result["text"]
+    assert "什么系统管" not in result["text"]
