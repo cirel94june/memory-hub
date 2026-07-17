@@ -332,7 +332,7 @@ async def generate_dreams(force: bool = False) -> dict:
         # 检查今天是否已经生成过梦境
         existing = conn.execute(
             "SELECT id FROM memories WHERE source_ai=? AND room IN ('diary', 'dreams') "
-            "AND tags LIKE '%dream%' AND created_at >= ? AND created_at < ?",
+            "AND tags LIKE '%dream%' AND status='active' AND created_at >= ? AND created_at < ?",
             (canonical, day_start_utc, day_end_utc),
         ).fetchone()
         if existing and not force:
