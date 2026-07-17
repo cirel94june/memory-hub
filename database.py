@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at      TEXT NOT NULL,
     history         TEXT NOT NULL DEFAULT '[]',
     resolved        INTEGER,
-    anchored        INTEGER
+    anchored        INTEGER,
+    provenance_type TEXT NOT NULL DEFAULT '',
+    fact_confidence REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_status     ON memories(status);
@@ -283,6 +285,12 @@ async def init_db(db_path: str = None) -> None:
     if "anchored" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
         logger.info("Migrated: added 'anchored' column")
+    if "provenance_type" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'provenance_type' column")
+    if "fact_confidence" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
+        logger.info("Migrated: added 'fact_confidence' column")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
 
@@ -302,7 +310,7 @@ _ALL_COLUMNS = [
     "source_ai", "source_platform", "tags", "linked_memories",
     "supersedes", "superseded_by", "event_date", "source_context",
     "comments", "embedding", "status", "created_at", "updated_at",
-    "history", "resolved", "anchored",
+    "history", "resolved", "anchored", "provenance_type", "fact_confidence",
 ]
 
 
@@ -336,6 +344,8 @@ def set_memory(mem: dict) -> None:
             return val
         if key == "embedding":
             return val  # bytes or None
+        if key == "fact_confidence":
+            return val  # REAL or None
         if val is None:
             return ""
         return val

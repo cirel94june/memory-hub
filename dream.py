@@ -485,6 +485,7 @@ async def generate_dreams(force: bool = False) -> dict:
             source_platform="daemon_dream",
             tags=["dream", "nightly", "reflection", "daytime_residue"],
             auto_merge=False,
+            provenance_type="dream",
         )
         results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
         diagnostics[canonical] = {

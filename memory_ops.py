@@ -131,6 +131,40 @@ def _rrf_merge(*rank_lists, k: int = 60) -> list[dict]:
     return [item["data"] | {"score": round(item["score"], 6)} for item in merged]
 
 
+# ── 记忆出处（provenance）体系 ──
+# 防止 AI 复述/玩梗反向污染用户事实（"真丝裤衩"被 AI 误说成"真丝羽毛"后
+# 错误版本自我强化取代原始事实）。
+# AI 生成的内容永远不能 supersede 用户陈述；用户纠正优先级最高。
+
+_AI_PROVENANCE = {"ai_summary", "ai_speculation", "roleplay_meme", "dream", "diary"}
+
+_PROVENANCE_CONFIDENCE = {
+    "user_correction": 1.0,
+    "user_statement": 0.9,
+    "user_quote": 0.8,
+    "ai_summary": 0.5,
+    "roleplay_meme": 0.4,
+    "diary": 0.4,
+    "ai_speculation": 0.3,
+    "dream": 0.2,
+}
+
+
+def _can_supersede(new_provenance: str, target_mem: dict) -> bool:
+    """新记忆能否取代目标记忆。
+    - AI 生成内容（复述/推测/玩梗/梦/日记）永远不能 supersede
+    - 用户纠正（user_correction）只有另一条用户纠正能取代
+    - 出处未知（legacy/手动写入）不能取代用户纠正，其余保持旧行为
+    """
+    new_prov = (new_provenance or "").strip()
+    if new_prov in _AI_PROVENANCE:
+        return False
+    target_prov = (target_mem.get("provenance_type") or "").strip()
+    if target_prov == "user_correction" and new_prov != "user_correction":
+        return False
+    return True
+
+
 # ── 写入记忆（带自动打标 + 合并检测） ──
 
 async def remember(
@@ -150,8 +184,16 @@ async def remember(
     auto_merge: bool = True,
     quick: bool = False,
     force_create: bool = False,
+    provenance_type: str = "",
+    fact_confidence: float = None,
 ) -> dict:
-    """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）"""
+    """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
+
+    provenance_type: 出处类型（user_statement/user_correction/user_quote/
+        ai_summary/ai_speculation/roleplay_meme/dream/diary，留空=未知）。
+    fact_confidence: 事实置信度，不传时按 provenance 默认。"""
+    if fact_confidence is None:
+        fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
     # 归一化 AI 别名（cloudy → claude）
     from config import AI_ALIASES
     source_ai = AI_ALIASES.get(source_ai, source_ai)
@@ -199,6 +241,9 @@ async def remember(
     # Step 2: 智能关系检测（替代简单合并）
     if force_create:
         auto_merge = False
+    if provenance_type in _AI_PROVENANCE:
+        # AI 生成内容不允许改写/合并已有记忆——只能新建，防止 AI 复述污染事实层
+        auto_merge = False
     if auto_merge:
         # 先找相似候选
         query_vec = await get_embedding(content)
@@ -208,9 +253,10 @@ async def remember(
             # 高相似度（>= MERGE_SIMILARITY）走传统合并
             best = candidates[0]
             if best["score"] >= MERGE_SIMILARITY:
-                merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal, target_room=room)
-                if merge_result:
-                    return merge_result
+                if _can_supersede(provenance_type, best["mem"]):
+                    merge_result = await _try_merge(content, domain, tags, importance, valence, emotion_arousal, target_room=room)
+                    if merge_result:
+                        return merge_result
 
             # 中等相似度（0.55-0.75）走关系分类：可能是更新/补充/矛盾
             if candidates and best["score"] < MERGE_SIMILARITY:
@@ -226,6 +272,26 @@ async def remember(
                     target_id = rel.get("target_id", "")
                     target_mem = store.get_memory(target_id)
                     if not target_mem:
+                        continue
+
+                    if (rel.get("should_supersede") and rel["relation"] in ("updates", "contradicts")
+                            and not _can_supersede(provenance_type, target_mem)):
+                        # 无权取代（AI 复述想覆盖用户事实 / 想覆盖用户纠正）：
+                        # 保留 canonical，把新记忆记为 conflicting variant（只链接）
+                        now = _now()
+                        comments = target_mem.get("comments", [])
+                        if not isinstance(comments, list):
+                            comments = []
+                        comments.append({
+                            "date": now,
+                            "author": source_ai or "system",
+                            "kind": "conflict_note",
+                            "content": f"出现冲突版本但无权取代（新出处：{provenance_type or '未知'}）：{content[:100]}",
+                        })
+                        target_mem["comments"] = comments
+                        store.set_memory(target_mem)
+                        linked_ids.append(target_id)
+                        logger.info(f"Supersede blocked by provenance guard: {provenance_type or 'unknown'} -> {target_id}")
                         continue
 
                     if rel.get("should_supersede") and rel["relation"] in ("updates", "contradicts"):
@@ -268,6 +334,8 @@ async def remember(
                     "valence": valence,
                     "domain": json.dumps(domain),
                     "decay_score": 1.0,
+                    "provenance_type": provenance_type,
+                    "fact_confidence": fact_confidence,
                     "activation_count": 0,
                     "last_activated": "",
                     "source_ai": source_ai,
@@ -323,6 +391,8 @@ async def remember(
         "valence": valence,
         "domain": json.dumps(domain),
         "decay_score": 1.0,
+                    "provenance_type": provenance_type,
+                    "fact_confidence": fact_confidence,
         "activation_count": 0,
         "last_activated": "",
         "source_ai": source_ai,
@@ -1362,6 +1432,91 @@ async def list_anchors(ai_id: str = None) -> list[dict]:
                 "owner_ai": mem.get("owner_ai", ""),
             })
     return anchors
+
+
+# ── 用户纠正处理 ──
+
+async def apply_user_correction(
+    corrected_value: str,
+    old_value: str = "",
+    source_ai: str = "",
+    room: str = "living_room",
+    source_context: str = "",
+    layer: str = "shared",
+    owner_ai: str = "",
+) -> dict:
+    """用户纠正了一条错误信息（通常是 AI 复述错了）。
+
+    1. 纠正版作为 canonical 事实入库（provenance=user_correction，最高置信度）
+    2. 找到包含错误值的 active 记忆，标记为 corrected_by_user（退出召回/走廊/动态）
+    3. 清走廊缓存，避免旧版本残留
+    找不到错误来源时不乱猜：纠正版打上 conflict_pending 标记待人工看。
+    """
+    result = await remember(
+        content=corrected_value,
+        layer=layer,
+        room=room,
+        owner_ai=owner_ai,
+        importance=0.85,
+        source_ai=source_ai,
+        source_platform="user_correction",
+        source_context=source_context,
+        provenance_type="user_correction",
+        fact_confidence=1.0,
+        auto_analyze=False,
+        force_create=True,
+    )
+    new_id = result.get("id", "")
+
+    corrected_ids = []
+    old_value = (old_value or "").strip()
+    if old_value and new_id:
+        now = _now()
+        for mem in list(store.get_all_memories().values()):
+            if mem.get("id") == new_id or mem.get("status") != "active":
+                continue
+            if old_value not in (mem.get("content") or ""):
+                continue
+            mem["status"] = "corrected_by_user"
+            mem["superseded_by"] = new_id
+            mem["updated_at"] = now
+            comments = mem.get("comments", [])
+            if not isinstance(comments, list):
+                comments = []
+            comments.append({
+                "date": now,
+                "author": "user",
+                "kind": "correction_note",
+                "content": f"被用户纠正：「{old_value[:80]}」→「{corrected_value[:80]}」",
+            })
+            mem["comments"] = comments
+            store.set_memory(mem)
+            corrected_ids.append(mem["id"])
+            logger.info(f"User correction: invalidated {mem['id']} ({old_value[:40]})")
+
+    if not corrected_ids and old_value and new_id:
+        # 没定位到错误来源——不乱覆盖，标记待查
+        new_mem = store.get_memory(new_id)
+        if new_mem:
+            tags = _parse_json_field(new_mem.get("tags", "[]"))
+            if "conflict_pending" not in tags:
+                tags.append("conflict_pending")
+            new_mem["tags"] = json.dumps(tags, ensure_ascii=False)
+            store.set_memory(new_mem)
+
+    # 清走廊缓存，防止旧版本继续注入
+    try:
+        import corridor
+        corridor._mem_cache.clear()
+    except Exception:
+        pass
+
+    return {
+        "status": "corrected",
+        "canonical_id": new_id,
+        "invalidated": corrected_ids,
+        "old_value": old_value,
+    }
 
 
 # ── 按标签搜索 ──
