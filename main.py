@@ -93,7 +93,8 @@ def _seconds_until_next_run() -> int:
     # 加上明天的 02:00 兜底
     tomorrow = today + timedelta(days=1)
     slots.append(datetime(tomorrow.year, tomorrow.month, tomorrow.day, 2, 0, tzinfo=bj))
-    future = [s for s in slots if s > now]
+    # 5 分钟余量：避免在整点前几秒醒来时把"下一班"算成 1 分钟后，连跑两次
+    future = [s for s in slots if (s - now).total_seconds() > 300]
     nxt = future[0]
     delta = int((nxt - now).total_seconds())
     return max(delta, 60)
@@ -102,7 +103,10 @@ def _seconds_until_next_run() -> int:
 async def _daemon_loop():
     """北京时间 02:00 和 14:00 各跑一次维护（含做梦）"""
     log = logging.getLogger("daemon_scheduler")
-    await asyncio.sleep(300)
+    # 启动后不立刻跑维护（会占用 6h 冷却，导致下一个整点档被跳过），直接等下一班
+    wait = _seconds_until_next_run()
+    log.info(f"Daemon scheduler started, first maintenance in {wait // 3600}h{(wait % 3600) // 60}m")
+    await asyncio.sleep(wait)
     while True:
         try:
             log.info("Starting scheduled maintenance...")
