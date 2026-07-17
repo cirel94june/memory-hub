@@ -30,6 +30,14 @@ FACT_ROOMS = {"living_room", "relationships", "career", "health",
 
 MAX_LLM_PAIRS = 8  # 每次体检最多让小模型判断的记忆对数（控制成本）
 
+# AI 的展示别名 → canonical（与 dream._ALIAS_GLOSSARY / identity_registry 保持一致）
+# 用于内容级"张冠李戴"检查：别称出现在错误的人名括号里
+_AI_DISPLAY_ALIASES = {
+    "claude": {"小克", "cloudy", "夜鹭", "大蟑螂"},
+    "lucien": {"lucien", "狐狸", "老狐狸"},
+    "jasper": {"jasper", "狗蛋", "鹦鹉", "谷歌大少爷"},
+}
+
 
 async def run_checkup() -> dict:
     """完整体检。返回并保存报告。"""
@@ -220,6 +228,61 @@ async def run_checkup() -> dict:
             })
     except Exception as e:
         log.warning(f"doctor unresolved review failed: {e}")
+
+    # ── 2.5 身份别名张冠李戴（内容级）──
+    # 实例：「Lucien（夜鹭/狐狸）」——夜鹭是小克的别称，被塞进了 Lucien 的括号。
+    # 结构性检查看不到这种错误，必须扫正文。报告不自动修。
+    try:
+        import re
+        alias_owner = {}
+        for canon, aliases in _AI_DISPLAY_ALIASES.items():
+            for a in aliases:
+                alias_owner[a] = canon
+        pat = re.compile(r"([A-Za-z一-鿿]{2,10})[（(]([^）)]{1,50})[）)]")
+        found = 0
+        for mem in active:
+            content = mem.get("content") or ""
+            for name, inside in pat.findall(content):
+                owner = alias_owner.get(name.lower()) or alias_owner.get(name)
+                if not owner:
+                    continue
+                for alias, a_owner in alias_owner.items():
+                    if a_owner != owner and alias in inside:
+                        report["issues"].append({
+                            "type": "identity_alias_confusion",
+                            "memory_id": mem["id"],
+                            "detail": f"「{name}（…{alias}…）」——{alias} 是 {a_owner} 的别称，不是 {owner} 的",
+                            "content_head": content[:80],
+                        })
+                        found += 1
+                        break
+                if found >= 20:
+                    break
+            if found >= 20:
+                break
+        report["stats"]["identity_alias_confusion"] = found
+    except Exception as e:
+        log.warning(f"doctor identity alias check failed: {e}")
+
+    # ── 2.6 preferences 房间串味（事件/技术支持/玩梗被当成稳定偏好）──
+    try:
+        misfiled = []
+        for mem in active:
+            if mem.get("room") != "preferences":
+                continue
+            content = mem.get("content") or ""
+            prov = mem.get("provenance_type") or ""
+            if content.startswith("[互动]") or prov in ("roleplay_meme", "ai_summary"):
+                misfiled.append({
+                    "type": "preferences_misfile",
+                    "memory_id": mem["id"],
+                    "detail": "疑似事件/互动/玩梗被归入偏好房间（偏好应是长期稳定的事实）",
+                    "content_head": content[:80],
+                })
+        report["issues"].extend(misfiled[:15])
+        report["stats"]["preferences_misfile"] = len(misfiled)
+    except Exception as e:
+        log.warning(f"doctor preferences misfile check failed: {e}")
 
     # ── 3. 门卫统计 ──
     try:

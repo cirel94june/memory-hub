@@ -1252,6 +1252,10 @@ def explain_decay(mem: dict, now_dt: datetime | None = None) -> dict:
     anchored = bool(mem.get("anchored"))
 
     lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+    # 玩梗/角色扮演是一次性的场景幽默，不该和"怕蜘蛛"这类锚点事实
+    # 在同一个池子里永久共存——走快衰减，热闹散场后自然退役
+    if (mem.get("provenance_type") or "") == "roleplay_meme":
+        lam = max(lam, DECAY_LAMBDA_FAST)
     is_auto = "auto_capture" in source_platform
     auto_accelerated = bool(is_auto and activations == 0 and days > 3)
     if auto_accelerated:
@@ -1363,6 +1367,9 @@ async def run_decay() -> dict:
 
         room_cfg = get_room(mem.get("room", "")) or {}
         lam = DECAY_LAMBDA_FAST if room_cfg.get("fast_decay") else DECAY_LAMBDA
+        # 玩梗走快衰减（与 decay 打分保持一致）
+        if (mem.get("provenance_type") or "") == "roleplay_meme":
+            lam = max(lam, DECAY_LAMBDA_FAST)
 
         # 从未被召回的自动记忆加速衰减
         is_auto = "auto_capture" in (mem.get("source_platform") or "")

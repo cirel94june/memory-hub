@@ -422,6 +422,11 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         if provenance not in valid_prov:
             provenance = ""
 
+        # 玩梗封顶：一次性场景幽默不允许以高 importance 永久驻留
+        # （decay 侧对 roleplay_meme 也走快衰减，双保险）
+        if provenance == "roleplay_meme":
+            raw_importance = min(raw_importance, 0.55)
+
         # 附上LLM实际看到的对话原文作为源追溯
         source_ctx = conversation_text[:1500]
         is_private_memory = chat_type == "private"
