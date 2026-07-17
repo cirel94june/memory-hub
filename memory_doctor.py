@@ -264,25 +264,40 @@ async def run_checkup() -> dict:
     except Exception as e:
         log.warning(f"doctor identity alias check failed: {e}")
 
-    # ── 2.6 preferences 房间串味（事件/技术支持/玩梗被当成稳定偏好）──
+    # ── 2.6 身份类房间串味（事件/技术支持/玩梗被当成稳定偏好/核心人设）──
+    # living_room 是 type=always 的核心身份房间，每次唤醒必读，串味进这里
+    # 比进 preferences 更严重（实例：「享受被骗」玩梗被客厅刷新升格成人设双胞胎）
+    _IDENTITY_ROOMS = {"preferences", "living_room"}
     try:
         misfiled = []
         for mem in active:
-            if mem.get("room") != "preferences":
+            if mem.get("room") not in _IDENTITY_ROOMS:
                 continue
             content = mem.get("content") or ""
             prov = mem.get("provenance_type") or ""
-            if content.startswith("[互动]") or prov in ("roleplay_meme", "ai_summary"):
+            if content.startswith("[互动]") or prov == "roleplay_meme":
                 misfiled.append({
-                    "type": "preferences_misfile",
+                    "type": "identity_room_misfile",
                     "memory_id": mem["id"],
-                    "detail": "疑似事件/互动/玩梗被归入偏好房间（偏好应是长期稳定的事实）",
+                    "room": mem.get("room"),
+                    "detail": "疑似事件/互动/玩梗被归入身份类房间（这里只该放长期稳定的事实）",
+                    "content_head": content[:80],
+                })
+            elif (mem.get("room") == "living_room"
+                  and prov == "ai_summary"
+                  and float(mem.get("importance", 0.5) or 0.5) >= 0.75):
+                # AI 再总结写进核心身份且高 importance：需要人工确认没把梗升格
+                misfiled.append({
+                    "type": "identity_room_misfile",
+                    "memory_id": mem["id"],
+                    "room": "living_room",
+                    "detail": "AI 摘要以高 importance 写入核心身份房间，请确认不是玩梗升格",
                     "content_head": content[:80],
                 })
         report["issues"].extend(misfiled[:15])
-        report["stats"]["preferences_misfile"] = len(misfiled)
+        report["stats"]["identity_room_misfile"] = len(misfiled)
     except Exception as e:
-        log.warning(f"doctor preferences misfile check failed: {e}")
+        log.warning(f"doctor identity room misfile check failed: {e}")
 
     # ── 3. 门卫统计 ──
     try:

@@ -800,6 +800,10 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
             source_platform="living_room_refresh",
             auto_analyze=False,
             quick=False,
+            # 客厅刷新是 AI 对已有记忆的再总结：必须标 ai_summary，
+            # 否则梗会被升格成"稳定人设"写进核心身份房间且能 supersede 用户事实
+            # （实例：「享受被骗」玩梗被刷新成 living_room 偏好双胞胎）
+            provenance_type="ai_summary",
         )
         written.append({**item, "result": result})
 
