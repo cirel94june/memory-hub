@@ -273,7 +273,7 @@ async def _read_github_json(path: str) -> dict:
         return {}
 
 
-async def _commit_files(files: dict[str, str], message: str, delete_paths: set[str] | None = None) -> str | None:
+async def _commit_files(files: dict[str, str], message: str, delete_paths: set[str] | None = None, _retry: bool = True) -> str | None:
     token, repo, branch = _github_config()
     delete_paths = delete_paths or set()
     if not token or not repo or (not files and not delete_paths):
@@ -318,6 +318,10 @@ async def _commit_files(files: dict[str, str], message: str, delete_paths: set[s
             headers=headers,
             json={"sha": commit_sha, "force": False},
         )
+        # 422 = 非快进更新：读取分支指针后有别的提交插了队（并发导出竞态）。
+        # 重读最新指针整体重试一次，而不是 force push 覆盖别人的提交。
+        if update.status_code == 422 and _retry:
+            return await _commit_files(files, message, delete_paths, _retry=False)
         update.raise_for_status()
         return commit_sha
 

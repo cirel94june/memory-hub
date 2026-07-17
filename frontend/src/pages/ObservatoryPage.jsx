@@ -495,7 +495,19 @@ export default function ObservatoryPage() {
     try {
       const suffix = force ? "?force=true" : "";
       await fetch(`/api/dream/run${suffix}`, { method: "POST", headers: auth });
-      setTimeout(load, 1200);
+      // 做梦要跑几十秒（多次 LLM 调用），轮询到状态落定为止，
+      // 否则页面停留在旧状态，按钮看起来像没反应
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const res = await fetch("/api/dream/status", { headers: auth });
+          if (res.ok) {
+            const d = await res.json();
+            setDream(d);
+            if (d.status === "success" || d.status === "error") break;
+          }
+        } catch { /* 网络抖动继续轮询 */ }
+      }
     } finally {
       setDreamRunning(false);
     }
