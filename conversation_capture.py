@@ -156,6 +156,8 @@ EXTRACT_OUTPUT_FORMAT = """
   game_room(游戏/角色扮演)
 
 提示：群聊中的梗、外号、暗号、互动细节 → social 房间
+⚠️ preferences 只收**长期稳定**的偏好/边界/雷点（"怕蜘蛛""不吃香菜"级别）。
+一次性事件、技术支持记录、玩梗、宠物趣事 → social 或对应房间，绝不进 preferences。
 
 只输出 JSON。
 
