@@ -196,9 +196,16 @@ def list_rooms() -> dict:
 
 # ── AI 身份别名（多个 ID 指向同一个 AI）──
 # cloudy(TG bot) 和 claude(MCP/Web) 是同一个小克
-AI_ALIASES = {"cloudy": "claude"}
+# 平台身份 → canonical 身份。cloudy/lucien/jasper 是 TG bot 端，
+# claude/gpt/gemini 是网页端——同一个 AI 的两个马甲必须映射到同一 canonical，
+# 否则私有记忆权限、做梦素材、走廊都会把一个 AI 当成两个陌生人。
+AI_ALIASES = {"cloudy": "claude", "gpt": "lucien", "gemini": "jasper"}
 # 反向映射：一个 canonical ID 的所有别名
-AI_ALIAS_GROUPS = {"claude": ["cloudy", "claude"]}
+AI_ALIAS_GROUPS = {
+    "claude": ["cloudy", "claude"],
+    "lucien": ["gpt", "lucien"],
+    "jasper": ["gemini", "jasper"],
+}
 
 
 # ── 记忆衰减参数 ──

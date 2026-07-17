@@ -13,7 +13,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
-from config import AI_ROLES
+from config import AI_ROLES, AI_ALIASES as _ALIASES
 import github_store as store
 
 log = logging.getLogger("corridor")
@@ -51,7 +51,9 @@ async def build_corridor(ai_id: str) -> str:
     为指定 AI 编译走廊文档。
     返回一段自然语言文本，AI 读了就能"醒来"。
     """
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
+    # 归一化到 canonical id（cloudy→claude、gpt→lucien、gemini→jasper 等），
+    # 否则用别名请求时 owner_ai 匹配不上，走廊会缺私有材料
+    ai_id = _ALIASES.get(ai_id, ai_id)
     all_mems = store.get_all_memories()
 
     # 1. 客厅要点（你是谁）
@@ -207,7 +209,9 @@ async def build_corridor(ai_id: str) -> str:
 
 async def get_corridor(ai_id: str, force: bool = False) -> str:
     """获取走廊文档。优先用进程内存缓存（0 网络开销），TTL 内直接返回。"""
-    ai_id = {"cloudy": "claude"}.get(ai_id, ai_id)
+    # 归一化到 canonical id（cloudy→claude、gpt→lucien、gemini→jasper 等），
+    # 否则用别名请求时 owner_ai 匹配不上，走廊会缺私有材料
+    ai_id = _ALIASES.get(ai_id, ai_id)
 
     if not force:
         entry = _mem_cache.get(ai_id)

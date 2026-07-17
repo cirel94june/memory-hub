@@ -640,12 +640,10 @@ async def recall(
         }
 
     def _passes_private_filter(mem):
-        """Check private layer access — must be done in Python since
-        database queries don't enforce cross-field logic like this."""
-        if mem.get("layer") == "private":
-            if not ai_ids or mem.get("owner_ai") not in ai_ids:
-                return False
-        return True
+        """Check private layer access — 统一走 visibility.can_view
+        （处理别名映射和 owner 为空的 private 记忆）。"""
+        from visibility import can_view
+        return can_view(mem, ai_id)
 
     # ── 纯 DB 搜索逻辑（可在线程中运行）──
     def _db_search_all():
@@ -931,8 +929,13 @@ async def list_memories(
     source_ai: str = None,
     ai_id: str = None,
     status: str = "active", page: int = 1, per_page: int = 20,
+    viewer_ai: str = None,
 ) -> dict:
+    """viewer_ai：请求者身份。None = 主人视角（Hub 前端，全量）；
+    ""（空串）= 匿名 MCP 调用，过滤掉所有 private；
+    具体 ai_id = 只保留 shared + 本人的 private。"""
     if ai_id:
+        from visibility import can_view
         ids = _identity_ids(ai_id)
         all_mems = database.query_memories(
             layer=layer, room=room, owner_ai=owner_ai, status=status,
@@ -940,12 +943,26 @@ async def list_memories(
         )
 
         def related(mem):
-            return mem.get("source_ai") in ids or mem.get("owner_ai") in ids
+            # 与该 AI 相关（自己写的或自己拥有的），且必须通过可见性检查：
+            # 别人的 private 即使 source_ai 是自己也不能列出
+            if not (mem.get("source_ai") in ids or mem.get("owner_ai") in ids):
+                return False
+            return can_view(mem, ai_id)
 
         filtered = [m for m in all_mems if related(m)]
         total = len(filtered)
         start = (page - 1) * per_page
         mems = filtered[start:start + per_page]
+    elif viewer_ai is not None:
+        from visibility import filter_visible
+        all_mems = database.query_memories(
+            layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
+            order_by="updated_at DESC",
+        )
+        visible = filter_visible(all_mems, viewer_ai)
+        total = len(visible)
+        start = (page - 1) * per_page
+        mems = visible[start:start + per_page]
     else:
         mems = database.query_memories(
             layer=layer, room=room, owner_ai=owner_ai, source_ai=source_ai, status=status,
@@ -1326,10 +1343,14 @@ async def release_anchor(memory_id: str) -> dict:
     return {"status": "released", "id": memory_id}
 
 
-async def list_anchors() -> list[dict]:
-    """列出所有锚点记忆。"""
+async def list_anchors(ai_id: str = None) -> list[dict]:
+    """列出锚点记忆。ai_id=None 为主人视角（全量）；
+    传 ai_id（含空串=匿名）时按 can_view 过滤 private。"""
+    from visibility import can_view
     anchors = []
     for mem in database.iter_memories(status="active"):
+        if ai_id is not None and not can_view(mem, ai_id):
+            continue
         if mem.get("anchored"):
             anchors.append({
                 "id": mem["id"],
@@ -1351,12 +1372,17 @@ async def search_by_tags(
     room: str = "",
     status: str = "active",
     limit: int = 20,
+    ai_id: str = "",
 ) -> list[dict]:
-    """按标签搜索记忆。mode="any" 匹配任一标签，mode="all" 要求全部匹配。"""
+    """按标签搜索记忆。mode="any" 匹配任一标签，mode="all" 要求全部匹配。
+    ai_id 为请求者身份：传入时 private 记忆只返回本人的；不传时不返回任何 private。"""
+    from visibility import can_view
     results = []
     search_lower = [t.lower() for t in tags]
 
     for mem in database.iter_memories(status=status):
+        if not can_view(mem, ai_id):
+            continue
         if room and mem.get("room") != room:
             continue
         mem_tags = [t.lower() for t in _parse_json_field(mem.get("tags", "[]"))]

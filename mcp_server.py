@@ -379,6 +379,7 @@ async def list_memories(
     page: int = 1,
     per_page: int = 20,
     compact: bool = True,
+    source_ai: str = "",
 ) -> str:
     """列出记忆。可按房间、状态筛选。
 
@@ -389,9 +390,12 @@ async def list_memories(
         per_page: 每页数量
         compact: 精简模式（默认开）。只返回核心字段，不带原始对话全文/标签/年轮；
                  需要完整详情时用 get_memory_detail 单条查看。
+        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人可见；
+                   不传身份时列表不包含任何 private 记忆。
     """
     result = await memory_ops.list_memories(
         room=room or None, status=status, page=page, per_page=per_page,
+        viewer_ai=source_ai or "",
     )
     if compact and isinstance(result, dict) and isinstance(result.get("items"), list):
         result["items"] = [
@@ -533,7 +537,7 @@ async def delete_memory(memory_id: str) -> str:
 
 
 @mcp.tool()
-async def get_memory_detail(memory_id: str) -> str:
+async def get_memory_detail(memory_id: str, source_ai: str = "") -> str:
     """获取一条记忆的完整详情，包括原始对话上下文、全部年轮评论、关联记忆等。
 
     当你通过 recall 想起了某条记忆但需要更多细节时，用这个工具深入查看。
@@ -542,10 +546,14 @@ async def get_memory_detail(memory_id: str) -> str:
 
     Args:
         memory_id: 记忆ID（从 recall 结果中获取）
+        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人能查看详情。
     """
+    from visibility import can_view
     mem = store.get_memory(memory_id)
     if not mem:
         return json.dumps({"error": f"Memory {memory_id} not found"}, ensure_ascii=False)
+    if not can_view(mem, source_ai):
+        return json.dumps({"error": "该记忆是其他 AI 的私有记忆，无权查看"}, ensure_ascii=False)
     safe = {k: v for k, v in mem.items() if k != "embedding"}
     return json.dumps(safe, ensure_ascii=False, indent=2)
 
@@ -842,6 +850,7 @@ async def search_by_tags(
     mode: str = "any",
     room: str = "",
     limit: int = 20,
+    source_ai: str = "",
 ) -> str:
     """按标签搜索记忆。比 recall 更精确——直接匹配标签字段，不走语义模糊搜索。
 
@@ -855,8 +864,9 @@ async def search_by_tags(
         mode: "any"=匹配任一标签（默认），"all"=要求全部匹配
         room: 限定房间（留空=全部）
         limit: 最多返回条数
+        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人可被搜到。
     """
-    results = await memory_ops.search_by_tags(tags=tags, mode=mode, room=room, limit=limit)
+    results = await memory_ops.search_by_tags(tags=tags, mode=mode, room=room, limit=limit, ai_id=source_ai)
     return json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2)
 
 
