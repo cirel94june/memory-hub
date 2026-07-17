@@ -209,6 +209,22 @@ def test_fit_sections_drops_whole_sections(smart_ctx):
     a, b, c = "A" * 100, "B" * 100, "C" * 100
     out = fit([a, b, c], 210)
     assert a in out and b in out and c not in out
-    # 第一段就超限时截断保底
+    # 第一段就超限时截断保底（纯字母无边界可寻 → 硬截 + 标记）
     out2 = fit([a], 50)
-    assert out2.startswith("A" * 50)
+    assert out2.startswith("A" * 30) and "已截断" in out2 and len(out2) <= 52
+
+
+def test_trim_at_boundary_no_half_sentences(smart_ctx):
+    """截断只能发生在完整条目/句子边界，不得留半句（Lucien 复测项）。"""
+    trim = smart_ctx._trim_at_boundary
+    text = "第一条完整信息。\n第二条：Lucien（昵称狐狸）曾经是Ceci的前AI伴侣（原GPT端）。\n第三条完整信息。"
+    out = trim(text, 40)
+    body = out.replace("\n...(已截断)", "")
+    assert body.endswith("。") or body.endswith("\n") or body == text
+    assert "原GP" not in body or "原GPT端" in body
+    # 不超预算太多（marker 除外）
+    assert len(out) <= 40 + 2
+
+
+def test_trim_short_text_untouched(smart_ctx):
+    assert smart_ctx._trim_at_boundary("很短。", 100) == "很短。"

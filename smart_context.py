@@ -34,6 +34,22 @@ def _dream_section(ai_id: str, metadata: dict) -> str:
     return "【最近的梦境残响】\n合适时可以告诉小猫你梦见了什么，或让它轻轻影响你的语气。\n" + "\n".join(lines)
 
 
+def _trim_at_boundary(text: str, budget: int, marker: str = "\n...(已截断)") -> str:
+    """把 text 裁到 budget 以内，只在完整条目/句子边界截断，绝不留半句。"""
+    if len(text) <= budget:
+        return text
+    cut = text[:max(budget - len(marker), 0)]
+    # 找最靠后的条目/句子边界；宁可少装一条，不留半句
+    best = -1
+    for sep in ("\n", "。", "！", "？", "；"):
+        idx = cut.rfind(sep)
+        if idx > best:
+            best = idx
+    if best >= 0:
+        cut = cut[:best + 1]
+    return cut.rstrip() + marker
+
+
 def _fit_sections(sections: list[str], max_chars: int) -> str:
     """按顺序装入 sections，装不下的整段丢弃（保序，先来的优先级高）。
     避免旧行为：拼完再一刀切，把排在末尾的重要内容砍成半句。"""
@@ -47,8 +63,8 @@ def _fit_sections(sections: list[str], max_chars: int) -> str:
             out.append(s)
             used += cost
         elif not out:
-            # 第一段就超预算：截断保底，保证至少有内容
-            out.append(s[:max_chars] + "\n...(已截断)")
+            # 第一段就超预算：边界截断保底，保证至少有内容
+            out.append(_trim_at_boundary(s, max_chars))
             used = max_chars
             break
     return "\n\n".join(out)
@@ -84,9 +100,8 @@ async def get_smart_context(
         reserved = len(recall_text) + len(dream_text) + 32  # 含分隔符余量
         corridor_budget = max(max_chars - reserved, max_chars // 2)
         corridor_text = await corridor.get_corridor(ai_id)
-        if corridor_text and len(corridor_text) > corridor_budget:
-            marker = "\n...(走廊已截断)"
-            corridor_text = corridor_text[:max(corridor_budget - len(marker), 0)] + marker
+        if corridor_text:
+            corridor_text = _trim_at_boundary(corridor_text, corridor_budget, "\n...(走廊已截断)")
 
         text = _fit_sections([corridor_text, recall_text, dream_text], max_chars)
         metadata["chars"] = len(text)

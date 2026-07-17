@@ -813,6 +813,26 @@ async def recall(
         # RRF 融合
         merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
 
+        # owner=self 的 private 记忆加权：查询者自己的梦/日记等高匹配私有内容
+        # 不能被 shared 高频梗（RRF 多路都命中）压到后排
+        if ai_ids:
+            _self_material_markers = ("我梦", "梦见", "梦到", "我的梦", "昨晚的梦",
+                                      "我的日记", "我写的", "我记得我")
+            query_wants_self = any(k in query for k in _self_material_markers)
+            for item in merged:
+                mem = get_fn(item["id"])
+                if not mem or (mem.get("layer") or "shared") != "private":
+                    continue
+                owner = mem.get("owner_ai") or mem.get("source_ai") or ""
+                from config import AI_ALIASES as _al
+                if owner in ai_ids or _al.get(owner, owner) in ai_ids:
+                    boost = 1.3
+                    if query_wants_self and mem.get("room") in ("dreams", "diary"):
+                        # 用户明确在问"我梦见/我的日记"：本人私有材料强力优先
+                        boost = 2.0
+                    item["score"] = round(item.get("score", 0) * boost, 6)
+            merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+
         # Unresolved 优先浮现
         unresolved_items = []
         normal_items = []
