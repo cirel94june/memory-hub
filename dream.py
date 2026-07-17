@@ -168,7 +168,7 @@ async def _call_llm(prompt: str) -> str:
         return ""
     url = f"{LLM_BASE_URL}/chat/completions"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {LLM_API_KEY}"},
@@ -176,11 +176,17 @@ async def _call_llm(prompt: str) -> str:
                     "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 600,
+                    # 正文长度由 prompt 控制（120-250字）；max_tokens 只是保险丝。
+                    # 注意：reasoning 类模型的思考 token 也计入 max_tokens，
+                    # 上限设小了正文会被随机截断（曾导致梦频繁断尾）。
+                    "max_tokens": 3000,
                 },
             )
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            choice = resp.json()["choices"][0]
+            if choice.get("finish_reason") == "length":
+                logger.warning("Dream LLM hit max_tokens (finish_reason=length), output truncated")
+            return (choice["message"].get("content") or "").strip()
     except Exception as e:
         logger.error(f"Dream LLM error: {e}")
         return ""
