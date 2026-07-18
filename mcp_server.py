@@ -526,6 +526,38 @@ async def archive_memory(memory_id: str) -> str:
 
 
 @mcp.tool()
+async def apply_correction(
+    corrected_value: str,
+    old_value: str = "",
+    source_ai: str = "",
+    room: str = "living_room",
+) -> str:
+    """用户纠正了一条错误信息时，一步完成整个纠错流程（行使定夺权专用）。
+
+    效果：
+    - 纠正版作为 canonical 事实入库（provenance=user_correction，置信度 1.0，
+      任何 AI 复述都无法再取代它）
+    - 库里包含错误说法的 active 记忆自动标记 corrected_by_user、退出召回/走廊/
+      动态（原文保留在 history 可追溯），old_value 支持模糊匹配（差一两个字也能对上）
+    - 走廊缓存同步清除
+    - 定位不到错误来源时不乱覆盖，纠正版标 conflict_pending 待人工看
+
+    Args:
+        corrected_value: 正确的说法（完整陈述，如"狐狸的围巾是灰色的"）
+        old_value: 被纠正的错误说法关键词（如"围巾是绿色的"；留空=只入库纠正版）
+        source_ai: 你的身份（claude/lucien/jasper）
+        room: 纠正版存放的房间（默认 living_room）
+    """
+    result = await memory_ops.apply_user_correction(
+        corrected_value=corrected_value,
+        old_value=old_value,
+        source_ai=source_ai,
+        room=room,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def delete_memory(memory_id: str) -> str:
     """永久删除一条记忆。
 
