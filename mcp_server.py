@@ -486,6 +486,23 @@ async def resolve_memory(memory_id: str, resolved: bool = True) -> str:
 
 
 @mcp.tool()
+async def unarchive_memory(memory_id: str, source_ai: str = "claude") -> str:
+    """将已归档/过期/衰减的记忆恢复为活跃状态。
+
+    适用场景：
+    - daemon 误归档了非任务类记忆
+    - 用户指出某条被归档的记忆仍然重要
+    - 修复自动化流程的错误操作
+
+    Args:
+        memory_id: 记忆ID
+        source_ai: 你的身份(claude/lucien/jasper)
+    """
+    result = await memory_ops.unarchive_memory(memory_id, changed_by=source_ai)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
 async def anchor(memory_id: str) -> str:
     """将一条记忆设为锚点——永不衰减、走廊里单独显示的"坐标系"记忆。
 

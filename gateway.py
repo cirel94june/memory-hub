@@ -787,8 +787,31 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
     if dry_run:
         return {"dry_run": True, "actions": actions, "count": len(actions)}
 
+    # 去重闸：对比目标房间现有记忆的 embedding，跳过高相似度条目
+    from embedding import get_embedding as _get_emb, cosine_similarity, unpack_embedding
+    import database as _db
+    _existing_vecs = []
+    for mem in _db.ro_iter_memories(status="active"):
+        if mem.get("room") not in valid_rooms:
+            continue
+        if mem.get("embedding"):
+            _existing_vecs.append(unpack_embedding(mem["embedding"]))
+
     written = []
+    skipped_dedup = 0
     for item in actions[:12]:
+        # 写入前检查：与已有记忆的余弦相似度 >= 0.82 就跳过
+        try:
+            new_vec = await _get_emb(item["content"])
+            if new_vec and _existing_vecs:
+                max_sim = max(cosine_similarity(new_vec, ev) for ev in _existing_vecs)
+                if max_sim >= 0.82:
+                    skipped_dedup += 1
+                    log.info(f"  Living room dedup: skipped (sim={max_sim:.2f}): {item['content'][:60]}")
+                    continue
+        except Exception as e:
+            log.warning(f"  Living room dedup check failed: {e}")
+
         result = await remember(
             content=item["content"],
             layer="shared",
@@ -800,16 +823,20 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
             source_platform="living_room_refresh",
             auto_analyze=False,
             quick=False,
-            # 客厅刷新是 AI 对已有记忆的再总结：必须标 ai_summary，
-            # 否则梗会被升格成"稳定人设"写进核心身份房间且能 supersede 用户事实
-            # （实例：「享受被骗」玩梗被刷新成 living_room 偏好双胞胎）
             provenance_type="ai_summary",
         )
         written.append({**item, "result": result})
+        # 新写入的也加入对比池，防止同批次内重复
+        try:
+            wv = await _get_emb(item["content"])
+            if wv:
+                _existing_vecs.append(wv)
+        except Exception:
+            pass
 
     if written:
         try:
             await corridor_mod.rebuild_all_corridors()
         except Exception:
             pass
-    return {"dry_run": False, "written": written, "count": len(written)}
+    return {"dry_run": False, "written": written, "count": len(written), "skipped_dedup": skipped_dedup}

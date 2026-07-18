@@ -941,11 +941,19 @@ async def backfill_embeddings(batch: int = 40) -> dict:
     return {"backfilled": done, "remaining": remaining}
 
 
-async def expire_dated_tasks() -> dict:
-    """过期任务自动清理：带 event_date 的限时记忆（约定/安排/待办），
-    日期过去 2 天还活跃的自动归档——"今天下午喝咖啡"不该在下周还被推给 AI。
+_TASK_ROOMS = {"work_tasks"}
+_TASK_CATEGORIES = {
+    "todo", "task", "appointment", "deadline", "reminder",
+    "待办", "任务", "约定", "安排", "提醒",
+}
 
-    保护规则：锚点、人生章节、高重要度（>0.65）不动；只清理任务类轻记忆。
+
+async def expire_dated_tasks() -> dict:
+    """过期任务自动清理：仅 work_tasks 房间或任务类 category 的限时记忆，
+    日期过去 2 天还活跃的自动归档。非任务记忆（社交梗、偏好等）即使带
+    event_date 也不动——event_date 只表示"发生日期"，不代表"过期日期"。
+
+    保护规则：锚点、人生章节、高重要度（>0.65）不动。
     """
     from time_utils import local_now
     today = local_now().date()
@@ -957,6 +965,15 @@ async def expire_dated_tasks() -> dict:
         if m.get("anchored"):
             continue
         if m.get("category") == "life_chapter":
+            continue
+        room = m.get("room", "")
+        cat = (m.get("category") or "").strip().lower()
+        is_task = (
+            room in _TASK_ROOMS
+            or cat in _TASK_CATEGORIES
+            or m.get("resolved") is False
+        )
+        if not is_task:
             continue
         event_date = str(m.get("event_date") or "").strip()[:10]
         if not event_date:

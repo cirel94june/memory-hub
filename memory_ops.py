@@ -617,6 +617,30 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
     return {"id": memory_id, "status": "updated"}
 
 
+async def unarchive_memory(memory_id: str, changed_by: str = "") -> dict:
+    """将 archived/stale/decayed 状态的记忆恢复为 active。"""
+    mem = store.get_memory(memory_id)
+    if not mem:
+        return {"id": memory_id, "status": "not_found"}
+    if mem.get("status") == "active":
+        return {"id": memory_id, "status": "already_active"}
+    old_status = mem.get("status")
+    mem["status"] = "active"
+    mem["decay_score"] = max(float(mem.get("decay_score", 0.5)), 0.5)
+    now = _now()
+    mem["updated_at"] = now
+    comments = mem.get("comments") if isinstance(mem.get("comments"), list) else []
+    comments.append({
+        "date": now,
+        "author": changed_by or "system",
+        "kind": "unarchive_note",
+        "content": f"从 {old_status} 恢复为 active",
+    })
+    mem["comments"] = comments
+    store.set_memory(mem)
+    return {"id": memory_id, "status": "unarchived", "previous_status": old_status}
+
+
 # ── 召回记忆（多维搜索） ──
 
 def _parse_json_field(val) -> list:
