@@ -143,6 +143,8 @@ EXTRACT_OUTPUT_FORMAT = """
     "importance": 0.0到1.0（闲聊寒暄0.1，临时话题0.3，有信息量的事实0.5+，重要事件/情感/身份变化0.7+）,
     "event_date": "事件日期（如 2026-06-08，推算不出就留空）",
     "provenance": "user_statement / user_correction / user_quote / ai_summary / ai_speculation / roleplay_meme（见上方出处规则）",
+    "claim_type": "fact / observation / hypothesis（用户亲口说的事实=fact，AI总结或观察到的=observation，推测猜想=hypothesis）",
+    "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经说话=literal，玩梗开玩笑=playful，假设性讨论=hypothetical，虚构角色扮演=fictional，分不清=uncertain）",
     "corrects_old_value": "仅 provenance=user_correction 时填：被纠正的错误说法原文关键词",
     "resolved": null 或 false。⚠️ 极少使用 false！只有用户明确说了"要做某事""还没做完""待办""记得提醒我"时才设为 false。群聊梗、知识、互动记录、情绪、观点 → 一律 null。90%以上的记忆应该是 null。
   }
@@ -460,6 +462,8 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             auto_analyze=False,
             quick=True,
             provenance_type=provenance,
+            claim_type=item.get("claim_type", ""),
+            speech_mode=item.get("speech_mode", ""),
         )
         memories.append(result)
 
@@ -564,6 +568,8 @@ async def extract_from_messages(
             auto_analyze=False,
             quick=quick,
             provenance_type=provenance,
+            claim_type=item.get("claim_type", ""),
+            speech_mode=item.get("speech_mode", ""),
         )
         memories.append(result)
 

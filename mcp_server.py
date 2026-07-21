@@ -503,6 +503,61 @@ async def unarchive_memory(memory_id: str, source_ai: str = "claude") -> str:
 
 
 @mcp.tool()
+async def list_proposals(
+    status: str = "pending",
+    page: int = 1,
+    per_page: int = 20,
+) -> str:
+    """列出待审记忆提案。自动捕获的记忆不再直接入库，而是先进提案队列等待审核。
+
+    只有「用户亲口说的事实（claim_type=fact + speech_mode=literal）且无冲突」
+    才会自动通过，其余需要人工/AI审核后才能入库。
+
+    状态说明：
+    - pending: 等待审核（默认）
+    - auto_approved: 系统自动通过的高置信度事实
+    - approved: 人工批准
+    - rejected: 已拒绝
+
+    Args:
+        status: 筛选状态（pending/auto_approved/approved/rejected）
+        page: 页码（从1开始）
+        per_page: 每页条数（默认20）
+    """
+    result = await memory_ops.list_proposals(status=status, limit=per_page, page=page)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def review_proposal(
+    proposal_id: str,
+    action: str,
+    reject_reason: str = "",
+    source_ai: str = "claude",
+) -> str:
+    """审核一条记忆提案：批准入库或拒绝。
+
+    批准后提案会被提升为正式记忆（走完整的分析+打标流程）。
+    拒绝的提案保留记录但不入库。
+
+    用 list_proposals 查看待审提案列表。
+
+    Args:
+        proposal_id: 提案ID（prop_开头）
+        action: "approve" 批准入库 / "reject" 拒绝
+        reject_reason: 拒绝原因（reject时建议填写）
+        source_ai: 审核者身份（claude/lucien/jasper）
+    """
+    result = await memory_ops.review_proposal(
+        proposal_id=proposal_id,
+        action=action,
+        reviewed_by=source_ai,
+        reject_reason=reject_reason,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def anchor(memory_id: str) -> str:
     """将一条记忆设为锚点——永不衰减、走廊里单独显示的"坐标系"记忆。
 

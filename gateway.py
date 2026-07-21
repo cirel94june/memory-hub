@@ -572,7 +572,9 @@ AI回复：{ai_response[:1500]}
       "room": "从上面的房间列表选",
       "category": "简短分类词",
       "importance": 0.4到1.0,
-      "emotion_arousal": 0.1到1.0
+      "emotion_arousal": 0.1到1.0,
+      "claim_type": "fact / observation / hypothesis（用户亲口说的=fact，AI总结=observation，推测=hypothesis）",
+      "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经=literal，玩梗=playful，假设=hypothetical，虚构=fictional，不确定=uncertain）"
     }}
   ]
 }}
@@ -641,6 +643,9 @@ AI回复：{ai_response[:1500]}
                 source_context=source_ctx,
                 auto_analyze=False,
                 quick=True,
+                provenance_type="ai_summary",
+                claim_type=action.get("claim_type", ""),
+                speech_mode=action.get("speech_mode", ""),
             )
             executed.append(action)
 
