@@ -226,12 +226,16 @@ async def remember(
     speech_mode: str = "",
     conversation_kind: str = "",
     evidence_excerpt: str = "",
+    subject_id: str = "",
+    source_speaker_id: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
 
     provenance_type: 出处类型（user_statement/user_correction/user_quote/
         ai_summary/ai_speculation/roleplay_meme/dream/diary，留空=未知）。
-    fact_confidence: 事实置信度，不传时按 provenance 默认。"""
+    fact_confidence: 事实置信度，不传时按 provenance 默认。
+    subject_id: 这条记忆关于谁（person_id）。
+    source_speaker_id: 谁说的（person_id）。"""
     if fact_confidence is None:
         fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
     # 归一化 AI 别名（cloudy → claude）
@@ -272,6 +276,7 @@ async def remember(
             provenance_type=provenance_type, fact_confidence=fact_confidence,
             claim_type=claim_type, speech_mode=speech_mode,
             conversation_kind=conversation_kind, evidence_excerpt=evidence_excerpt,
+            subject_id=subject_id, source_speaker_id=source_speaker_id,
         )
 
     # Step 1: 自动打标
@@ -396,6 +401,8 @@ async def remember(
                     "supersedes": json.dumps(superseded_ids),
                     "event_date": event_date,
                     "source_context": source_context,
+                    "subject_id": subject_id,
+                    "source_speaker_id": source_speaker_id,
                     "comments": [],
                     "embedding": pack_embedding(query_vec) if query_vec else None,
                     "status": "active",
@@ -453,6 +460,8 @@ async def remember(
         "supersedes": "[]",
         "event_date": event_date,
         "source_context": source_context,
+        "subject_id": subject_id,
+        "source_speaker_id": source_speaker_id,
         "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
         "status": "active",
@@ -529,6 +538,7 @@ async def _create_proposal(
     source_context: str, provenance_type: str, fact_confidence: float,
     claim_type: str, speech_mode: str, conversation_kind: str,
     evidence_excerpt: str,
+    subject_id: str = "", source_speaker_id: str = "",
 ) -> dict:
     ct = claim_type or _provenance_to_claim_type(provenance_type)
     sm = speech_mode or _provenance_to_speech_mode(provenance_type)
@@ -561,6 +571,8 @@ async def _create_proposal(
         "source_context": source_context,
         "source_platform": source_platform,
         "provenance_type": provenance_type,
+        "subject_id": subject_id,
+        "source_speaker_id": source_speaker_id,
         "created_at": now,
         "reviewed_at": "",
         "reviewed_by": "",
@@ -652,6 +664,8 @@ async def _promote_proposal(proposal: dict) -> dict:
         quick=False,
         provenance_type=proposal.get("provenance_type", ""),
         fact_confidence=proposal.get("confidence"),
+        subject_id=proposal.get("subject_id", ""),
+        source_speaker_id=proposal.get("source_speaker_id", ""),
     )
 
     logger.info(f"Promoted proposal {proposal['id']} -> memory {result.get('id', '?')}")
@@ -1144,6 +1158,23 @@ async def recall(
                         boost = 2.0
                     item["score"] = round(item.get("score", 0) * boost, 6)
             merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # subject_id 加权：查询提到某人时，关于该人的记忆 boost
+        try:
+            all_aliases = database.get_all_aliases(scope="any")
+            query_person_ids = set()
+            ql = query.lower()
+            for alias_name, pid in all_aliases.items():
+                if len(alias_name) >= 2 and alias_name.lower() in ql:
+                    query_person_ids.add(pid)
+            if query_person_ids:
+                for item in merged:
+                    mem = get_fn(item["id"])
+                    if mem and mem.get("subject_id") in query_person_ids:
+                        item["score"] = round(item.get("score", 0) * 1.25, 6)
+                merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        except Exception:
+            pass
 
         # Unresolved 优先浮现
         unresolved_items = []

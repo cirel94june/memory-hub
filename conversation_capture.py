@@ -20,6 +20,7 @@ from time_utils import local_now, local_today
 from typing import Optional
 
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
+import database
 
 logger = logging.getLogger("memory_hub.capture")
 
@@ -145,6 +146,8 @@ EXTRACT_OUTPUT_FORMAT = """
     "provenance": "user_statement / user_correction / user_quote / ai_summary / ai_speculation / roleplay_meme（见上方出处规则）",
     "claim_type": "fact / observation / hypothesis（用户亲口说的事实=fact，AI总结或观察到的=observation，推测猜想=hypothesis）",
     "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经说话=literal，玩梗开玩笑=playful，假设性讨论=hypothetical，虚构角色扮演=fictional，分不清=uncertain）",
+    "subject_name": "这条记忆主要关于谁（填人名，如'小猫'/'Jasper'/'Lucien'，关于多人互动可留空）",
+    "speaker_name": "谁说的/谁是信息来源（填人名，如'小猫'/'Cloudy'，AI总结的填AI名字）",
     "corrects_old_value": "仅 provenance=user_correction 时填：被纠正的错误说法原文关键词",
     "resolved": null 或 false。⚠️ 极少使用 false！只有用户明确说了"要做某事""还没做完""待办""记得提醒我"时才设为 false。群聊梗、知识、互动记录、情绪、观点 → 一律 null。90%以上的记忆应该是 null。
   }
@@ -449,6 +452,11 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             memories.append(result)
             continue
 
+        subj_name = item.get("subject_name", "")
+        spkr_name = item.get("speaker_name", "")
+        subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
+        source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+
         result = await memory_ops.remember(
             content=content,
             layer="private" if is_private_memory else "shared",
@@ -464,6 +472,8 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             provenance_type=provenance,
             claim_type=item.get("claim_type", ""),
             speech_mode=item.get("speech_mode", ""),
+            subject_id=subject_id,
+            source_speaker_id=source_speaker_id,
         )
         memories.append(result)
 
@@ -556,6 +566,11 @@ async def extract_from_messages(
             memories.append(result)
             continue
 
+        subj_name = item.get("subject_name", "")
+        spkr_name = item.get("speaker_name", "")
+        subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
+        source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+
         result = await memory_ops.remember(
             content=content,
             layer="private" if chat_type == "private" else "shared",
@@ -570,6 +585,8 @@ async def extract_from_messages(
             provenance_type=provenance,
             claim_type=item.get("claim_type", ""),
             speech_mode=item.get("speech_mode", ""),
+            subject_id=subject_id,
+            source_speaker_id=source_speaker_id,
         )
         memories.append(result)
 

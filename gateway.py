@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL, ROOMS, AI_ALIASES
 from memory_ops import recall, get_living_room, get_ai_private_summary, remember, update_memory
 from corridor import get_corridor
+import database
 
 log = logging.getLogger("gateway")
 
@@ -574,7 +575,9 @@ AI回复：{ai_response[:1500]}
       "importance": 0.4到1.0,
       "emotion_arousal": 0.1到1.0,
       "claim_type": "fact / observation / hypothesis（用户亲口说的=fact，AI总结=observation，推测=hypothesis）",
-      "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经=literal，玩梗=playful，假设=hypothetical，虚构=fictional，不确定=uncertain）"
+      "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经=literal，玩梗=playful，假设=hypothetical，虚构=fictional，不确定=uncertain）",
+      "subject_name": "这条记忆主要关于谁（填人名，如'小猫'/'Jasper'/'Lucien'，关于多人互动可留空）",
+      "speaker_name": "谁说的/谁是信息来源（填人名，如'小猫'/'Cloudy'，AI总结的填AI名字）"
     }}
   ]
 }}
@@ -630,6 +633,10 @@ AI回复：{ai_response[:1500]}
             elif about == "ai" and not content.startswith("[AI]"):
                 content = f"[AI] {content}"
             source_ctx = f"用户: {user_message[:400]}\nAI: {ai_response[:400]}"
+            subj_name = action.get("subject_name", "")
+            spkr_name = action.get("speaker_name", "")
+            subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
+            source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
             await remember(
                 content=content,
                 layer=layer,
@@ -646,6 +653,8 @@ AI回复：{ai_response[:1500]}
                 provenance_type="ai_summary",
                 claim_type=action.get("claim_type", ""),
                 speech_mode=action.get("speech_mode", ""),
+                subject_id=subject_id,
+                source_speaker_id=source_speaker_id,
             )
             executed.append(action)
 
