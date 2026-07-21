@@ -42,8 +42,11 @@ async def lifespan(app: FastAPI):
     await github_store.load_all()
     import database
     activity_log.init_activity_table()
+    seeded = database.seed_baseline_persons()
+    if seeded:
+        print(f"[Memory Hub] Seeded {seeded} baseline persons")
     mem_count = database.count_memories()
-    print(f"[Memory Hub] SQLite ready: {mem_count} active memories")
+    print(f"[Memory Hub] SQLite ready: {mem_count} active memories, {len(database.list_persons())} persons")
     print(f"[Memory Hub] Roles: {list(AI_ROLES.keys())}")
     print(f"[Memory Hub] Rooms: {list(ROOMS.keys())}")
 
@@ -292,6 +295,63 @@ async def create_room(body: RoomCreate, authorization: str = Header(default=""))
 async def get_rooms():
     rooms = list_rooms()
     return [{"id": k, **{kk: vv for kk, vv in v.items()}} for k, v in rooms.items()]
+
+
+# ── 人物名片 (Persons) ──
+
+import database
+
+class PersonCreate(BaseModel):
+    person_id: str
+    entity_type: str = "other"
+    canonical_name: str
+    aliases: list = []
+    linked_agent_id: str = ""
+    note: str = ""
+
+@app.get("/api/persons")
+async def api_list_persons(entity_type: str = None, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    return database.list_persons(entity_type=entity_type)
+
+@app.get("/api/persons/{person_id}")
+async def api_get_person(person_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    person = database.get_person(person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return person
+
+@app.post("/api/persons")
+async def api_create_person(body: PersonCreate, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    database.upsert_person(body.model_dump())
+    return {"person_id": body.person_id, "status": "created"}
+
+@app.put("/api/persons/{person_id}")
+async def api_update_person(person_id: str, body: PersonCreate, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    data = body.model_dump()
+    data["person_id"] = person_id
+    database.upsert_person(data)
+    return {"person_id": person_id, "status": "updated"}
+
+@app.delete("/api/persons/{person_id}")
+async def api_delete_person(person_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    ok = database.delete_person(person_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Person not found")
+    return {"person_id": person_id, "status": "deleted"}
+
+@app.get("/api/persons/resolve/{name}")
+async def api_resolve_alias(name: str, scope: str = "household", authorization: str = Header(default="")):
+    verify_secret(authorization)
+    pid = database.resolve_alias(name, scope)
+    if not pid:
+        raise HTTPException(status_code=404, detail="No person matches this alias")
+    person = database.get_person(pid)
+    return person
 
 
 # ── 记忆 CRUD ──

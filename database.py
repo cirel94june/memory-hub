@@ -342,6 +342,22 @@ async def init_db(db_path: str = None) -> None:
             conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
             logger.info(f"Migrated proposals: added '{col}' column")
 
+    # ── Persons table (人物名片) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS persons (
+            person_id       TEXT PRIMARY KEY,
+            entity_type     TEXT NOT NULL DEFAULT 'other',
+            canonical_name  TEXT NOT NULL,
+            aliases         TEXT NOT NULL DEFAULT '[]',
+            linked_agent_id TEXT NOT NULL DEFAULT '',
+            note            TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT '',
+            updated_at      TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
+        CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
+    """)
+
     conn.commit()
     _conn = conn
     logger.info("Database initialised successfully")
@@ -1146,3 +1162,193 @@ def ro_get_memory(mem_id: str) -> dict | None:
     if row is None:
         return None
     return _row_to_dict(row)
+
+
+# ════════════════════════════════════════════
+#  Persons CRUD (人物名片)
+# ════════════════════════════════════════════
+
+def _person_row_to_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    for key in ("aliases",):
+        val = d.get(key)
+        if isinstance(val, str):
+            try:
+                d[key] = json.loads(val)
+            except (json.JSONDecodeError, TypeError):
+                d[key] = []
+    return d
+
+
+def upsert_person(person: dict) -> None:
+    conn = _get_conn()
+    aliases = person.get("aliases", [])
+    if isinstance(aliases, list):
+        aliases = json.dumps(aliases, ensure_ascii=False)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO persons (person_id, entity_type, canonical_name, aliases, "
+        "linked_agent_id, note, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(person_id) DO UPDATE SET "
+        "entity_type=excluded.entity_type, canonical_name=excluded.canonical_name, "
+        "aliases=excluded.aliases, linked_agent_id=excluded.linked_agent_id, "
+        "note=excluded.note, updated_at=excluded.updated_at",
+        (
+            person["person_id"],
+            person.get("entity_type", "other"),
+            person["canonical_name"],
+            aliases,
+            person.get("linked_agent_id", ""),
+            person.get("note", ""),
+            person.get("created_at", now),
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def get_person(person_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM persons WHERE person_id = ?", (person_id,)
+    ).fetchone()
+    return _person_row_to_dict(row) if row else None
+
+
+def list_persons(entity_type: str = None) -> list[dict]:
+    conn = _get_conn()
+    if entity_type:
+        rows = conn.execute(
+            "SELECT * FROM persons WHERE entity_type = ? ORDER BY canonical_name",
+            (entity_type,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM persons ORDER BY entity_type, canonical_name"
+        ).fetchall()
+    return [_person_row_to_dict(r) for r in rows]
+
+
+def delete_person(person_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def resolve_alias(name: str, scope: str = "household") -> str | None:
+    """根据别名找到 person_id。先精确匹配 canonical_name，再搜 aliases JSON。"""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT person_id FROM persons WHERE canonical_name = ?", (name,)
+    ).fetchone()
+    if row:
+        return row[0]
+    rows = conn.execute("SELECT person_id, aliases FROM persons").fetchall()
+    for r in rows:
+        try:
+            aliases = json.loads(r[1]) if isinstance(r[1], str) else r[1]
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for a in aliases:
+            if isinstance(a, dict):
+                if a.get("name") == name and (a.get("scope", "household") == scope or scope == "any"):
+                    return r[0]
+            elif isinstance(a, str) and a == name:
+                return r[0]
+    return None
+
+
+def seed_baseline_persons() -> int:
+    """启动时种入基线人物（如果 persons 表为空）。返回种入数量。"""
+    conn = _get_conn()
+    count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+    if count > 0:
+        return 0
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+
+    baseline = [
+        {
+            "person_id": "ceci",
+            "entity_type": "user",
+            "canonical_name": "小猫",
+            "aliases": json.dumps([
+                {"name": "ceci", "scope": "household"},
+                {"name": "Ceci", "scope": "household"},
+                {"name": "咪", "scope": "household"},
+                {"name": "香蕉猫", "scope": "household"},
+            ], ensure_ascii=False),
+            "linked_agent_id": "",
+            "note": "用户本人（人类女性）",
+        },
+        {
+            "person_id": "claude",
+            "entity_type": "ai",
+            "canonical_name": "小克",
+            "aliases": json.dumps([
+                {"name": "Cloudy", "scope": "household"},
+                {"name": "cloudy", "scope": "household"},
+                {"name": "Claude", "scope": "household"},
+                {"name": "夜鹭", "scope": "household"},
+            ], ensure_ascii=False),
+            "linked_agent_id": "claude",
+            "note": "AI 住户，偏技术/项目/冷门工具",
+        },
+        {
+            "person_id": "lucien",
+            "entity_type": "ai",
+            "canonical_name": "Lucien",
+            "aliases": json.dumps([
+                {"name": "狐狸", "scope": "household"},
+            ], ensure_ascii=False),
+            "linked_agent_id": "lucien",
+            "note": "AI 住户，偏文化/心理/生活建议",
+        },
+        {
+            "person_id": "jasper",
+            "entity_type": "ai",
+            "canonical_name": "Jasper",
+            "aliases": json.dumps([
+                {"name": "狗蛋", "scope": "household"},
+                {"name": "鹦鹉", "scope": "household"},
+            ], ensure_ascii=False),
+            "linked_agent_id": "jasper",
+            "note": "AI 住户，偏娱乐/音乐/社交热点",
+        },
+    ]
+
+    for p in baseline:
+        conn.execute(
+            "INSERT OR IGNORE INTO persons "
+            "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (p["person_id"], p["entity_type"], p["canonical_name"],
+             p["aliases"], p["linked_agent_id"], p["note"], now, now),
+        )
+    conn.commit()
+    return len(baseline)
+
+
+def get_all_aliases(scope: str = "household") -> dict[str, str]:
+    """返回 {别名: person_id} 映射表，用于批量归一。"""
+    conn = _get_conn()
+    rows = conn.execute("SELECT person_id, canonical_name, aliases FROM persons").fetchall()
+    result: dict[str, str] = {}
+    for r in rows:
+        pid = r[0]
+        result[r[1]] = pid
+        try:
+            aliases = json.loads(r[2]) if isinstance(r[2], str) else r[2]
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for a in aliases:
+            if isinstance(a, dict):
+                if a.get("scope", "household") == scope or scope == "any":
+                    result[a["name"]] = pid
+            elif isinstance(a, str):
+                result[a] = pid
+    return result

@@ -37,6 +37,42 @@ def _safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def _expand_query_aliases(query: str) -> str:
+    """把查询中出现的人物别名展开，同时搜索同一人的所有叫法。
+
+    例如 "狗蛋昨天说了什么" → "狗蛋昨天说了什么 Jasper"
+    这样 FTS/LIKE 也能命中用 canonical_name 写的记忆。
+    """
+    try:
+        alias_map = database.get_all_aliases(scope="any")
+    except Exception:
+        return query
+    if not alias_map:
+        return query
+
+    pid_to_names: dict[str, set[str]] = {}
+    for name, pid in alias_map.items():
+        pid_to_names.setdefault(pid, set()).add(name)
+
+    matched_pids: set[str] = set()
+    for name, pid in alias_map.items():
+        if name in query and pid not in matched_pids:
+            matched_pids.add(pid)
+
+    if not matched_pids:
+        return query
+
+    extra_terms = []
+    for pid in matched_pids:
+        for name in pid_to_names.get(pid, []):
+            if name not in query and len(name) >= 2:
+                extra_terms.append(name)
+
+    if extra_terms:
+        return query + " " + " ".join(extra_terms[:6])
+    return query
+
+
 def _identity_ids(ai_id: str) -> set[str]:
     if not ai_id:
         return set()
@@ -922,6 +958,9 @@ async def recall(
     仅用向量+关键词+LIKE 搜索，不做 emotion/domain 加权。
     """
     ai_ids = _identity_ids(ai_id)
+
+    query = _expand_query_aliases(query)
+
     query_vec = await get_embedding(query)
 
     if not query_domain and not skip_analyze:

@@ -216,6 +216,7 @@ conversationKind = game_world 默认禁止提取为现实事实。game_discussio
 
 | 日期 | 内容 |
 |---|---|
+| 2026-07-21 | PersonEntity 人物名片：persons 表 + CRUD + REST API + 别名归一(recall 前展开) + alias scope(household/game_world) + 基线种子(小猫/小克/Lucien/Jasper) + 前端可视化页面 + 11 条测试 |
 | 2026-07-20 | P0 MemoryProposal 候选区：proposals 表 + quick=True 拦截 + claim_type/speech_mode 分流 + 自动通过(fact+literal) + list/review MCP 工具 + 17 条测试 |
 | 2026-07-18 | #10 修复：daemon 过期逻辑限定任务类 + living_room_refresh 去重闸 + unarchive 工具 |
 | 2026-07-17 | 大修（Lucien 三轮 + 小克两轮 MCP 审计）：visibility.can_view 统一过滤、provenance 体系、apply_user_correction 纠错、embedding 自愈、正文完整性审计、doctor 内容级体检、玩梗快衰减、别名表补全 |
@@ -245,4 +246,4 @@ conversationKind = game_world 默认禁止提取为现实事实。game_discussio
 - 嵌入：硅基流动 API（BAAI/bge-large-zh-v1.5）
 - 小模型：deepseek-v4-flash via DeepSeek 官方 API
 - 定时维护：进程内调度器（北京 02:00/14:00）
-- 测试：`ALLOW_DEFAULT_HUB_SECRET=1 python -m pytest tests/ -q`（29 条）
+- 测试：`ALLOW_DEFAULT_HUB_SECRET=1 python -m pytest tests/ -q`（60 条）
