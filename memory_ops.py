@@ -507,8 +507,32 @@ def _provenance_to_speech_mode(prov: str) -> str:
 _AUTO_APPROVE_PROVENANCE = {"user_statement", "user_correction"}
 
 
+_PLAYFUL_KEYWORDS = (
+    "角色扮演", "嘿嘿", "哈哈哈", "闹着玩", "开玩笑", "搞笑",
+    "大猛", "啵啵", "亲亲", "抱抱", "rp", "RP",
+    "表现出对", "喜爱", "偏好将", "显示出",
+)
+_OVERANALYSIS_PATTERNS = (
+    "表现出对", "显示出对", "展现了", "反映出",
+    "性格特征", "人格特点", "内心深处",
+)
+
+
+def _guard_speech_mode(proposal: dict) -> None:
+    """后端守卫：关键词检测纠正小模型的 speech_mode/claim_type 错标。"""
+    content = proposal.get("content", "")
+    sm = proposal.get("speech_mode", "literal")
+    ct = proposal.get("claim_type", "fact")
+
+    if sm == "literal" and any(kw in content for kw in _PLAYFUL_KEYWORDS):
+        proposal["speech_mode"] = "playful"
+    if ct == "fact" and any(kw in content for kw in _OVERANALYSIS_PATTERNS):
+        proposal["claim_type"] = "observation"
+
+
 def _triage_proposal(proposal: dict) -> str:
     """Returns 'auto_approve' or a reason string for why it's pending."""
+    _guard_speech_mode(proposal)
     conflicts = json.loads(proposal.get("conflicts_with", "[]"))
     if conflicts:
         return "conflicts_with_existing"

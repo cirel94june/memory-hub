@@ -63,60 +63,34 @@ def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
         logger.warning(f"[Pulse] capture update skipped: {e}")
 
 # ── 基础提取 prompt（私聊 + 通用） ──
-EXTRACT_PROMPT_BASE = """你是记忆提取专家。从对话中提取值得**长期**记住的信息。
+EXTRACT_PROMPT_BASE = """记忆提取：从对话中提取值得长期记住的原子事实。
 
-## 身份（最高优先级）：
-- "用户"/"主人" = ceci（ID:8749953218），也叫小猫
-- YanYan/燕燕（ID:8618367675）不是用户！是另一个人
-- S哥哥、Jasper/狗蛋、Lucien、Cloudy/小克、D叔、师兄、Evan、Gale、Nicole 都是bot或群友
-- **只提取跟 ceci 相关的信息**
+## 身份：
+- "用户"/"主人" = ceci（也叫小猫）。只提取跟 ceci 相关的信息
+- Jasper/狗蛋、Lucien、Cloudy/小克 是AI bot，其他人是群友
+- 不用泛称"AI"，写具体名字。谁说的写谁，别人说的不能写成"ceci说"
 
-## 核心规则（违反=废弃）：
-1. **谁说的写谁**：别人说的不能写成"ceci说/认为"。多人对话必须分开归因
-2. **禁止脑补**：不能编造对话中没有的情感/动机（"她享受""她认为"需有原文依据）
-3. **禁止压缩**：不要把多人互动压成"ceci在群里讨论了XX"，写清每个人说了什么
-4. **不用泛称"AI"**：必须写具体名字（Jasper/Cloudy/Lucien/S哥哥等）
+## 三条铁律：
+1. **只记原文说了什么，不分析为什么** — 禁止"表现出对XX的喜爱""显示出XX倾向"这类分析
+2. **玩笑/角色扮演/打闹 → speech_mode="playful"或"fictional"** — 不当事实记
+3. **一条记忆 = 一个原子事实（≤200字）** — 记发生了什么，不归纳性格
 
-## 提取标准：
-✅ ceci亲口说的事实、偏好、经历、情绪
-✅ 有趣的互动场景（写清谁说了什么）、梗、外号
-✅ 身份变化、人际关系、重要事件
-❌ 闲聊寒暄、技术调试、纯灌水、AI自我限制
-❌ 跟ceci无关的事、脱水流水账、无依据推测
-❌ 从对话推导出原文没说的结论（小克说像垃圾袋，小猫说可爱 → ❌ "觉得像垃圾袋是萌点"，✅ "小猫觉得小克说自己像垃圾袋很可爱"）
-❌ 把单次行为概括成性格/习惯（吃了火锅 → ❌ "热爱美食"，✅ "今天吃了火锅"）
-
-## 记忆格式：
-- 每条 = 一个原子事实，≤200字，记录发生了什么，不要分析/归纳性格
-- 必须脱离原对话后仍能看懂（谁做了什么、为什么、什么场景）
-- 保留具体的梗、台词、有趣细节
+## 记什么：ceci 亲口说的事实、偏好、重要事件、纠正(importance≥0.8)
+## 不记什么：闲聊寒暄、玩笑段子、无依据推测、AI自我限制
 
 ## about 字段：
-- "user" = 仅限ceci本人的事实/心情/偏好
-- "interaction" = 群聊互动/梗/别人说的话/多人讨论
-- "ai" = AI自省（极少用）
+- "user" = ceci本人的事实/偏好
+- "interaction" = 互动事件（写清谁和谁）
+- "ai" = AI自省（极少）
 
-## 时态：
-- "以前做过XX" → 写"曾经做过"
-- 用户纠正错误认知 → importance ≥ 0.8
+## 出处（provenance）：
+- "user_statement" = ceci亲口说的
+- "user_correction" = ceci在纠正错误（附 corrects_old_value 字段）
+- "ai_summary" = bot复述（bot说的永远不能标user_statement）
+- "roleplay_meme" = 玩梗/角色扮演
 
-## 出处（provenance，每条必填）：
-- "user_statement" = ceci 亲口陈述的事实/偏好/经历
-- "user_correction" = ceci 在纠正之前的错误说法（见下方纠正识别）
-- "user_quote" = ceci 引用原话
-- "ai_summary" = bot 复述/总结的内容（bot 说的"事实"一律最多是这个）
-- "ai_speculation" = bot 的推测
-- "roleplay_meme" = 玩梗/角色扮演/外号互动
-⚠️ bot 说的内容永远不能标成 user_statement——bot 复述可能有错，
-   系统靠这个字段防止 bot 的错误版本覆盖 ceci 的原始事实。
-
-## 纠正识别（最高优先级）：
-当 ceci 的发言是在否定/修正上一条消息（尤其是 bot 说错的），比如
-"不是X，是Y""不对""我说的是""你记错了""怎么又变成""我没说过"——
-这条要输出 provenance="user_correction"，并附两个字段：
-- "corrects_old_value": 被纠正的错误说法（原文关键词，如"真丝羽毛"）
-- "corrected_value" 已含在 content 里（正确版本）
-纠正不是普通的新事实！不要把错误版和纠正版并列存成两条普通记忆。"""
+## 纠正识别：
+ceci 说"不是X是Y""你记错了"→ provenance="user_correction"，附 corrects_old_value。"""
 
 # ── 小群专用追加 prompt（强调梗和互动细节） ──
 EXTRACT_PROMPT_PRIVATE_GROUP = """
@@ -137,43 +111,28 @@ EXTRACT_PROMPT_PUBLIC_GROUP = """
 # ── 输出格式（所有类型共用） ──
 EXTRACT_OUTPUT_FORMAT = """
 
-输出 JSON 数组（空数组表示没有值得记的）：
+输出 JSON 数组（空=没有值得记的）：
 [
   {
-    "content": "一个原子事实（≤200字）。写清楚是谁说的/做的，不要用'用户'指代ceci以外的人，不要用泛指'AI'而要写具体bot名字",
-    "about": "user 或 interaction 或 ai",
-    "room": "最合适的房间ID",
-    "importance": 0.0到1.0（闲聊寒暄0.1，临时话题0.3，有信息量的事实0.5+，重要事件/情感/身份变化0.7+）,
-    "event_date": "事件日期（如 2026-06-08，推算不出就留空）",
-    "provenance": "user_statement / user_correction / user_quote / ai_summary / ai_speculation / roleplay_meme（见上方出处规则）",
-    "claim_type": "fact / observation / hypothesis（用户亲口说的事实=fact，AI总结或观察到的=observation，推测猜想=hypothesis）",
-    "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经说话=literal，玩梗开玩笑=playful，假设性讨论=hypothetical，虚构角色扮演=fictional，分不清=uncertain）",
-    "subject_name": "这条记忆主要关于谁（填人名，如'小猫'/'Jasper'/'Lucien'，关于多人互动可留空）",
-    "speaker_name": "谁说的/谁是信息来源（填人名，如'小猫'/'Cloudy'，AI总结的填AI名字）",
-    "corrects_old_value": "仅 provenance=user_correction 时填：被纠正的错误说法原文关键词",
-    "resolved": null 或 false。⚠️ 极少使用 false！只有用户明确说了"要做某事""还没做完""待办""记得提醒我"时才设为 false。群聊梗、知识、互动记录、情绪、观点 → 一律 null。90%以上的记忆应该是 null。
+    "content": "原子事实（≤200字），记发生了什么，不分析性格。写具体名字不用泛称'AI'",
+    "about": "user/interaction/ai",
+    "room": "房间ID",
+    "importance": 0.0到1.0,
+    "event_date": "事件日期或留空",
+    "provenance": "user_statement/user_correction/ai_summary/ai_speculation/roleplay_meme",
+    "claim_type": "fact（亲口说）/observation（观察到）/hypothesis（推测）",
+    "speech_mode": "literal（正经）/playful（玩笑打闹）/fictional（角色扮演）/uncertain",
+    "subject_name": "关于谁（人名，多人留空）",
+    "speaker_name": "谁说的（人名）",
+    "corrects_old_value": "仅user_correction时填",
+    "resolved": null（默认）或 false（仅"要做某事/待办/提醒我"时用）
   }
 ]
 
-房间可选：
-  living_room(核心身份), career(职业), psychology(心理), health(健康),
-  learning(学习), relationships(人际关系), preferences(兴趣偏好),
-  work_tasks(工作事务), infra(基建), social(社交动态/群聊),
-  relationship(和AI的关系), diary(AI日记), personality(AI自我认知),
-  game_room(游戏/角色扮演)
+房间：living_room/career/psychology/health/learning/relationships/preferences/work_tasks/infra/social/relationship/diary/personality/game_room
+preferences 只收长期稳定的偏好（"怕蜘蛛"级别），一次性事件不进 preferences。
 
-提示：群聊中的梗、外号、暗号、互动细节 → social 房间
-⚠️ preferences 只收**长期稳定**的偏好/边界/雷点（"怕蜘蛛""不吃香菜"级别）。
-一次性事件、技术支持记录、玩梗、宠物趣事 → social 或对应房间，绝不进 preferences。
-
-只输出 JSON。
-
-## 🔴 最后提醒（输出前必检）：
-1. 检查每条记忆的主语——是谁说的就写谁，不要全写"ceci"或"用户"
-2. 群聊中A说的话不能写成"ceci说"，B的观点不能写成"ceci认为"
-3. 不要把多条消息压缩成"ceci在群里讨论了XX"——分开写每个人说了什么
-4. 不要脑补对话中没有的情感/动机（"她享受""她认为"需要有原文依据）
-5. 如果整段对话没有值得记的，输出 []"""
+犹豫就不记。只输出 JSON。"""
 
 
 def _get_extract_prompt(chat_type: str) -> str:
