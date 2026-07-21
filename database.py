@@ -331,6 +331,17 @@ async def init_db(db_path: str = None) -> None:
         CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
     """)
 
+    # ── Proposals table migrations ──
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
+    for col, typedef in [
+        ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
+        ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
+            logger.info(f"Migrated proposals: added '{col}' column")
+
     conn.commit()
     _conn = conn
     logger.info("Database initialised successfully")
