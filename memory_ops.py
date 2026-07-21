@@ -186,6 +186,10 @@ async def remember(
     force_create: bool = False,
     provenance_type: str = "",
     fact_confidence: float = None,
+    claim_type: str = "",
+    speech_mode: str = "",
+    conversation_kind: str = "",
+    evidence_excerpt: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
 
@@ -222,6 +226,17 @@ async def remember(
                     return {"id": existing["id"], "status": "dedup_skipped", "similarity": similar[0]["score"]}
         except Exception as e:
             logger.warning(f"Quick dedup check failed: {e}")
+
+        # 走 MemoryProposal 候选区
+        return await _create_proposal(
+            content=content, room=room, category=category, layer=layer,
+            owner_ai=owner_ai, importance=importance, emotion_arousal=emotion_arousal,
+            source_ai=source_ai, source_platform=source_platform, tags=tags,
+            event_date=event_date, source_context=source_context,
+            provenance_type=provenance_type, fact_confidence=fact_confidence,
+            claim_type=claim_type, speech_mode=speech_mode,
+            conversation_kind=conversation_kind, evidence_excerpt=evidence_excerpt,
+        )
 
     # Step 1: 自动打标
     original_category = category
@@ -415,6 +430,234 @@ async def remember(
     if original_category and original_category != category:
         result["original_category"] = original_category
     return result
+
+
+# ── MemoryProposal 候选区 ──
+
+_SENSITIVE_ROOMS = {"health", "psychology"}
+
+_CLAIM_TYPE_MAP = {
+    "user_statement": "fact", "user_correction": "fact",
+    "user_quote": "observation",
+    "ai_summary": "observation", "ai_speculation": "hypothesis",
+    "roleplay_meme": "observation",
+}
+
+_SPEECH_MODE_MAP = {
+    "user_statement": "literal", "user_correction": "literal",
+    "user_quote": "uncertain",
+    "ai_summary": "literal", "ai_speculation": "uncertain",
+    "roleplay_meme": "playful",
+}
+
+
+def _provenance_to_claim_type(prov: str) -> str:
+    return _CLAIM_TYPE_MAP.get(prov, "observation")
+
+
+def _provenance_to_speech_mode(prov: str) -> str:
+    return _SPEECH_MODE_MAP.get(prov, "uncertain")
+
+
+_AUTO_APPROVE_PROVENANCE = {"user_statement", "user_correction"}
+
+
+def _triage_proposal(proposal: dict) -> str:
+    """Returns 'auto_approve' or a reason string for why it's pending."""
+    conflicts = json.loads(proposal.get("conflicts_with", "[]"))
+    if conflicts:
+        return "conflicts_with_existing"
+    if proposal.get("conflict_check_failed"):
+        return "conflict_check_failed"
+    if proposal.get("proposed_room", "") in _SENSITIVE_ROOMS:
+        return "sensitive_room"
+    ck = proposal.get("conversation_kind", "")
+    if ck in ("game_world", "game_discussion"):
+        return "game_content"
+    sm = proposal.get("speech_mode", "uncertain")
+    if sm != "literal":
+        return f"{sm}_speech_mode"
+    ct = proposal.get("claim_type", "observation")
+    if ct != "fact":
+        return f"{ct}_claim"
+    prov = (proposal.get("provenance_type") or "").strip()
+    if prov not in _AUTO_APPROVE_PROVENANCE:
+        return f"provenance_{prov or 'unknown'}"
+    return "auto_approve"
+
+
+async def _create_proposal(
+    content: str, room: str, category: str, layer: str, owner_ai: str,
+    importance: float, emotion_arousal: float, source_ai: str,
+    source_platform: str, tags: list[str], event_date: str,
+    source_context: str, provenance_type: str, fact_confidence: float,
+    claim_type: str, speech_mode: str, conversation_kind: str,
+    evidence_excerpt: str,
+) -> dict:
+    ct = claim_type or _provenance_to_claim_type(provenance_type)
+    sm = speech_mode or _provenance_to_speech_mode(provenance_type)
+    if fact_confidence is None:
+        fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
+
+    prop_id = f"prop_{int(time.time() * 1000)}_{int(time.time_ns() % 10000):04d}"
+    now = _now()
+
+    proposal = {
+        "id": prop_id,
+        "content": content,
+        "claim_type": ct,
+        "speech_mode": sm,
+        "conversation_kind": conversation_kind or "house_chat",
+        "proposed_room": room,
+        "source_message_ids": json.dumps([]),
+        "evidence_excerpt": evidence_excerpt or (source_context[:500] if source_context else ""),
+        "proposer_ai_id": source_ai,
+        "confidence": fact_confidence,
+        "conflicts_with": json.dumps([]),
+        "status": "pending",
+        "layer": layer,
+        "owner_ai": owner_ai,
+        "importance": importance,
+        "emotion_arousal": emotion_arousal,
+        "category": category,
+        "tags": json.dumps(tags or []),
+        "event_date": event_date,
+        "source_context": source_context,
+        "source_platform": source_platform,
+        "provenance_type": provenance_type,
+        "created_at": now,
+        "reviewed_at": "",
+        "reviewed_by": "",
+        "reject_reason": "",
+    }
+
+    # 冲突检测（限同 room + layer + owner + active，避免跨房间/跨 AI 误拦）
+    try:
+        qv = await get_embedding(content)
+        if qv:
+            search_kw = dict(top_k=6, status="active", room=room, layer=layer)
+            if layer == "private" and owner_ai:
+                search_kw["owner_ai"] = owner_ai
+            raw = database.vector_search(qv, **search_kw)
+            conflict_ids = []
+            for mem in raw:
+                dist = mem.pop("distance", 0.0)
+                sim = _distance_to_cosine(dist)
+                if sim >= 0.65:
+                    conflict_ids.append(mem["id"])
+            if conflict_ids:
+                proposal["conflicts_with"] = json.dumps(conflict_ids[:3])
+    except Exception as e:
+        logger.warning(f"Conflict check failed for proposal: {e}")
+        proposal["conflict_check_failed"] = True
+
+    decision = _triage_proposal(proposal)
+
+    proposal["triage_reason"] = decision
+
+    if decision == "auto_approve":
+        # 先以 pending 入库，promote 成功后再标 auto_approved
+        proposal["status"] = "pending"
+        database.insert_proposal(proposal)
+        try:
+            result = await _promote_proposal(proposal)
+            mem_id = result.get("id", "")
+            database.update_proposal_status(
+                prop_id, "auto_approved", "system", applied_memory_id=mem_id,
+            )
+            result["proposal_id"] = prop_id
+            result["proposal_status"] = "auto_approved"
+            return result
+        except Exception as e:
+            database.update_proposal_status(
+                prop_id, "promotion_failed", "system", failure_reason=str(e),
+            )
+            logger.error(f"Proposal auto-promote failed: {prop_id} - {e}")
+            return {
+                "id": prop_id,
+                "status": "proposed",
+                "proposal_status": "promotion_failed",
+                "triage_reason": decision,
+                "error": str(e),
+            }
+    else:
+        proposal["status"] = "pending"
+        database.insert_proposal(proposal)
+        logger.info(f"Proposal created (pending: {decision}): {prop_id} - {content[:60]}")
+        return {
+            "id": prop_id,
+            "status": "proposed",
+            "proposal_status": "pending",
+            "triage_reason": decision,
+        }
+
+
+async def _promote_proposal(proposal: dict) -> dict:
+    """Promote an approved proposal to a canonical memory via remember(quick=False).
+
+    Goes through the full merge/supersede/relation-classify path,
+    so promoted proposals don't create duplicates or skip supersede logic.
+    """
+    tags_raw = json.loads(proposal.get("tags", "[]")) if isinstance(proposal.get("tags"), str) else (proposal.get("tags") or [])
+
+    result = await remember(
+        content=proposal["content"],
+        layer=proposal.get("layer", "shared"),
+        room=proposal.get("proposed_room", "living_room"),
+        category=proposal.get("category", ""),
+        owner_ai=proposal.get("owner_ai", ""),
+        importance=proposal.get("importance", 0.5),
+        emotion_arousal=proposal.get("emotion_arousal", 0.3),
+        source_ai=proposal.get("proposer_ai_id", ""),
+        source_platform=proposal.get("source_platform", ""),
+        tags=tags_raw or None,
+        event_date=proposal.get("event_date", ""),
+        source_context=proposal.get("source_context", ""),
+        quick=False,
+        provenance_type=proposal.get("provenance_type", ""),
+        fact_confidence=proposal.get("confidence"),
+    )
+
+    logger.info(f"Promoted proposal {proposal['id']} -> memory {result.get('id', '?')}")
+    return result
+
+
+async def list_proposals(status: str = "pending", limit: int = 50, page: int = 1) -> dict:
+    offset = (page - 1) * limit
+    items = database.list_proposals(status=status, limit=limit, offset=offset)
+    total = database.count_proposals(status=status)
+    return {"total": total, "page": page, "per_page": limit, "items": items}
+
+
+async def review_proposal(
+    proposal_id: str, action: str, reviewed_by: str = "user", reject_reason: str = "",
+) -> dict:
+    proposal = database.get_proposal(proposal_id)
+    if not proposal:
+        return {"error": f"Proposal {proposal_id} not found"}
+    if proposal["status"] not in ("pending", "promotion_failed"):
+        return {"error": f"Proposal already {proposal['status']}"}
+
+    if action == "approve":
+        try:
+            result = await _promote_proposal(proposal)
+            mem_id = result.get("id", "")
+            database.update_proposal_status(
+                proposal_id, "approved", reviewed_by, applied_memory_id=mem_id,
+            )
+            result["proposal_id"] = proposal_id
+            result["proposal_status"] = "approved"
+            return result
+        except Exception as e:
+            database.update_proposal_status(
+                proposal_id, "promotion_failed", reviewed_by, failure_reason=str(e),
+            )
+            return {"proposal_id": proposal_id, "status": "promotion_failed", "error": str(e)}
+    elif action == "reject":
+        database.update_proposal_status(proposal_id, "rejected", reviewed_by, reject_reason)
+        return {"proposal_id": proposal_id, "status": "rejected", "reason": reject_reason}
+    else:
+        return {"error": f"Unknown action: {action}"}
 
 
 def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:

@@ -216,6 +216,7 @@ conversationKind = game_world 默认禁止提取为现实事实。game_discussio
 
 | 日期 | 内容 |
 |---|---|
+| 2026-07-20 | P0 MemoryProposal 候选区：proposals 表 + quick=True 拦截 + claim_type/speech_mode 分流 + 自动通过(fact+literal) + list/review MCP 工具 + 17 条测试 |
 | 2026-07-18 | #10 修复：daemon 过期逻辑限定任务类 + living_room_refresh 去重闸 + unarchive 工具 |
 | 2026-07-17 | 大修（Lucien 三轮 + 小克两轮 MCP 审计）：visibility.can_view 统一过滤、provenance 体系、apply_user_correction 纠错、embedding 自愈、正文完整性审计、doctor 内容级体检、玩梗快衰减、别名表补全 |
 | 2026-07-13 | MCPGateway 审计层（mcp_audit.jsonl） |

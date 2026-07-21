@@ -294,6 +294,54 @@ async def init_db(db_path: str = None) -> None:
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
 
+    # ── Proposals table (MemoryProposal 候选区) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS proposals (
+            id                  TEXT PRIMARY KEY,
+            content             TEXT NOT NULL,
+            claim_type          TEXT NOT NULL DEFAULT 'observation',
+            speech_mode         TEXT NOT NULL DEFAULT 'uncertain',
+            conversation_kind   TEXT NOT NULL DEFAULT 'house_chat',
+            proposed_room       TEXT NOT NULL DEFAULT 'living_room',
+            source_message_ids  TEXT NOT NULL DEFAULT '[]',
+            evidence_excerpt    TEXT NOT NULL DEFAULT '',
+            proposer_ai_id      TEXT NOT NULL DEFAULT '',
+            confidence          REAL NOT NULL DEFAULT 0.5,
+            conflicts_with      TEXT NOT NULL DEFAULT '[]',
+            status              TEXT NOT NULL DEFAULT 'pending',
+            layer               TEXT NOT NULL DEFAULT 'shared',
+            owner_ai            TEXT NOT NULL DEFAULT '',
+            importance          REAL NOT NULL DEFAULT 0.5,
+            emotion_arousal     REAL NOT NULL DEFAULT 0.3,
+            category            TEXT NOT NULL DEFAULT '',
+            tags                TEXT NOT NULL DEFAULT '[]',
+            event_date          TEXT NOT NULL DEFAULT '',
+            source_context      TEXT NOT NULL DEFAULT '',
+            source_platform     TEXT NOT NULL DEFAULT '',
+            provenance_type     TEXT NOT NULL DEFAULT '',
+            created_at          TEXT NOT NULL,
+            reviewed_at         TEXT NOT NULL DEFAULT '',
+            reviewed_by         TEXT NOT NULL DEFAULT '',
+            reject_reason       TEXT NOT NULL DEFAULT '',
+            triage_reason       TEXT NOT NULL DEFAULT '',
+            applied_memory_id   TEXT NOT NULL DEFAULT '',
+            failure_reason      TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
+        CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
+    """)
+
+    # ── Proposals table migrations ──
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
+    for col, typedef in [
+        ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
+        ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
+            logger.info(f"Migrated proposals: added '{col}' column")
+
     conn.commit()
     _conn = conn
     logger.info("Database initialised successfully")
@@ -568,6 +616,71 @@ def count_memories(status: str = "active") -> int:
     conn = _get_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE status = ?", (status,)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+# ════════════════════════════════════════════
+#  Proposals CRUD
+# ════════════════════════════════════════════
+
+_PROPOSAL_COLUMNS = [
+    "id", "content", "claim_type", "speech_mode", "conversation_kind",
+    "proposed_room", "source_message_ids", "evidence_excerpt",
+    "proposer_ai_id", "confidence", "conflicts_with", "status",
+    "layer", "owner_ai", "importance", "emotion_arousal",
+    "category", "tags", "event_date", "source_context",
+    "source_platform", "provenance_type",
+    "created_at", "reviewed_at", "reviewed_by", "reject_reason",
+    "triage_reason", "applied_memory_id", "failure_reason",
+]
+
+
+def insert_proposal(row: dict) -> None:
+    conn = _get_conn()
+    values = [row.get(c, "") for c in _PROPOSAL_COLUMNS]
+    placeholders = ", ".join(["?"] * len(_PROPOSAL_COLUMNS))
+    cols = ", ".join(_PROPOSAL_COLUMNS)
+    conn.execute(f"INSERT INTO proposals ({cols}) VALUES ({placeholders})", values)
+    conn.commit()
+
+
+def get_proposal(pid: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM proposals WHERE id = ?", (pid,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_proposals(
+    status: str = "pending", limit: int = 50, offset: int = 0,
+) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (status, limit, offset),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_proposal_status(
+    pid: str, status: str, reviewed_by: str = "", reject_reason: str = "",
+    applied_memory_id: str = "", failure_reason: str = "",
+) -> None:
+    conn = _get_conn()
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE proposals SET status = ?, reviewed_at = ?, reviewed_by = ?, "
+        "reject_reason = ?, applied_memory_id = ?, failure_reason = ? WHERE id = ?",
+        (status, now, reviewed_by, reject_reason, applied_memory_id, failure_reason, pid),
+    )
+    conn.commit()
+
+
+def count_proposals(status: str = "pending") -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM proposals WHERE status = ?", (status,)
     ).fetchone()
     return row[0] if row else 0
 
