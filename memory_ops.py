@@ -553,6 +553,8 @@ async def _create_proposal(
 
     decision = _triage_proposal(proposal)
 
+    proposal["triage_reason"] = decision
+
     if decision == "auto_approve":
         # 先以 pending 入库，promote 成功后再标 auto_approved
         proposal["status"] = "pending"

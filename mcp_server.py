@@ -521,7 +521,7 @@ async def list_proposals(
     - promotion_failed: 晋升失败（可用 review_proposal approve 重试）
 
     Args:
-        status: 筛选状态（pending/auto_approved/approved/rejected）
+        status: 筛选状态（pending/auto_approved/approved/rejected/promotion_failed）
         page: 页码（从1开始）
         per_page: 每页条数（默认20）
     """

@@ -323,6 +323,7 @@ async def init_db(db_path: str = None) -> None:
             reviewed_at         TEXT NOT NULL DEFAULT '',
             reviewed_by         TEXT NOT NULL DEFAULT '',
             reject_reason       TEXT NOT NULL DEFAULT '',
+            triage_reason       TEXT NOT NULL DEFAULT '',
             applied_memory_id   TEXT NOT NULL DEFAULT '',
             failure_reason      TEXT NOT NULL DEFAULT ''
         );
@@ -620,7 +621,7 @@ _PROPOSAL_COLUMNS = [
     "category", "tags", "event_date", "source_context",
     "source_platform", "provenance_type",
     "created_at", "reviewed_at", "reviewed_by", "reject_reason",
-    "applied_memory_id", "failure_reason",
+    "triage_reason", "applied_memory_id", "failure_reason",
 ]
 
 
