@@ -518,6 +518,7 @@ async def list_proposals(
     - auto_approved: 系统自动通过的高置信度事实
     - approved: 人工批准
     - rejected: 已拒绝
+    - promotion_failed: 晋升失败（可用 review_proposal approve 重试）
 
     Args:
         status: 筛选状态（pending/auto_approved/approved/rejected）

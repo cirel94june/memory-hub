@@ -56,13 +56,15 @@ def _prop(**overrides):
         "proposed_room": "living_room",
         "conversation_kind": "house_chat",
         "conflicts_with": "[]",
+        "provenance_type": "user_statement",
     }
     base.update(overrides)
     return base
 
 
-def test_triage_fact_literal_auto_approves():
+def test_triage_fact_literal_user_statement_auto_approves():
     assert _triage_proposal(_prop()) == "auto_approve"
+    assert _triage_proposal(_prop(provenance_type="user_correction")) == "auto_approve"
 
 
 def test_triage_conflicts_block():
@@ -93,6 +95,18 @@ def test_triage_observation_blocks():
 
 def test_triage_hypothesis_blocks():
     assert _triage_proposal(_prop(claim_type="hypothesis")) == "hypothesis_claim"
+
+
+def test_triage_ai_provenance_blocks_even_fact_literal():
+    """AI 出处 + fact + literal 不能自动通过（防小模型误标）。"""
+    assert _triage_proposal(_prop(provenance_type="ai_summary")) == "provenance_ai_summary"
+    assert _triage_proposal(_prop(provenance_type="ai_speculation")) == "provenance_ai_speculation"
+    assert _triage_proposal(_prop(provenance_type="")) == "provenance_unknown"
+
+
+def test_triage_conflict_check_failed_blocks():
+    p = _prop(conflict_check_failed=True)
+    assert _triage_proposal(p) == "conflict_check_failed"
 
 
 # ── 端到端场景（fake store + fake embedding）──

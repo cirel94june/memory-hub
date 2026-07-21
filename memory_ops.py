@@ -459,11 +459,16 @@ def _provenance_to_speech_mode(prov: str) -> str:
     return _SPEECH_MODE_MAP.get(prov, "uncertain")
 
 
+_AUTO_APPROVE_PROVENANCE = {"user_statement", "user_correction"}
+
+
 def _triage_proposal(proposal: dict) -> str:
     """Returns 'auto_approve' or a reason string for why it's pending."""
     conflicts = json.loads(proposal.get("conflicts_with", "[]"))
     if conflicts:
         return "conflicts_with_existing"
+    if proposal.get("conflict_check_failed"):
+        return "conflict_check_failed"
     if proposal.get("proposed_room", "") in _SENSITIVE_ROOMS:
         return "sensitive_room"
     ck = proposal.get("conversation_kind", "")
@@ -473,9 +478,12 @@ def _triage_proposal(proposal: dict) -> str:
     if sm != "literal":
         return f"{sm}_speech_mode"
     ct = proposal.get("claim_type", "observation")
-    if ct == "fact":
-        return "auto_approve"
-    return f"{ct}_claim"
+    if ct != "fact":
+        return f"{ct}_claim"
+    prov = (proposal.get("provenance_type") or "").strip()
+    if prov not in _AUTO_APPROVE_PROVENANCE:
+        return f"provenance_{prov or 'unknown'}"
+    return "auto_approve"
 
 
 async def _create_proposal(
@@ -539,8 +547,9 @@ async def _create_proposal(
                     conflict_ids.append(mem["id"])
             if conflict_ids:
                 proposal["conflicts_with"] = json.dumps(conflict_ids[:3])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Conflict check failed for proposal: {e}")
+        proposal["conflict_check_failed"] = True
 
     decision = _triage_proposal(proposal)
 
