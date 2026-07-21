@@ -509,6 +509,8 @@ AI回复：{ai_response[:1500]}
 - 角色扮演/玩笑当成真实态度
 - 编造对话中没出现的信息
 - 把AI自己的分析当成用户的观点
+- **把单次行为概括成性格/习惯**（小猫亲了小克 → ❌ "小猫是个喜欢亲亲的人"，✅ "小猫亲了小克"）
+- **过度抽象**（用户吃了火锅 → ❌ "用户热爱美食"，✅ "用户今天吃了火锅"）
 
 判断标准：能否在对话中找到这条记忆的直接依据？找不到就不记。
 情绪观察可以稍放宽——不需要原话，但对话中要有明显的情绪表现。
@@ -567,7 +569,7 @@ AI回复：{ai_response[:1500]}
   "actions": [
     {{
       "type": "remember",
-      "content": "一个原子事实（≤200字，保留具体细节）",
+      "content": "一个原子事实（≤200字，记录发生了什么，不要分析/归纳人的性格）",
       "about": "user 或 interaction 或 ai",
       "layer": "shared 或 private",
       "room": "从上面的房间列表选",
@@ -623,7 +625,7 @@ AI回复：{ai_response[:1500]}
             about = action.get("about", "user")
             if about not in valid_about:
                 about = "user"
-            layer = "private" if chat_type == "private" else action.get("layer", "shared")
+            layer = "private" if chat_type == "private" else "shared"
             owner = ai_id if layer == "private" else ""
             # 给记忆内容加上 about 前缀，让走廊和搜索时能区分
             if about == "user" and not content.startswith("[用户]"):
