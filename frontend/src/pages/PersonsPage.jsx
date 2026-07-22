@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Users, Plus, X, Save, Trash2, Search, UserCircle, Bot, User } from "lucide-react";
+import { Users, Plus, X, Save, Trash2, Search, UserCircle, Bot, User, MessageSquare, ChevronDown } from "lucide-react";
 
 const TYPE_LABELS = { user: "用户", ai: "AI", other: "其他人物" };
 const TYPE_COLORS = { user: "#e879a0", ai: "#6e9fff", other: "#a3a3a3" };
@@ -182,11 +182,110 @@ export default function PersonsPage() {
               saving={saving}
             />
           ) : (
-            <DetailPanel
-              person={current}
-              onEdit={() => setEditing({ ...current })}
-              onDelete={() => deletePerson(current.person_id)}
-            />
+            <>
+              <DetailPanel
+                person={current}
+                onEdit={() => setEditing({ ...current })}
+                onDelete={() => deletePerson(current.person_id)}
+              />
+              <PersonMemories personId={current.person_id} auth={auth} />
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const ROOM_LABELS = {
+  living_room: "客厅", career: "职业", psychology: "心理", health: "健康",
+  learning: "学习", relationships: "关系", preferences: "偏好", work_tasks: "任务",
+  social: "社交", diary: "日记", dreams: "梦境", personality: "性格", game_room: "游戏",
+};
+
+function PersonMemories({ personId, auth }) {
+  const [memories, setMemories] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  const fetchMemories = (p = 1) => {
+    setLoading(true);
+    fetch(`/api/persons/${personId}/memories?page=${p}&limit=10`, { headers: auth })
+      .then((r) => r.json())
+      .then((d) => {
+        setMemories(d.memories || []);
+        setTotal(d.total || 0);
+        setPage(p);
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    if (expanded) fetchMemories(1);
+  }, [personId, expanded]);
+
+  return (
+    <div style={{ marginTop: "var(--space-md)", borderTop: "1px solid var(--glass-border)", paddingTop: "var(--space-md)" }}>
+      <button
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          display: "flex", alignItems: "center", gap: 6, background: "none", border: "none",
+          cursor: "pointer", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, padding: 0,
+        }}
+      >
+        <MessageSquare size={14} />
+        相关记忆 {total > 0 && <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>({total})</span>}
+        <ChevronDown size={14} style={{ transform: expanded ? "rotate(180deg)" : "none", transition: "var(--transition-fast)" }} />
+      </button>
+
+      {expanded && (
+        <div style={{ marginTop: "var(--space-sm)" }}>
+          {loading && <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "8px 0" }}>加载中...</div>}
+          {!loading && memories.length === 0 && (
+            <div style={{ fontSize: 12, color: "var(--text-muted)", padding: "8px 0" }}>暂无关联记忆</div>
+          )}
+          {memories.map((m) => (
+            <div key={m.id} style={{
+              padding: "8px 10px", marginBottom: 6, borderRadius: "var(--radius-sm)",
+              background: "var(--bg-hover)", fontSize: 13, lineHeight: 1.5,
+            }}>
+              <div style={{ display: "flex", gap: 6, marginBottom: 4, flexWrap: "wrap" }}>
+                {m.room && (
+                  <span style={{
+                    fontSize: 10, padding: "1px 6px", borderRadius: 10,
+                    background: "var(--primary-light)", color: "var(--primary)",
+                  }}>
+                    {ROOM_LABELS[m.room] || m.room}
+                  </span>
+                )}
+                {m.layer === "private" && (
+                  <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 10, background: "#f0abfc33", color: "#d946ef" }}>
+                    私密
+                  </span>
+                )}
+                {m.source_ai && (
+                  <span style={{ fontSize: 10, color: "var(--text-muted)" }}>来自 {m.source_ai}</span>
+                )}
+                <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: "auto" }}>
+                  {m.created_at ? new Date(m.created_at).toLocaleDateString("zh-CN") : ""}
+                </span>
+              </div>
+              <div style={{ color: "var(--text-primary)" }}>{m.content}</div>
+            </div>
+          ))}
+          {total > 10 && (
+            <div style={{ display: "flex", justifyContent: "center", gap: "var(--space-sm)", marginTop: 8 }}>
+              <button className="btn btn-ghost" disabled={page <= 1} onClick={() => fetchMemories(page - 1)}
+                style={{ padding: "4px 12px", fontSize: 12 }}>上一页</button>
+              <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: "28px" }}>
+                {page} / {Math.ceil(total / 10)}
+              </span>
+              <button className="btn btn-ghost" disabled={page >= Math.ceil(total / 10)} onClick={() => fetchMemories(page + 1)}
+                style={{ padding: "4px 12px", fontSize: 12 }}>下一页</button>
+            </div>
           )}
         </div>
       )}

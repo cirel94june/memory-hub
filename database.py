@@ -292,7 +292,15 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
         logger.info("Migrated: added 'fact_confidence' column")
 
+    if "subject_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'subject_id' column")
+    if "source_speaker_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN source_speaker_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'source_speaker_id' column")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
 
     # ── Proposals table (MemoryProposal 候选区) ──
     conn.executescript("""
@@ -337,6 +345,8 @@ async def init_db(db_path: str = None) -> None:
         ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
         ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
         ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+        ("source_speaker_id", "TEXT NOT NULL DEFAULT ''"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
@@ -375,6 +385,7 @@ _ALL_COLUMNS = [
     "supersedes", "superseded_by", "event_date", "source_context",
     "comments", "embedding", "status", "created_at", "updated_at",
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
+    "subject_id", "source_speaker_id",
 ]
 
 
@@ -649,6 +660,7 @@ _PROPOSAL_COLUMNS = [
     "source_platform", "provenance_type",
     "created_at", "reviewed_at", "reviewed_by", "reject_reason",
     "triage_reason", "applied_memory_id", "failure_reason",
+    "subject_id", "source_speaker_id",
 ]
 
 
@@ -1229,6 +1241,25 @@ def list_persons(entity_type: str = None) -> list[dict]:
             "SELECT * FROM persons ORDER BY entity_type, canonical_name"
         ).fetchall()
     return [_person_row_to_dict(r) for r in rows]
+
+
+def get_memories_by_subject(person_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM memories WHERE subject_id = ? AND status = 'active' "
+        "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        (person_id, limit, offset),
+    ).fetchall()
+    return [_row_to_dict_no_embedding(r) for r in rows]
+
+
+def count_memories_by_subject(person_id: str) -> int:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE subject_id = ? AND status = 'active'",
+        (person_id,),
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def delete_person(person_id: str) -> bool:

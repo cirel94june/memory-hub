@@ -344,6 +344,18 @@ async def api_delete_person(person_id: str, authorization: str = Header(default=
         raise HTTPException(status_code=404, detail="Person not found")
     return {"person_id": person_id, "status": "deleted"}
 
+@app.get("/api/persons/{person_id}/memories")
+async def api_person_memories(person_id: str, limit: int = 50, page: int = 1, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    p = database.get_person(person_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Person not found")
+    offset = (max(1, page) - 1) * limit
+    memories = database.get_memories_by_subject(person_id, limit=limit, offset=offset)
+    total = database.count_memories_by_subject(person_id)
+    return {"person_id": person_id, "total": total, "page": page, "memories": memories}
+
+
 @app.get("/api/persons/resolve/{name}")
 async def api_resolve_alias(name: str, scope: str = "household", authorization: str = Header(default="")):
     verify_secret(authorization)
