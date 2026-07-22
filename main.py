@@ -991,6 +991,25 @@ async def api_ai_aliases():
     return {"aliases": AI_ALIASES}
 
 
+@app.get("/api/stats/ai/{ai_id}")
+async def api_ai_stats(ai_id: str, authorization: str = Header(default="")):
+    verify_secret(authorization)
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    all_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
+    conn = database._get_conn()
+    placeholders = ",".join(["?"] * len(all_ids))
+    rows = conn.execute(
+        f"SELECT room, COUNT(*) as cnt FROM memories "
+        f"WHERE status='active' AND (owner_ai IN ({placeholders}) OR source_ai IN ({placeholders})) "
+        f"GROUP BY room ORDER BY cnt DESC",
+        list(all_ids) + list(all_ids),
+    ).fetchall()
+    rooms = [{"room": r["room"] or "living_room", "count": r["cnt"]} for r in rows]
+    total = sum(r["count"] for r in rooms)
+    return {"total": total, "rooms": rooms}
+
+
 @app.get("/api/ai-profiles")
 async def api_list_profiles(authorization: str = Header(default="")):
     """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""
