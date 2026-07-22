@@ -149,14 +149,24 @@ def _setup_loop_exception_handler():
 async def _event_loop_lag_monitor():
     _setup_loop_exception_handler()
     lag_log = logging.getLogger("event_loop_lag")
+    consecutive_stuck = 0
     while True:
         try:
             t0 = asyncio.get_event_loop().time()
-            await asyncio.sleep(1)
-            lag_ms = (asyncio.get_event_loop().time() - t0 - 1.0) * 1000
-            if lag_ms > 200:
+            await asyncio.sleep(5)
+            lag_ms = (asyncio.get_event_loop().time() - t0 - 5.0) * 1000
+            if lag_ms > 5000:
+                consecutive_stuck += 1
                 all_tasks = [t for t in asyncio.all_tasks() if not t.done()]
-                lag_log.warning(f"event loop lag {lag_ms:.0f}ms | active_tasks={len(all_tasks)}")
+                lag_log.warning(f"event loop lag {lag_ms:.0f}ms (stuck {consecutive_stuck}/6) | active_tasks={len(all_tasks)}")
+                if consecutive_stuck >= 6:
+                    lag_log.critical(f"Event loop stuck for {consecutive_stuck * 5}s+, forcing exit for systemd restart")
+                    import os, signal
+                    os.kill(os.getpid(), signal.SIGTERM)
+            else:
+                consecutive_stuck = 0
+                if lag_ms > 200:
+                    lag_log.warning(f"event loop lag {lag_ms:.0f}ms")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -310,12 +320,12 @@ class PersonCreate(BaseModel):
     note: str = ""
 
 @app.get("/api/persons")
-async def api_list_persons(entity_type: str = None, authorization: str = Header(default="")):
+def api_list_persons(entity_type: str = None, authorization: str = Header(default="")):
     verify_secret(authorization)
     return database.list_persons(entity_type=entity_type)
 
 @app.get("/api/persons/{person_id}")
-async def api_get_person(person_id: str, authorization: str = Header(default="")):
+def api_get_person(person_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
     person = database.get_person(person_id)
     if not person:
@@ -323,13 +333,13 @@ async def api_get_person(person_id: str, authorization: str = Header(default="")
     return person
 
 @app.post("/api/persons")
-async def api_create_person(body: PersonCreate, authorization: str = Header(default="")):
+def api_create_person(body: PersonCreate, authorization: str = Header(default="")):
     verify_secret(authorization)
     database.upsert_person(body.model_dump())
     return {"person_id": body.person_id, "status": "created"}
 
 @app.put("/api/persons/{person_id}")
-async def api_update_person(person_id: str, body: PersonCreate, authorization: str = Header(default="")):
+def api_update_person(person_id: str, body: PersonCreate, authorization: str = Header(default="")):
     verify_secret(authorization)
     data = body.model_dump()
     data["person_id"] = person_id
@@ -337,7 +347,7 @@ async def api_update_person(person_id: str, body: PersonCreate, authorization: s
     return {"person_id": person_id, "status": "updated"}
 
 @app.delete("/api/persons/{person_id}")
-async def api_delete_person(person_id: str, authorization: str = Header(default="")):
+def api_delete_person(person_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
     ok = database.delete_person(person_id)
     if not ok:
@@ -345,7 +355,7 @@ async def api_delete_person(person_id: str, authorization: str = Header(default=
     return {"person_id": person_id, "status": "deleted"}
 
 @app.get("/api/persons/{person_id}/memories")
-async def api_person_memories(person_id: str, limit: int = 50, page: int = 1, authorization: str = Header(default="")):
+def api_person_memories(person_id: str, limit: int = 50, page: int = 1, authorization: str = Header(default="")):
     verify_secret(authorization)
     p = database.get_person(person_id)
     if not p:
@@ -357,7 +367,7 @@ async def api_person_memories(person_id: str, limit: int = 50, page: int = 1, au
 
 
 @app.get("/api/persons/resolve/{name}")
-async def api_resolve_alias(name: str, scope: str = "household", authorization: str = Header(default="")):
+def api_resolve_alias(name: str, scope: str = "household", authorization: str = Header(default="")):
     verify_secret(authorization)
     pid = database.resolve_alias(name, scope)
     if not pid:
@@ -726,7 +736,7 @@ async def api_maintain(background_tasks: BackgroundTasks, authorization: str = H
 
 
 @app.get("/api/daemon/status")
-async def api_daemon_status(authorization: str = Header(default="")):
+def api_daemon_status(authorization: str = Header(default="")):
     """查看最近一次后台整理报告。"""
     verify_secret(authorization)
     import daemon_status
@@ -754,7 +764,7 @@ async def api_run_dreams(background_tasks: BackgroundTasks, force: bool = False,
 
 
 @app.get("/api/dream/status")
-async def api_dream_status(authorization: str = Header(default="")):
+def api_dream_status(authorization: str = Header(default="")):
     """查看最近一次梦境生成诊断。"""
     verify_secret(authorization)
     from dream import read_dream_status
@@ -985,14 +995,14 @@ async def api_activity_stats(authorization: str = Header(default="")):
 # ── AI Profile API + get_llm_config_for_ai ──
 
 @app.get("/api/ai-aliases")
-async def api_ai_aliases():
+def api_ai_aliases():
     """返回 AI 别名映射，前端用于解析 cloudy→claude 等"""
     from config import AI_ALIASES
     return {"aliases": AI_ALIASES}
 
 
 @app.get("/api/stats/ai/{ai_id}")
-async def api_ai_stats(ai_id: str, authorization: str = Header(default="")):
+def api_ai_stats(ai_id: str, authorization: str = Header(default="")):
     verify_secret(authorization)
     from config import AI_ALIASES, AI_ALIAS_GROUPS
     canonical = AI_ALIASES.get(ai_id, ai_id)
@@ -1011,7 +1021,7 @@ async def api_ai_stats(ai_id: str, authorization: str = Header(default="")):
 
 
 @app.get("/api/ai-profiles")
-async def api_list_profiles(authorization: str = Header(default="")):
+def api_list_profiles(authorization: str = Header(default="")):
     """获取所有 AI 档案（合并别名：cloudy/claude 显示为一个小克）"""
     verify_secret(authorization)
     from ai_profiles import get_all_profiles, get_model_profile
@@ -1224,7 +1234,7 @@ async def api_delete_profile(ai_id: str, authorization: str = Header(default="")
 # ── Phase 6 P0: 前端可观测性 API ──
 
 @app.get("/api/memory/{memory_id}/detail")
-async def api_memory_detail(memory_id: str, authorization: str = Header(default="")):
+def api_memory_detail(memory_id: str, authorization: str = Header(default="")):
     """完整记忆详情：正文 + source_context + history + supersede 链 + 关联记忆"""
     verify_secret(authorization)
     import database as db
@@ -1314,7 +1324,7 @@ async def api_memory_detail(memory_id: str, authorization: str = Header(default=
 
 
 @app.get("/api/memory/timeline")
-async def api_memory_timeline(
+def api_memory_timeline(
     days: int = Query(default=90, le=365),
     room: str = Query(default=None),
     source_ai: str = Query(default=None),
@@ -1380,7 +1390,7 @@ async def api_memory_timeline(
 
 
 @app.get("/api/memory/by-date")
-async def api_memory_by_date(
+def api_memory_by_date(
     date: str = Query(...),
     authorization: str = Header(default=""),
 ):
@@ -1399,7 +1409,7 @@ async def api_memory_by_date(
 
 
 @app.get("/api/memory/calendar")
-async def api_memory_calendar(
+def api_memory_calendar(
     months: int = Query(default=6, le=12),
     authorization: str = Header(default=""),
 ):
@@ -1423,7 +1433,7 @@ async def api_memory_calendar(
 
 
 @app.get("/api/memory/graph")
-async def api_memory_graph(authorization: str = Header(default="")):
+def api_memory_graph(authorization: str = Header(default="")):
     """记忆星图数据：nodes + edges（共 tag / 同日 / supersede）"""
     verify_secret(authorization)
     import database as db
@@ -1501,7 +1511,7 @@ async def api_memory_graph(authorization: str = Header(default="")):
 
 
 @app.get("/api/memory/emotion-map")
-async def api_memory_emotion_map(authorization: str = Header(default="")):
+def api_memory_emotion_map(authorization: str = Header(default="")):
     """所有记忆的 valence/arousal 散点数据"""
     verify_secret(authorization)
     import database as db
@@ -1526,7 +1536,7 @@ async def api_memory_emotion_map(authorization: str = Header(default="")):
 
 
 @app.get("/api/memory/decay-scores")
-async def api_memory_decay_scores(authorization: str = Header(default="")):
+def api_memory_decay_scores(authorization: str = Header(default="")):
     """每条记忆的当前衰减分数 + 健康状态"""
     verify_secret(authorization)
     import database as db
