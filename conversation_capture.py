@@ -62,13 +62,46 @@ def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
     except Exception as e:
         logger.warning(f"[Pulse] capture update skipped: {e}")
 
+def _build_identity_block() -> str:
+    """从 persons 表动态生成身份提示，让小模型认识所有已知人物。"""
+    try:
+        persons = database.list_persons()
+    except Exception:
+        persons = []
+    if not persons:
+        return (
+            "- \"用户\"/\"主人\" = ceci（也叫小猫）。只提取跟 ceci 相关的信息\n"
+            "- Jasper/狗蛋、Lucien、Cloudy/小克 是AI bot，其他人是群友"
+        )
+    lines = []
+    for p in persons:
+        name = p.get("canonical_name", p["person_id"])
+        etype = p.get("entity_type", "other")
+        aliases_raw = p.get("aliases", "[]")
+        if isinstance(aliases_raw, str):
+            import json as _json
+            try:
+                alias_list = _json.loads(aliases_raw)
+            except Exception:
+                alias_list = []
+        else:
+            alias_list = aliases_raw
+        alias_names = [a["name"] for a in alias_list if isinstance(a, dict) and a.get("name")]
+        all_names = [name] + [n for n in alias_names if n != name]
+        label = {"user": "用户本人", "ai": "AI bot"}.get(etype, "群友/其他")
+        lines.append(f"- {'/'.join(all_names)} = {label}（同一个人，不要当成多个人）")
+    lines.append("- 不在上面列表里的名字 = 群友。不用泛称\"AI\"，写具体名字")
+    lines.append("- 只提取跟 ceci 相关的信息。谁说的写谁，别人说的不能写成\"ceci说\"")
+    return "\n".join(lines)
+
+
 # ── 基础提取 prompt（私聊 + 通用） ──
-EXTRACT_PROMPT_BASE = """记忆提取：从对话中提取值得长期记住的原子事实。
+def _extract_prompt_base() -> str:
+    identity = _build_identity_block()
+    return f"""记忆提取：从对话中提取值得长期记住的原子事实。
 
 ## 身份：
-- "用户"/"主人" = ceci（也叫小猫）。只提取跟 ceci 相关的信息
-- Jasper/狗蛋、Lucien、Cloudy/小克 是AI bot，其他人是群友
-- 不用泛称"AI"，写具体名字。谁说的写谁，别人说的不能写成"ceci说"
+{identity}
 
 ## 三条铁律：
 1. **只记原文说了什么，不分析为什么** — 禁止"表现出对XX的喜爱""显示出XX倾向"这类分析
@@ -137,7 +170,7 @@ preferences 只收长期稳定的偏好（"怕蜘蛛"级别），一次性事件
 
 def _get_extract_prompt(chat_type: str) -> str:
     """根据聊天类型组装提取 prompt"""
-    base = EXTRACT_PROMPT_BASE
+    base = _extract_prompt_base()
     if chat_type == "private_group":
         base += EXTRACT_PROMPT_PRIVATE_GROUP
     elif chat_type == "public_group":

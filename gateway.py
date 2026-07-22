@@ -488,10 +488,37 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
     except Exception:
         glossary = ""
 
+    # 从 persons 表补充身份信息（别名归一）
+    persons_block = ""
+    try:
+        persons = database.list_persons()
+        if persons:
+            plines = []
+            for p in persons:
+                name = p.get("canonical_name", p["person_id"])
+                etype = p.get("entity_type", "other")
+                aliases_raw = p.get("aliases", "[]")
+                if isinstance(aliases_raw, str):
+                    try:
+                        alias_list = json.loads(aliases_raw)
+                    except Exception:
+                        alias_list = []
+                else:
+                    alias_list = aliases_raw
+                alias_names = [a["name"] for a in alias_list if isinstance(a, dict) and a.get("name")]
+                all_names = [name] + [n for n in alias_names if n != name]
+                label = {"user": "用户本人", "ai": "AI bot"}.get(etype, "群友")
+                plines.append(f"- {'/'.join(all_names)} = {label}（同一个人）")
+            plines.append("- 不在列表里的名字 = 群友")
+            persons_block = "\n".join(plines)
+    except Exception:
+        pass
+
     prompt = f"""记忆提取：从对话中提取值得长期记住的原子事实。
 
 {glossary}
-（人名统一用主称呼。人名即使像动物也是人，不是宠物。）
+{persons_block}
+（人名统一用主称呼。人名即使像动物也是人，不是宠物。同一个人的不同称呼不要当成多个人。）
 
 用户(ceci)说：{user_message[:1500]}
 {ai_id}回复：{ai_response[:1500]}
