@@ -2265,7 +2265,9 @@ class MCPGateway:
             methods.append("unparsed")
             request_ids.append(f"parse_error:{type(exc).__name__}")
 
-        identity = await get_mcp_identity_async()
+        if not hasattr(self, "_mcp_identity_cache"):
+            self._mcp_identity_cache = await get_mcp_identity_async()
+        identity = self._mcp_identity_cache
         response_status = None
         response_body = b""
 
@@ -2278,7 +2280,12 @@ class MCPGateway:
             await send(message)
 
         try:
-            await _mcp_session_manager.handle_request(scope, replay_receive, audit_send)
+            method = scope.get("method", "GET")
+            mcp_coro = _mcp_session_manager.handle_request(scope, replay_receive, audit_send)
+            if method != "GET":
+                await asyncio.wait_for(mcp_coro, timeout=30.0)
+            else:
+                await mcp_coro
         except Exception as e:
             import traceback
             traceback.print_exc()
