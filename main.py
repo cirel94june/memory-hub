@@ -2222,115 +2222,40 @@ class MCPGateway:
             await send({"type": "http.response.body", "body": b"MCP not initialized"})
             return
 
-        from mcp_server import _audit, get_mcp_identity_async
+        method = scope.get("method", "GET").upper()
 
-        body_events = []
-        body = b""
-        while True:
-            event = await receive()
-            body_events.append(event)
-            if event.get("type") == "http.request":
-                body += event.get("body", b"")
-                if not event.get("more_body", False):
-                    break
-            else:
-                break
-
-        replay_index = 0
-        async def replay_receive():
-            nonlocal replay_index
-            if replay_index < len(body_events):
-                event = body_events[replay_index]
-                replay_index += 1
-                return event
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        headers = {
-            k.decode("latin1").lower(): v.decode("latin1", errors="replace")
-            for k, v in scope.get("headers", [])
-        }
-        methods = []
-        request_ids = []
-        try:
-            if body.strip():
-                request_payload = json.loads(body.decode("utf-8", errors="replace"))
-                items = request_payload if isinstance(request_payload, list) else [request_payload]
-                for item in items:
-                    if isinstance(item, dict):
-                        if item.get("method"):
-                            methods.append(item.get("method"))
-                        if "id" in item:
-                            request_ids.append(item.get("id"))
-        except Exception as exc:
-            methods.append("unparsed")
-            request_ids.append(f"parse_error:{type(exc).__name__}")
-
-        if not hasattr(self, "_mcp_identity_cache"):
-            self._mcp_identity_cache = await get_mcp_identity_async()
-        identity = self._mcp_identity_cache
-        response_status = None
-        response_body = b""
-
-        async def audit_send(message):
-            nonlocal response_status, response_body
-            if message.get("type") == "http.response.start":
-                response_status = message.get("status")
-            elif message.get("type") == "http.response.body":
-                response_body += message.get("body", b"")
-            await send(message)
+        # stateless_http + json_response 模式下不需要 SSE 长连接
+        # GET /mcp 是 SSE 端点，会无限阻塞事件循环，必须拒绝
+        if method == "GET":
+            await send({"type": "http.response.start", "status": 405,
+                       "headers": [(b"content-type", b"text/plain"),
+                                   (b"allow", b"POST, DELETE")]})
+            await send({"type": "http.response.body",
+                       "body": b"SSE not supported. This server uses stateless HTTP (json_response)."})
+            return
 
         try:
-            method = scope.get("method", "GET")
-            mcp_coro = _mcp_session_manager.handle_request(scope, replay_receive, audit_send)
-            if method != "GET":
-                await asyncio.wait_for(mcp_coro, timeout=30.0)
-            else:
-                await mcp_coro
+            await asyncio.wait_for(
+                _mcp_session_manager.handle_request(scope, receive, send),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logging.getLogger("mcp").error("MCP POST request timed out after 30s")
+            try:
+                await send({"type": "http.response.start", "status": 504,
+                           "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"MCP request timed out"})
+            except Exception:
+                pass
         except Exception as e:
             import traceback
             traceback.print_exc()
-            _audit(
-                "mcp_http_error",
-                methods=methods,
-                request_ids=request_ids,
-                error_type=type(e).__name__,
-                error=str(e),
-                tool_count=identity.get("tool_count"),
-                tool_schema_hash=identity.get("tool_schema_hash"),
-                user_agent=headers.get("user-agent", ""),
-                client=headers.get("x-forwarded-for", "") or headers.get("cf-connecting-ip", ""),
-            )
-            await send({"type": "http.response.start", "status": 500,
-                       "headers": [(b"content-type", b"text/plain")]})
-            await send({"type": "http.response.body", "body": f"MCP Error: {e}".encode()})
-            return
-
-        response_tool_count = None
-        if "tools/list" in methods:
             try:
-                response_payload = json.loads(response_body.decode("utf-8", errors="replace"))
-                response_items = response_payload if isinstance(response_payload, list) else [response_payload]
-                for item in response_items:
-                    if isinstance(item, dict):
-                        tools = (item.get("result") or {}).get("tools")
-                        if isinstance(tools, list):
-                            response_tool_count = len(tools)
-                            break
+                await send({"type": "http.response.start", "status": 500,
+                           "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": f"MCP Error: {e}".encode()})
             except Exception:
-                response_tool_count = None
-
-        _audit(
-            "mcp_http_request",
-            methods=methods,
-            request_ids=request_ids,
-            status=response_status,
-            service_tool_count=identity.get("tool_count"),
-            response_tool_count=response_tool_count,
-            tool_schema_hash=identity.get("tool_schema_hash"),
-            version=identity.get("version"),
-            user_agent=headers.get("user-agent", "")[:240],
-            client=headers.get("x-forwarded-for", "") or headers.get("cf-connecting-ip", ""),
-        )
+                pass
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
