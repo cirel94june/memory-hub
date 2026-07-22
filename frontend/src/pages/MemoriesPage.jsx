@@ -120,15 +120,16 @@ function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
 
   useEffect(() => {
     fetch(`/api/stats/ai/${encodeURIComponent(aiId)}`, { headers: authHeaders })
-      .then((r) => r.json())
-      .then(setAiStats)
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d) setAiStats(d); })
       .catch(() => {});
   }, [aiId]);
 
   const ai = getAI(aiId);
   const label = ai.name;
   const emoji = ai.emoji;
-  const maxCount = aiStats ? Math.max(1, ...aiStats.rooms.map((r) => r.count)) : 1;
+  const rooms = aiStats?.rooms || [];
+  const maxCount = rooms.length ? Math.max(1, ...rooms.map((r) => r.count)) : 1;
 
   return (
     <div>
@@ -145,9 +146,9 @@ function AiRoomView({ aiId, authHeaders, onSelectRoom, onBack }) {
         </div>
       </div>
 
-      {aiStats && (
+      {rooms.length > 0 && (
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--space-sm)" }}>
-          {aiStats.rooms.map((r) => (
+          {rooms.map((r) => (
             <div key={r.room} className="glass" style={{
               padding: "var(--space-md)", cursor: "pointer",
               transition: "transform var(--transition-fast)",
