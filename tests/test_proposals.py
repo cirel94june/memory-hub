@@ -108,13 +108,16 @@ def test_triage_ai_provenance():
 
 
 def test_triage_observation_silent_approve():
-    """observation + literal + ai_summary + high confidence → auto_approve_silent."""
+    """observation + literal + ai_summary + confidence>=0.7 → auto_approve_silent."""
     assert _triage_proposal(_prop(
         claim_type="observation", provenance_type="ai_summary", confidence=0.7,
     )) == "auto_approve_silent"
-    # low confidence → pending
     assert _triage_proposal(_prop(
-        claim_type="observation", provenance_type="ai_summary", confidence=0.4,
+        claim_type="observation", provenance_type="ai_summary", confidence=0.9,
+    )) == "auto_approve_silent"
+    # below threshold → pending
+    assert _triage_proposal(_prop(
+        claim_type="observation", provenance_type="ai_summary", confidence=0.6,
     )) == "observation_low_confidence"
     # untrusted provenance → pending
     assert _triage_proposal(_prop(
@@ -170,21 +173,32 @@ def fake_env(monkeypatch, tmp_path):
     return mems
 
 
-def test_quick_ai_summary_auto_approves_silent(fake_env):
-    """ai_summary → observation + literal → auto_approve_silent with capped importance."""
+def test_quick_ai_summary_default_confidence_pending(fake_env):
+    """ai_summary base confidence 0.6 < threshold 0.7 → pending."""
     result = asyncio.run(memory_ops.remember(
         content="ceci喜欢看动漫",
         quick=True,
         provenance_type="ai_summary",
         source_ai="claude",
-        importance=0.7,
+    ))
+    assert result["proposal_status"] == "pending"
+    assert result["id"].startswith("prop_")
+    assert not any(m.get("content") == "ceci喜欢看动漫" for m in fake_env.values())
+
+
+def test_quick_ai_summary_high_confidence_silent(fake_env):
+    """ai_summary with explicit high confidence → auto_approve_silent."""
+    result = asyncio.run(memory_ops.remember(
+        content="ceci最近在学日语",
+        quick=True,
+        provenance_type="ai_summary",
+        source_ai="claude",
+        fact_confidence=0.8,
     ))
     assert result["proposal_status"] == "auto_approved"
     assert result.get("recall_policy") == "silent"
-    # 入库了
-    matching = [m for m in fake_env.values() if m.get("content") == "ceci喜欢看动漫"]
+    matching = [m for m in fake_env.values() if m.get("content") == "ceci最近在学日语"]
     assert len(matching) == 1
-    # importance 被 cap 到 0.4
     assert float(matching[0].get("importance", 1)) <= 0.4
 
 

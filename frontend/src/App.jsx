@@ -11,6 +11,7 @@ import GroupChatPage from "./pages/GroupChatPage";
 import ForumPage from "./pages/ForumPage";
 import AiProfilesPage from "./pages/AiProfilesPage";
 import PersonsPage from "./pages/PersonsPage";
+import ProposalsPage from "./pages/ProposalsPage";
 import ThemePage from "./pages/ThemePage";
 import SettingsPage from "./pages/SettingsPage";
 import PulsePage from "./pages/PulsePage";
@@ -38,6 +39,7 @@ export default function App() {
               <Route path="forum" element={<ForumPage />} />
               <Route path="ai-profiles" element={<AiProfilesPage />} />
               <Route path="persons" element={<PersonsPage />} />
+              <Route path="proposals" element={<ProposalsPage />} />
               <Route path="theme" element={<ThemePage />} />
               <Route path="settings" element={<SettingsPage />} />
             </Route>

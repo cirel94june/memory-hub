@@ -563,9 +563,9 @@ def _triage_proposal(proposal: dict) -> str:
 
     if ct == "observation":
         conf = float(proposal.get("confidence", 0.5))
-        if conf >= 0.6 and prov in _AUTO_APPROVE_PROVENANCE:
+        if conf >= 0.7 and prov in _AUTO_APPROVE_PROVENANCE:
             return "auto_approve_silent"
-        return "observation_low_confidence" if conf < 0.6 else f"provenance_{prov or 'unknown'}"
+        return "observation_low_confidence" if conf < 0.7 else f"provenance_{prov or 'unknown'}"
 
     return f"{ct}_claim"
 

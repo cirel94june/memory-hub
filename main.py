@@ -703,6 +703,27 @@ async def api_force_extract(authorization: str = Header(default="")):
     verify_secret(authorization)
     return await conversation_capture.force_extract()
 
+@app.get("/api/proposals")
+async def api_list_proposals(
+    status: str = "pending", page: int = 1, per_page: int = 50,
+    authorization: str = Header(default=""),
+):
+    verify_secret(authorization)
+    return await memory_ops.list_proposals(status=status, limit=per_page, page=page)
+
+@app.post("/api/proposals/{proposal_id}/review")
+async def api_review_proposal(
+    proposal_id: str, request: Request, authorization: str = Header(default=""),
+):
+    verify_secret(authorization)
+    body = await request.json()
+    return await memory_ops.review_proposal(
+        proposal_id=proposal_id,
+        action=body.get("action", ""),
+        reviewed_by=body.get("reviewed_by", "user"),
+        reject_reason=body.get("reject_reason", ""),
+    )
+
 @app.post("/api/proposals/retriage")
 async def api_retriage_proposals(authorization: str = Header(default="")):
     """用更新后的分流规则重新评估所有 pending proposals"""
