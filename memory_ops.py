@@ -178,7 +178,7 @@ _PROVENANCE_CONFIDENCE = {
     "user_correction": 1.0,
     "user_statement": 0.9,
     "user_quote": 0.8,
-    "ai_summary": 0.5,
+    "ai_summary": 0.6,
     "roleplay_meme": 0.4,
     "diary": 0.4,
     "ai_speculation": 0.3,
@@ -484,7 +484,7 @@ _SENSITIVE_ROOMS = {"health", "psychology"}
 _CLAIM_TYPE_MAP = {
     "user_statement": "fact", "user_correction": "fact",
     "user_quote": "observation",
-    "ai_summary": "fact", "ai_speculation": "hypothesis",
+    "ai_summary": "observation", "ai_speculation": "hypothesis",
     "roleplay_meme": "observation",
 }
 
@@ -531,14 +531,21 @@ def _guard_speech_mode(proposal: dict) -> None:
 
 
 def _triage_proposal(proposal: dict) -> str:
-    """Returns 'auto_approve' or a reason string for why it's pending."""
+    """Returns 'auto_approve' / 'auto_approve_silent' or a reason string.
+
+    auto_approve: fact + literal + trusted provenance + no conflict
+    auto_approve_silent: observation + literal + high confidence + no conflict + low-sensitivity
+        → enters memory store but with capped importance (recall_policy=silent)
+    """
     _guard_speech_mode(proposal)
     conflicts = json.loads(proposal.get("conflicts_with", "[]"))
     if conflicts:
         return "conflicts_with_existing"
     if proposal.get("conflict_check_failed"):
         return "conflict_check_failed"
-    if proposal.get("proposed_room", "") in _SENSITIVE_ROOMS:
+    room = proposal.get("proposed_room", "")
+    is_sensitive = room in _SENSITIVE_ROOMS
+    if is_sensitive:
         return "sensitive_room"
     ck = proposal.get("conversation_kind", "")
     if ck in ("game_world", "game_discussion"):
@@ -546,13 +553,21 @@ def _triage_proposal(proposal: dict) -> str:
     sm = proposal.get("speech_mode", "uncertain")
     if sm != "literal":
         return f"{sm}_speech_mode"
-    ct = proposal.get("claim_type", "observation")
-    if ct != "fact":
-        return f"{ct}_claim"
     prov = (proposal.get("provenance_type") or "").strip()
-    if prov not in _AUTO_APPROVE_PROVENANCE:
-        return f"provenance_{prov or 'unknown'}"
-    return "auto_approve"
+    ct = proposal.get("claim_type", "observation")
+
+    if ct == "fact":
+        if prov not in _AUTO_APPROVE_PROVENANCE:
+            return f"provenance_{prov or 'unknown'}"
+        return "auto_approve"
+
+    if ct == "observation":
+        conf = float(proposal.get("confidence", 0.5))
+        if conf >= 0.6 and prov in _AUTO_APPROVE_PROVENANCE:
+            return "auto_approve_silent"
+        return "observation_low_confidence" if conf < 0.6 else f"provenance_{prov or 'unknown'}"
+
+    return f"{ct}_claim"
 
 
 async def _create_proposal(
@@ -629,8 +644,13 @@ async def _create_proposal(
 
     proposal["triage_reason"] = decision
 
-    if decision == "auto_approve":
-        # 先以 pending 入库，promote 成功后再标 auto_approved
+    if decision in ("auto_approve", "auto_approve_silent"):
+        if decision == "auto_approve_silent":
+            proposal["importance"] = min(float(proposal.get("importance", 0.5)), 0.4)
+            existing_tags = json.loads(proposal.get("tags", "[]")) if isinstance(proposal.get("tags"), str) else (proposal.get("tags") or [])
+            if "auto_observation" not in existing_tags:
+                existing_tags.append("auto_observation")
+            proposal["tags"] = json.dumps(existing_tags)
         proposal["status"] = "pending"
         database.insert_proposal(proposal)
         try:
@@ -641,6 +661,8 @@ async def _create_proposal(
             )
             result["proposal_id"] = prop_id
             result["proposal_status"] = "auto_approved"
+            if decision == "auto_approve_silent":
+                result["recall_policy"] = "silent"
             return result
         except Exception as e:
             database.update_proposal_status(
@@ -754,7 +776,13 @@ async def retriage_pending_proposals() -> dict:
         if not prop.get("speech_mode") or prop.get("speech_mode") == "uncertain":
             prop["speech_mode"] = _provenance_to_speech_mode(prov)
         decision = _triage_proposal(prop)
-        if decision == "auto_approve":
+        if decision in ("auto_approve", "auto_approve_silent"):
+            if decision == "auto_approve_silent":
+                prop["importance"] = min(float(prop.get("importance", 0.5)), 0.4)
+                existing_tags = json.loads(prop.get("tags", "[]")) if isinstance(prop.get("tags"), str) else (prop.get("tags") or [])
+                if "auto_observation" not in existing_tags:
+                    existing_tags.append("auto_observation")
+                prop["tags"] = json.dumps(existing_tags)
             try:
                 result = await _promote_proposal(prop)
                 mem_id = result.get("id", "")

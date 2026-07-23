@@ -32,7 +32,7 @@ def test_provenance_to_claim_type():
     assert _provenance_to_claim_type("user_statement") == "fact"
     assert _provenance_to_claim_type("user_correction") == "fact"
     assert _provenance_to_claim_type("user_quote") == "observation"
-    assert _provenance_to_claim_type("ai_summary") == "fact"
+    assert _provenance_to_claim_type("ai_summary") == "observation"
     assert _provenance_to_claim_type("ai_speculation") == "hypothesis"
     assert _provenance_to_claim_type("roleplay_meme") == "observation"
     assert _provenance_to_claim_type("") == "observation"
@@ -89,8 +89,9 @@ def test_triage_non_literal_blocks():
     assert _triage_proposal(_prop(speech_mode="uncertain")) == "uncertain_speech_mode"
 
 
-def test_triage_observation_blocks():
-    assert _triage_proposal(_prop(claim_type="observation")) == "observation_claim"
+def test_triage_observation_low_confidence_blocks():
+    """observation with default confidence (0.5 < 0.6) stays pending."""
+    assert _triage_proposal(_prop(claim_type="observation")) == "observation_low_confidence"
 
 
 def test_triage_hypothesis_blocks():
@@ -98,10 +99,27 @@ def test_triage_hypothesis_blocks():
 
 
 def test_triage_ai_provenance():
-    """ai_summary 自动通过（主要的自动提取来源），ai_speculation 和空 provenance 仍然拦截。"""
+    """ai_summary provenance with fact claim still auto-approves (fact path)."""
     assert _triage_proposal(_prop(provenance_type="ai_summary")) == "auto_approve"
+    # ai_speculation is not in _AUTO_APPROVE_PROVENANCE
     assert _triage_proposal(_prop(provenance_type="ai_speculation")) == "provenance_ai_speculation"
+    # empty provenance → blocked
     assert _triage_proposal(_prop(provenance_type="")) == "provenance_unknown"
+
+
+def test_triage_observation_silent_approve():
+    """observation + literal + ai_summary + high confidence → auto_approve_silent."""
+    assert _triage_proposal(_prop(
+        claim_type="observation", provenance_type="ai_summary", confidence=0.7,
+    )) == "auto_approve_silent"
+    # low confidence → pending
+    assert _triage_proposal(_prop(
+        claim_type="observation", provenance_type="ai_summary", confidence=0.4,
+    )) == "observation_low_confidence"
+    # untrusted provenance → pending
+    assert _triage_proposal(_prop(
+        claim_type="observation", provenance_type="", confidence=0.8,
+    )) == "provenance_unknown"
 
 
 def test_triage_conflict_check_failed_blocks():
@@ -152,16 +170,22 @@ def fake_env(monkeypatch, tmp_path):
     return mems
 
 
-def test_quick_ai_summary_auto_approves(fake_env):
-    """ai_summary + fact + literal = 自动通过，直接入库。"""
+def test_quick_ai_summary_auto_approves_silent(fake_env):
+    """ai_summary → observation + literal → auto_approve_silent with capped importance."""
     result = asyncio.run(memory_ops.remember(
         content="ceci喜欢看动漫",
         quick=True,
         provenance_type="ai_summary",
         source_ai="claude",
+        importance=0.7,
     ))
     assert result["proposal_status"] == "auto_approved"
-    assert any(m.get("content") == "ceci喜欢看动漫" for m in fake_env.values())
+    assert result.get("recall_policy") == "silent"
+    # 入库了
+    matching = [m for m in fake_env.values() if m.get("content") == "ceci喜欢看动漫"]
+    assert len(matching) == 1
+    # importance 被 cap 到 0.4
+    assert float(matching[0].get("importance", 1)) <= 0.4
 
 
 def test_quick_user_statement_auto_approves(fake_env):
