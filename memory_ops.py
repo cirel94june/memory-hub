@@ -484,7 +484,7 @@ _SENSITIVE_ROOMS = {"health", "psychology"}
 _CLAIM_TYPE_MAP = {
     "user_statement": "fact", "user_correction": "fact",
     "user_quote": "observation",
-    "ai_summary": "observation", "ai_speculation": "hypothesis",
+    "ai_summary": "fact", "ai_speculation": "hypothesis",
     "roleplay_meme": "observation",
 }
 
@@ -504,7 +504,7 @@ def _provenance_to_speech_mode(prov: str) -> str:
     return _SPEECH_MODE_MAP.get(prov, "uncertain")
 
 
-_AUTO_APPROVE_PROVENANCE = {"user_statement", "user_correction"}
+_AUTO_APPROVE_PROVENANCE = {"user_statement", "user_correction", "ai_summary"}
 
 
 _PLAYFUL_KEYWORDS = (
@@ -564,6 +564,8 @@ async def _create_proposal(
     evidence_excerpt: str,
     subject_id: str = "", source_speaker_id: str = "",
 ) -> dict:
+    if not provenance_type and "auto_capture" in (source_platform or ""):
+        provenance_type = "ai_summary"
     ct = claim_type or _provenance_to_claim_type(provenance_type)
     sm = speech_mode or _provenance_to_speech_mode(provenance_type)
     if fact_confidence is None:
@@ -732,6 +734,40 @@ async def review_proposal(
         return {"proposal_id": proposal_id, "status": "rejected", "reason": reject_reason}
     else:
         return {"error": f"Unknown action: {action}"}
+
+
+async def retriage_pending_proposals() -> dict:
+    """Re-evaluate all pending proposals with current triage rules.
+    Auto-approve those that now pass; leave others as pending."""
+    all_pending = database.list_proposals(status="pending", limit=500, offset=0)
+    approved = 0
+    failed = 0
+    still_pending = 0
+    for prop in all_pending:
+        # Re-derive claim_type/speech_mode if provenance changed
+        prov = (prop.get("provenance_type") or "").strip()
+        if not prov and "auto_capture" in (prop.get("source_platform") or ""):
+            prov = "ai_summary"
+            prop["provenance_type"] = prov
+        if not prop.get("claim_type") or prop.get("claim_type") == "observation":
+            prop["claim_type"] = _provenance_to_claim_type(prov)
+        if not prop.get("speech_mode") or prop.get("speech_mode") == "uncertain":
+            prop["speech_mode"] = _provenance_to_speech_mode(prov)
+        decision = _triage_proposal(prop)
+        if decision == "auto_approve":
+            try:
+                result = await _promote_proposal(prop)
+                mem_id = result.get("id", "")
+                database.update_proposal_status(
+                    prop["id"], "auto_approved", "retriage", applied_memory_id=mem_id,
+                )
+                approved += 1
+            except Exception as e:
+                logger.error(f"Retriage promote failed: {prop['id']} - {e}")
+                failed += 1
+        else:
+            still_pending += 1
+    return {"approved": approved, "failed": failed, "still_pending": still_pending, "total": len(all_pending)}
 
 
 def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:

@@ -32,7 +32,7 @@ def test_provenance_to_claim_type():
     assert _provenance_to_claim_type("user_statement") == "fact"
     assert _provenance_to_claim_type("user_correction") == "fact"
     assert _provenance_to_claim_type("user_quote") == "observation"
-    assert _provenance_to_claim_type("ai_summary") == "observation"
+    assert _provenance_to_claim_type("ai_summary") == "fact"
     assert _provenance_to_claim_type("ai_speculation") == "hypothesis"
     assert _provenance_to_claim_type("roleplay_meme") == "observation"
     assert _provenance_to_claim_type("") == "observation"
@@ -97,9 +97,9 @@ def test_triage_hypothesis_blocks():
     assert _triage_proposal(_prop(claim_type="hypothesis")) == "hypothesis_claim"
 
 
-def test_triage_ai_provenance_blocks_even_fact_literal():
-    """AI 出处 + fact + literal 不能自动通过（防小模型误标）。"""
-    assert _triage_proposal(_prop(provenance_type="ai_summary")) == "provenance_ai_summary"
+def test_triage_ai_provenance():
+    """ai_summary 自动通过（主要的自动提取来源），ai_speculation 和空 provenance 仍然拦截。"""
+    assert _triage_proposal(_prop(provenance_type="ai_summary")) == "auto_approve"
     assert _triage_proposal(_prop(provenance_type="ai_speculation")) == "provenance_ai_speculation"
     assert _triage_proposal(_prop(provenance_type="")) == "provenance_unknown"
 
@@ -152,18 +152,16 @@ def fake_env(monkeypatch, tmp_path):
     return mems
 
 
-def test_quick_ai_summary_creates_pending_proposal(fake_env):
+def test_quick_ai_summary_auto_approves(fake_env):
+    """ai_summary + fact + literal = 自动通过，直接入库。"""
     result = asyncio.run(memory_ops.remember(
         content="ceci喜欢看动漫",
         quick=True,
         provenance_type="ai_summary",
         source_ai="claude",
     ))
-    assert result["status"] == "proposed"
-    assert result["proposal_status"] == "pending"
-    assert result["id"].startswith("prop_")
-    # 不应该在正式库中
-    assert not any(m.get("content") == "ceci喜欢看动漫" for m in fake_env.values())
+    assert result["proposal_status"] == "auto_approved"
+    assert any(m.get("content") == "ceci喜欢看动漫" for m in fake_env.values())
 
 
 def test_quick_user_statement_auto_approves(fake_env):

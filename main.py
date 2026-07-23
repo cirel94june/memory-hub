@@ -703,6 +703,12 @@ async def api_force_extract(authorization: str = Header(default="")):
     verify_secret(authorization)
     return await conversation_capture.force_extract()
 
+@app.post("/api/proposals/retriage")
+async def api_retriage_proposals(authorization: str = Header(default="")):
+    """用更新后的分流规则重新评估所有 pending proposals"""
+    verify_secret(authorization)
+    return await memory_ops.retriage_pending_proposals()
+
 @app.get("/api/capture/status")
 async def api_capture_status(authorization: str = Header(default="")):
     """查看对话缓冲区状态"""
