@@ -96,7 +96,7 @@ jobs:
 
             PASS="$(openssl rand -hex 32)"
             openssl enc -aes-256-cbc -salt -pbkdf2 -iter 10000               -in "$AUDIT_DIR/audit.txt" -out "$AUDIT_DIR/audit.enc"               -pass "pass:$PASS"
-            printf '%s' "$PASS" | openssl pkeyutl -encrypt -pubin               -inkey "$AUDIT_DIR/public.pem"               -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256               -out "$AUDIT_DIR/key.enc"
+            printf '%s' "$PASS" | openssl pkeyutl -encrypt -pubin               -inkey "$AUDIT_DIR/public.pem"               -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256               -out "$AUDIT_DIR/key.enc"
 
             echo "AUDIT_KEY_B64_BEGIN"
             base64 -w0 "$AUDIT_DIR/key.enc"
