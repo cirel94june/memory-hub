@@ -298,9 +298,13 @@ async def init_db(db_path: str = None) -> None:
     if "source_speaker_id" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN source_speaker_id TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated: added 'source_speaker_id' column")
+    if "info_type" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
+        logger.info("Migrated: added 'info_type' column")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
 
     # ── Proposals table (MemoryProposal 候选区) ──
     conn.executescript("""
@@ -347,10 +351,34 @@ async def init_db(db_path: str = None) -> None:
         ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
         ("subject_id", "TEXT NOT NULL DEFAULT ''"),
         ("source_speaker_id", "TEXT NOT NULL DEFAULT ''"),
+        ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
+        ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
+        ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
             logger.info(f"Migrated proposals: added '{col}' column")
+
+    # ── Maintenance Audit table ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS maintenance_audit (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            action              TEXT NOT NULL,
+            target_id           TEXT NOT NULL DEFAULT '',
+            new_content         TEXT NOT NULL DEFAULT '',
+            source_message_ids  TEXT NOT NULL DEFAULT '[]',
+            decision_reason     TEXT NOT NULL DEFAULT '',
+            state_before        TEXT NOT NULL DEFAULT '{}',
+            state_after         TEXT NOT NULL DEFAULT '{}',
+            model_id            TEXT NOT NULL DEFAULT '',
+            source_ai           TEXT NOT NULL DEFAULT '',
+            auto_executed       INTEGER NOT NULL DEFAULT 1,
+            created_at          TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
+        CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
+    """)
 
     # ── Persons table (人物名片) ──
     conn.executescript("""
@@ -385,7 +413,7 @@ _ALL_COLUMNS = [
     "supersedes", "superseded_by", "event_date", "source_context",
     "comments", "embedding", "status", "created_at", "updated_at",
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
-    "subject_id", "source_speaker_id",
+    "subject_id", "source_speaker_id", "info_type",
 ]
 
 
@@ -661,6 +689,7 @@ _PROPOSAL_COLUMNS = [
     "created_at", "reviewed_at", "reviewed_by", "reject_reason",
     "triage_reason", "applied_memory_id", "failure_reason",
     "subject_id", "source_speaker_id",
+    "info_type", "maintenance_action", "maintenance_target_id",
 ]
 
 
@@ -710,6 +739,51 @@ def count_proposals(status: str = "pending") -> int:
     row = conn.execute(
         "SELECT COUNT(*) FROM proposals WHERE status = ?", (status,)
     ).fetchone()
+    return row[0] if row else 0
+
+
+# ════════════════════════════════════════════
+#  Maintenance Audit CRUD
+# ════════════════════════════════════════════
+
+_AUDIT_COLUMNS = [
+    "action", "target_id", "new_content", "source_message_ids",
+    "decision_reason", "state_before", "state_after",
+    "model_id", "source_ai", "auto_executed", "created_at",
+]
+
+
+def insert_audit(row: dict) -> int:
+    conn = _get_conn()
+    values = [row.get(c, "") for c in _AUDIT_COLUMNS]
+    placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+    cols = ", ".join(_AUDIT_COLUMNS)
+    cur = conn.execute(f"INSERT INTO maintenance_audit ({cols}) VALUES ({placeholders})", values)
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = _get_conn()
+    if action:
+        rows = conn.execute(
+            "SELECT * FROM maintenance_audit WHERE action = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (action, limit, offset),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM maintenance_audit ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_audits(action: str = None) -> int:
+    conn = _get_conn()
+    if action:
+        row = conn.execute("SELECT COUNT(*) FROM maintenance_audit WHERE action = ?", (action,)).fetchone()
+    else:
+        row = conn.execute("SELECT COUNT(*) FROM maintenance_audit").fetchone()
     return row[0] if row else 0
 
 

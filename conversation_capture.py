@@ -157,6 +157,7 @@ EXTRACT_OUTPUT_FORMAT = """
     "speech_mode": "literal（正经）/playful（玩笑打闹）/fictional（角色扮演）/uncertain",
     "subject_name": "关于谁（人名，多人留空）",
     "speaker_name": "谁说的（人名）",
+    "info_type": "identity（身份/很少变）/state（当前状态/会过期）/event（已发生的事）/task（待办）/reflection（AI感受）/relationship（关系相关）",
     "corrects_old_value": "仅user_correction时填",
     "resolved": null（默认）或 false（仅"要做某事/待办/提醒我"时用）
   }
@@ -469,6 +470,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             speech_mode=item.get("speech_mode", ""),
             subject_id=subject_id,
             source_speaker_id=source_speaker_id,
+            info_type=item.get("info_type", ""),
         )
         memories.append(result)
 
@@ -582,6 +584,7 @@ async def extract_from_messages(
             speech_mode=item.get("speech_mode", ""),
             subject_id=subject_id,
             source_speaker_id=source_speaker_id,
+            info_type=item.get("info_type", ""),
         )
         memories.append(result)
 
