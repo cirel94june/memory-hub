@@ -559,7 +559,8 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
       "claim_type": "fact / observation / hypothesis（用户亲口说的=fact，AI总结=observation，推测=hypothesis）",
       "speech_mode": "literal / playful / hypothetical / fictional / uncertain（正经=literal，玩梗=playful，假设=hypothetical，虚构=fictional，不确定=uncertain）",
       "subject_name": "这条记忆主要关于谁（填人名，如'小猫'/'Jasper'/'Lucien'，关于多人互动可留空）",
-      "speaker_name": "谁说的/谁是信息来源（填人名，如'小猫'/'Cloudy'，AI总结的填AI名字）"
+      "speaker_name": "谁说的/谁是信息来源（填人名，如'小猫'/'Cloudy'，AI总结的填AI名字）",
+      "info_type": "identity（身份/很少变）/state（当前状态/会过期）/event（已发生的事）/task（待办）/reflection（AI感受）/relationship（关系相关）"
     }}
   ]
 }}
@@ -618,7 +619,7 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
             subj_name = action.get("subject_name", "")
             spkr_name = action.get("speaker_name", "")
             subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
-            source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+            source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
             await remember(
                 content=content,
                 layer=layer,
@@ -636,7 +637,8 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
                 claim_type=action.get("claim_type", ""),
                 speech_mode=action.get("speech_mode", ""),
                 subject_id=subject_id,
-                source_speaker_id=source_speaker_id,
+                source_actor_id=source_actor_id,
+                info_type=action.get("info_type", ""),
             )
             executed.append(action)
 

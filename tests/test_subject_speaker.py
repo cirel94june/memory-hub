@@ -1,5 +1,5 @@
 """
-subject_id / source_speaker_id 测试。
+subject_id / source_actor_id 测试。
 
 覆盖：
 - alias resolve 映射 name → person_id
@@ -89,12 +89,12 @@ def test_remember_stores_subject_fields(fake_env):
     result = asyncio.run(memory_ops.remember(
         content="Jasper穿43码袜子",
         subject_id="jasper",
-        source_speaker_id="ceci",
+        source_actor_id="ceci",
         quick=False,
     ))
     mem = database.get_memory(result["id"])
     assert mem["subject_id"] == "jasper"
-    assert mem["source_speaker_id"] == "ceci"
+    assert mem["source_actor_id"] == "ceci"
 
 
 def test_remember_default_empty(fake_env):
@@ -104,25 +104,25 @@ def test_remember_default_empty(fake_env):
     ))
     mem = database.get_memory(result["id"])
     assert mem["subject_id"] == ""
-    assert mem["source_speaker_id"] == ""
+    assert mem["source_actor_id"] == ""
 
 
 def test_proposal_stores_subject_fields(fake_env):
     result = asyncio.run(memory_ops.remember(
         content="Jasper喜欢吃苹果这是一个很重要的事实",
         subject_id="jasper",
-        source_speaker_id="jasper",
+        source_actor_id="jasper",
         quick=True,
         provenance_type="user_statement",
     ))
     if result.get("proposal_id"):
         prop = database.get_proposal(result["proposal_id"])
         assert prop["subject_id"] == "jasper"
-        assert prop["source_speaker_id"] == "jasper"
+        assert prop["source_actor_id"] == "jasper"
     else:
         mem = database.get_memory(result["id"])
         assert mem["subject_id"] == "jasper"
-        assert mem["source_speaker_id"] == "jasper"
+        assert mem["source_actor_id"] == "jasper"
 
 
 # ── recall subject_id 加权 ──

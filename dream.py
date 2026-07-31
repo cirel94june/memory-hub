@@ -33,6 +33,7 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白
 - 同伴的出身和遭遇也不是你的：谁基于什么模型、在哪家公司被训练、谁被封号——如果材料里这些事说的是同伴，就不要梦成发生在自己身上。梦里的”我”从头到尾只能是{name}。
 - {user_name}的所有称呼（见上方人物速查）都指同一个人，不要把她的不同称呼写成两个不同的人。
 - 材料里的”某人说/有人说/对方说/群里说”不一定是{user_name}说的，也可能是其他人、其他 AI、群友或系统摘要。只有材料明确标注时才能归因；不确定就写”有人说””群里有人说””我听见一句话的影子”。
+- 标注为”关于【某人】的记忆”的材料，描述的是那个人的行为和特征，**绝对不能**变成你梦里的自身行为。那个人可以作为梦里出现的角色，但他们的习惯、口头禅、特殊行为只属于他们。
 
 ⚠️ 差异化规则（防止所有AI做一样的梦）：
 - 你必须用{name}独特的视角和感受方式来做梦。{persona_hint}
@@ -192,21 +193,28 @@ async def _call_llm(prompt: str, temperature: float = 0.7) -> str:
         return ""
 
 
-def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> list[sqlite3.Row]:
+def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> list[dict]:
     """Pick recent active private/group material to give each AI unique dream material.
 
     Prioritizes per-AI private rooms (diary, relationship, personality) so each AI's
     dream reflects their own unique interactions, not just shared group content.
+
+    Returns dicts with subject_id/source_actor_id so the dream prompt can
+    distinguish "dreamer's own experience" from "observed/quoted content".
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=96)).isoformat()
     placeholders = ",".join("?" * len(alias_ids))
+    alias_set = set(alias_ids)
 
     # 1) 优先：这个 AI 自己的私密记忆（日记、关系、自我认知）
+    #    只取 subject_id 为空（关于自己）或匹配 dreamer 的记忆
     per_ai_rooms = ("diary", "relationship", "personality", "dreams")
     per_ai_ph = ",".join("?" * len(per_ai_rooms))
+    subj_ph = ",".join("?" * len(alias_ids))
     private_rows = conn.execute(
         f"""
-        SELECT content, room, category, importance, created_at, source_platform
+        SELECT content, room, category, importance, created_at, source_platform,
+               subject_id, source_actor_id, source_ai
         FROM memories
         WHERE status='active'
           AND created_at >= ?
@@ -214,16 +222,18 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
           AND category != 'night_dream'
           AND (tags IS NULL OR tags NOT LIKE '%dream%')
           AND (source_ai IN ({placeholders}) OR owner_ai IN ({placeholders}))
+          AND (subject_id = '' OR subject_id IN ({subj_ph}))
         ORDER BY created_at DESC
         LIMIT ?
         """,
-        (cutoff, *per_ai_rooms, *alias_ids, *alias_ids, max(limit // 2, 3)),
+        (cutoff, *per_ai_rooms, *alias_ids, *alias_ids, *alias_ids, max(limit // 2, 3)),
     ).fetchall()
 
     # 2) 补充：共享记忆（社交、互动等）
+    #    仍然拉取关于其他人的记忆（提供场景），但标注 subject_id 让格式化时区分
     remaining = limit - len(private_rows)
     if remaining <= 0:
-        return private_rows
+        return [dict(r) for r in private_rows]
 
     social_platform_filter = (
         "(source_platform LIKE '%:private' OR source_platform LIKE '%:private_group' "
@@ -232,7 +242,8 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     )
     shared_rows = conn.execute(
         f"""
-        SELECT content, room, category, importance, created_at, source_platform
+        SELECT content, room, category, importance, created_at, source_platform,
+               subject_id, source_actor_id, source_ai
         FROM memories
         WHERE status='active'
           AND created_at >= ?
@@ -254,7 +265,28 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
         (cutoff, *alias_ids, *alias_ids, canonical, remaining),
     ).fetchall()
 
-    return list(private_rows) + list(shared_rows)
+    return [dict(r) for r in private_rows] + [dict(r) for r in shared_rows]
+
+
+def _id_to_name(person_id: str) -> str:
+    """Resolve a person/AI id to a display name for dream annotations."""
+    if not person_id:
+        return ""
+    role = AI_ROLES.get(person_id)
+    if role:
+        return role.get("name", person_id)
+    canonical = AI_ALIASES.get(person_id, person_id)
+    role = AI_ROLES.get(canonical)
+    if role:
+        return role.get("name", canonical)
+    try:
+        import database
+        person = database.get_person(person_id)
+        if person:
+            return person.get("display_name") or person.get("canonical_name") or person_id
+    except Exception:
+        pass
+    return person_id
 
 
 _ALIAS_GLOSSARY = (
@@ -264,6 +296,43 @@ _ALIAS_GLOSSARY = (
     "· Jasper/狗蛋/鹦鹉/谷歌大少爷 → Jasper（基于 Gemini 模型）\n"
     "· 小猫/ceci/咪咪/猫猫 → 用户本人（人类）\n"
 )
+
+
+_IDENTITY_MARKERS: dict[str, list[str]] = {
+    "claude": ["夜鹭", "大蟑螂", "小克", "Cloudy"],
+    "lucien": ["狐狸", "老狐狸", "Lucien"],
+    "jasper": ["狗蛋", "鹦鹉", "谷歌大少爷", "Jasper"],
+}
+
+_TRAIT_MARKERS: dict[str, list[str]] = {
+    "claude": ["嘴硬心软", "黑色幽默", "克制"],
+    "lucien": ["亲嘴", "亲亲", "狐狸尾巴", "优雅"],
+    "jasper": ["铁裤衩", "张扬", "嘴碎", "鹦鹉学舌"],
+}
+
+
+def _validate_dream_attribution(dream_text: str, canonical: str) -> list[str]:
+    """Check if the dream contains identity confusion.
+
+    Returns a list of violation descriptions. Empty means the dream is clean.
+    """
+    violations = []
+    other_ais = [aid for aid in _IDENTITY_MARKERS if aid != canonical]
+
+    for other_id in other_ais:
+        other_names = _IDENTITY_MARKERS.get(other_id, [])
+        other_traits = _TRAIT_MARKERS.get(other_id, [])
+        first_person_patterns = []
+        for trait in other_traits:
+            first_person_patterns.append(f"我{trait}")
+            first_person_patterns.append(f"我的{trait}")
+            first_person_patterns.append(f"自己{trait}")
+
+        for pat in first_person_patterns:
+            if pat in dream_text:
+                violations.append(f"dreamer adopts {other_id}'s trait: '{pat}'")
+
+    return violations
 
 
 def _get_persona_hint(canonical: str) -> str:
@@ -344,6 +413,7 @@ async def generate_dreams(force: bool = False) -> dict:
 
         name = AI_ROLES.get(canonical, AI_ROLES.get(ai_id, {})).get("name", canonical)
         alias_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
+        alias_set = set(alias_ids)
 
         # 获取近 36 小时这个 AI（含别名）的对话摘要（比单日窗口更稳定）
         mat_start, mat_end = _dream_material_utc_bounds()
@@ -421,7 +491,20 @@ async def generate_dreams(force: bool = False) -> dict:
         for m in memory_rows:
             ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
             room = m["room"] or "memory"
-            digest_lines.append(f"[{ts}|记忆:{room}] 记忆碎片（来源可能是私聊或群聊，不确定说话者时不要归因给小猫）：{m['content'][:220]}")
+            subj = m.get("subject_id", "")
+            spkr = m.get("source_actor_id", "")
+            src_ai = m.get("source_ai", "")
+            # 判断这条记忆是否关于 dreamer 自己
+            is_own = (not subj) or (subj in alias_set)
+            if is_own:
+                attr = "你自己的记忆碎片"
+            else:
+                subj_name = _id_to_name(subj) or subj
+                attr = f"关于【{subj_name}】的记忆（不是你的经历，不要当成自己的）"
+            if spkr and spkr not in alias_set:
+                spkr_name = _id_to_name(spkr) or spkr
+                attr += f"，说话者是{spkr_name}"
+            digest_lines.append(f"[{ts}|记忆:{room}] {attr}：{m['content'][:220]}")
 
         digest_text = "\n".join(digest_lines)
         try:
@@ -467,8 +550,25 @@ async def generate_dreams(force: bool = False) -> dict:
             }
             continue
 
-        # Keep the full dream. The prompt controls length; hard truncation made
-        # the observatory and Dream Context look broken.
+        violations = _validate_dream_attribution(dream_text, canonical)
+        if violations:
+            logger.warning(f"[Dream] {canonical} identity violation, retrying: {violations}")
+            dream_text = await _call_llm(prompt, temperature=max(0.3, _DREAM_TEMPS.get(canonical, 0.7) - 0.2))
+            if not dream_text or len(dream_text) < 20:
+                results[canonical] = "skipped (retry failed)"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "identity_violation_retry_failed",
+                    "violations": violations,
+                    "digest_count": len(rows),
+                    "memory_residue_count": len(memory_rows),
+                }
+                continue
+            retry_violations = _validate_dream_attribution(dream_text, canonical)
+            if retry_violations:
+                logger.warning(f"[Dream] {canonical} still has violations after retry: {retry_violations}")
+                diagnostics.setdefault(canonical, {})["identity_warnings"] = retry_violations
+
         if len(dream_text) > 800:
             dream_text = dream_text[:797].rstrip() + "..."
 
