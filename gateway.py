@@ -619,7 +619,7 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
             subj_name = action.get("subject_name", "")
             spkr_name = action.get("speaker_name", "")
             subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
-            source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+            source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
             await remember(
                 content=content,
                 layer=layer,
@@ -637,7 +637,7 @@ async def post_process(user_message: str, ai_response: str, ai_id: str, platform
                 claim_type=action.get("claim_type", ""),
                 speech_mode=action.get("speech_mode", ""),
                 subject_id=subject_id,
-                source_speaker_id=source_speaker_id,
+                source_actor_id=source_actor_id,
                 info_type=action.get("info_type", ""),
             )
             executed.append(action)

@@ -24,7 +24,7 @@ RULES = [
 ]
 
 
-def migrate():
+def migrate(dry_run: bool = False):
     if not DB_PATH.exists():
         print(f"Database not found: {DB_PATH}")
         sys.exit(1)
@@ -32,7 +32,6 @@ def migrate():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
-    # Check if info_type column exists
     cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
     if "info_type" not in cols:
         print("info_type column doesn't exist yet. Run the app first to trigger migration.")
@@ -44,34 +43,42 @@ def migrate():
     ).fetchone()[0]
     print(f"Total active memories: {total}")
     print(f"Eligible for classification (info_type='fact'): {eligible}")
+    if dry_run:
+        print("** DRY RUN — no changes will be written **")
     print()
 
     updated_total = 0
     for sql_cond, info_type, desc in RULES:
-        query = f"""
-            UPDATE memories SET info_type = ?
+        count_query = f"""
+            SELECT COUNT(*) FROM memories
             WHERE status = 'active' AND info_type = 'fact' AND ({sql_cond})
         """
-        cur = conn.execute(query, (info_type,))
-        count = cur.rowcount
+        count = conn.execute(count_query).fetchone()[0]
         if count > 0:
             print(f"  {desc}: {count} records → {info_type}")
             updated_total += count
+            if not dry_run:
+                conn.execute(f"""
+                    UPDATE memories SET info_type = ?
+                    WHERE status = 'active' AND info_type = 'fact' AND ({sql_cond})
+                """, (info_type,))
 
-    conn.commit()
+    if not dry_run:
+        conn.commit()
 
-    # Print distribution
-    print(f"\nTotal updated: {updated_total}")
-    print("\nFinal distribution:")
-    for row in conn.execute(
-        "SELECT info_type, COUNT(*) as cnt FROM memories WHERE status = 'active' "
-        "GROUP BY info_type ORDER BY cnt DESC"
-    ).fetchall():
-        print(f"  {row[0] or '(empty)'}: {row[1]}")
+    print(f"\nTotal {'would update' if dry_run else 'updated'}: {updated_total}")
+    if not dry_run:
+        print("\nFinal distribution:")
+        for row in conn.execute(
+            "SELECT info_type, COUNT(*) as cnt FROM memories WHERE status = 'active' "
+            "GROUP BY info_type ORDER BY cnt DESC"
+        ).fetchall():
+            print(f"  {row[0] or '(empty)'}: {row[1]}")
 
     conn.close()
     print("\nDone.")
 
 
 if __name__ == "__main__":
-    migrate()
+    dry = "--dry-run" in sys.argv
+    migrate(dry_run=dry)

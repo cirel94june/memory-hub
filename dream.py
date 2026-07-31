@@ -199,7 +199,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     Prioritizes per-AI private rooms (diary, relationship, personality) so each AI's
     dream reflects their own unique interactions, not just shared group content.
 
-    Returns dicts with subject_id/source_speaker_id so the dream prompt can
+    Returns dicts with subject_id/source_actor_id so the dream prompt can
     distinguish "dreamer's own experience" from "observed/quoted content".
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=96)).isoformat()
@@ -214,7 +214,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     private_rows = conn.execute(
         f"""
         SELECT content, room, category, importance, created_at, source_platform,
-               subject_id, source_speaker_id, source_ai
+               subject_id, source_actor_id, source_ai
         FROM memories
         WHERE status='active'
           AND created_at >= ?
@@ -243,7 +243,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     shared_rows = conn.execute(
         f"""
         SELECT content, room, category, importance, created_at, source_platform,
-               subject_id, source_speaker_id, source_ai
+               subject_id, source_actor_id, source_ai
         FROM memories
         WHERE status='active'
           AND created_at >= ?
@@ -492,7 +492,7 @@ async def generate_dreams(force: bool = False) -> dict:
             ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
             room = m["room"] or "memory"
             subj = m.get("subject_id", "")
-            spkr = m.get("source_speaker_id", "")
+            spkr = m.get("source_actor_id", "")
             src_ai = m.get("source_ai", "")
             # 判断这条记忆是否关于 dreamer 自己
             is_own = (not subj) or (subj in alias_set)

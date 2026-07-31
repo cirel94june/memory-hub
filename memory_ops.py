@@ -227,7 +227,7 @@ async def remember(
     conversation_kind: str = "",
     evidence_excerpt: str = "",
     subject_id: str = "",
-    source_speaker_id: str = "",
+    source_actor_id: str = "",
     info_type: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
@@ -236,7 +236,7 @@ async def remember(
         ai_summary/ai_speculation/roleplay_meme/dream/diary，留空=未知）。
     fact_confidence: 事实置信度，不传时按 provenance 默认。
     subject_id: 这条记忆关于谁（person_id）。
-    source_speaker_id: 谁说的（person_id）。
+    source_actor_id: 动作来源（person_id，user/ai/system）。
     info_type: 记忆生命周期类型（identity/state/event/task/reflection/relationship/fact）。"""
     if fact_confidence is None:
         fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
@@ -278,7 +278,7 @@ async def remember(
             provenance_type=provenance_type, fact_confidence=fact_confidence,
             claim_type=claim_type, speech_mode=speech_mode,
             conversation_kind=conversation_kind, evidence_excerpt=evidence_excerpt,
-            subject_id=subject_id, source_speaker_id=source_speaker_id,
+            subject_id=subject_id, source_actor_id=source_actor_id,
             info_type=info_type,
         )
 
@@ -405,7 +405,7 @@ async def remember(
                     "event_date": event_date,
                     "source_context": source_context,
                     "subject_id": subject_id,
-                    "source_speaker_id": source_speaker_id,
+                    "source_actor_id": source_actor_id,
                     "info_type": info_type or "fact",
                     "comments": [],
                     "embedding": pack_embedding(query_vec) if query_vec else None,
@@ -465,7 +465,7 @@ async def remember(
         "event_date": event_date,
         "source_context": source_context,
         "subject_id": subject_id,
-        "source_speaker_id": source_speaker_id,
+        "source_actor_id": source_actor_id,
         "info_type": info_type or "fact",
         "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
@@ -579,6 +579,8 @@ _SAFE_AUTO_PROVENANCE = {"user_statement", "user_correction", "user_quote"}
 
 _RESOLVE_PATTERNS = ("已完成", "搞定了", "做完了", "已解决", "完成了", "已经做了", "办好了")
 
+_REOPEN_PATTERNS = ("又出问题了", "没搞定", "还没完", "又复发", "重新开", "再来一次", "还是有问题", "又坏了")
+
 
 def _map_relation_to_action(relation: dict, new_prov: str, target_mem: dict) -> str:
     """Map analyzer relation output to one of 9 maintenance actions."""
@@ -599,6 +601,7 @@ def _map_relation_to_action(relation: dict, new_prov: str, target_mem: dict) -> 
             if rel_type == "contradicts" and new_prov not in _SAFE_AUTO_PROVENANCE:
                 return "correct"
             return "supersede" if new_prov in _SAFE_AUTO_PROVENANCE else "update"
+        return "annotate"
 
     return "create"
 
@@ -609,6 +612,8 @@ def _is_auto_executable(action: str, provenance: str) -> bool:
         return True
     if action == "resolve_thread":
         return True
+    if action == "reopen_thread":
+        return False
     if action in ("update", "supersede") and provenance in _SAFE_AUTO_PROVENANCE:
         return True
     return False
@@ -616,22 +621,24 @@ def _is_auto_executable(action: str, provenance: str) -> bool:
 
 def _write_audit(action: str, target_id: str, new_content: str, reason: str,
                  state_before: dict, state_after: dict, auto: bool,
-                 source_ai: str = ""):
-    """Write a maintenance_audit record."""
-    try:
-        database.insert_audit({
-            "action": action,
-            "target_id": target_id,
-            "new_content": new_content[:500],
-            "decision_reason": reason[:200],
-            "state_before": json.dumps(state_before, ensure_ascii=False)[:1000],
-            "state_after": json.dumps(state_after, ensure_ascii=False)[:1000],
-            "auto_executed": 1 if auto else 0,
-            "source_ai": source_ai,
-            "created_at": _now(),
-        })
-    except Exception as e:
-        logger.warning(f"Failed to write audit: {e}")
+                 source_ai: str = "", source_message_ids: list = None,
+                 model_id: str = "", prompt_version: str = ""):
+    """Write a maintenance_audit record. Raises on failure — red line #16 requires
+    every maintenance action to have a matching audit record."""
+    database.insert_audit({
+        "action": action,
+        "target_id": target_id,
+        "new_content": new_content,
+        "source_message_ids": json.dumps(source_message_ids or []),
+        "decision_reason": reason,
+        "state_before": json.dumps(state_before, ensure_ascii=False),
+        "state_after": json.dumps(state_after, ensure_ascii=False),
+        "auto_executed": 1 if auto else 0,
+        "source_ai": source_ai,
+        "model_id": model_id,
+        "prompt_version": prompt_version,
+        "created_at": _now(),
+    })
 
 
 async def _execute_maintenance_action(
@@ -642,7 +649,8 @@ async def _execute_maintenance_action(
     """Execute a safe maintenance action on an existing memory. Returns result dict."""
     target_id = target_mem["id"]
     now = _now()
-    state_before = {"content": target_mem.get("content", "")[:200], "status": target_mem.get("status")}
+    state_before = {"content": target_mem.get("content", ""), "status": target_mem.get("status"),
+                    "resolved": target_mem.get("resolved"), "info_type": target_mem.get("info_type")}
 
     if action == "no_change":
         _write_audit("no_change", target_id, new_content, reason, state_before, state_before, True, source_ai)
@@ -659,7 +667,7 @@ async def _execute_maintenance_action(
         target_mem["comments"] = comments
         target_mem["updated_at"] = now
         store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"][:200], "comments_count": len(comments)}
+        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
         _write_audit("annotate", target_id, new_content, reason, state_before, state_after, True, source_ai)
         return {"id": target_id, "status": "annotated", "maintenance_action": "annotate"}
 
@@ -674,7 +682,7 @@ async def _execute_maintenance_action(
         target_mem["comments"] = comments
         target_mem["updated_at"] = now
         store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"][:200], "comments_count": len(comments)}
+        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
         _write_audit("supplement", target_id, new_content, reason, state_before, state_after, True, source_ai)
         return {"id": target_id, "status": "supplemented", "maintenance_action": "supplement"}
 
@@ -693,6 +701,22 @@ async def _execute_maintenance_action(
         state_after = {"resolved": True}
         _write_audit("resolve_thread", target_id, new_content, reason, state_before, state_after, True, source_ai)
         return {"id": target_id, "status": "resolved", "maintenance_action": "resolve_thread"}
+
+    if action == "reopen_thread":
+        target_mem["resolved"] = 0
+        target_mem["updated_at"] = now
+        comments = target_mem.get("comments", [])
+        if not isinstance(comments, list):
+            comments = []
+        comments.append({
+            "date": now, "author": source_ai or "system",
+            "kind": "reopen", "content": f"重新打开: {new_content[:100]}",
+        })
+        target_mem["comments"] = comments
+        store.set_memory(target_mem)
+        state_after = {"resolved": False}
+        _write_audit("reopen_thread", target_id, new_content, reason, state_before, state_after, False, source_ai)
+        return {"id": target_id, "status": "reopened", "maintenance_action": "reopen_thread"}
 
     if action in ("update", "supersede"):
         if not _can_supersede(provenance_type, target_mem):
@@ -726,7 +750,7 @@ async def _create_proposal(
     source_context: str, provenance_type: str, fact_confidence: float,
     claim_type: str, speech_mode: str, conversation_kind: str,
     evidence_excerpt: str,
-    subject_id: str = "", source_speaker_id: str = "",
+    subject_id: str = "", source_actor_id: str = "",
     info_type: str = "",
 ) -> dict:
     if not provenance_type and "auto_capture" in (source_platform or ""):
@@ -763,7 +787,7 @@ async def _create_proposal(
         "source_platform": source_platform,
         "provenance_type": provenance_type,
         "subject_id": subject_id,
-        "source_speaker_id": source_speaker_id,
+        "source_actor_id": source_actor_id,
         "info_type": info_type or "fact",
         "maintenance_action": "",
         "maintenance_target_id": "",
@@ -801,6 +825,26 @@ async def _create_proposal(
                 )
                 if result:
                     return result
+
+    # reopen_thread 检测：新内容匹配重开模式 + 相关记忆已完成
+    if related_mems and any(p in content for p in _REOPEN_PATTERNS):
+        for mem in related_mems:
+            if mem.get("resolved") == 1 or (mem.get("info_type") == "task" and mem.get("resolved")):
+                proposal["maintenance_action"] = "reopen_thread"
+                proposal["maintenance_target_id"] = mem["id"]
+                proposal["triage_reason"] = "maintenance_reopen_thread"
+                proposal["status"] = "pending"
+                database.insert_proposal(proposal)
+                _write_audit("reopen_thread", mem["id"], content,
+                             f"pending review: 内容匹配重开模式，关联已完成待办 {mem['id']}",
+                             {}, {}, False, source_ai)
+                return {
+                    "id": prop_id, "status": "proposed",
+                    "proposal_status": "pending",
+                    "maintenance_action": "reopen_thread",
+                    "maintenance_target_id": mem["id"],
+                    "triage_reason": "maintenance_reopen_thread",
+                }
 
     # 有相关记忆时，调用关系分类决定维护动作
     if related_mems:
@@ -947,7 +991,7 @@ async def _promote_proposal(proposal: dict) -> dict:
         provenance_type=proposal.get("provenance_type", ""),
         fact_confidence=proposal.get("confidence"),
         subject_id=proposal.get("subject_id", ""),
-        source_speaker_id=proposal.get("source_speaker_id", ""),
+        source_actor_id=proposal.get("source_actor_id", ""),
         info_type=proposal.get("info_type", ""),
     )
 

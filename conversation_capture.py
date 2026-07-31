@@ -451,7 +451,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         subj_name = item.get("subject_name", "")
         spkr_name = item.get("speaker_name", "")
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
-        source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+        source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
 
         result = await memory_ops.remember(
             content=content,
@@ -469,7 +469,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             claim_type=item.get("claim_type", ""),
             speech_mode=item.get("speech_mode", ""),
             subject_id=subject_id,
-            source_speaker_id=source_speaker_id,
+            source_actor_id=source_actor_id,
             info_type=item.get("info_type", ""),
         )
         memories.append(result)
@@ -566,7 +566,7 @@ async def extract_from_messages(
         subj_name = item.get("subject_name", "")
         spkr_name = item.get("speaker_name", "")
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
-        source_speaker_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+        source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
 
         result = await memory_ops.remember(
             content=content,
@@ -583,7 +583,7 @@ async def extract_from_messages(
             claim_type=item.get("claim_type", ""),
             speech_mode=item.get("speech_mode", ""),
             subject_id=subject_id,
-            source_speaker_id=source_speaker_id,
+            source_actor_id=source_actor_id,
             info_type=item.get("info_type", ""),
         )
         memories.append(result)

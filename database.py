@@ -295,9 +295,12 @@ async def init_db(db_path: str = None) -> None:
     if "subject_id" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated: added 'subject_id' column")
-    if "source_speaker_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN source_speaker_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'source_speaker_id' column")
+    if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'source_actor_id' column")
+    if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
+        logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
     if "info_type" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
         logger.info("Migrated: added 'info_type' column")
@@ -350,7 +353,7 @@ async def init_db(db_path: str = None) -> None:
         ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
         ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
         ("subject_id", "TEXT NOT NULL DEFAULT ''"),
-        ("source_speaker_id", "TEXT NOT NULL DEFAULT ''"),
+        ("source_actor_id", "TEXT NOT NULL DEFAULT ''"),
         ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
         ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
         ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
@@ -358,6 +361,9 @@ async def init_db(db_path: str = None) -> None:
         if col not in existing:
             conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
             logger.info(f"Migrated proposals: added '{col}' column")
+    if "source_speaker_id" in existing and "source_actor_id" not in existing:
+        conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
+        logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
 
     # ── Maintenance Audit table ──
     conn.executescript("""
@@ -373,12 +379,18 @@ async def init_db(db_path: str = None) -> None:
             model_id            TEXT NOT NULL DEFAULT '',
             source_ai           TEXT NOT NULL DEFAULT '',
             auto_executed       INTEGER NOT NULL DEFAULT 1,
+            prompt_version      TEXT NOT NULL DEFAULT '',
             created_at          TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
         CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
     """)
+
+    audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
+    if "prompt_version" not in audit_cols:
+        conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
     # ── Persons table (人物名片) ──
     conn.executescript("""
@@ -413,7 +425,7 @@ _ALL_COLUMNS = [
     "supersedes", "superseded_by", "event_date", "source_context",
     "comments", "embedding", "status", "created_at", "updated_at",
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
-    "subject_id", "source_speaker_id", "info_type",
+    "subject_id", "source_actor_id", "info_type",
 ]
 
 
@@ -688,7 +700,7 @@ _PROPOSAL_COLUMNS = [
     "source_platform", "provenance_type",
     "created_at", "reviewed_at", "reviewed_by", "reject_reason",
     "triage_reason", "applied_memory_id", "failure_reason",
-    "subject_id", "source_speaker_id",
+    "subject_id", "source_actor_id",
     "info_type", "maintenance_action", "maintenance_target_id",
 ]
 
@@ -749,7 +761,7 @@ def count_proposals(status: str = "pending") -> int:
 _AUDIT_COLUMNS = [
     "action", "target_id", "new_content", "source_message_ids",
     "decision_reason", "state_before", "state_after",
-    "model_id", "source_ai", "auto_executed", "created_at",
+    "model_id", "source_ai", "auto_executed", "prompt_version", "created_at",
 ]
 
 

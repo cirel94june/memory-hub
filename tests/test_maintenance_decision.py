@@ -71,6 +71,16 @@ def test_contradicts_supersede_user_maps_to_supersede():
     assert _map_relation_to_action(rel, "user_statement", {}) == "supersede"
 
 
+def test_updates_no_supersede_maps_to_annotate():
+    rel = {"relation": "updates", "should_supersede": False}
+    assert _map_relation_to_action(rel, "user_statement", {}) == "annotate"
+
+
+def test_contradicts_no_supersede_maps_to_annotate():
+    rel = {"relation": "contradicts", "should_supersede": False}
+    assert _map_relation_to_action(rel, "ai_summary", {}) == "annotate"
+
+
 # ── _is_auto_executable ──
 
 def test_no_change_always_auto():
@@ -107,6 +117,10 @@ def test_correct_never_auto():
 
 def test_create_never_auto():
     assert _is_auto_executable("create", "user_statement") is False
+
+
+def test_reopen_thread_never_auto():
+    assert _is_auto_executable("reopen_thread", "user_statement") is False
 
 
 # ── _execute_maintenance_action ──
@@ -156,7 +170,7 @@ def _make_memory(mems, mem_id="m1", content="小猫住在北京", room="living_r
         "comments": [], "embedding": None, "status": "active",
         "created_at": now, "updated_at": now, "history": [],
         "resolved": None, "anchored": None, "provenance_type": "user_statement",
-        "fact_confidence": 0.9, "subject_id": "", "source_speaker_id": "",
+        "fact_confidence": 0.9, "subject_id": "", "source_actor_id": "",
         "info_type": "fact",
         **extra,
     }
@@ -269,3 +283,40 @@ def test_audit_count(fake_env):
     _write_audit("no_change", "m3", "nope", "reason", {}, {}, True, "claude")
     assert database.count_audits() >= 2
     assert database.count_audits(action="supplement") >= 1
+
+
+def test_execute_reopen_thread(fake_env):
+    mem = _make_memory(fake_env, resolved=1, info_type="task")
+    result = asyncio.run(_execute_maintenance_action(
+        "reopen_thread", mem, "又出问题了", "待办重开", "claude",
+    ))
+    assert result["status"] == "reopened"
+    updated = fake_env["m1"]
+    assert updated["resolved"] == 0
+
+
+def test_write_audit_with_model_and_version(fake_env):
+    _write_audit("annotate", "m1", "stuff", "reason", {}, {}, True, "claude",
+                 model_id="claude-3.5-sonnet", prompt_version="v1.2")
+    audits = database.list_audits(action="annotate")
+    assert len(audits) >= 1
+    assert audits[0]["model_id"] == "claude-3.5-sonnet"
+    assert audits[0]["prompt_version"] == "v1.2"
+
+
+def test_write_audit_raises_on_failure(fake_env, monkeypatch):
+    monkeypatch.setattr(database, "insert_audit", lambda row: (_ for _ in ()).throw(RuntimeError("db error")))
+    with pytest.raises(RuntimeError, match="db error"):
+        _write_audit("annotate", "m1", "stuff", "reason", {}, {}, True, "claude")
+
+
+def test_state_before_stores_full_content(fake_env):
+    long_content = "这是一段很长的记忆内容" * 50
+    mem = _make_memory(fake_env, content=long_content)
+    asyncio.run(_execute_maintenance_action(
+        "annotate", mem, "补充", "测试完整存储", "claude",
+    ))
+    audits = database.list_audits(action="annotate")
+    audit = audits[0]
+    state = json.loads(audit["state_before"])
+    assert state["content"] == long_content

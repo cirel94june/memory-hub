@@ -80,7 +80,7 @@ def dream_db(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             subject_id TEXT NOT NULL DEFAULT '',
-            source_speaker_id TEXT NOT NULL DEFAULT ''
+            source_actor_id TEXT NOT NULL DEFAULT ''
         )
     """)
     now = datetime.now(timezone.utc)
@@ -144,12 +144,12 @@ def test_shared_residue_includes_others_with_annotation(dream_db):
 
 
 def test_residue_returns_dicts_with_attribution_fields(dream_db):
-    """All returned rows must have subject_id and source_speaker_id fields."""
+    """All returned rows must have subject_id and source_actor_id fields."""
     rows = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
     for r in rows:
         assert isinstance(r, dict)
         assert "subject_id" in r
-        assert "source_speaker_id" in r
+        assert "source_actor_id" in r
         assert "source_ai" in r
 
 
