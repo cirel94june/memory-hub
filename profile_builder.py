@@ -20,7 +20,7 @@ AI_IDS = ["claude", "lucien", "jasper"]
 PROFILE_NAMES = {"claude": "小克", "lucien": "Lucien", "jasper": "Jasper"}
 
 
-async def _call_llm(prompt: str, max_tokens: int = 2048) -> str:
+async def _call_llm(prompt: str, max_tokens: int = 8192) -> str:
     import httpx
 
     if not LLM_API_KEY:
