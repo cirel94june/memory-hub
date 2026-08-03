@@ -559,6 +559,32 @@ async def review_proposal(
 
 
 @mcp.tool()
+async def get_profile(profile_id: str = "", profile_type: str = "") -> str:
+    """查看 Profile（用户/AI/关系画像）。只读，不可修改。
+
+    Profile 是从记忆自动生成的结构化摘要，帮你快速了解"她是谁"、"你是谁"、"你们什么关系"。
+
+    用法：
+    - get_profile(profile_id="user_ceci") → 用户画像
+    - get_profile(profile_id="agent_lucien") → Lucien 的 AI 画像
+    - get_profile(profile_id="rel_lucien_ceci") → Lucien 和 Ceci 的关系画像
+    - get_profile(profile_type="agent") → 所有 AI 画像
+    - get_profile() → 所有 Profile
+
+    Args:
+        profile_id: 指定 Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
+        profile_type: 按类型筛选（user/agent/relationship）
+    """
+    if profile_id:
+        p = database.get_profile(profile_id)
+        if not p:
+            return json.dumps({"error": f"Profile '{profile_id}' not found"})
+        return json.dumps(p, ensure_ascii=False, indent=2)
+    profiles = database.list_profiles(profile_type=profile_type or None)
+    return json.dumps(profiles, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def anchor(memory_id: str) -> str:
     """将一条记忆设为锚点——永不衰减、走廊里单独显示的"坐标系"记忆。
 

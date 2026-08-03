@@ -408,6 +408,21 @@ async def init_db(db_path: str = None) -> None:
         CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
     """)
 
+    # ── Profiles table (User/Agent/Relationship Profile) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            id              TEXT PRIMARY KEY,
+            profile_type    TEXT NOT NULL,
+            owner_ai        TEXT NOT NULL DEFAULT '',
+            content         TEXT NOT NULL DEFAULT '{}',
+            generated_at    TEXT NOT NULL DEFAULT '',
+            source_memory_ids TEXT NOT NULL DEFAULT '[]',
+            version         INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
+        CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
+    """)
+
     conn.commit()
     _conn = conn
     logger.info("Database initialised successfully")
@@ -797,6 +812,52 @@ def count_audits(action: str = None) -> int:
     else:
         row = conn.execute("SELECT COUNT(*) FROM maintenance_audit").fetchone()
     return row[0] if row else 0
+
+
+# ════════════════════════════════════════════
+#  Profiles CRUD
+# ════════════════════════════════════════════
+
+def upsert_profile(profile: dict) -> None:
+    conn = _get_conn()
+    pid = profile["id"]
+    existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
+    if existing:
+        new_version = existing[0] + 1
+        conn.execute("""
+            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?, version = ?
+            WHERE id = ?
+        """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
+              new_version, pid))
+    else:
+        conn.execute("""
+            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at, source_memory_ids, version)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+        """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
+              profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]")))
+    conn.commit()
+
+
+def get_profile(profile_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_profiles(profile_type: str = None) -> list[dict]:
+    conn = _get_conn()
+    if profile_type:
+        rows = conn.execute("SELECT * FROM profiles WHERE profile_type = ? ORDER BY generated_at DESC", (profile_type,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM profiles ORDER BY profile_type, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_profile(profile_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ════════════════════════════════════════════
