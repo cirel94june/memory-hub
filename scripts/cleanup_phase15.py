@@ -43,6 +43,21 @@ def cleanup(dry_run: bool = False):
         print("** DRY RUN — no changes will be written **")
     print()
 
+    # ── 0. Room name unification ──
+    print("=== Room name unification ===")
+    count = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE status='active' AND room='relationships'"
+    ).fetchone()[0]
+    if count > 0:
+        print(f"  relationships → relationship: {count} records")
+        if not dry_run:
+            conn.execute("UPDATE memories SET room='relationship' WHERE room='relationships'")
+    else:
+        print("  (no 'relationships' room records to unify)")
+    if not dry_run:
+        conn.commit()
+    print()
+
     # ── 1. Provenance backfill ──
     empty_prov = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE status = 'active' AND (provenance_type = '' OR provenance_type IS NULL)"
