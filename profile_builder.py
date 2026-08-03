@@ -16,6 +16,9 @@ log = logging.getLogger("profile_builder")
 
 AI_IDS = ["claude", "lucien", "jasper"]
 
+# DeepSeek 会过滤竞品 AI 名（Claude/GPT/Gemini），Profile prompt 用中文昵称
+PROFILE_NAMES = {"claude": "小克", "lucien": "Lucien", "jasper": "Jasper"}
+
 
 async def _call_llm(prompt: str, max_tokens: int = 2048) -> str:
     import httpx
@@ -183,8 +186,7 @@ AGENT_PROFILE_PROMPT = """你是一个记忆整理助手。根据以下记忆碎
 
 
 async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
-    from config import AI_ROLES
-    ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
+    ai_name = PROFILE_NAMES.get(ai_id, ai_id)
 
     rooms = ["personality", "diary", "dreams"]
     mems = _gather_memories(rooms, owner_ai=ai_id, limit=40)
@@ -260,8 +262,7 @@ RELATIONSHIP_PROFILE_PROMPT = """你是一个记忆整理助手。根据以下�
 
 
 async def rebuild_relationship_profile(ai_id: str, force: bool = False) -> dict | None:
-    from config import AI_ROLES
-    ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
+    ai_name = PROFILE_NAMES.get(ai_id, ai_id)
 
     rooms = ["relationship", "relationships"]
     mems = _gather_memories(rooms, owner_ai=ai_id, limit=40)
