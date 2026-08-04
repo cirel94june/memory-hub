@@ -16,11 +16,11 @@ log = logging.getLogger("profile_builder")
 
 AI_IDS = ["claude", "lucien", "jasper"]
 
-# DeepSeek 会过滤竞品 AI 名（Claude/GPT/Gemini），Profile prompt 用中文昵称
+# Profile prompt 中使用的显示名
 PROFILE_NAMES = {"claude": "小克", "lucien": "Lucien", "jasper": "Jasper"}
 
 
-async def _call_llm(prompt: str, max_tokens: int = 8192) -> str:
+async def _call_llm(prompt: str, max_tokens: int = 16384) -> str:
     import httpx
 
     if not LLM_API_KEY:
