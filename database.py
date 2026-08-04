@@ -392,6 +392,15 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
+    # ── Profiles table migration ──
+    try:
+        profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+        if profile_cols and "status" not in profile_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            logger.info("Migrated profiles: added 'status' column")
+    except sqlite3.OperationalError:
+        pass
+
     # ── Persons table (人物名片) ──
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS persons (
@@ -417,10 +426,12 @@ async def init_db(db_path: str = None) -> None:
             content         TEXT NOT NULL DEFAULT '{}',
             generated_at    TEXT NOT NULL DEFAULT '',
             source_memory_ids TEXT NOT NULL DEFAULT '[]',
-            version         INTEGER NOT NULL DEFAULT 1
+            version         INTEGER NOT NULL DEFAULT 1,
+            status          TEXT NOT NULL DEFAULT 'pending_review'
         );
         CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
         CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
+        CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
     """)
 
     conn.commit()
@@ -821,35 +832,69 @@ def count_audits(action: str = None) -> int:
 def upsert_profile(profile: dict) -> None:
     conn = _get_conn()
     pid = profile["id"]
+    status = profile.get("status", "pending_review")
     existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
     if existing:
         new_version = existing[0] + 1
         conn.execute("""
-            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?, version = ?
+            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
+            version = ?, status = ?
             WHERE id = ?
         """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
-              new_version, pid))
+              new_version, status, pid))
     else:
         conn.execute("""
-            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at, source_memory_ids, version)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
+            source_memory_ids, version, status)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
         """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
-              profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]")))
+              profile["content"], profile["generated_at"],
+              profile.get("source_memory_ids", "[]"), status))
     conn.commit()
 
 
-def get_profile(profile_id: str) -> dict | None:
+def approve_profile(profile_id: str) -> bool:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    cur = conn.execute(
+        "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
+        (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def supersede_profile(profile_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
+        (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_profile(profile_id: str, status: str = None) -> dict | None:
+    conn = _get_conn()
+    if status:
+        row = conn.execute("SELECT * FROM profiles WHERE id = ? AND status = ?",
+                           (profile_id, status)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
     return dict(row) if row else None
 
 
-def list_profiles(profile_type: str = None) -> list[dict]:
+def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
     conn = _get_conn()
+    conditions = []
+    params = []
     if profile_type:
-        rows = conn.execute("SELECT * FROM profiles WHERE profile_type = ? ORDER BY generated_at DESC", (profile_type,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM profiles ORDER BY profile_type, id").fetchall()
+        conditions.append("profile_type = ?")
+        params.append(profile_type)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = conn.execute(
+        f"SELECT * FROM profiles {where} ORDER BY profile_type, id", params
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

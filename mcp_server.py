@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
+import database
 import memory_ops
 import corridor as corridor_mod
 import gateway as gateway_mod
@@ -582,6 +583,25 @@ async def get_profile(profile_id: str = "", profile_type: str = "") -> str:
         return json.dumps(p, ensure_ascii=False, indent=2)
     profiles = database.list_profiles(profile_type=profile_type or None)
     return json.dumps(profiles, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def approve_profile(profile_id: str) -> str:
+    """审批 Profile：将 pending_review 状态的 Profile 设为 active。
+
+    只有小猫（用户）审核通过后才应调用。Profile 生成后默认是 pending_review 状态，
+    需要用户确认内容准确后才能激活。
+
+    Args:
+        profile_id: Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
+    """
+    ok = database.approve_profile(profile_id)
+    if ok:
+        return json.dumps({"status": "approved", "profile_id": profile_id}, ensure_ascii=False)
+    p = database.get_profile(profile_id)
+    if not p:
+        return json.dumps({"error": f"Profile '{profile_id}' not found"})
+    return json.dumps({"error": f"Profile '{profile_id}' is '{p.get('status')}', not pending_review"})
 
 
 @mcp.tool()

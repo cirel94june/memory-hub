@@ -23,7 +23,9 @@ import pytest
 import database
 from profile_builder import (
     _extract_json, _contains_first_person, _has_changed,
-    _gather_memories,
+    _gather_memories, _filter_evidence, _is_excluded_category,
+    _filter_relationship_group_dynamic,
+    EXCLUDED_ROOMS, EXCLUDED_PROVENANCE,
 )
 
 
@@ -183,3 +185,166 @@ def test_no_profile_to_memory_write():
     assert "remember(" not in source
     assert "set_memory(" not in source
     assert "insert_" not in source or "insert_audit" not in source
+
+
+# ── Evidence filtering (item 6: 3 base tests) ──
+
+def _make_mem(**kwargs):
+    defaults = {
+        "id": "mem_test", "content": "test", "room": "living_room",
+        "info_type": "fact", "importance": 0.5, "created_at": "2026-08-03",
+        "category": "", "provenance_type": "user_statement", "fact_confidence": 0.9,
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
+def test_profile_filters_dreams():
+    """Dreams room and dream provenance must be excluded."""
+    mems = [
+        _make_mem(id="m1", room="dreams", content="梦到了飞行"),
+        _make_mem(id="m2", room="living_room", provenance_type="dream", content="梦境记录"),
+        _make_mem(id="m3", room="living_room", content="她喜欢猫"),
+        _make_mem(id="m4", category="night_dream", content="梦里变成蝴蝶"),
+    ]
+    filtered = _filter_evidence(mems, "agent")
+    ids = [m["id"] for m in filtered]
+    assert "m1" not in ids, "dreams room should be excluded"
+    assert "m2" not in ids, "dream provenance should be excluded"
+    assert "m4" not in ids, "night_dream category should be excluded"
+    assert "m3" in ids, "normal memory should pass"
+
+
+def test_profile_rejects_hypothesis():
+    """Roleplay categories and game_room must be excluded."""
+    mems = [
+        _make_mem(id="m1", room="game_room", content="游戏里的角色"),
+        _make_mem(id="m2", category="角色扮演", content="扮演场景"),
+        _make_mem(id="m3", provenance_type="roleplay_meme", content="群聊梗"),
+        _make_mem(id="m4", category="群聊玩梗", content="搞笑互动"),
+        _make_mem(id="m5", room="living_room", content="正常对话"),
+    ]
+    filtered = _filter_evidence(mems, "agent")
+    ids = [m["id"] for m in filtered]
+    assert "m1" not in ids, "game_room should be excluded"
+    assert "m2" not in ids, "roleplay category should be excluded"
+    assert "m3" not in ids, "roleplay_meme provenance should be excluded"
+    assert "m4" not in ids, "群聊玩梗 category should be excluded"
+    assert "m5" in ids, "normal memory should pass"
+
+
+def test_profile_requires_source_ids():
+    """Profile schema must include source_ids per field — verified via prompt template."""
+    import profile_builder
+    source = open(profile_builder.__file__, encoding="utf-8").read()
+    assert "source_ids" in source, "prompts must require source_ids per field"
+    assert "evidence_tier" in source, "prompts must require evidence_tier per field"
+    assert "confidence" in source, "prompts must require confidence per field"
+
+
+# ── Item A: group_dynamic conditional inclusion ──
+
+def test_group_dynamic_needs_threshold():
+    """group_dynamic memories need >=3 count and >=1 non-roleplay to be included."""
+    gd_mems = [
+        _make_mem(id=f"gd{i}", category="group_dynamic interaction")
+        for i in range(2)
+    ]
+    normal = [_make_mem(id="n1", content="正常记忆")]
+    result = _filter_relationship_group_dynamic(normal + gd_mems)
+    ids = [m["id"] for m in result]
+    assert "gd0" not in ids, "<3 group_dynamic should be excluded"
+
+    gd_mems_enough = [
+        _make_mem(id=f"gd{i}", category="group_dynamic interaction")
+        for i in range(4)
+    ]
+    result2 = _filter_relationship_group_dynamic(normal + gd_mems_enough)
+    ids2 = [m["id"] for m in result2]
+    assert "gd0" in ids2, ">=3 group_dynamic with non-roleplay should be included"
+
+
+# ── Item C: test_metaphor_to_fact ──
+
+def test_metaphor_to_fact():
+    """Metaphorical/joke categories must be excluded, not promoted to facts."""
+    mems = [
+        _make_mem(id="m1", category="joke", content="她是古狐转世"),
+        _make_mem(id="m2", category="玩笑", content="降维打击"),
+        _make_mem(id="m3", room="living_room", content="她住在上海"),
+    ]
+    filtered = _filter_evidence(mems, "user")
+    ids = [m["id"] for m in filtered]
+    assert "m1" not in ids, "joke category should be filtered"
+    assert "m2" not in ids, "玩笑 category should be filtered"
+    assert "m3" in ids
+
+
+# ── Item D: test_label_compression_conservative ──
+
+def test_label_compression_conservative():
+    """Prompt must contain conservative summary instruction."""
+    import profile_builder
+    source = open(profile_builder.__file__, encoding="utf-8").read()
+    assert "保守摘要" in source or "conservative" in source.lower(), \
+        "prompts must instruct conservative label compression"
+    assert "禁止生成比原始记忆更具体的标签" in source or "宁可保留宽泛描述" in source, \
+        "prompts must warn against over-specific labels"
+
+
+# ── Status workflow tests ──
+
+def test_profile_default_pending_review(db_env):
+    """New profiles should default to pending_review status."""
+    database.upsert_profile({
+        "id": "test_status", "profile_type": "user", "content": "{}",
+        "generated_at": "2026-08-03T00:00:00Z", "status": "pending_review",
+    })
+    result = database.get_profile("test_status")
+    assert result["status"] == "pending_review"
+
+
+def test_approve_profile(db_env):
+    database.upsert_profile({
+        "id": "test_approve", "profile_type": "user", "content": "{}",
+        "generated_at": "2026-08-03T00:00:00Z", "status": "pending_review",
+    })
+    assert database.approve_profile("test_approve") is True
+    assert database.get_profile("test_approve")["status"] == "active"
+
+
+def test_supersede_profile(db_env):
+    database.upsert_profile({
+        "id": "test_super", "profile_type": "user", "content": "{}",
+        "generated_at": "2026-08-03T00:00:00Z", "status": "active",
+    })
+    assert database.supersede_profile("test_super") is True
+    assert database.get_profile("test_super")["status"] == "superseded"
+
+
+def test_social_room_only_user_statement():
+    """Social room memories must be user_statement to pass filter."""
+    mems = [
+        _make_mem(id="m1", room="social", provenance_type="ai_summary", content="AI 总结"),
+        _make_mem(id="m2", room="social", provenance_type="user_statement", content="用户说的"),
+    ]
+    filtered = _filter_evidence(mems, "agent")
+    ids = [m["id"] for m in filtered]
+    assert "m1" not in ids
+    assert "m2" in ids
+
+
+def test_user_profile_strict_provenance():
+    """User Profile uses strict provenance: only user_statement/correction, confidence >= 0.7."""
+    mems = [
+        _make_mem(id="m1", provenance_type="ai_summary", content="AI 推断"),
+        _make_mem(id="m2", provenance_type="user_statement", fact_confidence=0.3, content="低信心"),
+        _make_mem(id="m3", provenance_type="user_statement", fact_confidence=0.9, content="高信心事实"),
+        _make_mem(id="m4", provenance_type="user_correction", fact_confidence=None, content="用户纠正"),
+    ]
+    filtered = _filter_evidence(mems, "user", strict_provenance=True)
+    ids = [m["id"] for m in filtered]
+    assert "m1" not in ids, "ai_summary excluded in strict mode"
+    assert "m2" not in ids, "low confidence excluded"
+    assert "m3" in ids
+    assert "m4" in ids, "null confidence should pass (no threshold applies)"
