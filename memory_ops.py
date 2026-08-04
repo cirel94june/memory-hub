@@ -1363,6 +1363,7 @@ async def recall(
         db_kwargs["include_rooms"] = include_rooms
     elif exclude_isolated and isolated_rooms:
         db_kwargs["exclude_rooms"] = list(isolated_rooms)
+    db_kwargs["exclude_provenance"] = ["dream"]
 
     def _build_result(mem, score):
         room = mem.get("room", "")
@@ -1592,6 +1593,36 @@ async def recall(
         filtered_results.append(r)
 
     return filtered_results
+
+
+async def dream_recall(
+    query: str,
+    ai_id: str = "",
+    top_k: int = 5,
+) -> list[dict]:
+    """Search only dream memories (provenance_type='dream', room='dreams')."""
+    query_vec = await get_embedding(query)
+    if not query_vec:
+        return []
+
+    raw = database.vector_search(
+        query_vec, top_k=top_k, status="active",
+        include_rooms=["dreams"],
+    )
+    results = []
+    for mem in raw:
+        if mem.get("provenance_type") != "dream":
+            continue
+        distance = mem.pop("distance", 0.0)
+        results.append({
+            "id": mem["id"],
+            "content": mem["content"],
+            "room": mem.get("room", ""),
+            "source_ai": mem.get("source_ai", ""),
+            "created_at": mem.get("created_at", ""),
+            "score": round(max(0, 1 - distance / 2), 4),
+        })
+    return results[:top_k]
 
 
 # ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──

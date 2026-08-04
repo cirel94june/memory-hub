@@ -9,7 +9,8 @@ Profile 是派生视图，不参与衰减，不进入 memories 表（红线 #17�
 import json
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 import database
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
@@ -244,6 +245,144 @@ def _get_version(profile_id: str) -> int:
 
 
 # ════════════════════════════════════════════
+#  Stylization detector
+# ════════════════════════════════════════════
+
+_STYLIZED_PATTERNS = [
+    "深邃的", "绚烂的", "独特的灵魂", "内心深处", "灵魂深处",
+    "温暖的光芒", "如诗如画", "不可替代的", "无与伦比",
+    "独一无二的存在", "照亮了", "点亮了", "温柔地守护",
+    "深深的", "浓浓的", "满满的", "暖暖的",
+    "宛如", "仿若", "恰似", "犹如一",
+    "闪耀着", "绽放着", "散发着",
+    "不经意间", "悄然", "默默地",
+]
+
+_STYLIZED_THRESHOLD = 3
+
+
+def _text_too_stylized(text: str) -> bool:
+    """Reject text with excessive literary embellishment."""
+    if not text:
+        return False
+    count = sum(1 for p in _STYLIZED_PATTERNS if p in text)
+    return count >= _STYLIZED_THRESHOLD
+
+
+# ════════════════════════════════════════════
+#  Field length limits + truncation
+# ════════════════════════════════════════════
+
+FIELD_CHAR_LIMITS = {
+    "identity": 160,
+    "personality": 160,
+    "style": 160,
+    "mode": 160,
+    "interaction_pattern": 160,
+    "shared_context": 160,
+    "health_status": 160,
+    "communication_style": 160,
+    "current_focus": 60,
+    "daily_summary": 60,
+}
+
+PERSONA_TOKEN_LIMIT = 100
+
+
+def _truncate_profile_fields(content_json: str) -> str:
+    """Enforce per-field character limits on Profile JSON."""
+    try:
+        data = json.loads(content_json)
+    except (json.JSONDecodeError, TypeError):
+        return content_json
+
+    for field_name, limit in FIELD_CHAR_LIMITS.items():
+        if field_name not in data:
+            continue
+        field = data[field_name]
+        if isinstance(field, dict) and "value" in field:
+            val = field["value"]
+            if isinstance(val, str) and len(val) > limit:
+                field["value"] = val[:limit - 3].rstrip() + "..."
+            elif isinstance(val, list):
+                field["value"] = [
+                    (item[:limit - 3].rstrip() + "..." if isinstance(item, str) and len(item) > limit else item)
+                    for item in val
+                ]
+        elif isinstance(field, str) and len(field) > limit:
+            data[field_name] = field[:limit - 3].rstrip() + "..."
+
+    if "notable_patterns" in data:
+        pats = data["notable_patterns"]
+        if isinstance(pats, dict) and "value" in pats and isinstance(pats["value"], list):
+            pats["value"] = [
+                (item[:157].rstrip() + "..." if isinstance(item, str) and len(item) > 160 else item)
+                for item in pats["value"]
+            ]
+
+    return json.dumps(data, ensure_ascii=False)
+
+
+# ════════════════════════════════════════════
+#  Temporal stability check (stable_candidate)
+# ════════════════════════════════════════════
+
+def _check_temporal_stability(mems: list[dict], min_span_days: int = 3) -> tuple[list[dict], list[dict]]:
+    """Split memories into stable (span >= min_span_days) and candidate groups.
+
+    Groups memories by approximate topic (first 20 chars of content),
+    then checks if the group spans at least min_span_days.
+
+    Returns (stable_mems, candidate_mems).
+    """
+    if not mems:
+        return [], []
+
+    def _date_key(m):
+        ca = m.get("created_at", "")
+        return ca[:10] if len(ca) >= 10 else ""
+
+    topic_groups = defaultdict(list)
+    for m in mems:
+        info_type = m.get("info_type", "")
+        if info_type not in ("identity", "relationship"):
+            topic_groups["__pass__"].append(m)
+            continue
+        key = m.get("content", "")[:20].strip()
+        if not key:
+            key = m.get("id", "unknown")
+        topic_groups[key].append(m)
+
+    stable = []
+    candidate = []
+    for key, group in topic_groups.items():
+        if key == "__pass__":
+            stable.extend(group)
+            continue
+
+        dates = {_date_key(m) for m in group if _date_key(m)}
+        if len(dates) < 2:
+            candidate.extend(group)
+            continue
+
+        sorted_dates = sorted(dates)
+        try:
+            first = datetime.strptime(sorted_dates[0], "%Y-%m-%d")
+            last = datetime.strptime(sorted_dates[-1], "%Y-%m-%d")
+            span = (last - first).days
+        except ValueError:
+            candidate.extend(group)
+            continue
+
+        if span >= min_span_days:
+            stable.extend(group)
+        else:
+            candidate.extend(group)
+
+    return stable, candidate
+
+
+# ════════════════════════════════════════════
 #  Shared Prompt Constraints
 # ════════════════════════════════════════════
 
@@ -265,6 +404,18 @@ EVIDENCE_CONSTRAINTS = """
 - 玩笑和调侃（随口说的不是核心信念）
 - 群聊梗（社交互动不等于稳定特征）
 - 比喻和修辞（"古狐""降维打击"等不是真实身份）
+
+## 绝对禁止的写法
+- 不把单次事件写成稳定人格（"她有一次迟到"≠"她经常迟到"）
+- 不做心理诊断（不写"她有焦虑倾向"、"他有回避型依附"等）
+- 不用夸张语气（不写"极其"、"无比"、"深深的"、"独一无二"）
+- 不复述已有内容（不要把记忆原文串起来当 Profile）
+- 不把事件原文拼接成段落（Profile 是提炼，不是拼贴）
+
+## 字数硬上限
+- identity_traits 等描述字段：每条 ≤160 字
+- daily_summary / current_focus：≤60 字
+- 超出自动截断。宁可写短，不要啰嗦。
 """
 
 
@@ -336,22 +487,27 @@ async def rebuild_user_profile(force: bool = False) -> dict | None:
     raw_mems = _gather_memories(rooms, info_types=info_types, limit=100)
 
     mems = _filter_evidence(raw_mems, "user", strict_provenance=True)
-    log.info(f"User Profile: {len(raw_mems)} raw → {len(mems)} after evidence filter")
+    stable, candidates = _check_temporal_stability(mems)
+    log.info(f"User Profile: {len(raw_mems)} raw → {len(mems)} filtered → {len(stable)} stable, {len(candidates)} candidate")
 
-    if not mems:
-        log.info("No memories found for User Profile after filtering")
+    if not stable:
+        log.info("No stable memories found for User Profile")
         return None
 
-    mem_ids = [m["id"] for m in mems]
+    mem_ids = [m["id"] for m in stable]
     if not force and not _has_changed("user_ceci", mem_ids):
         log.info("User Profile unchanged, skipping")
         return None
 
     mem_text = "\n".join(
-        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in mems
+        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in stable
     )
+    candidate_note = ""
+    if candidates:
+        candidate_note = f"\n\n（另有 {len(candidates)} 条候选断言跨度不足 3 天，暂不纳入正式 Profile，待更多证据确认。）"
+
     prompt = USER_PROFILE_PROMPT.format(
-        memories=mem_text,
+        memories=mem_text + candidate_note,
         evidence_constraints=EVIDENCE_CONSTRAINTS,
         tier0=json.dumps(TIER0_USER_FACTS, ensure_ascii=False),
     )
@@ -364,6 +520,16 @@ async def rebuild_user_profile(force: bool = False) -> dict | None:
         log.warning("User Profile generation returned non-JSON")
         return None
 
+    if _text_too_stylized(content):
+        log.warning("User Profile too stylized, retrying with stricter prompt")
+        prompt += "\n\n重要：你上次的输出文风太华丽了。禁止使用形容词堆砌（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。"
+        raw = await _call_llm(prompt)
+        content = _extract_json(raw) if raw else None
+        if not content:
+            return None
+
+    content = _truncate_profile_fields(content)
+
     profile = {
         "id": "user_ceci",
         "profile_type": "user",
@@ -371,10 +537,11 @@ async def rebuild_user_profile(force: bool = False) -> dict | None:
         "content": content,
         "generated_at": _now(),
         "source_memory_ids": json.dumps(mem_ids),
+        "stable_candidates": json.dumps([m["id"] for m in candidates]),
         "status": "pending_review",
     }
     database.upsert_profile(profile)
-    log.info(f"User Profile rebuilt (v{_get_version('user_ceci')}, {len(mems)} sources) → pending_review")
+    log.info(f"User Profile rebuilt (v{_get_version('user_ceci')}, {len(stable)} stable, {len(candidates)} candidates) → pending_review")
     return profile
 
 
@@ -435,20 +602,21 @@ async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
     raw_mems = _gather_memories(rooms, owner_ai=ai_id, limit=60)
 
     mems = _filter_evidence(raw_mems, "agent")
-    log.info(f"Agent Profile ({ai_id}): {len(raw_mems)} raw → {len(mems)} after evidence filter")
+    stable, candidates = _check_temporal_stability(mems)
+    log.info(f"Agent Profile ({ai_id}): {len(raw_mems)} raw → {len(mems)} filtered → {len(stable)} stable, {len(candidates)} candidate")
 
-    if not mems:
-        log.info(f"No memories found for Agent Profile ({ai_id}) after filtering")
+    if not stable:
+        log.info(f"No stable memories found for Agent Profile ({ai_id})")
         return None
 
     profile_id = f"agent_{ai_id}"
-    mem_ids = [m["id"] for m in mems]
+    mem_ids = [m["id"] for m in stable]
     if not force and not _has_changed(profile_id, mem_ids):
         log.info(f"Agent Profile ({ai_id}) unchanged, skipping")
         return None
 
     mem_text = "\n".join(
-        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in mems
+        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in stable
     )
     tier0 = json.dumps(TIER0_AGENT_FACTS.get(ai_id, {}), ensure_ascii=False)
     prompt = AGENT_PROFILE_PROMPT.format(
@@ -473,6 +641,16 @@ async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
             log.error(f"Agent Profile ({ai_id}) still has first person after retry, aborting")
             return None
 
+    if _text_too_stylized(content):
+        log.warning(f"Agent Profile ({ai_id}) too stylized, retrying")
+        prompt += "\n\n重要：禁止使用华丽形容词（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。"
+        raw = await _call_llm(prompt)
+        content = _extract_json(raw) if raw else None
+        if not content:
+            return None
+
+    content = _truncate_profile_fields(content)
+
     profile = {
         "id": profile_id,
         "profile_type": "agent",
@@ -480,10 +658,11 @@ async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
         "content": content,
         "generated_at": _now(),
         "source_memory_ids": json.dumps(mem_ids),
+        "stable_candidates": json.dumps([m["id"] for m in candidates]),
         "status": "pending_review",
     }
     database.upsert_profile(profile)
-    log.info(f"Agent Profile ({ai_id}) rebuilt (v{_get_version(profile_id)}, {len(mems)} sources) → pending_review")
+    log.info(f"Agent Profile ({ai_id}) rebuilt (v{_get_version(profile_id)}, {len(stable)} stable, {len(candidates)} candidates) → pending_review")
     return profile
 
 
@@ -547,20 +726,21 @@ async def rebuild_relationship_profile(ai_id: str, force: bool = False) -> dict 
 
     mems = _filter_evidence(raw_mems, "relationship")
     mems = _filter_relationship_group_dynamic(mems)
-    log.info(f"Relationship Profile ({ai_id}): {len(raw_mems)} raw → {len(mems)} after evidence filter")
+    stable, candidates = _check_temporal_stability(mems)
+    log.info(f"Relationship Profile ({ai_id}): {len(raw_mems)} raw → {len(mems)} filtered → {len(stable)} stable, {len(candidates)} candidate")
 
-    if not mems:
-        log.info(f"No memories found for Relationship Profile ({ai_id}) after filtering")
+    if not stable:
+        log.info(f"No stable memories found for Relationship Profile ({ai_id})")
         return None
 
     profile_id = f"rel_{ai_id}_ceci"
-    mem_ids = [m["id"] for m in mems]
+    mem_ids = [m["id"] for m in stable]
     if not force and not _has_changed(profile_id, mem_ids):
         log.info(f"Relationship Profile ({ai_id}) unchanged, skipping")
         return None
 
     mem_text = "\n".join(
-        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in mems
+        f"- [{m['id']}] [{m['room']}|{m['info_type']}] {m['content'][:200]}" for m in stable
     )
     prompt = RELATIONSHIP_PROFILE_PROMPT.format(
         ai_name=ai_name, memories=mem_text,
@@ -584,6 +764,16 @@ async def rebuild_relationship_profile(ai_id: str, force: bool = False) -> dict 
             log.error(f"Relationship Profile ({ai_id}) still has first person after retry, aborting")
             return None
 
+    if _text_too_stylized(content):
+        log.warning(f"Relationship Profile ({ai_id}) too stylized, retrying")
+        prompt += "\n\n重要：禁止使用华丽形容词，用平实语言重写。"
+        raw = await _call_llm(prompt)
+        content = _extract_json(raw) if raw else None
+        if not content:
+            return None
+
+    content = _truncate_profile_fields(content)
+
     profile = {
         "id": profile_id,
         "profile_type": "relationship",
@@ -591,10 +781,11 @@ async def rebuild_relationship_profile(ai_id: str, force: bool = False) -> dict 
         "content": content,
         "generated_at": _now(),
         "source_memory_ids": json.dumps(mem_ids),
+        "stable_candidates": json.dumps([m["id"] for m in candidates]),
         "status": "pending_review",
     }
     database.upsert_profile(profile)
-    log.info(f"Relationship Profile ({ai_id}) rebuilt (v{_get_version(profile_id)}, {len(mems)} sources) → pending_review")
+    log.info(f"Relationship Profile ({ai_id}) rebuilt (v{_get_version(profile_id)}, {len(stable)} stable, {len(candidates)} candidates) → pending_review")
     return profile
 
 

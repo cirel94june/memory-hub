@@ -407,6 +407,26 @@ async def list_memories(
 
 
 @mcp.tool()
+async def dream_recall(query: str, top_k: int = 3, source_ai: str = "claude") -> str:
+    """专门搜索梦境记忆。梦境不会出现在普通 recall 结果中，只能通过这个工具查看。
+
+    用这个工具来：
+    - 回忆之前做过的梦
+    - 查找梦里出现过的意象或场景
+    - 对比不同 AI 的梦
+
+    Args:
+        query: 搜索关键词（如"飞行""小猫""那个奇怪的梦"）
+        top_k: 最多返回几条梦境（默认 3）
+        source_ai: 你的身份（cloudy/lucien/jasper）
+    """
+    results = await memory_ops.dream_recall(query, ai_id=source_ai, top_k=top_k)
+    if not results:
+        return json.dumps({"message": "没有找到相关的梦境记忆"}, ensure_ascii=False)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def update_memory(
     memory_id: str,
     content: str = "",

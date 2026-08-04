@@ -24,8 +24,9 @@ import database
 from profile_builder import (
     _extract_json, _contains_first_person, _has_changed,
     _gather_memories, _filter_evidence, _is_excluded_category,
-    _filter_relationship_group_dynamic,
-    EXCLUDED_ROOMS, EXCLUDED_PROVENANCE,
+    _filter_relationship_group_dynamic, _text_too_stylized,
+    _truncate_profile_fields, _check_temporal_stability,
+    EXCLUDED_ROOMS, EXCLUDED_PROVENANCE, FIELD_CHAR_LIMITS,
 )
 
 
@@ -348,3 +349,70 @@ def test_user_profile_strict_provenance():
     assert "m2" not in ids, "low confidence excluded"
     assert "m3" in ids
     assert "m4" in ids, "null confidence should pass (no threshold applies)"
+
+
+# ── Phase 1.5 v2: New features ──
+
+def test_text_too_stylized_detects():
+    """Text with >= 3 stylized patterns should be rejected."""
+    stylized = "她是一个深邃的、独一无二的存在，内心深处散发着温暖的光芒"
+    assert _text_too_stylized(stylized) is True
+
+
+def test_text_too_stylized_passes_normal():
+    """Normal text should pass."""
+    normal = "她喜欢猫，住在上海，做过记者"
+    assert _text_too_stylized(normal) is False
+
+
+def test_truncate_profile_fields():
+    """Fields exceeding char limits should be truncated."""
+    long_text = "这是一段很长的文字" * 50
+    data = json.dumps({
+        "identity": {"value": long_text, "confidence": "high", "evidence_tier": 1, "source_ids": []},
+        "current_focus": {"value": long_text, "confidence": "medium", "evidence_tier": 4, "source_ids": []},
+    }, ensure_ascii=False)
+    result = json.loads(_truncate_profile_fields(data))
+    assert len(result["identity"]["value"]) <= FIELD_CHAR_LIMITS["identity"]
+    assert len(result["current_focus"]["value"]) <= FIELD_CHAR_LIMITS["current_focus"]
+    assert result["identity"]["value"].endswith("...")
+
+
+def test_temporal_stability_splits():
+    """Identity assertions need >= 3 days span to be stable."""
+    from datetime import datetime, timedelta
+    base = datetime(2026, 7, 1)
+    same_day = [
+        _make_mem(id=f"s{i}", info_type="identity", content="她是记者",
+                  created_at=(base + timedelta(hours=i)).isoformat())
+        for i in range(3)
+    ]
+    stable, candidates = _check_temporal_stability(same_day)
+    assert len(candidates) > 0, "same-day identity assertions should be candidates"
+
+    multi_day = [
+        _make_mem(id=f"m{i}", info_type="identity", content="她是记者",
+                  created_at=(base + timedelta(days=i * 2)).isoformat())
+        for i in range(3)
+    ]
+    stable2, candidates2 = _check_temporal_stability(multi_day)
+    assert len(stable2) > 0, "multi-day identity assertions should be stable"
+
+
+def test_temporal_stability_passes_non_identity():
+    """Non-identity/relationship info_types bypass stability check."""
+    mems = [
+        _make_mem(id="f1", info_type="fact", content="她喜欢猫",
+                  created_at="2026-07-01T00:00:00Z"),
+    ]
+    stable, candidates = _check_temporal_stability(mems)
+    assert len(stable) == 1, "fact type should pass through directly"
+    assert len(candidates) == 0
+
+
+def test_prompt_has_no_psych_diagnosis_constraint():
+    """Profile prompts must prohibit psychological diagnosis."""
+    import profile_builder
+    source = open(profile_builder.__file__, encoding="utf-8").read()
+    assert "不做心理诊断" in source
+    assert "不把单次事件写成稳定人格" in source

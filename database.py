@@ -918,6 +918,7 @@ def vector_search(
     exclude_rooms: list[str] = None,
     layer: str = None,
     owner_ai: str = None,
+    exclude_provenance: list[str] = None,
 ) -> list[dict]:
     """Vector similarity search using sqlite-vec.
 
@@ -992,6 +993,8 @@ def vector_search(
             if layer is not None and mem.get("layer") != layer:
                 continue
             if owner_ai is not None and mem.get("owner_ai") != owner_ai:
+                continue
+            if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
                 continue
 
             mem["distance"] = distances[vec_rid]
@@ -1287,6 +1290,11 @@ def ro_vector_search(
         rph = ", ".join(["?"] * len(exclude_rooms))
         clauses.append(f"room NOT IN ({rph})")
         params.extend(exclude_rooms)
+    exclude_prov = kwargs.get("exclude_provenance")
+    if exclude_prov:
+        pph = ", ".join(["?"] * len(exclude_prov))
+        clauses.append(f"(provenance_type IS NULL OR provenance_type NOT IN ({pph}))")
+        params.extend(exclude_prov)
     where = " AND ".join(clauses)
     mem_rows = conn.execute(f"SELECT * FROM memories WHERE {where}", params).fetchall()
     results = []
