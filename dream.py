@@ -184,7 +184,7 @@ async def _call_llm(prompt: str, temperature: float = 0.7) -> str:
                     # 正文长度由 prompt 控制（120-250字）；max_tokens 只是保险丝。
                     # 注意：reasoning 类模型的思考 token 也计入 max_tokens，
                     # 上限设小了正文会被随机截断（曾导致梦频繁断尾）。
-                    "max_tokens": 3000,
+                    "max_tokens": 16384,
                 },
             )
             resp.raise_for_status()
