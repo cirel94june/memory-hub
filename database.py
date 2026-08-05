@@ -401,6 +401,17 @@ async def init_db(db_path: str = None) -> None:
     except sqlite3.OperationalError:
         pass
 
+    # ── Dream dedup table (one dream per AI per local day) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS dream_log (
+            ai_id       TEXT NOT NULL,
+            local_day   TEXT NOT NULL,
+            memory_id   TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (ai_id, local_day)
+        );
+    """)
+
     # ── Persons table (人物名片) ──
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS persons (
@@ -1013,7 +1024,8 @@ def vector_search(
 #  Full-text search
 # ════════════════════════════════════════════
 
-def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def fts_search(query: str, top_k: int = 50, status: str = "active",
+               exclude_provenance: list[str] = None) -> list[dict]:
     """Full-text search using FTS5.
 
     Returns memories matching the query with a ``rank`` field
@@ -1064,6 +1076,8 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
     results = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
+        if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
+            continue
         mem["rank"] = row["rank"]
         results.append(mem)
 
@@ -1073,7 +1087,8 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
 _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 
 
-def cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                    exclude_provenance: list[str] = None) -> list[dict]:
     """中文子串搜索（LIKE 路）。
 
     FTS5 默认分词器不切中文——整段中文被当成一个 token，"妈妈"永远匹配不上
@@ -1107,6 +1122,8 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list
     scored = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
+        if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
+            continue
         text = f"{mem.get('content', '')} {mem.get('tags', '')} {mem.get('category', '')}"
         hits = sum(1 for g in grams if g in text)
         if hits:
@@ -1308,7 +1325,8 @@ def ro_vector_search(
     return results[:top_k]
 
 
-def ro_fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
+                  exclude_provenance: list[str] = None) -> list[dict]:
     """线程安全版 fts_search。"""
     conn = _get_read_conn()
     if not query or not query.strip():
@@ -1331,10 +1349,17 @@ def ro_fts_search(query: str, top_k: int = 50, status: str = "active") -> list[d
     except Exception as e:
         logger.warning(f"ro_fts_search failed: {e}")
         return []
-    return [_row_to_dict_no_embedding(r) for r in rows[:top_k]]
+    results = []
+    for r in rows:
+        d = _row_to_dict_no_embedding(r)
+        if exclude_provenance and d.get("provenance_type") in exclude_provenance:
+            continue
+        results.append(d)
+    return results[:top_k]
 
 
-def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                       exclude_provenance: list[str] = None) -> list[dict]:
     """线程安全版 cjk_like_search。"""
     conn = _get_read_conn()
     CJK_RE = re.compile(r'[一-鿿㐀-䶿]+')
@@ -1360,6 +1385,8 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> l
     results = []
     for row in rows:
         d = _row_to_dict_no_embedding(row)
+        if exclude_provenance and d.get("provenance_type") in exclude_provenance:
+            continue
         hits = sum(1 for g in grams if g in d.get("content", ""))
         d["like_hits"] = hits
         results.append(d)

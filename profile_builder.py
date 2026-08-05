@@ -11,6 +11,9 @@ import re
 import logging
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+from typing import Optional
+
+from pydantic import BaseModel, field_validator
 
 import database
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
@@ -18,6 +21,96 @@ from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
 log = logging.getLogger("profile_builder")
 
 AI_IDS = ["claude", "lucien", "jasper"]
+
+
+# ════════════════════════════════════════════
+#  Pydantic schemas for Profile validation
+# ════════════════════════════════════════════
+
+class ProfileField(BaseModel):
+    value: str | list[str]
+    confidence: str
+    evidence_tier: int
+    source_ids: list[str] = []
+
+    @field_validator("confidence")
+    @classmethod
+    def valid_confidence(cls, v):
+        if v not in ("high", "medium", "low"):
+            raise ValueError(f"Invalid confidence: {v}")
+        return v
+
+    @field_validator("evidence_tier")
+    @classmethod
+    def valid_tier(cls, v):
+        if v not in (1, 2, 3, 4):
+            raise ValueError(f"Invalid evidence_tier: {v}, must be 1-4")
+        return v
+
+
+class UserProfileSchema(BaseModel):
+    tier0: dict
+    identity: ProfileField
+    stable_preferences: Optional[ProfileField] = None
+    communication_style: Optional[ProfileField] = None
+    current_focus: Optional[ProfileField] = None
+    health_status: Optional[ProfileField] = None
+    boundaries: Optional[ProfileField] = None
+
+
+class AgentProfileSchema(BaseModel):
+    tier0: dict
+    identity: ProfileField
+    personality: Optional[ProfileField] = None
+    style: Optional[ProfileField] = None
+    notable_patterns: Optional[ProfileField] = None
+
+
+class RelationshipProfileSchema(BaseModel):
+    mode: Optional[ProfileField] = None
+    interaction_pattern: Optional[ProfileField] = None
+    shared_context: Optional[ProfileField] = None
+    boundaries: Optional[ProfileField] = None
+
+
+_PROFILE_SCHEMAS = {
+    "user": UserProfileSchema,
+    "agent": AgentProfileSchema,
+    "relationship": RelationshipProfileSchema,
+}
+
+
+def _validate_profile_schema(content_json: str, profile_type: str,
+                             valid_mem_ids: set[str] = None) -> tuple[bool, str]:
+    """Validate Profile JSON against its Pydantic schema.
+
+    Returns (is_valid, error_message). Also checks source_ids ⊆ valid_mem_ids.
+    """
+    schema_cls = _PROFILE_SCHEMAS.get(profile_type)
+    if not schema_cls:
+        return False, f"Unknown profile type: {profile_type}"
+
+    try:
+        data = json.loads(content_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        return False, f"Invalid JSON: {e}"
+
+    if not isinstance(data, dict):
+        return False, "Top-level must be an object"
+
+    try:
+        schema_cls.model_validate(data)
+    except Exception as e:
+        return False, f"Schema validation failed: {e}"
+
+    if valid_mem_ids is not None:
+        for field_name, field_val in data.items():
+            if isinstance(field_val, dict) and "source_ids" in field_val:
+                bad_ids = [sid for sid in field_val["source_ids"] if sid and sid not in valid_mem_ids]
+                if bad_ids:
+                    return False, f"Field '{field_name}' has source_ids not in stable mems: {bad_ids}"
+
+    return True, ""
 
 PROFILE_NAMES = {"claude": "小克", "lucien": "Lucien", "jasper": "Jasper"}
 
@@ -104,10 +197,27 @@ def _filter_evidence(mems: list[dict], profile_type: str,
     return filtered
 
 
+def _extract_pattern_key(mem: dict) -> str:
+    """Extract a pattern key from a group_dynamic memory for grouping.
+    Uses first non-empty tag as key; falls back to category sub-type."""
+    tags_raw = mem.get("tags", "[]")
+    if isinstance(tags_raw, str):
+        try:
+            tags = json.loads(tags_raw)
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+    else:
+        tags = tags_raw if tags_raw else []
+    for t in tags:
+        if t and isinstance(t, str):
+            return t.strip().lower()
+    return mem.get("category", "group_dynamic").strip().lower()
+
+
 def _filter_relationship_group_dynamic(mems: list[dict]) -> list[dict]:
     """Allow group_dynamic memories into Relationship Profile only if
-    the same interaction pattern appears in >=3 different memories
-    and at least 1 is not roleplay/joke category."""
+    the same interaction pattern (by tag/key) appears in >=3 different
+    memories and at least 1 per group is not roleplay/joke category."""
     normal = []
     group_dynamic = []
     for m in mems:
@@ -117,13 +227,19 @@ def _filter_relationship_group_dynamic(mems: list[dict]) -> list[dict]:
         else:
             normal.append(m)
 
-    if len(group_dynamic) >= 3:
-        has_non_roleplay = any(
-            not _is_excluded_category(m.get("category", ""))
-            for m in group_dynamic
-        )
-        if has_non_roleplay:
-            normal.extend(group_dynamic)
+    groups: dict[str, list[dict]] = {}
+    for m in group_dynamic:
+        key = _extract_pattern_key(m)
+        groups.setdefault(key, []).append(m)
+
+    for key, members in groups.items():
+        if len(members) >= 3:
+            has_non_roleplay = any(
+                not _is_excluded_category(m.get("category", ""))
+                for m in members
+            )
+            if has_non_roleplay:
+                normal.extend(members)
 
     return normal
 
@@ -155,7 +271,7 @@ def _gather_memories(rooms: list[str], owner_ai: str = None,
     where = " AND ".join(conditions)
     rows = conn.execute(
         f"SELECT id, content, room, info_type, importance, created_at, "
-        f"category, provenance_type, fact_confidence "
+        f"category, provenance_type, fact_confidence, tags "
         f"FROM memories WHERE {where} "
         f"ORDER BY importance DESC, created_at DESC LIMIT ?",
         (*params, limit),
@@ -386,6 +502,54 @@ def _check_temporal_stability(mems: list[dict], min_span_days: int = 3) -> tuple
 #  Shared Prompt Constraints
 # ════════════════════════════════════════════
 
+MAX_PROFILE_RETRIES = 3
+
+
+async def _validate_and_retry(prompt: str, profile_type: str, valid_mem_ids: set[str],
+                               is_agent_or_rel: bool = False) -> str | None:
+    """Unified validation loop: up to MAX_PROFILE_RETRIES attempts.
+
+    Each attempt runs: JSON parse → schema validation → first-person check
+    → stylization check → source_id check → field truncation.
+    Returns validated+truncated JSON string, or None if all retries fail.
+    """
+    retry_notes = []
+    for attempt in range(MAX_PROFILE_RETRIES):
+        suffix = "\n\n".join(retry_notes) if retry_notes else ""
+        raw = await _call_llm(prompt + suffix)
+        if not raw:
+            log.warning(f"Profile LLM returned empty (attempt {attempt + 1})")
+            continue
+
+        content = _extract_json(raw)
+        if not content:
+            retry_notes.append("重要：上次输出不是合法 JSON，请确保输出以 { 开头、以 } 结尾的纯 JSON。")
+            log.warning(f"Profile non-JSON output (attempt {attempt + 1})")
+            continue
+
+        ok, err = _validate_profile_schema(content, profile_type, valid_mem_ids)
+        if not ok:
+            retry_notes.append(f"重要：上次输出 schema 校验失败（{err}），请严格按要求的 JSON 格式重新生成。")
+            log.warning(f"Profile schema invalid (attempt {attempt + 1}): {err}")
+            continue
+
+        if is_agent_or_rel and _contains_first_person(content):
+            retry_notes.append("重要：你的上一次输出包含了第一人称（我），这是不允许的。请严格使用第三人称重新生成。")
+            log.warning(f"Profile first-person detected (attempt {attempt + 1})")
+            continue
+
+        if _text_too_stylized(content):
+            retry_notes.append("重要：禁止使用华丽形容词（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。")
+            log.warning(f"Profile too stylized (attempt {attempt + 1})")
+            continue
+
+        content = _truncate_profile_fields(content)
+        return content
+
+    log.error(f"Profile generation failed after {MAX_PROFILE_RETRIES} attempts")
+    return None
+
+
 EVIDENCE_CONSTRAINTS = """
 ## 严格证据约束（必须遵守）
 
@@ -511,24 +675,9 @@ async def rebuild_user_profile(force: bool = False) -> dict | None:
         evidence_constraints=EVIDENCE_CONSTRAINTS,
         tier0=json.dumps(TIER0_USER_FACTS, ensure_ascii=False),
     )
-    raw = await _call_llm(prompt)
-    if not raw:
-        return None
-
-    content = _extract_json(raw)
+    content = await _validate_and_retry(prompt, "user", set(mem_ids))
     if not content:
-        log.warning("User Profile generation returned non-JSON")
         return None
-
-    if _text_too_stylized(content):
-        log.warning("User Profile too stylized, retrying with stricter prompt")
-        prompt += "\n\n重要：你上次的输出文风太华丽了。禁止使用形容词堆砌（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。"
-        raw = await _call_llm(prompt)
-        content = _extract_json(raw) if raw else None
-        if not content:
-            return None
-
-    content = _truncate_profile_fields(content)
 
     profile = {
         "id": "user_ceci",
@@ -623,33 +772,9 @@ async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
         ai_name=ai_name, memories=mem_text,
         evidence_constraints=EVIDENCE_CONSTRAINTS, tier0=tier0,
     )
-    raw = await _call_llm(prompt)
-    if not raw:
-        return None
-
-    content = _extract_json(raw)
+    content = await _validate_and_retry(prompt, "agent", set(mem_ids), is_agent_or_rel=True)
     if not content:
-        log.warning(f"Agent Profile ({ai_id}) generation returned non-JSON")
         return None
-
-    if _contains_first_person(content):
-        log.warning(f"Agent Profile ({ai_id}) contains first person, retrying")
-        prompt += "\n\n重要提醒：你的上一次输出包含了第一人称（我），这是不允许的。请严格使用第三人称重新生成。"
-        raw = await _call_llm(prompt)
-        content = _extract_json(raw) if raw else None
-        if not content or _contains_first_person(content):
-            log.error(f"Agent Profile ({ai_id}) still has first person after retry, aborting")
-            return None
-
-    if _text_too_stylized(content):
-        log.warning(f"Agent Profile ({ai_id}) too stylized, retrying")
-        prompt += "\n\n重要：禁止使用华丽形容词（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。"
-        raw = await _call_llm(prompt)
-        content = _extract_json(raw) if raw else None
-        if not content:
-            return None
-
-    content = _truncate_profile_fields(content)
 
     profile = {
         "id": profile_id,
@@ -746,33 +871,10 @@ async def rebuild_relationship_profile(ai_id: str, force: bool = False) -> dict 
         ai_name=ai_name, memories=mem_text,
         evidence_constraints=EVIDENCE_CONSTRAINTS,
     )
-    raw = await _call_llm(prompt)
-    if not raw:
-        return None
-
-    content = _extract_json(raw)
+    content = await _validate_and_retry(prompt, "relationship", set(mem_ids), is_agent_or_rel=True)
     if not content:
-        log.warning(f"Relationship Profile ({ai_id}) generation returned non-JSON")
+        log.warning(f"Relationship Profile ({ai_id}) generation failed after retries")
         return None
-
-    if _contains_first_person(content):
-        log.warning(f"Relationship Profile ({ai_id}) contains first person, retrying")
-        prompt += "\n\n重要提醒：你的上一次输出包含了第一人称（我），这是不允许的。请严格使用第三人称重新生成。"
-        raw = await _call_llm(prompt)
-        content = _extract_json(raw) if raw else None
-        if not content or _contains_first_person(content):
-            log.error(f"Relationship Profile ({ai_id}) still has first person after retry, aborting")
-            return None
-
-    if _text_too_stylized(content):
-        log.warning(f"Relationship Profile ({ai_id}) too stylized, retrying")
-        prompt += "\n\n重要：禁止使用华丽形容词，用平实语言重写。"
-        raw = await _call_llm(prompt)
-        content = _extract_json(raw) if raw else None
-        if not content:
-            return None
-
-    content = _truncate_profile_fields(content)
 
     profile = {
         "id": profile_id,

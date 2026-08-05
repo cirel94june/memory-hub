@@ -3,6 +3,7 @@
 由 daemon.py 的 run_full_maintenance() 调用。
 通过 memory_ops.remember() 存储，确保有 embedding 和正确的元数据。
 """
+import asyncio
 import sqlite3
 import logging
 import json
@@ -16,6 +17,8 @@ from time_utils import LOCAL_TZ, local_today
 logger = logging.getLogger("memory_hub.dream")
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
 DREAM_STATUS_PATH = Path(__file__).parent / "data" / "dream_status.json"
+
+_dream_lock = asyncio.Lock()
 
 
 def _connect() -> sqlite3.Connection:
@@ -393,15 +396,16 @@ _DREAM_TEMPS = {"claude": 0.6, "lucien": 0.7, "jasper": 0.95}
 
 # 梦境频率控制
 DREAM_PROBABILITY = 0.40
-DREAM_HOUR_START = 3
+DREAM_HOUR_START = 2
 DREAM_HOUR_END = 6
 
 
-def _in_dream_window() -> bool:
-    """Check if current local time is within the dream generation window (3-6 AM)."""
-    from time_utils import LOCAL_TZ
-    now_local = datetime.now(LOCAL_TZ)
-    return DREAM_HOUR_START <= now_local.hour < DREAM_HOUR_END
+def _in_dream_window(hour: int = None) -> bool:
+    """Check if current (or given) local hour is within the dream generation window."""
+    if hour is None:
+        from time_utils import LOCAL_TZ
+        hour = datetime.now(LOCAL_TZ).hour
+    return DREAM_HOUR_START <= hour < DREAM_HOUR_END
 
 
 def _should_dream_today(canonical: str, today: str) -> bool:
@@ -413,6 +417,11 @@ def _should_dream_today(canonical: str, today: str) -> bool:
 
 async def generate_dreams(force: bool = False) -> dict:
     """为每个有今日对话摘要的 AI 生成梦境日记"""
+    async with _dream_lock:
+        return await _generate_dreams_inner(force)
+
+
+async def _generate_dreams_inner(force: bool = False) -> dict:
     import memory_ops
 
     _today, day_start_utc, day_end_utc = _local_day_utc_bounds()
@@ -459,12 +468,17 @@ async def generate_dreams(force: bool = False) -> dict:
             (*alias_ids, mat_start, mat_end),
         ).fetchall()
 
-        # 检查今天是否已经生成过梦境
+        # 检查今天是否已经生成过梦境（dream_log 优先，memories 表兜底）
         existing = conn.execute(
-            "SELECT id FROM memories WHERE source_ai=? AND room IN ('diary', 'dreams') "
-            "AND tags LIKE '%dream%' AND status='active' AND created_at >= ? AND created_at < ?",
-            (canonical, day_start_utc, day_end_utc),
+            "SELECT memory_id FROM dream_log WHERE ai_id=? AND local_day=?",
+            (canonical, _today),
         ).fetchone()
+        if not existing:
+            existing = conn.execute(
+                "SELECT id FROM memories WHERE source_ai=? AND room IN ('diary', 'dreams') "
+                "AND tags LIKE '%dream%' AND status='active' AND created_at >= ? AND created_at < ?",
+                (canonical, day_start_utc, day_end_utc),
+            ).fetchone()
         if existing and not force:
             results[canonical] = "skipped (already dreamed)"
             diagnostics[canonical] = {
@@ -641,6 +655,17 @@ async def generate_dreams(force: bool = False) -> dict:
             auto_merge=False,
             provenance_type="dream",
         )
+        # Record in dream_log for dedup (PRIMARY KEY enforces one dream per AI per day)
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (canonical, _today, r.get("id", ""), _now_utc()),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"dream_log insert failed: {e}")
+
         results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
         diagnostics[canonical] = {
             "status": "dreamed",
