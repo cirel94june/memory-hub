@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from typing import Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 import database
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
@@ -28,10 +28,11 @@ AI_IDS = ["claude", "lucien", "jasper"]
 # ════════════════════════════════════════════
 
 class ProfileField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     value: str | list[str]
     confidence: str
     evidence_tier: int
-    source_ids: list[str] = []
+    source_ids: list[str]
 
     @field_validator("confidence")
     @classmethod
@@ -47,8 +48,16 @@ class ProfileField(BaseModel):
             raise ValueError(f"Invalid evidence_tier: {v}, must be 1-4")
         return v
 
+    @field_validator("source_ids")
+    @classmethod
+    def non_empty_source_ids(cls, v):
+        if len(v) < 1:
+            raise ValueError("source_ids must have at least 1 entry")
+        return v
+
 
 class UserProfileSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     tier0: dict
     identity: ProfileField
     stable_preferences: Optional[ProfileField] = None
@@ -59,6 +68,7 @@ class UserProfileSchema(BaseModel):
 
 
 class AgentProfileSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     tier0: dict
     identity: ProfileField
     personality: Optional[ProfileField] = None
@@ -67,10 +77,17 @@ class AgentProfileSchema(BaseModel):
 
 
 class RelationshipProfileSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     mode: Optional[ProfileField] = None
     interaction_pattern: Optional[ProfileField] = None
     shared_context: Optional[ProfileField] = None
     boundaries: Optional[ProfileField] = None
+
+    @model_validator(mode="after")
+    def at_least_one_field(self):
+        if not any([self.mode, self.interaction_pattern, self.shared_context, self.boundaries]):
+            raise ValueError("Relationship profile must have at least one field")
+        return self
 
 
 _PROFILE_SCHEMAS = {
@@ -81,36 +98,37 @@ _PROFILE_SCHEMAS = {
 
 
 def _validate_profile_schema(content_json: str, profile_type: str,
-                             valid_mem_ids: set[str] = None) -> tuple[bool, str]:
+                             valid_mem_ids: set[str] = None) -> tuple[bool, str, str]:
     """Validate Profile JSON against its Pydantic schema.
 
-    Returns (is_valid, error_message). Also checks source_ids ⊆ valid_mem_ids.
+    Returns (is_valid, error_message, validated_json).
+    validated_json is model_dump_json() output — canonical, not raw LLM.
     """
     schema_cls = _PROFILE_SCHEMAS.get(profile_type)
     if not schema_cls:
-        return False, f"Unknown profile type: {profile_type}"
+        return False, f"Unknown profile type: {profile_type}", ""
 
     try:
         data = json.loads(content_json)
     except (json.JSONDecodeError, TypeError) as e:
-        return False, f"Invalid JSON: {e}"
+        return False, f"Invalid JSON: {e}", ""
 
     if not isinstance(data, dict):
-        return False, "Top-level must be an object"
+        return False, "Top-level must be an object", ""
 
     try:
-        schema_cls.model_validate(data)
+        validated = schema_cls.model_validate(data)
     except Exception as e:
-        return False, f"Schema validation failed: {e}"
+        return False, f"Schema validation failed: {e}", ""
 
     if valid_mem_ids is not None:
         for field_name, field_val in data.items():
             if isinstance(field_val, dict) and "source_ids" in field_val:
                 bad_ids = [sid for sid in field_val["source_ids"] if sid and sid not in valid_mem_ids]
                 if bad_ids:
-                    return False, f"Field '{field_name}' has source_ids not in stable mems: {bad_ids}"
+                    return False, f"Field '{field_name}' has source_ids not in stable mems: {bad_ids}", ""
 
-    return True, ""
+    return True, "", validated.model_dump_json()
 
 PROFILE_NAMES = {"claude": "小克", "lucien": "Lucien", "jasper": "Jasper"}
 
@@ -197,9 +215,17 @@ def _filter_evidence(mems: list[dict], profile_type: str,
     return filtered
 
 
-def _extract_pattern_key(mem: dict) -> str:
-    """Extract a pattern key from a group_dynamic memory for grouping.
-    Uses first non-empty tag as key; falls back to category sub-type."""
+_PATTERN_TAG_RE = re.compile(r"^pattern:(.+)$", re.IGNORECASE)
+
+
+def _extract_pattern_key(mem: dict) -> str | None:
+    """Extract a pattern key from a group_dynamic memory.
+    Only accepts explicit 'pattern:<key>' tags or a 'pattern_key' field.
+    Returns None if no reliable key is found."""
+    pattern_key = mem.get("pattern_key")
+    if pattern_key and isinstance(pattern_key, str):
+        return pattern_key.strip().lower()
+
     tags_raw = mem.get("tags", "[]")
     if isinstance(tags_raw, str):
         try:
@@ -210,14 +236,17 @@ def _extract_pattern_key(mem: dict) -> str:
         tags = tags_raw if tags_raw else []
     for t in tags:
         if t and isinstance(t, str):
-            return t.strip().lower()
-    return mem.get("category", "group_dynamic").strip().lower()
+            m = _PATTERN_TAG_RE.match(t.strip())
+            if m:
+                return m.group(1).strip().lower()
+    return None
 
 
 def _filter_relationship_group_dynamic(mems: list[dict]) -> list[dict]:
     """Allow group_dynamic memories into Relationship Profile only if
-    the same interaction pattern (by tag/key) appears in >=3 different
-    memories and at least 1 per group is not roleplay/joke category."""
+    the same interaction pattern (by explicit pattern: tag) appears in >=3
+    different memories and at least 1 per group is not roleplay/joke.
+    Memories without a reliable pattern key are conservatively excluded."""
     normal = []
     group_dynamic = []
     for m in mems:
@@ -230,6 +259,8 @@ def _filter_relationship_group_dynamic(mems: list[dict]) -> list[dict]:
     groups: dict[str, list[dict]] = {}
     for m in group_dynamic:
         key = _extract_pattern_key(m)
+        if key is None:
+            continue
         groups.setdefault(key, []).append(m)
 
     for key, members in groups.items():
@@ -527,24 +558,24 @@ async def _validate_and_retry(prompt: str, profile_type: str, valid_mem_ids: set
             log.warning(f"Profile non-JSON output (attempt {attempt + 1})")
             continue
 
-        ok, err = _validate_profile_schema(content, profile_type, valid_mem_ids)
+        ok, err, validated_json = _validate_profile_schema(content, profile_type, valid_mem_ids)
         if not ok:
             retry_notes.append(f"重要：上次输出 schema 校验失败（{err}），请严格按要求的 JSON 格式重新生成。")
             log.warning(f"Profile schema invalid (attempt {attempt + 1}): {err}")
             continue
 
-        if is_agent_or_rel and _contains_first_person(content):
+        if is_agent_or_rel and _contains_first_person(validated_json):
             retry_notes.append("重要：你的上一次输出包含了第一人称（我），这是不允许的。请严格使用第三人称重新生成。")
             log.warning(f"Profile first-person detected (attempt {attempt + 1})")
             continue
 
-        if _text_too_stylized(content):
+        if _text_too_stylized(validated_json):
             retry_notes.append("重要：禁止使用华丽形容词（'深邃的''绚烂的''独特的灵魂'等），用平实语言重写。")
             log.warning(f"Profile too stylized (attempt {attempt + 1})")
             continue
 
-        content = _truncate_profile_fields(content)
-        return content
+        validated_json = _truncate_profile_fields(validated_json)
+        return validated_json
 
     log.error(f"Profile generation failed after {MAX_PROFILE_RETRIES} attempts")
     return None

@@ -195,6 +195,7 @@ def _make_mem(**kwargs):
         "id": "mem_test", "content": "test", "room": "living_room",
         "info_type": "fact", "importance": 0.5, "created_at": "2026-08-03",
         "category": "", "provenance_type": "user_statement", "fact_confidence": 0.9,
+        "tags": "[]",
     }
     defaults.update(kwargs)
     return defaults
@@ -245,24 +246,28 @@ def test_profile_requires_source_ids():
 
 # ── Item A: group_dynamic conditional inclusion ──
 
-def test_group_dynamic_needs_threshold():
-    """group_dynamic memories need >=3 count and >=1 non-roleplay to be included."""
-    gd_mems = [
-        _make_mem(id=f"gd{i}", category="group_dynamic interaction")
-        for i in range(2)
-    ]
-    normal = [_make_mem(id="n1", content="正常记忆")]
-    result = _filter_relationship_group_dynamic(normal + gd_mems)
-    ids = [m["id"] for m in result]
-    assert "gd0" not in ids, "<3 group_dynamic should be excluded"
-
-    gd_mems_enough = [
+def test_group_dynamic_needs_pattern_tag_and_threshold():
+    """group_dynamic without pattern: tags are excluded; with pattern: need >=3."""
+    # No pattern tags → excluded even if >=3
+    gd_no_tag = [
         _make_mem(id=f"gd{i}", category="group_dynamic interaction")
         for i in range(4)
     ]
-    result2 = _filter_relationship_group_dynamic(normal + gd_mems_enough)
+    normal = [_make_mem(id="n1", content="正常记忆")]
+    result = _filter_relationship_group_dynamic(normal + gd_no_tag)
+    ids = [m["id"] for m in result]
+    assert "gd0" not in ids, "no-tag group_dynamic should be excluded"
+    assert "n1" in ids
+
+    # With pattern: tags and >=3 → included
+    gd_tagged = [
+        _make_mem(id=f"gt{i}", category="group_dynamic interaction",
+                  tags='["pattern:teasing"]')
+        for i in range(3)
+    ]
+    result2 = _filter_relationship_group_dynamic(normal + gd_tagged)
     ids2 = [m["id"] for m in result2]
-    assert "gd0" in ids2, ">=3 group_dynamic with non-roleplay should be included"
+    assert "gt0" in ids2, ">=3 same-pattern group_dynamic should be included"
 
 
 # ── Item C: test_metaphor_to_fact ──

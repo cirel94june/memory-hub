@@ -1039,6 +1039,13 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     # Escape special FTS5 characters and build a safe query
     safe_query = _fts_escape(query)
 
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND m.provenance_type NOT IN ({ph})"
+        prov_params = list(exclude_provenance)
+
     try:
         rows = conn.execute(
             "SELECT m.*, fts.rank "
@@ -1046,15 +1053,14 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
             "JOIN memories m ON m.rowid = fts.rowid "
             "WHERE memories_fts MATCH ? "
             "AND m.status = ? "
+            f"{prov_clause} "
             "ORDER BY fts.rank "
             "LIMIT ?",
-            (safe_query, status, top_k),
+            (safe_query, status, *prov_params, top_k),
         ).fetchall()
     except sqlite3.OperationalError:
-        # If the query has syntax issues for FTS5, fall back to a simpler query
         logger.warning(f"FTS5 query failed for: {query!r}, trying fallback")
         try:
-            # Fallback: wrap each token in quotes
             tokens = query.strip().split()
             fallback = " OR ".join(f'"{_fts_escape_token(t)}"' for t in tokens if t)
             if not fallback:
@@ -1065,9 +1071,10 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
                 "JOIN memories m ON m.rowid = fts.rowid "
                 "WHERE memories_fts MATCH ? "
                 "AND m.status = ? "
+                f"{prov_clause} "
                 "ORDER BY fts.rank "
                 "LIMIT ?",
-                (fallback, status, top_k),
+                (fallback, status, *prov_params, top_k),
             ).fetchall()
         except sqlite3.OperationalError:
             logger.exception("FTS5 fallback also failed")
@@ -1076,8 +1083,6 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     results = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
-        if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
-            continue
         mem["rank"] = row["rank"]
         results.append(mem)
 
@@ -1110,10 +1115,16 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
 
     conn = _get_conn()
     conds = " OR ".join(["content LIKE ?"] * len(grams))
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND provenance_type NOT IN ({ph})"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
-            (status, *[f"%{g}%" for g in grams]),
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
+            (status, *[f"%{g}%" for g in grams], *prov_params),
         ).fetchall()
     except sqlite3.OperationalError:
         logger.exception("cjk_like_search failed")
@@ -1122,8 +1133,6 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     scored = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
-        if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
-            continue
         text = f"{mem.get('content', '')} {mem.get('tags', '')} {mem.get('category', '')}"
         hits = sum(1 for g in grams if g in text)
         if hits:
@@ -1338,13 +1347,20 @@ def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
     if not terms:
         return []
     fts_query = " OR ".join(f'"{t}"' for t in terms[:10])
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND m.provenance_type NOT IN ({ph})"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
             "SELECT m.*, f.rank FROM memories_fts f "
             "JOIN memories m ON m.rowid = f.rowid "
             "WHERE memories_fts MATCH ? AND m.status = ? "
+            f"{prov_clause} "
             "ORDER BY f.rank LIMIT ?",
-            (fts_query, status, top_k * 2),
+            (fts_query, status, *prov_params, top_k * 2),
         ).fetchall()
     except Exception as e:
         logger.warning(f"ro_fts_search failed: {e}")
@@ -1352,8 +1368,6 @@ def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
     results = []
     for r in rows:
         d = _row_to_dict_no_embedding(r)
-        if exclude_provenance and d.get("provenance_type") in exclude_provenance:
-            continue
         results.append(d)
     return results[:top_k]
 
@@ -1374,10 +1388,16 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
         return []
     grams = grams[:8]
     conds = " OR ".join(["content LIKE ?"] * len(grams))
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND provenance_type NOT IN ({ph})"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
-            (status, *[f"%{g}%" for g in grams]),
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
+            (status, *[f"%{g}%" for g in grams], *prov_params),
         ).fetchall()
     except Exception as e:
         logger.warning(f"ro_cjk_like_search failed: {e}")
@@ -1385,8 +1405,6 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     results = []
     for row in rows:
         d = _row_to_dict_no_embedding(row)
-        if exclude_provenance and d.get("provenance_type") in exclude_provenance:
-            continue
         hits = sum(1 for g in grams if g in d.get("content", ""))
         d["like_hits"] = hits
         results.append(d)

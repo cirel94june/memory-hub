@@ -1504,12 +1504,13 @@ async def recall(
         merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
 
         # Fail-closed: final provenance filter after RRF (defense in depth)
+        # Unknown items (get_fn returns None) are EXCLUDED — fail-closed.
         _excl_prov = db_kwargs.get("exclude_provenance")
         if _excl_prov:
             merged = [
                 item for item in merged
-                if get_fn(item["id"]) is None
-                or get_fn(item["id"]).get("provenance_type") not in _excl_prov
+                if get_fn(item["id"]) is not None
+                and get_fn(item["id"]).get("provenance_type") not in _excl_prov
             ]
 
         # 残缺正文降权（content_incomplete 由完整性审计标记）
