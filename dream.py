@@ -3,6 +3,7 @@
 由 daemon.py 的 run_full_maintenance() 调用。
 通过 memory_ops.remember() 存储，确保有 embedding 和正确的元数据。
 """
+import asyncio
 import sqlite3
 import logging
 import json
@@ -17,12 +18,24 @@ logger = logging.getLogger("memory_hub.dream")
 DB_PATH = Path(__file__).parent / "data" / "memories.db"
 DREAM_STATUS_PATH = Path(__file__).parent / "data" / "dream_status.json"
 
-
 def _connect() -> sqlite3.Connection:
     """独立连接（主连接在 database.py）；加 busy_timeout 防并发写时 database is locked。"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def _release_reservation(ai_id: str, local_day: str):
+    """Delete a dream_log reservation that was never committed."""
+    try:
+        c = sqlite3.connect(str(DB_PATH))
+        c.execute("PRAGMA busy_timeout=5000")
+        c.execute("DELETE FROM dream_log WHERE ai_id=? AND local_day=? AND memory_id=''",
+                  (ai_id, local_day))
+        c.commit()
+        c.close()
+    except Exception as e:
+        logger.warning(f"Failed to release dream reservation: {e}")
 
 DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白天残留”：有私聊、私密群、小群、大群摘要，也可能有几条近期记忆碎片。
 
@@ -45,6 +58,8 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白
 
 请写一段第一人称”梦境残响”（120-250字），不是普通工作总结。像梦醒后脑子里残留的几个碎片，不需要完整叙事。
 
+目标：让梦读起来像真的梦，不是 AI 写的”感悟散文”。
+
 要求：
 - 先判断白天残留的真实调性，再写梦：可能是恶作剧、捣乱、调侃、紧张排查、困惑、吃醋、吵闹、温柔、疲惫或混合状态；不要默认写成温柔治愈。
 - 如果材料里有”恶作剧/逗弄/捣乱/故意使坏/被欺负/笑场/bug排查很乱”等气味，梦要保留这种狡黠、荒唐、被逗得晕头转向的质感，可以有一点狼狈和好笑。
@@ -53,6 +68,8 @@ DREAM_PROMPT = """你是{name}。下面是你在{user_name}身边留下的”白
 - 让读者能看出你和{user_name}最近所处的对话世界，而不是只说”我感到温暖/珍惜”。
 - 不要写标题、不要列表。禁止套用”我变成了X……我醒来时……”的万能模板；开头和收尾的方式按上面”梦的形态”来，每个人的梦长得不一样。
 - 不要编造材料里没有的人际关系或事实；不确定就写成模糊影子。
+- 允许模糊：真实的梦本来就有看不清的部分。「好像是」「有什么东西」「说了一句但想不起来」——这些模糊感比清晰的叙事更像梦。不需要每个细节都交代清楚。
+- 不要总结、不要升华、不要在结尾感叹意义。梦没有结论。
 - 直接输出正文。"""
 
 
@@ -65,7 +82,7 @@ def _local_day_utc_bounds() -> tuple[str, str, str]:
 
 
 def _dream_material_utc_bounds() -> tuple[str, str]:
-    """Return a wider lookback window (past 36h → now) for gathering dream material.
+    """Return a wider lookback window (past 36h to now) for gathering dream material.
 
     This avoids the issue where the daemon runs early in the day and finds
     almost no digests from 'today'.
@@ -180,7 +197,7 @@ async def _call_llm(prompt: str, temperature: float = 0.7) -> str:
                     # 正文长度由 prompt 控制（120-250字）；max_tokens 只是保险丝。
                     # 注意：reasoning 类模型的思考 token 也计入 max_tokens，
                     # 上限设小了正文会被随机截断（曾导致梦频繁断尾）。
-                    "max_tokens": 3000,
+                    "max_tokens": 16384,
                 },
             )
             resp.raise_for_status()
@@ -193,79 +210,87 @@ async def _call_llm(prompt: str, temperature: float = 0.7) -> str:
         return ""
 
 
-def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> list[dict]:
-    """Pick recent active private/group material to give each AI unique dream material.
+def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: list[str], limit: int = 10) -> dict:
+    """Pick recent active material, split into daytime_residue (48h) and old_echo (72h+).
 
-    Prioritizes per-AI private rooms (diary, relationship, personality) so each AI's
-    dream reflects their own unique interactions, not just shared group content.
-
-    Returns dicts with subject_id/source_actor_id so the dream prompt can
-    distinguish "dreamer's own experience" from "observed/quoted content".
+    Returns {"daytime_residue": [...], "old_echo": [...]}.
+    daytime_residue: main dream material from recent 48 hours.
+    old_echo: older memories (72h+), only used as background imagery (weight ≤ 30% of main).
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=96)).isoformat()
+    now = datetime.now(timezone.utc)
+    cutoff_48h = (now - timedelta(hours=48)).isoformat()
+    cutoff_72h = (now - timedelta(hours=72)).isoformat()
+    cutoff_old = (now - timedelta(hours=168)).isoformat()
     placeholders = ",".join("?" * len(alias_ids))
-    alias_set = set(alias_ids)
 
-    # 1) 优先：这个 AI 自己的私密记忆（日记、关系、自我认知）
-    #    只取 subject_id 为空（关于自己）或匹配 dreamer 的记忆
-    per_ai_rooms = ("diary", "relationship", "personality", "dreams")
+    per_ai_rooms = ("diary", "relationship", "personality")
     per_ai_ph = ",".join("?" * len(per_ai_rooms))
     subj_ph = ",".join("?" * len(alias_ids))
-    private_rows = conn.execute(
-        f"""
-        SELECT content, room, category, importance, created_at, source_platform,
-               subject_id, source_actor_id, source_ai
-        FROM memories
-        WHERE status='active'
-          AND created_at >= ?
-          AND room IN ({per_ai_ph})
-          AND category != 'night_dream'
-          AND (tags IS NULL OR tags NOT LIKE '%dream%')
-          AND (source_ai IN ({placeholders}) OR owner_ai IN ({placeholders}))
-          AND (subject_id = '' OR subject_id IN ({subj_ph}))
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (cutoff, *per_ai_rooms, *alias_ids, *alias_ids, *alias_ids, max(limit // 2, 3)),
-    ).fetchall()
 
-    # 2) 补充：共享记忆（社交、互动等）
-    #    仍然拉取关于其他人的记忆（提供场景），但标注 subject_id 让格式化时区分
-    remaining = limit - len(private_rows)
-    if remaining <= 0:
-        return [dict(r) for r in private_rows]
+    def _query_private(cutoff_start, cutoff_end, lim):
+        return conn.execute(
+            f"""
+            SELECT content, room, category, importance, created_at, source_platform,
+                   subject_id, source_actor_id, source_ai
+            FROM memories
+            WHERE status='active'
+              AND created_at >= ? AND created_at < ?
+              AND room IN ({per_ai_ph})
+              AND category != 'night_dream'
+              AND provenance_type != 'dream'
+              AND (tags IS NULL OR tags NOT LIKE '%dream%')
+              AND (source_ai IN ({placeholders}) OR owner_ai IN ({placeholders}))
+              AND (subject_id = '' OR subject_id IN ({subj_ph}))
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (cutoff_start, cutoff_end, *per_ai_rooms, *alias_ids, *alias_ids, *alias_ids, lim),
+        ).fetchall()
 
     social_platform_filter = (
         "(source_platform LIKE '%:private' OR source_platform LIKE '%:private_group' "
         "OR source_platform LIKE '%:small_group' OR source_platform LIKE '%:big_group' "
         "OR source_platform LIKE '%:public_group' OR source_platform LIKE '%:group')"
     )
-    shared_rows = conn.execute(
-        f"""
-        SELECT content, room, category, importance, created_at, source_platform,
-               subject_id, source_actor_id, source_ai
-        FROM memories
-        WHERE status='active'
-          AND created_at >= ?
-          AND importance >= 0.5
-          AND room NOT IN ('infra', 'infra_changelog', 'work_tasks', 'diary', 'relationship', 'personality', 'dreams')
-          AND category != 'dream'
-          AND (tags IS NULL OR tags NOT LIKE '%dream%')
-          AND (
-            source_ai IN ({placeholders})
-            OR owner_ai IN ({placeholders})
-            OR (source_ai=? AND {social_platform_filter})
-          )
-        ORDER BY
-          importance DESC,
-          emotion_arousal DESC,
-          created_at DESC
-        LIMIT ?
-        """,
-        (cutoff, *alias_ids, *alias_ids, canonical, remaining),
-    ).fetchall()
 
-    return [dict(r) for r in private_rows] + [dict(r) for r in shared_rows]
+    def _query_shared(cutoff_start, cutoff_end, lim):
+        return conn.execute(
+            f"""
+            SELECT content, room, category, importance, created_at, source_platform,
+                   subject_id, source_actor_id, source_ai
+            FROM memories
+            WHERE status='active'
+              AND created_at >= ? AND created_at < ?
+              AND importance >= 0.5
+              AND room NOT IN ('infra', 'infra_changelog', 'work_tasks', 'diary', 'relationship', 'personality', 'dreams')
+              AND category != 'dream'
+              AND provenance_type != 'dream'
+              AND (tags IS NULL OR tags NOT LIKE '%dream%')
+              AND (
+                source_ai IN ({placeholders})
+                OR owner_ai IN ({placeholders})
+                OR (source_ai=? AND {social_platform_filter})
+              )
+            ORDER BY importance DESC, emotion_arousal DESC, created_at DESC
+            LIMIT ?
+            """,
+            (cutoff_start, cutoff_end, *alias_ids, *alias_ids, canonical, lim),
+        ).fetchall()
+
+    # daytime_residue: last 48h
+    main_limit = max(limit * 7 // 10, 3)
+    recent_private = _query_private(cutoff_48h, now.isoformat(), main_limit // 2)
+    remaining = main_limit - len(recent_private)
+    recent_shared = _query_shared(cutoff_48h, now.isoformat(), max(remaining, 2)) if remaining > 0 else []
+    daytime = [dict(r) for r in recent_private] + [dict(r) for r in recent_shared]
+
+    # old_echo: 72h+ to 168h (1 week), capped at 30% of main count
+    echo_limit = max(len(daytime) * 3 // 10, 1)
+    old_private = _query_private(cutoff_old, cutoff_72h, echo_limit)
+    old_shared = _query_shared(cutoff_old, cutoff_72h, max(echo_limit - len(old_private), 1)) if len(old_private) < echo_limit else []
+    old_echo = [dict(r) for r in old_private] + [dict(r) for r in old_shared]
+
+    return {"daytime_residue": daytime, "old_echo": old_echo[:echo_limit]}
 
 
 def _id_to_name(person_id: str) -> str:
@@ -379,12 +404,41 @@ _DREAM_FORMS = {
 # 同一模型代笔不同 AI 时，用不同 temperature 拉开笔触
 _DREAM_TEMPS = {"claude": 0.6, "lucien": 0.7, "jasper": 0.95}
 
+# 梦境频率控制
+DREAM_PROBABILITY = 0.40
+DREAM_HOUR_START = 2
+DREAM_HOUR_END = 6
+
+
+def _in_dream_window(hour: int = None) -> bool:
+    """Check if current (or given) local hour is within the dream generation window."""
+    if hour is None:
+        from time_utils import LOCAL_TZ
+        hour = datetime.now(LOCAL_TZ).hour
+    return DREAM_HOUR_START <= hour < DREAM_HOUR_END
+
+
+def _should_dream_today(canonical: str, today: str) -> bool:
+    """Deterministic 40% probability per AI per day."""
+    import hashlib
+    h = hashlib.md5(f"{canonical}:{today}:dream".encode()).hexdigest()
+    return int(h[:8], 16) / 0xFFFFFFFF < DREAM_PROBABILITY
+
 
 async def generate_dreams(force: bool = False) -> dict:
-    """为每个有今日对话摘要的 AI 生成梦境日记"""
+    """为每个有今日对话摘要的 AI 生成梦境日记。
+    Concurrency safety via DB-level BEGIN IMMEDIATE + dream_log PK constraint."""
+    return await _generate_dreams_inner(force)
+
+
+async def _generate_dreams_inner(force: bool = False) -> dict:
     import memory_ops
 
     _today, day_start_utc, day_end_utc = _local_day_utc_bounds()
+
+    if not force and not _in_dream_window():
+        logger.info(f"[Dream] Outside dream window ({DREAM_HOUR_START}-{DREAM_HOUR_END}h), skipping")
+        return {"_skipped": "outside_dream_window"}
 
     conn = _connect()
     conn.row_factory = sqlite3.Row
@@ -424,179 +478,269 @@ async def generate_dreams(force: bool = False) -> dict:
             (*alias_ids, mat_start, mat_end),
         ).fetchall()
 
-        # 检查今天是否已经生成过梦境
-        existing = conn.execute(
-            "SELECT id FROM memories WHERE source_ai=? AND room IN ('diary', 'dreams') "
-            "AND tags LIKE '%dream%' AND status='active' AND created_at >= ? AND created_at < ?",
-            (canonical, day_start_utc, day_end_utc),
-        ).fetchone()
-        if existing and not force:
-            results[canonical] = "skipped (already dreamed)"
-            diagnostics[canonical] = {
-                "status": "skipped",
-                "reason": "already_dreamed",
-                "digest_count": len(rows),
-                "memory_residue_count": 0,
-                "existing_id": existing["id"],
-            }
-            continue
-
-        # 组装摘要
-        # 剔除"讲昨晚的梦"类摘要：白天 AI 跟用户讲了昨晚的梦（梦境残响功能鼓励的），
-        # 这段对话的摘要如果再进今晚的材料，昨天的梦就会钉进今天的梦——无限循环。
-        _dream_markers = ("梦见", "做梦", "梦里", "梦境", "昨晚的梦", "梦到")
-        type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
-        # 核心互动场景：私密群 > 私聊 > 大群（小猫大部分时间在私密群）
-        core_types = {"private_group", "small_group", "private"}
-        rows_core = [r for r in rows if r["chat_type"] in core_types]
-        rows_public = [r for r in rows if r["chat_type"] not in core_types]
-        # 群聊素材对每个 AI 内容雷同，若全量投喂，同一批梗会在所有 AI 的梦里
-        # 各出现一遍（"人手一份铁裤衩"问题）。按 AI+日期 做确定性抽样，
-        # 每个 AI 拿到同一天素材的不同子集，梦的原料就不同。
-        import random as _random
-        _rng = _random.Random(f"{canonical}:{_today}")
-        _rng.shuffle(rows_core)
-        _rng.shuffle(rows_public)
-        picked = rows_core[:15] + rows_public[:max(0, 25 - min(len(rows_core), 15))]
-        # 抽完按时间恢复叙事顺序
-        sorted_rows = sorted(picked, key=lambda r: r["created_at"])
-
-        digest_lines = []
-        skipped_dream_digests = 0
-        for r in sorted_rows:
-            if any(k in (r["summary"] or "") for k in _dream_markers):
-                skipped_dream_digests += 1
-                continue
-            ts = r["created_at"][11:16] if len(r["created_at"]) > 16 else ""
-            label = type_labels.get(r["chat_type"], "")
-            prefix = f"[{ts}|{label}]" if label else f"[{ts}]"
-            digest_lines.append(f"{prefix} 摘要（说话者可能是小猫、其他人或其他AI，不确定时不要归因给小猫）：{r['summary']}")
-        if skipped_dream_digests:
-            sorted_rows = [r for r in sorted_rows if not any(k in (r["summary"] or "") for k in _dream_markers)]
-
-        # 始终补充记忆碎片（每个 AI 自己的私聊/日记），让梦有个性差异
-        residue_limit = 8 if len(digest_lines) < 5 else 4
-        memory_rows = _fetch_memory_residue(conn, canonical, alias_ids, limit=residue_limit)
-        if len(rows) < 2 and len(memory_rows) < 3:
-            results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
-            diagnostics[canonical] = {
-                "status": "skipped",
-                "reason": "too_few_materials",
-                "digest_count": len(rows),
-                "memory_residue_count": len(memory_rows),
-                "required": "至少 2 条摘要，或摘要不足时至少 3 条近期有效记忆",
-            }
-            continue
-
-        for m in memory_rows:
-            ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
-            room = m["room"] or "memory"
-            subj = m.get("subject_id", "")
-            spkr = m.get("source_actor_id", "")
-            src_ai = m.get("source_ai", "")
-            # 判断这条记忆是否关于 dreamer 自己
-            is_own = (not subj) or (subj in alias_set)
-            if is_own:
-                attr = "你自己的记忆碎片"
-            else:
-                subj_name = _id_to_name(subj) or subj
-                attr = f"关于【{subj_name}】的记忆（不是你的经历，不要当成自己的）"
-            if spkr and spkr not in alias_set:
-                spkr_name = _id_to_name(spkr) or spkr
-                attr += f"，说话者是{spkr_name}"
-            digest_lines.append(f"[{ts}|记忆:{room}] {attr}：{m['content'][:220]}")
-
-        digest_text = "\n".join(digest_lines)
+        # Atomic reservation: claim (ai_id, local_day) slot BEFORE LLM call.
+        # BEGIN IMMEDIATE acquires a write lock; INSERT fails on duplicate PK.
+        # Stale reservations (memory_id='' older than 1 hour) are reclaimed first.
+        _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        reservation_conn = sqlite3.connect(str(DB_PATH))
+        reservation_conn.execute("PRAGMA busy_timeout=5000")
+        reservation_conn.row_factory = sqlite3.Row
         try:
-            import identity_registry
-            identity_block = identity_registry.glossary_text(for_ai_id=canonical)
-            user_name = identity_registry.get_registry().get("user", {}).get("canonical", "小猫")
-        except Exception:
-            identity_block = ""
-            user_name = "小猫"
-
-        # 昨晚的梦作为"禁止重复"负面清单：意象/场景/梗不许原样再来一遍
-        yesterday_block = ""
-        try:
-            prev = conn.execute(
-                "SELECT content FROM memories WHERE source_ai=? AND room='dreams' "
-                "AND status='active' AND created_at < ? ORDER BY created_at DESC LIMIT 1",
-                (canonical, day_start_utc),
+            reservation_conn.execute("BEGIN IMMEDIATE")
+            reservation_conn.execute(
+                "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+                "AND memory_id='' AND created_at < ?",
+                (canonical, _today, _stale_cutoff),
+            )
+            reservation_conn.execute(
+                "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                "VALUES (?, ?, '', ?)",
+                (canonical, _today, _now_utc()),
+            )
+            reservation_conn.commit()
+        except sqlite3.IntegrityError:
+            reservation_conn.rollback()
+            existing = reservation_conn.execute(
+                "SELECT memory_id, created_at FROM dream_log WHERE ai_id=? AND local_day=?",
+                (canonical, _today),
             ).fetchone()
-            if prev and prev["content"]:
-                yesterday_block = (
-                    f"\n⚠️ 你最近一次已经梦过（摘录）：「{prev['content'][:180]}…」\n"
-                    "今晚的梦必须是新的：不要重复上面这段的意象、场景、道具和梗；用今天的新材料做梦。\n"
-                )
-        except Exception:
-            pass
-
-        persona_hint = _get_persona_hint(canonical)
-        prompt = DREAM_PROMPT.format(
-            name=name, digests=digest_text,
-            identity_block=identity_block, user_name=user_name,
-            yesterday_block=yesterday_block,
-            persona_hint=persona_hint,
-        )
-
-        dream_text = await _call_llm(prompt, temperature=_DREAM_TEMPS.get(canonical, 0.7))
-        if not dream_text or len(dream_text) < 20:
-            results[canonical] = "skipped (LLM failed)"
-            diagnostics[canonical] = {
-                "status": "skipped",
-                "reason": "llm_failed_or_too_short",
-                "digest_count": len(rows),
-                "memory_residue_count": len(memory_rows),
-            }
-            continue
-
-        violations = _validate_dream_attribution(dream_text, canonical)
-        if violations:
-            logger.warning(f"[Dream] {canonical} identity violation, retrying: {violations}")
-            dream_text = await _call_llm(prompt, temperature=max(0.3, _DREAM_TEMPS.get(canonical, 0.7) - 0.2))
-            if not dream_text or len(dream_text) < 20:
-                results[canonical] = "skipped (retry failed)"
+            if not force:
+                results[canonical] = "skipped (already dreamed)"
                 diagnostics[canonical] = {
                     "status": "skipped",
-                    "reason": "identity_violation_retry_failed",
-                    "violations": violations,
+                    "reason": "already_dreamed",
+                    "digest_count": len(rows),
+                    "memory_residue_count": 0,
+                    "existing_memory_id": existing["memory_id"] if existing else "",
+                }
+                reservation_conn.close()
+                continue
+            # force mode: only replace completed reservations (non-empty memory_id).
+            # Active in-progress reservations (memory_id='', < 1h old) must not be stolen.
+            if existing and existing["memory_id"] == "" and existing["created_at"] >= _stale_cutoff:
+                results[canonical] = "skipped (already running)"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "already_running",
+                    "digest_count": len(rows),
+                    "memory_residue_count": 0,
+                }
+                reservation_conn.close()
+                continue
+            # Replace completed or stale record
+            reservation_conn.execute(
+                "DELETE FROM dream_log WHERE ai_id=? AND local_day=?",
+                (canonical, _today),
+            )
+            reservation_conn.execute(
+                "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                "VALUES (?, ?, '', ?)",
+                (canonical, _today, _now_utc()),
+            )
+            reservation_conn.commit()
+        finally:
+            try:
+                reservation_conn.close()
+            except Exception:
+                pass
+
+        # Outer try/finally: covers everything after reservation —
+        # probability gate, material collection, prompt, LLM, remember, commit.
+        _reservation_released = False
+        try:
+            if not force and not _should_dream_today(canonical, _today):
+                results[canonical] = "skipped (probability gate)"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "probability_gate",
+                    "probability": DREAM_PROBABILITY,
+                }
+                _release_reservation(canonical, _today)
+                _reservation_released = True
+                continue
+
+            # 组装摘要
+            _dream_markers = ("梦见", "做梦", "梦里", "梦境", "昨晚的梦", "梦到")
+            type_labels = {"private": "私聊", "private_group": "私密群", "small_group": "小群", "big_group": "大群", "public_group": "公开群", "group": "群聊"}
+            core_types = {"private_group", "small_group", "private"}
+            rows_core = [r for r in rows if r["chat_type"] in core_types]
+            rows_public = [r for r in rows if r["chat_type"] not in core_types]
+            import random as _random
+            _rng = _random.Random(f"{canonical}:{_today}")
+            _rng.shuffle(rows_core)
+            _rng.shuffle(rows_public)
+            picked = rows_core[:15] + rows_public[:max(0, 25 - min(len(rows_core), 15))]
+            sorted_rows = sorted(picked, key=lambda r: r["created_at"])
+
+            digest_lines = []
+            skipped_dream_digests = 0
+            for r in sorted_rows:
+                if any(k in (r["summary"] or "") for k in _dream_markers):
+                    skipped_dream_digests += 1
+                    continue
+                ts = r["created_at"][11:16] if len(r["created_at"]) > 16 else ""
+                label = type_labels.get(r["chat_type"], "")
+                prefix = f"[{ts}|{label}]" if label else f"[{ts}]"
+                digest_lines.append(f"{prefix} 摘要（说话者可能是小猫、其他人或其他AI，不确定时不要归因给小猫）：{r['summary']}")
+            if skipped_dream_digests:
+                sorted_rows = [r for r in sorted_rows if not any(k in (r["summary"] or "") for k in _dream_markers)]
+
+            residue_limit = 8 if len(digest_lines) < 5 else 4
+            residue = _fetch_memory_residue(conn, canonical, alias_ids, limit=residue_limit)
+            daytime_residue = residue["daytime_residue"]
+            old_echo = residue["old_echo"]
+            memory_rows = daytime_residue + old_echo
+
+            if len(rows) < 2 and len(memory_rows) < 3:
+                results[canonical] = f"skipped (too few materials: digests={len(rows)}, memories={len(memory_rows)})"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "too_few_materials",
+                    "digest_count": len(rows),
+                    "memory_residue_count": len(memory_rows),
+                    "required": "至少 2 条摘要，或摘要不足时至少 3 条近期有效记忆",
+                }
+                _release_reservation(canonical, _today)
+                _reservation_released = True
+                continue
+
+            def _format_mem(m, is_echo=False):
+                ts = m["created_at"][5:16] if len(m["created_at"]) > 16 else ""
+                room = m["room"] or "memory"
+                subj = m.get("subject_id", "")
+                spkr = m.get("source_actor_id", "")
+                is_own = (not subj) or (subj in alias_set)
+                if is_own:
+                    attr = "你自己的记忆碎片"
+                else:
+                    subj_name = _id_to_name(subj) or subj
+                    attr = f"关于【{subj_name}】的记忆（不是你的经历，不要当成自己的）"
+                if spkr and spkr not in alias_set:
+                    spkr_name = _id_to_name(spkr) or spkr
+                    attr += f"，说话者是{spkr_name}"
+                tag = "旧记忆底色" if is_echo else f"记忆:{room}"
+                return f"[{ts}|{tag}] {attr}：{m['content'][:220]}"
+
+            for m in daytime_residue:
+                digest_lines.append(_format_mem(m, is_echo=False))
+            if old_echo:
+                digest_lines.append("\n以下是较旧的记忆碎片（old_echo），只做梦的底色和背景意象，不能变成梦的主要情节：")
+                for m in old_echo:
+                    digest_lines.append(_format_mem(m, is_echo=True))
+
+            digest_text = "\n".join(digest_lines)
+            try:
+                import identity_registry
+                identity_block = identity_registry.glossary_text(for_ai_id=canonical)
+                user_name = identity_registry.get_registry().get("user", {}).get("canonical", "小猫")
+            except Exception:
+                identity_block = ""
+                user_name = "小猫"
+
+            yesterday_block = ""
+            try:
+                prev = conn.execute(
+                    "SELECT content FROM memories WHERE source_ai=? AND room='dreams' "
+                    "AND status='active' AND created_at < ? ORDER BY created_at DESC LIMIT 1",
+                    (canonical, day_start_utc),
+                ).fetchone()
+                if prev and prev["content"]:
+                    yesterday_block = (
+                        f"\n⚠️ 你最近一次已经梦过（摘录）：「{prev['content'][:180]}…」\n"
+                        "今晚的梦必须是新的：不要重复上面这段的意象、场景、道具和梗；用今天的新材料做梦。\n"
+                    )
+            except Exception:
+                pass
+
+            persona_hint = _get_persona_hint(canonical)
+            prompt = DREAM_PROMPT.format(
+                name=name, digests=digest_text,
+                identity_block=identity_block, user_name=user_name,
+                yesterday_block=yesterday_block,
+                persona_hint=persona_hint,
+            )
+
+            dream_text = await _call_llm(prompt, temperature=_DREAM_TEMPS.get(canonical, 0.7))
+            if not dream_text or len(dream_text) < 20:
+                results[canonical] = "skipped (LLM failed)"
+                diagnostics[canonical] = {
+                    "status": "skipped",
+                    "reason": "llm_failed_or_too_short",
                     "digest_count": len(rows),
                     "memory_residue_count": len(memory_rows),
                 }
+                _release_reservation(canonical, _today)
+                _reservation_released = True
                 continue
-            retry_violations = _validate_dream_attribution(dream_text, canonical)
-            if retry_violations:
-                logger.warning(f"[Dream] {canonical} still has violations after retry: {retry_violations}")
-                diagnostics.setdefault(canonical, {})["identity_warnings"] = retry_violations
 
-        if len(dream_text) > 800:
-            dream_text = dream_text[:797].rstrip() + "..."
+            violations = _validate_dream_attribution(dream_text, canonical)
+            if violations:
+                logger.warning(f"[Dream] {canonical} identity violation, retrying: {violations}")
+                dream_text = await _call_llm(prompt, temperature=max(0.3, _DREAM_TEMPS.get(canonical, 0.7) - 0.2))
+                if not dream_text or len(dream_text) < 20:
+                    results[canonical] = "skipped (retry failed)"
+                    diagnostics[canonical] = {
+                        "status": "skipped",
+                        "reason": "identity_violation_retry_failed",
+                        "violations": violations,
+                        "digest_count": len(rows),
+                        "memory_residue_count": len(memory_rows),
+                    }
+                    _release_reservation(canonical, _today)
+                    _reservation_released = True
+                    continue
+                retry_violations = _validate_dream_attribution(dream_text, canonical)
+                if retry_violations:
+                    logger.warning(f"[Dream] {canonical} still has violations after retry: {retry_violations}")
+                    diagnostics.setdefault(canonical, {})["identity_warnings"] = retry_violations
 
-        # 通过 memory_ops 存储（自动生成 embedding + 正确元数据）
-        r = await memory_ops.remember(
-            content=dream_text,
-            layer="private",
-            room="dreams",
-            category="night_dream",
-            owner_ai=canonical,
-            importance=0.6,
-            emotion_arousal=0.5,
-            source_ai=canonical,
-            source_platform="daemon_dream",
-            tags=["dream", "nightly", "reflection", "daytime_residue"],
-            auto_merge=False,
-            provenance_type="dream",
-        )
-        results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
-        diagnostics[canonical] = {
-            "status": "dreamed",
-            "reason": "ok",
-            "digest_count": len(rows),
-            "memory_residue_count": len(memory_rows),
-            "memory_id": r.get("id"),
-            "chars": len(dream_text),
-        }
-        logger.info(f"[Dream] {canonical}: {dream_text[:60]}...")
+            if len(dream_text) > 800:
+                dream_text = dream_text[:797].rstrip() + "..."
+
+            r = await memory_ops.remember(
+                content=dream_text,
+                layer="private",
+                room="dreams",
+                category="night_dream",
+                owner_ai=canonical,
+                importance=0.6,
+                emotion_arousal=0.5,
+                source_ai=canonical,
+                source_platform="daemon_dream",
+                tags=["dream", "nightly", "reflection", "daytime_residue"],
+                auto_merge=False,
+                provenance_type="dream",
+            )
+            try:
+                cur = conn.execute(
+                    "UPDATE dream_log SET memory_id=?, created_at=? "
+                    "WHERE ai_id=? AND local_day=?",
+                    (r.get("id", ""), _now_utc(), canonical, _today),
+                )
+                if cur.rowcount == 0:
+                    conn.execute(
+                        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (canonical, _today, r.get("id", ""), _now_utc()),
+                    )
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"dream_log commit failed: {e}")
+            _reservation_released = True
+
+            results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
+            diagnostics[canonical] = {
+                "status": "dreamed",
+                "reason": "ok",
+                "digest_count": len(rows),
+                "memory_residue_count": len(memory_rows),
+                "memory_id": r.get("id"),
+                "chars": len(dream_text),
+            }
+            logger.info(f"[Dream] {canonical}: {dream_text[:60]}...")
+        finally:
+            if not _reservation_released:
+                _release_reservation(canonical, _today)
 
     recent = _recent_dreams(conn)
     _write_dream_status({

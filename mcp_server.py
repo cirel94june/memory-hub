@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
+import database
 import memory_ops
 import corridor as corridor_mod
 import gateway as gateway_mod
@@ -406,6 +407,26 @@ async def list_memories(
 
 
 @mcp.tool()
+async def dream_recall(query: str, top_k: int = 3, source_ai: str = "claude") -> str:
+    """专门搜索梦境记忆。梦境不会出现在普通 recall 结果中，只能通过这个工具查看。
+
+    用这个工具来：
+    - 回忆之前做过的梦
+    - 查找梦里出现过的意象或场景
+    - 对比不同 AI 的梦
+
+    Args:
+        query: 搜索关键词（如"飞行""小猫""那个奇怪的梦"）
+        top_k: 最多返回几条梦境（默认 3）
+        source_ai: 你的身份（cloudy/lucien/jasper）
+    """
+    results = await memory_ops.dream_recall(query, ai_id=source_ai, top_k=top_k)
+    if not results:
+        return json.dumps({"message": "没有找到相关的梦境记忆"}, ensure_ascii=False)
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def update_memory(
     memory_id: str,
     content: str = "",
@@ -556,6 +577,51 @@ async def review_proposal(
         reject_reason=reject_reason,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def get_profile(profile_id: str = "", profile_type: str = "") -> str:
+    """查看 Profile（用户/AI/关系画像）。只读，不可修改。
+
+    Profile 是从记忆自动生成的结构化摘要，帮你快速了解"她是谁"、"你是谁"、"你们什么关系"。
+
+    用法：
+    - get_profile(profile_id="user_ceci") → 用户画像
+    - get_profile(profile_id="agent_lucien") → Lucien 的 AI 画像
+    - get_profile(profile_id="rel_lucien_ceci") → Lucien 和 Ceci 的关系画像
+    - get_profile(profile_type="agent") → 所有 AI 画像
+    - get_profile() → 所有 Profile
+
+    Args:
+        profile_id: 指定 Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
+        profile_type: 按类型筛选（user/agent/relationship）
+    """
+    if profile_id:
+        p = database.get_profile(profile_id)
+        if not p:
+            return json.dumps({"error": f"Profile '{profile_id}' not found"})
+        return json.dumps(p, ensure_ascii=False, indent=2)
+    profiles = database.list_profiles(profile_type=profile_type or None)
+    return json.dumps(profiles, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def approve_profile(profile_id: str) -> str:
+    """审批 Profile：将 pending_review 状态的 Profile 设为 active。
+
+    只有小猫（用户）审核通过后才应调用。Profile 生成后默认是 pending_review 状态，
+    需要用户确认内容准确后才能激活。
+
+    Args:
+        profile_id: Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
+    """
+    ok = database.approve_profile(profile_id)
+    if ok:
+        return json.dumps({"status": "approved", "profile_id": profile_id}, ensure_ascii=False)
+    p = database.get_profile(profile_id)
+    if not p:
+        return json.dumps({"error": f"Profile '{profile_id}' not found"})
+    return json.dumps({"error": f"Profile '{profile_id}' is '{p.get('status')}', not pending_review"})
 
 
 @mcp.tool()

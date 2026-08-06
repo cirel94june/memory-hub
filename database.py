@@ -392,6 +392,26 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
+    # ── Profiles table migration ──
+    try:
+        profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+        if profile_cols and "status" not in profile_cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            logger.info("Migrated profiles: added 'status' column")
+    except sqlite3.OperationalError:
+        pass
+
+    # ── Dream dedup table (one dream per AI per local day) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS dream_log (
+            ai_id       TEXT NOT NULL,
+            local_day   TEXT NOT NULL,
+            memory_id   TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (ai_id, local_day)
+        );
+    """)
+
     # ── Persons table (人物名片) ──
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS persons (
@@ -406,6 +426,23 @@ async def init_db(db_path: str = None) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
         CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
+    """)
+
+    # ── Profiles table (User/Agent/Relationship Profile) ──
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            id              TEXT PRIMARY KEY,
+            profile_type    TEXT NOT NULL,
+            owner_ai        TEXT NOT NULL DEFAULT '',
+            content         TEXT NOT NULL DEFAULT '{}',
+            generated_at    TEXT NOT NULL DEFAULT '',
+            source_memory_ids TEXT NOT NULL DEFAULT '[]',
+            version         INTEGER NOT NULL DEFAULT 1,
+            status          TEXT NOT NULL DEFAULT 'pending_review'
+        );
+        CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
+        CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
+        CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
     """)
 
     conn.commit()
@@ -800,6 +837,86 @@ def count_audits(action: str = None) -> int:
 
 
 # ════════════════════════════════════════════
+#  Profiles CRUD
+# ════════════════════════════════════════════
+
+def upsert_profile(profile: dict) -> None:
+    conn = _get_conn()
+    pid = profile["id"]
+    status = profile.get("status", "pending_review")
+    existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
+    if existing:
+        new_version = existing[0] + 1
+        conn.execute("""
+            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
+            version = ?, status = ?
+            WHERE id = ?
+        """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
+              new_version, status, pid))
+    else:
+        conn.execute("""
+            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
+            source_memory_ids, version, status)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
+              profile["content"], profile["generated_at"],
+              profile.get("source_memory_ids", "[]"), status))
+    conn.commit()
+
+
+def approve_profile(profile_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
+        (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def supersede_profile(profile_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute(
+        "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
+        (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_profile(profile_id: str, status: str = None) -> dict | None:
+    conn = _get_conn()
+    if status:
+        row = conn.execute("SELECT * FROM profiles WHERE id = ? AND status = ?",
+                           (profile_id, status)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
+    conn = _get_conn()
+    conditions = []
+    params = []
+    if profile_type:
+        conditions.append("profile_type = ?")
+        params.append(profile_type)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = conn.execute(
+        f"SELECT * FROM profiles {where} ORDER BY profile_type, id", params
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_profile(profile_id: str) -> bool:
+    conn = _get_conn()
+    cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# ════════════════════════════════════════════
 #  Vector search
 # ════════════════════════════════════════════
 
@@ -812,6 +929,7 @@ def vector_search(
     exclude_rooms: list[str] = None,
     layer: str = None,
     owner_ai: str = None,
+    exclude_provenance: list[str] = None,
 ) -> list[dict]:
     """Vector similarity search using sqlite-vec.
 
@@ -887,6 +1005,8 @@ def vector_search(
                 continue
             if owner_ai is not None and mem.get("owner_ai") != owner_ai:
                 continue
+            if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
+                continue
 
             mem["distance"] = distances[vec_rid]
             results.append(mem)
@@ -904,7 +1024,8 @@ def vector_search(
 #  Full-text search
 # ════════════════════════════════════════════
 
-def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def fts_search(query: str, top_k: int = 50, status: str = "active",
+               exclude_provenance: list[str] = None) -> list[dict]:
     """Full-text search using FTS5.
 
     Returns memories matching the query with a ``rank`` field
@@ -918,6 +1039,13 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
     # Escape special FTS5 characters and build a safe query
     safe_query = _fts_escape(query)
 
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
+        prov_params = list(exclude_provenance)
+
     try:
         rows = conn.execute(
             "SELECT m.*, fts.rank "
@@ -925,15 +1053,14 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
             "JOIN memories m ON m.rowid = fts.rowid "
             "WHERE memories_fts MATCH ? "
             "AND m.status = ? "
+            f"{prov_clause} "
             "ORDER BY fts.rank "
             "LIMIT ?",
-            (safe_query, status, top_k),
+            (safe_query, status, *prov_params, top_k),
         ).fetchall()
     except sqlite3.OperationalError:
-        # If the query has syntax issues for FTS5, fall back to a simpler query
         logger.warning(f"FTS5 query failed for: {query!r}, trying fallback")
         try:
-            # Fallback: wrap each token in quotes
             tokens = query.strip().split()
             fallback = " OR ".join(f'"{_fts_escape_token(t)}"' for t in tokens if t)
             if not fallback:
@@ -944,9 +1071,10 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
                 "JOIN memories m ON m.rowid = fts.rowid "
                 "WHERE memories_fts MATCH ? "
                 "AND m.status = ? "
+                f"{prov_clause} "
                 "ORDER BY fts.rank "
                 "LIMIT ?",
-                (fallback, status, top_k),
+                (fallback, status, *prov_params, top_k),
             ).fetchall()
         except sqlite3.OperationalError:
             logger.exception("FTS5 fallback also failed")
@@ -964,7 +1092,8 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
 _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 
 
-def cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                    exclude_provenance: list[str] = None) -> list[dict]:
     """中文子串搜索（LIKE 路）。
 
     FTS5 默认分词器不切中文——整段中文被当成一个 token，"妈妈"永远匹配不上
@@ -986,10 +1115,16 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list
 
     conn = _get_conn()
     conds = " OR ".join(["content LIKE ?"] * len(grams))
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
-            (status, *[f"%{g}%" for g in grams]),
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
+            (status, *[f"%{g}%" for g in grams], *prov_params),
         ).fetchall()
     except sqlite3.OperationalError:
         logger.exception("cjk_like_search failed")
@@ -1181,6 +1316,11 @@ def ro_vector_search(
         rph = ", ".join(["?"] * len(exclude_rooms))
         clauses.append(f"room NOT IN ({rph})")
         params.extend(exclude_rooms)
+    exclude_prov = kwargs.get("exclude_provenance")
+    if exclude_prov:
+        pph = ", ".join(["?"] * len(exclude_prov))
+        clauses.append(f"(provenance_type IS NULL OR provenance_type NOT IN ({pph}))")
+        params.extend(exclude_prov)
     where = " AND ".join(clauses)
     mem_rows = conn.execute(f"SELECT * FROM memories WHERE {where}", params).fetchall()
     results = []
@@ -1194,7 +1334,8 @@ def ro_vector_search(
     return results[:top_k]
 
 
-def ro_fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
+                  exclude_provenance: list[str] = None) -> list[dict]:
     """线程安全版 fts_search。"""
     conn = _get_read_conn()
     if not query or not query.strip():
@@ -1206,21 +1347,33 @@ def ro_fts_search(query: str, top_k: int = 50, status: str = "active") -> list[d
     if not terms:
         return []
     fts_query = " OR ".join(f'"{t}"' for t in terms[:10])
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
             "SELECT m.*, f.rank FROM memories_fts f "
             "JOIN memories m ON m.rowid = f.rowid "
             "WHERE memories_fts MATCH ? AND m.status = ? "
+            f"{prov_clause} "
             "ORDER BY f.rank LIMIT ?",
-            (fts_query, status, top_k * 2),
+            (fts_query, status, *prov_params, top_k * 2),
         ).fetchall()
     except Exception as e:
         logger.warning(f"ro_fts_search failed: {e}")
         return []
-    return [_row_to_dict_no_embedding(r) for r in rows[:top_k]]
+    results = []
+    for r in rows:
+        d = _row_to_dict_no_embedding(r)
+        results.append(d)
+    return results[:top_k]
 
 
-def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                       exclude_provenance: list[str] = None) -> list[dict]:
     """线程安全版 cjk_like_search。"""
     conn = _get_read_conn()
     CJK_RE = re.compile(r'[一-鿿㐀-䶿]+')
@@ -1235,10 +1388,16 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active") -> l
         return []
     grams = grams[:8]
     conds = " OR ".join(["content LIKE ?"] * len(grams))
+    prov_clause = ""
+    prov_params: list = []
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
+        prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}) LIMIT 400",
-            (status, *[f"%{g}%" for g in grams]),
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
+            (status, *[f"%{g}%" for g in grams], *prov_params),
         ).fetchall()
     except Exception as e:
         logger.warning(f"ro_cjk_like_search failed: {e}")

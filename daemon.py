@@ -1191,6 +1191,10 @@ async def _run_full_maintenance_inner() -> dict:
         log.warning(f"  Memory safety export failed: {e}")
 
     # 11. 推送到 GitHub
+    # Profile rebuild (Phase 1.5) — 在 push 前重建，数据变化时才触发
+    from profile_builder import rebuild_all_profiles
+    await run_step("profiles", "Rebuild profiles", rebuild_all_profiles)
+
     await run_step("github_push", "Push dirty store", store.push_dirty)
 
     # 12. 重建所有 AI 的走廊（含 persona state + unresolved）

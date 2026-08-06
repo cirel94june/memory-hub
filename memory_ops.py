@@ -1363,6 +1363,7 @@ async def recall(
         db_kwargs["include_rooms"] = include_rooms
     elif exclude_isolated and isolated_rooms:
         db_kwargs["exclude_rooms"] = list(isolated_rooms)
+    db_kwargs["exclude_provenance"] = ["dream"]
 
     def _build_result(mem, score):
         room = mem.get("room", "")
@@ -1441,7 +1442,8 @@ async def recall(
 
         # 路径 2：FTS5
         fts_fn = database.ro_fts_search if use_ro else database.fts_search
-        raw_fts = fts_fn(query, top_k=50, status="active")
+        raw_fts = fts_fn(query, top_k=50, status="active",
+                         exclude_provenance=db_kwargs.get("exclude_provenance"))
         kw_scored = []
         for mem in raw_fts:
             if not _passes_private_filter(mem):
@@ -1462,7 +1464,8 @@ async def recall(
         like_results = []
         try:
             like_fn = database.ro_cjk_like_search if use_ro else database.cjk_like_search
-            like_raw = like_fn(query, top_k=50, status="active")
+            like_raw = like_fn(query, top_k=50, status="active",
+                               exclude_provenance=db_kwargs.get("exclude_provenance"))
             like_scored = []
             for mem in like_raw:
                 if not _passes_private_filter(mem):
@@ -1499,6 +1502,17 @@ async def recall(
 
         # RRF 融合
         merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
+
+        # Fail-closed: final provenance filter after RRF (defense in depth)
+        # Unknown items (get_fn returns None) are EXCLUDED — fail-closed.
+        _excl_prov = db_kwargs.get("exclude_provenance")
+        if _excl_prov:
+            filtered = []
+            for item in merged:
+                mem = get_fn(item["id"])
+                if mem is not None and mem.get("provenance_type") not in _excl_prov:
+                    filtered.append(item)
+            merged = filtered
 
         # 残缺正文降权（content_incomplete 由完整性审计标记）
         for item in merged:
@@ -1592,6 +1606,48 @@ async def recall(
         filtered_results.append(r)
 
     return filtered_results
+
+
+async def dream_recall(
+    query: str,
+    ai_id: str = "",
+    top_k: int = 5,
+) -> list[dict]:
+    """Search only dream memories (provenance_type='dream', room='dreams').
+
+    Privacy: dreams are layer='private' — only the owning AI (+ aliases) may
+    recall them.  Over-fetch ×4 then filter via visibility.can_view() so
+    invisible rows don't squeeze out legitimate results.
+    """
+    from visibility import can_view
+
+    query_vec = await get_embedding(query)
+    if not query_vec:
+        return []
+
+    over_fetch = top_k * 4
+    raw = database.vector_search(
+        query_vec, top_k=over_fetch, status="active",
+        include_rooms=["dreams"],
+    )
+    results = []
+    for mem in raw:
+        if mem.get("provenance_type") != "dream":
+            continue
+        if not can_view(mem, ai_id):
+            continue
+        distance = mem.pop("distance", 0.0)
+        results.append({
+            "id": mem["id"],
+            "content": mem["content"],
+            "room": mem.get("room", ""),
+            "source_ai": mem.get("source_ai", ""),
+            "created_at": mem.get("created_at", ""),
+            "score": round(max(0, 1 - distance / 2), 4),
+        })
+        if len(results) >= top_k:
+            break
+    return results
 
 
 # ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──

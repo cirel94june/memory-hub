@@ -80,7 +80,8 @@ def dream_db(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             subject_id TEXT NOT NULL DEFAULT '',
-            source_actor_id TEXT NOT NULL DEFAULT ''
+            source_actor_id TEXT NOT NULL DEFAULT '',
+            provenance_type TEXT NOT NULL DEFAULT ''
         )
     """)
     now = datetime.now(timezone.utc)
@@ -121,7 +122,8 @@ def dream_db(tmp_path):
 
 def test_private_residue_excludes_other_subject(dream_db):
     """Private diary entries about other AIs should be filtered out."""
-    rows = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    result = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    rows = result["daytime_residue"] + result["old_echo"]
     contents = [r["content"] for r in rows]
     # m1 (about self, subject_id='') should be included
     assert any("星星" in c for c in contents)
@@ -134,7 +136,8 @@ def test_private_residue_excludes_other_subject(dream_db):
 
 def test_shared_residue_includes_others_with_annotation(dream_db):
     """Shared memories about others are included but carry subject_id for annotation."""
-    rows = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    result = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    rows = result["daytime_residue"] + result["old_echo"]
     lucien_rows = [r for r in rows if r.get("subject_id") == "lucien"]
     # m4 is in living_room (shared), should still appear
     assert any("亲小猫" in r["content"] for r in lucien_rows)
@@ -145,7 +148,8 @@ def test_shared_residue_includes_others_with_annotation(dream_db):
 
 def test_residue_returns_dicts_with_attribution_fields(dream_db):
     """All returned rows must have subject_id and source_actor_id fields."""
-    rows = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    result = dream._fetch_memory_residue(dream_db, "claude", ["claude", "cloudy"], limit=10)
+    rows = result["daytime_residue"] + result["old_echo"]
     for r in rows:
         assert isinstance(r, dict)
         assert "subject_id" in r
