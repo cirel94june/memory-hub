@@ -1043,7 +1043,7 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     prov_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND m.provenance_type NOT IN ({ph})"
+        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
         prov_params = list(exclude_provenance)
 
     try:
@@ -1119,7 +1119,7 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     prov_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND provenance_type NOT IN ({ph})"
+        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
         prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
@@ -1351,7 +1351,7 @@ def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
     prov_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND m.provenance_type NOT IN ({ph})"
+        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
         prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(
@@ -1392,7 +1392,7 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     prov_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND provenance_type NOT IN ({ph})"
+        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
         prov_params = list(exclude_provenance)
     try:
         rows = conn.execute(

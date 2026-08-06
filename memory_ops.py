@@ -1507,11 +1507,12 @@ async def recall(
         # Unknown items (get_fn returns None) are EXCLUDED — fail-closed.
         _excl_prov = db_kwargs.get("exclude_provenance")
         if _excl_prov:
-            merged = [
-                item for item in merged
-                if get_fn(item["id"]) is not None
-                and get_fn(item["id"]).get("provenance_type") not in _excl_prov
-            ]
+            filtered = []
+            for item in merged:
+                mem = get_fn(item["id"])
+                if mem is not None and mem.get("provenance_type") not in _excl_prov:
+                    filtered.append(item)
+            merged = filtered
 
         # 残缺正文降权（content_incomplete 由完整性审计标记）
         for item in merged:

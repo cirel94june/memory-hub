@@ -121,10 +121,15 @@ def _validate_profile_schema(content_json: str, profile_type: str,
     except Exception as e:
         return False, f"Schema validation failed: {e}", ""
 
-    if valid_mem_ids is not None:
-        for field_name, field_val in data.items():
-            if isinstance(field_val, dict) and "source_ids" in field_val:
-                bad_ids = [sid for sid in field_val["source_ids"] if sid and sid not in valid_mem_ids]
+    for field_name, field_val in data.items():
+        if isinstance(field_val, dict) and "source_ids" in field_val:
+            for sid in field_val["source_ids"]:
+                stripped = sid.strip() if isinstance(sid, str) else ""
+                if not stripped:
+                    return False, f"Field '{field_name}' has blank source_id", ""
+            if valid_mem_ids is not None:
+                bad_ids = [sid.strip() for sid in field_val["source_ids"]
+                           if sid.strip() not in valid_mem_ids]
                 if bad_ids:
                     return False, f"Field '{field_name}' has source_ids not in stable mems: {bad_ids}", ""
 
@@ -224,7 +229,8 @@ def _extract_pattern_key(mem: dict) -> str | None:
     Returns None if no reliable key is found."""
     pattern_key = mem.get("pattern_key")
     if pattern_key and isinstance(pattern_key, str):
-        return pattern_key.strip().lower()
+        key = pattern_key.strip().lower()
+        return key if key else None
 
     tags_raw = mem.get("tags", "[]")
     if isinstance(tags_raw, str):
@@ -236,9 +242,11 @@ def _extract_pattern_key(mem: dict) -> str | None:
         tags = tags_raw if tags_raw else []
     for t in tags:
         if t and isinstance(t, str):
-            m = _PATTERN_TAG_RE.match(t.strip())
-            if m:
-                return m.group(1).strip().lower()
+            mt = _PATTERN_TAG_RE.match(t.strip())
+            if mt:
+                key = mt.group(1).strip().lower()
+                if key:
+                    return key
     return None
 
 

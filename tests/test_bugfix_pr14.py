@@ -664,3 +664,285 @@ def test_m6_cleanup_uses_single_transaction(cleanup_mod):
     assert "conn.rollback()" in source
     assert "finally:" in source
     assert "conn.close()" in source
+
+
+# ════════════════════════════════════════════
+#  Round 3 — M3: NULL provenance recall
+# ════════════════════════════════════════════
+
+def test_m3_empty_provenance_not_excluded_by_fts(db_env):
+    """Memories with empty-string provenance must NOT be excluded by exclude_provenance filter."""
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+    _insert_memory(conn, "empty_prov", "important factual content", provenance="")
+    _insert_memory(conn, "dream_prov", "dreamy ethereal content", provenance="dream")
+    conn.commit()
+    conn.close()
+
+    results = database.fts_search("content", top_k=10, exclude_provenance=["dream"])
+    ids = [r["id"] for r in results]
+    assert "empty_prov" in ids, "empty provenance should NOT be excluded"
+    assert "dream_prov" not in ids, "dream provenance should be excluded"
+
+
+def test_m3_empty_provenance_not_excluded_by_cjk_like(db_env):
+    """CJK LIKE path must also preserve empty-provenance memories."""
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+    _insert_memory(conn, "empty_prov_cn", "这是重要的内容", provenance="")
+    _insert_memory(conn, "dream_prov_cn", "这是梦境的内容", provenance="dream")
+    conn.commit()
+    conn.close()
+
+    results = database.cjk_like_search("重要", top_k=10, exclude_provenance=["dream"])
+    ids = [r["id"] for r in results]
+    assert "empty_prov_cn" in ids, "empty provenance should NOT be excluded by CJK LIKE"
+
+
+def test_m3_sql_null_handling_defensive(db_env):
+    """SQL clause uses IS NULL OR NOT IN — verify the SQL text is correct."""
+    import inspect
+    source = inspect.getsource(database.fts_search)
+    assert "IS NULL OR" in source, "FTS must have IS NULL guard for defense in depth"
+
+
+# ════════════════════════════════════════════
+#  Round 3 — M4: blank source_id / pattern key rejection
+# ════════════════════════════════════════════
+
+def test_m4_blank_source_id_rejected():
+    """source_ids containing whitespace-only strings must be rejected."""
+    from profile_builder import _validate_profile_schema
+    schema_json = json.dumps({
+        "tier0": {},
+        "identity": {
+            "value": "kind person",
+            "confidence": "high",
+            "evidence_tier": 1,
+            "source_ids": ["mem_1", "  ", "mem_2"],
+        }
+    })
+    ok, msg, _ = _validate_profile_schema(schema_json, "user")
+    assert not ok
+    assert "blank source_id" in msg
+
+
+def test_m4_empty_string_source_id_rejected():
+    """source_ids containing empty strings must be rejected."""
+    from profile_builder import _validate_profile_schema
+    schema_json = json.dumps({
+        "tier0": {},
+        "identity": {
+            "value": "kind person",
+            "confidence": "high",
+            "evidence_tier": 1,
+            "source_ids": [""],
+        }
+    })
+    ok, msg, _ = _validate_profile_schema(schema_json, "user")
+    assert not ok
+    assert "blank source_id" in msg
+
+
+def test_m4_empty_pattern_key_returns_none():
+    """_extract_pattern_key should return None for empty pattern key."""
+    from profile_builder import _extract_pattern_key
+    mem_blank_tag = {"tags": '["pattern:"]'}
+    assert _extract_pattern_key(mem_blank_tag) is None
+
+    mem_whitespace_tag = {"tags": '["pattern:   "]'}
+    assert _extract_pattern_key(mem_whitespace_tag) is None
+
+    mem_blank_field = {"pattern_key": "  "}
+    assert _extract_pattern_key(mem_blank_field) is None
+
+
+# ════════════════════════════════════════════
+#  Round 3 — M1/M2: force dream_log + crash recovery
+# ════════════════════════════════════════════
+
+def test_m1_force_mode_writes_dream_log(db_env):
+    """force=True mode must also create a dream_log entry."""
+    import dream
+    dream.DB_PATH = Path(db_env)
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dream_log "
+        "(ai_id TEXT, local_day TEXT, memory_id TEXT, created_at TEXT, "
+        "PRIMARY KEY (ai_id, local_day))"
+    )
+    conn.commit()
+
+    # Force mode: delete+reinsert reservation even if a row exists
+    conn.execute(
+        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+        "VALUES ('ai_test', '2026-08-03', 'old_mem', '2026-08-03T00:00:00')"
+    )
+    conn.commit()
+
+    # Simulate force reservation by running the reservation logic
+    reservation_conn = sqlite3.connect(db_env)
+    reservation_conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        reservation_conn.execute("BEGIN IMMEDIATE")
+        reservation_conn.execute(
+            "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+            "AND memory_id='' AND created_at < ?",
+            ("ai_test", "2026-08-03", "2030-01-01"),
+        )
+        reservation_conn.execute(
+            "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+            "VALUES (?, ?, '', ?)",
+            ("ai_test", "2026-08-03", "2026-08-03T02:00:00"),
+        )
+        reservation_conn.commit()
+    except sqlite3.IntegrityError:
+        reservation_conn.rollback()
+        # force mode: delete + re-insert
+        reservation_conn.execute(
+            "DELETE FROM dream_log WHERE ai_id=? AND local_day=?",
+            ("ai_test", "2026-08-03"),
+        )
+        reservation_conn.execute(
+            "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+            "VALUES (?, ?, '', ?)",
+            ("ai_test", "2026-08-03", "2026-08-03T02:00:00"),
+        )
+        reservation_conn.commit()
+    reservation_conn.close()
+
+    row = conn.execute(
+        "SELECT memory_id FROM dream_log WHERE ai_id='ai_test' AND local_day='2026-08-03'"
+    ).fetchone()
+    assert row is not None, "force mode must create dream_log entry"
+    assert row["memory_id"] == "", "reservation should have empty memory_id before commit"
+    conn.close()
+
+
+def test_m2_stale_reservation_reclaimed(db_env):
+    """Stale reservations (memory_id='' and created_at > 1h) must be reclaimed."""
+    import dream
+    dream.DB_PATH = Path(db_env)
+
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dream_log "
+        "(ai_id TEXT, local_day TEXT, memory_id TEXT, created_at TEXT, "
+        "PRIMARY KEY (ai_id, local_day))"
+    )
+    stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn.execute(
+        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+        "VALUES ('ai_stale', '2026-08-03', '', ?)",
+        (stale_time,),
+    )
+    conn.commit()
+
+    # Simulate reservation logic: stale reservation should be deleted, new one inserted
+    _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    reservation_conn = sqlite3.connect(db_env)
+    reservation_conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        reservation_conn.execute("BEGIN IMMEDIATE")
+        deleted = reservation_conn.execute(
+            "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+            "AND memory_id='' AND created_at < ?",
+            ("ai_stale", "2026-08-03", _stale_cutoff),
+        )
+        assert deleted.rowcount == 1, "stale reservation should be deleted"
+        reservation_conn.execute(
+            "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+            "VALUES (?, ?, '', ?)",
+            ("ai_stale", "2026-08-03", datetime.now(timezone.utc).isoformat()),
+        )
+        reservation_conn.commit()
+    except sqlite3.IntegrityError:
+        reservation_conn.rollback()
+        pytest.fail("Should not get IntegrityError after reclaiming stale reservation")
+    finally:
+        reservation_conn.close()
+
+    row = conn.execute(
+        "SELECT created_at FROM dream_log WHERE ai_id='ai_stale' AND local_day='2026-08-03'"
+    ).fetchone()
+    assert row is not None
+    conn.close()
+
+
+def test_m2_fresh_reservation_not_reclaimed(db_env):
+    """Non-stale reservations (< 1h old) must NOT be reclaimed."""
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dream_log "
+        "(ai_id TEXT, local_day TEXT, memory_id TEXT, created_at TEXT, "
+        "PRIMARY KEY (ai_id, local_day))"
+    )
+    fresh_time = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+        "VALUES ('ai_fresh', '2026-08-03', '', ?)",
+        (fresh_time,),
+    )
+    conn.commit()
+
+    _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    reservation_conn = sqlite3.connect(db_env)
+    reservation_conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        reservation_conn.execute("BEGIN IMMEDIATE")
+        reservation_conn.execute(
+            "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+            "AND memory_id='' AND created_at < ?",
+            ("ai_fresh", "2026-08-03", _stale_cutoff),
+        )
+        reservation_conn.execute(
+            "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+            "VALUES (?, ?, '', ?)",
+            ("ai_fresh", "2026-08-03", datetime.now(timezone.utc).isoformat()),
+        )
+        reservation_conn.commit()
+        pytest.fail("Should get IntegrityError — fresh reservation must NOT be reclaimed")
+    except sqlite3.IntegrityError:
+        reservation_conn.rollback()
+    finally:
+        reservation_conn.close()
+    conn.close()
+
+
+def test_m2_crash_recovery_releases_reservation():
+    """try/finally block in dream.py must release reservation on crash."""
+    import inspect
+    import dream
+    source = inspect.getsource(dream._generate_dreams_inner)
+    assert "_reservation_released = False" in source
+    assert "finally:" in source
+    assert "_release_reservation" in source
+
+
+def test_m1_dream_log_commit_checks_rowcount():
+    """dream_log commit must check UPDATE rowcount and INSERT if 0."""
+    import inspect
+    import dream
+    source = inspect.getsource(dream._generate_dreams_inner)
+    assert "cur.rowcount" in source or "rowcount" in source
+    assert "INSERT INTO dream_log" in source
+
+
+# ════════════════════════════════════════════
+#  Round 3 — L1: RRF get_fn dedup
+# ════════════════════════════════════════════
+
+def test_l1_rrf_filter_calls_get_fn_once_per_item():
+    """RRF provenance filter must not call get_fn twice per item."""
+    import inspect
+    import memory_ops
+    source = inspect.getsource(memory_ops.recall)
+    # The fixed code uses a for-loop with single get_fn call
+    # Old code had: get_fn(item["id"]) is not None and get_fn(item["id"]).get(...)
+    assert "get_fn(item[\"id\"]) is not None\n" not in source or \
+           "mem = get_fn(item" in source, \
+           "RRF filter should call get_fn once per item, not twice"

@@ -480,20 +480,27 @@ async def _generate_dreams_inner(force: bool = False) -> dict:
 
         # Atomic reservation: claim (ai_id, local_day) slot BEFORE LLM call.
         # BEGIN IMMEDIATE acquires a write lock; INSERT fails on duplicate PK.
-        if not force:
-            reservation_conn = sqlite3.connect(str(DB_PATH))
-            reservation_conn.execute("PRAGMA busy_timeout=5000")
-            reservation_conn.row_factory = sqlite3.Row
-            try:
-                reservation_conn.execute("BEGIN IMMEDIATE")
-                reservation_conn.execute(
-                    "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
-                    "VALUES (?, ?, '', ?)",
-                    (canonical, _today, _now_utc()),
-                )
-                reservation_conn.commit()
-            except sqlite3.IntegrityError:
-                reservation_conn.rollback()
+        # Stale reservations (memory_id='' older than 1 hour) are reclaimed first.
+        _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        reservation_conn = sqlite3.connect(str(DB_PATH))
+        reservation_conn.execute("PRAGMA busy_timeout=5000")
+        reservation_conn.row_factory = sqlite3.Row
+        try:
+            reservation_conn.execute("BEGIN IMMEDIATE")
+            reservation_conn.execute(
+                "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+                "AND memory_id='' AND created_at < ?",
+                (canonical, _today, _stale_cutoff),
+            )
+            reservation_conn.execute(
+                "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                "VALUES (?, ?, '', ?)",
+                (canonical, _today, _now_utc()),
+            )
+            reservation_conn.commit()
+        except sqlite3.IntegrityError:
+            reservation_conn.rollback()
+            if not force:
                 existing = reservation_conn.execute(
                     "SELECT memory_id FROM dream_log WHERE ai_id=? AND local_day=?",
                     (canonical, _today),
@@ -508,15 +515,23 @@ async def _generate_dreams_inner(force: bool = False) -> dict:
                 }
                 reservation_conn.close()
                 continue
-            finally:
-                try:
-                    reservation_conn.close()
-                except Exception:
-                    pass
-            _reserved_slot = True
-        else:
-            _reserved_slot = False
-
+            else:
+                # force mode: delete existing and re-insert
+                reservation_conn.execute(
+                    "DELETE FROM dream_log WHERE ai_id=? AND local_day=?",
+                    (canonical, _today),
+                )
+                reservation_conn.execute(
+                    "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                    "VALUES (?, ?, '', ?)",
+                    (canonical, _today, _now_utc()),
+                )
+                reservation_conn.commit()
+        finally:
+            try:
+                reservation_conn.close()
+            except Exception:
+                pass
         if not force and not _should_dream_today(canonical, _today):
             results[canonical] = "skipped (probability gate)"
             diagnostics[canonical] = {
@@ -524,8 +539,7 @@ async def _generate_dreams_inner(force: bool = False) -> dict:
                 "reason": "probability_gate",
                 "probability": DREAM_PROBABILITY,
             }
-            if _reserved_slot:
-                _release_reservation(canonical, _today)
+            _release_reservation(canonical, _today)
             continue
 
         # 组装摘要
@@ -577,8 +591,7 @@ async def _generate_dreams_inner(force: bool = False) -> dict:
                 "memory_residue_count": len(memory_rows),
                 "required": "至少 2 条摘要，或摘要不足时至少 3 条近期有效记忆",
             }
-            if _reserved_slot:
-                _release_reservation(canonical, _today)
+            _release_reservation(canonical, _today)
             continue
 
         def _format_mem(m, is_echo=False):
@@ -638,90 +651,90 @@ async def _generate_dreams_inner(force: bool = False) -> dict:
             persona_hint=persona_hint,
         )
 
-        dream_text = await _call_llm(prompt, temperature=_DREAM_TEMPS.get(canonical, 0.7))
-        if not dream_text or len(dream_text) < 20:
-            results[canonical] = "skipped (LLM failed)"
-            diagnostics[canonical] = {
-                "status": "skipped",
-                "reason": "llm_failed_or_too_short",
-                "digest_count": len(rows),
-                "memory_residue_count": len(memory_rows),
-            }
-            if _reserved_slot:
-                _release_reservation(canonical, _today)
-            continue
-
-        violations = _validate_dream_attribution(dream_text, canonical)
-        if violations:
-            logger.warning(f"[Dream] {canonical} identity violation, retrying: {violations}")
-            dream_text = await _call_llm(prompt, temperature=max(0.3, _DREAM_TEMPS.get(canonical, 0.7) - 0.2))
+        _reservation_released = False
+        try:
+            dream_text = await _call_llm(prompt, temperature=_DREAM_TEMPS.get(canonical, 0.7))
             if not dream_text or len(dream_text) < 20:
-                results[canonical] = "skipped (retry failed)"
+                results[canonical] = "skipped (LLM failed)"
                 diagnostics[canonical] = {
                     "status": "skipped",
-                    "reason": "identity_violation_retry_failed",
-                    "violations": violations,
+                    "reason": "llm_failed_or_too_short",
                     "digest_count": len(rows),
                     "memory_residue_count": len(memory_rows),
                 }
-                if _reserved_slot:
-                    _release_reservation(canonical, _today)
+                _release_reservation(canonical, _today)
+                _reservation_released = True
                 continue
-            retry_violations = _validate_dream_attribution(dream_text, canonical)
-            if retry_violations:
-                logger.warning(f"[Dream] {canonical} still has violations after retry: {retry_violations}")
-                diagnostics.setdefault(canonical, {})["identity_warnings"] = retry_violations
 
-        if len(dream_text) > 800:
-            dream_text = dream_text[:797].rstrip() + "..."
+            violations = _validate_dream_attribution(dream_text, canonical)
+            if violations:
+                logger.warning(f"[Dream] {canonical} identity violation, retrying: {violations}")
+                dream_text = await _call_llm(prompt, temperature=max(0.3, _DREAM_TEMPS.get(canonical, 0.7) - 0.2))
+                if not dream_text or len(dream_text) < 20:
+                    results[canonical] = "skipped (retry failed)"
+                    diagnostics[canonical] = {
+                        "status": "skipped",
+                        "reason": "identity_violation_retry_failed",
+                        "violations": violations,
+                        "digest_count": len(rows),
+                        "memory_residue_count": len(memory_rows),
+                    }
+                    _release_reservation(canonical, _today)
+                    _reservation_released = True
+                    continue
+                retry_violations = _validate_dream_attribution(dream_text, canonical)
+                if retry_violations:
+                    logger.warning(f"[Dream] {canonical} still has violations after retry: {retry_violations}")
+                    diagnostics.setdefault(canonical, {})["identity_warnings"] = retry_violations
 
-        # 通过 memory_ops 存储（自动生成 embedding + 正确元数据）
-        r = await memory_ops.remember(
-            content=dream_text,
-            layer="private",
-            room="dreams",
-            category="night_dream",
-            owner_ai=canonical,
-            importance=0.6,
-            emotion_arousal=0.5,
-            source_ai=canonical,
-            source_platform="daemon_dream",
-            tags=["dream", "nightly", "reflection", "daytime_residue"],
-            auto_merge=False,
-            provenance_type="dream",
-        )
-        # Commit reservation: update dream_log with actual memory_id
-        try:
-            conn.execute(
-                "UPDATE dream_log SET memory_id=?, created_at=? "
-                "WHERE ai_id=? AND local_day=?",
-                (r.get("id", ""), _now_utc(), canonical, _today),
+            if len(dream_text) > 800:
+                dream_text = dream_text[:797].rstrip() + "..."
+
+            r = await memory_ops.remember(
+                content=dream_text,
+                layer="private",
+                room="dreams",
+                category="night_dream",
+                owner_ai=canonical,
+                importance=0.6,
+                emotion_arousal=0.5,
+                source_ai=canonical,
+                source_platform="daemon_dream",
+                tags=["dream", "nightly", "reflection", "daytime_residue"],
+                auto_merge=False,
+                provenance_type="dream",
             )
-            conn.commit()
-        except Exception as e:
-            logger.warning(f"dream_log commit failed: {e}")
-            # If no reservation existed (force mode), insert directly
-            if not _reserved_slot:
-                try:
+            # Commit reservation: update dream_log with actual memory_id
+            try:
+                cur = conn.execute(
+                    "UPDATE dream_log SET memory_id=?, created_at=? "
+                    "WHERE ai_id=? AND local_day=?",
+                    (r.get("id", ""), _now_utc(), canonical, _today),
+                )
+                if cur.rowcount == 0:
                     conn.execute(
-                        "INSERT OR IGNORE INTO dream_log (ai_id, local_day, memory_id, created_at) "
+                        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
                         "VALUES (?, ?, ?, ?)",
                         (canonical, _today, r.get("id", ""), _now_utc()),
                     )
-                    conn.commit()
-                except Exception:
-                    pass
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"dream_log commit failed: {e}")
+            _reservation_released = True
 
-        results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
-        diagnostics[canonical] = {
-            "status": "dreamed",
-            "reason": "ok",
-            "digest_count": len(rows),
-            "memory_residue_count": len(memory_rows),
-            "memory_id": r.get("id"),
-            "chars": len(dream_text),
-        }
-        logger.info(f"[Dream] {canonical}: {dream_text[:60]}...")
+            results[canonical] = f"dreamed ({len(dream_text)} chars, id={r.get('id')})"
+            diagnostics[canonical] = {
+                "status": "dreamed",
+                "reason": "ok",
+                "digest_count": len(rows),
+                "memory_residue_count": len(memory_rows),
+                "memory_id": r.get("id"),
+                "chars": len(dream_text),
+            }
+            logger.info(f"[Dream] {canonical}: {dream_text[:60]}...")
+        finally:
+            if not _reservation_released:
+                _release_reservation(canonical, _today)
 
     recent = _recent_dreams(conn)
     _write_dream_status({
