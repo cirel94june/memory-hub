@@ -51,9 +51,10 @@ class ProfileField(BaseModel):
     @field_validator("source_ids")
     @classmethod
     def non_empty_source_ids(cls, v):
-        if len(v) < 1:
-            raise ValueError("source_ids must have at least 1 entry")
-        return v
+        normalized = list(dict.fromkeys(s.strip() for s in v if isinstance(s, str) and s.strip()))
+        if len(normalized) < 1:
+            raise ValueError("source_ids must have at least 1 non-blank entry")
+        return normalized
 
 
 class UserProfileSchema(BaseModel):

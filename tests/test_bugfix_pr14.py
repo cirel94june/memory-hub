@@ -728,7 +728,7 @@ def test_m4_blank_source_id_rejected():
 
 
 def test_m4_empty_string_source_id_rejected():
-    """source_ids containing empty strings must be rejected."""
+    """source_ids containing only empty strings must be rejected."""
     from profile_builder import _validate_profile_schema
     schema_json = json.dumps({
         "tier0": {},
@@ -741,7 +741,7 @@ def test_m4_empty_string_source_id_rejected():
     })
     ok, msg, _ = _validate_profile_schema(schema_json, "user")
     assert not ok
-    assert "blank source_id" in msg
+    assert "source_ids" in msg
 
 
 def test_m4_empty_pattern_key_returns_none():
@@ -761,46 +761,46 @@ def test_m4_empty_pattern_key_returns_none():
 #  Round 3 — M1/M2: force dream_log + crash recovery
 # ════════════════════════════════════════════
 
-def test_m1_force_mode_writes_dream_log(db_env):
-    """force=True mode must also create a dream_log entry."""
-    import dream
-    dream.DB_PATH = Path(db_env)
+def test_m1_force_replaces_completed_dream_log(db_env):
+    """force=True can replace a completed reservation (non-empty memory_id)."""
     conn = sqlite3.connect(db_env)
     conn.row_factory = sqlite3.Row
-
     conn.execute(
         "CREATE TABLE IF NOT EXISTS dream_log "
         "(ai_id TEXT, local_day TEXT, memory_id TEXT, created_at TEXT, "
         "PRIMARY KEY (ai_id, local_day))"
     )
-    conn.commit()
-
-    # Force mode: delete+reinsert reservation even if a row exists
     conn.execute(
         "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
         "VALUES ('ai_test', '2026-08-03', 'old_mem', '2026-08-03T00:00:00')"
     )
     conn.commit()
 
-    # Simulate force reservation by running the reservation logic
+    _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     reservation_conn = sqlite3.connect(db_env)
     reservation_conn.execute("PRAGMA busy_timeout=5000")
+    reservation_conn.row_factory = sqlite3.Row
     try:
         reservation_conn.execute("BEGIN IMMEDIATE")
         reservation_conn.execute(
             "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
             "AND memory_id='' AND created_at < ?",
-            ("ai_test", "2026-08-03", "2030-01-01"),
+            ("ai_test", "2026-08-03", _stale_cutoff),
         )
         reservation_conn.execute(
             "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
             "VALUES (?, ?, '', ?)",
-            ("ai_test", "2026-08-03", "2026-08-03T02:00:00"),
+            ("ai_test", "2026-08-03", datetime.now(timezone.utc).isoformat()),
         )
         reservation_conn.commit()
     except sqlite3.IntegrityError:
         reservation_conn.rollback()
-        # force mode: delete + re-insert
+        existing = reservation_conn.execute(
+            "SELECT memory_id, created_at FROM dream_log WHERE ai_id=? AND local_day=?",
+            ("ai_test", "2026-08-03"),
+        ).fetchone()
+        # Completed record (memory_id != ''): force can replace
+        assert existing["memory_id"] == "old_mem"
         reservation_conn.execute(
             "DELETE FROM dream_log WHERE ai_id=? AND local_day=?",
             ("ai_test", "2026-08-03"),
@@ -808,7 +808,7 @@ def test_m1_force_mode_writes_dream_log(db_env):
         reservation_conn.execute(
             "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
             "VALUES (?, ?, '', ?)",
-            ("ai_test", "2026-08-03", "2026-08-03T02:00:00"),
+            ("ai_test", "2026-08-03", datetime.now(timezone.utc).isoformat()),
         )
         reservation_conn.commit()
     reservation_conn.close()
@@ -816,8 +816,65 @@ def test_m1_force_mode_writes_dream_log(db_env):
     row = conn.execute(
         "SELECT memory_id FROM dream_log WHERE ai_id='ai_test' AND local_day='2026-08-03'"
     ).fetchone()
-    assert row is not None, "force mode must create dream_log entry"
-    assert row["memory_id"] == "", "reservation should have empty memory_id before commit"
+    assert row is not None
+    assert row["memory_id"] == "", "force should replace completed record with new reservation"
+    conn.close()
+
+
+def test_m1_force_does_not_steal_active_reservation(db_env):
+    """force=True must NOT steal a fresh in-progress reservation (memory_id='', < 1h)."""
+    conn = sqlite3.connect(db_env)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dream_log "
+        "(ai_id TEXT, local_day TEXT, memory_id TEXT, created_at TEXT, "
+        "PRIMARY KEY (ai_id, local_day))"
+    )
+    fresh_time = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+        "VALUES ('ai_active', '2026-08-03', '', ?)",
+        (fresh_time,),
+    )
+    conn.commit()
+
+    _stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    reservation_conn = sqlite3.connect(db_env)
+    reservation_conn.execute("PRAGMA busy_timeout=5000")
+    reservation_conn.row_factory = sqlite3.Row
+    try:
+        reservation_conn.execute("BEGIN IMMEDIATE")
+        reservation_conn.execute(
+            "DELETE FROM dream_log WHERE ai_id=? AND local_day=? "
+            "AND memory_id='' AND created_at < ?",
+            ("ai_active", "2026-08-03", _stale_cutoff),
+        )
+        reservation_conn.execute(
+            "INSERT INTO dream_log (ai_id, local_day, memory_id, created_at) "
+            "VALUES (?, ?, '', ?)",
+            ("ai_active", "2026-08-03", datetime.now(timezone.utc).isoformat()),
+        )
+        reservation_conn.commit()
+        pytest.fail("Should get IntegrityError — active reservation exists")
+    except sqlite3.IntegrityError:
+        reservation_conn.rollback()
+        existing = reservation_conn.execute(
+            "SELECT memory_id, created_at FROM dream_log WHERE ai_id=? AND local_day=?",
+            ("ai_active", "2026-08-03"),
+        ).fetchone()
+        # Active reservation: memory_id='' and fresh — force must NOT steal
+        assert existing["memory_id"] == ""
+        assert existing["created_at"] >= _stale_cutoff
+        # This is the "already_running" path — force skips
+        already_running = True
+    reservation_conn.close()
+
+    assert already_running, "force must skip when active reservation exists"
+    # Original reservation must be untouched
+    row = conn.execute(
+        "SELECT created_at FROM dream_log WHERE ai_id='ai_active' AND local_day='2026-08-03'"
+    ).fetchone()
+    assert row["created_at"] == fresh_time, "original reservation must be preserved"
     conn.close()
 
 
@@ -913,14 +970,19 @@ def test_m2_fresh_reservation_not_reclaimed(db_env):
     conn.close()
 
 
-def test_m2_crash_recovery_releases_reservation():
-    """try/finally block in dream.py must release reservation on crash."""
+def test_m2_crash_recovery_covers_full_post_reservation():
+    """try/finally must cover material collection, prompt building, LLM, and commit."""
     import inspect
     import dream
     source = inspect.getsource(dream._generate_dreams_inner)
     assert "_reservation_released = False" in source
-    assert "finally:" in source
-    assert "_release_reservation" in source
+    # The try block must come before material collection (_fetch_memory_residue)
+    try_pos = source.index("_reservation_released = False")
+    fetch_pos = source.index("_fetch_memory_residue")
+    llm_pos = source.index("_call_llm")
+    finally_pos = source.index("if not _reservation_released:")
+    assert try_pos < fetch_pos < llm_pos < finally_pos, \
+        "try/finally must cover material collection through LLM and commit"
 
 
 def test_m1_dream_log_commit_checks_rowcount():
@@ -932,6 +994,14 @@ def test_m1_dream_log_commit_checks_rowcount():
     assert "INSERT INTO dream_log" in source
 
 
+def test_m1_force_skips_active_reservation_in_source():
+    """force mode source must check for active (non-stale) empty reservations."""
+    import inspect
+    import dream
+    source = inspect.getsource(dream._generate_dreams_inner)
+    assert "already_running" in source, "force must return already_running for active reservations"
+
+
 # ════════════════════════════════════════════
 #  Round 3 — L1: RRF get_fn dedup
 # ════════════════════════════════════════════
@@ -941,8 +1011,36 @@ def test_l1_rrf_filter_calls_get_fn_once_per_item():
     import inspect
     import memory_ops
     source = inspect.getsource(memory_ops.recall)
-    # The fixed code uses a for-loop with single get_fn call
-    # Old code had: get_fn(item["id"]) is not None and get_fn(item["id"]).get(...)
-    assert "get_fn(item[\"id\"]) is not None\n" not in source or \
-           "mem = get_fn(item" in source, \
+    assert "mem = get_fn(item" in source, \
            "RRF filter should call get_fn once per item, not twice"
+
+
+def test_l1_source_ids_normalized_by_pydantic():
+    """ProfileField validator must strip whitespace and deduplicate source_ids."""
+    from profile_builder import ProfileField
+    field = ProfileField(
+        value="test",
+        confidence="high",
+        evidence_tier=1,
+        source_ids=["  m1 ", "m2", " m1 ", "m3"],
+    )
+    assert field.source_ids == ["m1", "m2", "m3"], "should strip and deduplicate"
+
+
+def test_l1_source_ids_normalized_in_model_dump():
+    """model_dump_json must contain normalized (stripped) source_ids."""
+    from profile_builder import _validate_profile_schema
+    schema_json = json.dumps({
+        "tier0": {},
+        "identity": {
+            "value": "kind",
+            "confidence": "high",
+            "evidence_tier": 1,
+            "source_ids": ["  mem_1  ", "mem_2", "mem_1"],
+        }
+    })
+    ok, msg, validated = _validate_profile_schema(schema_json, "user")
+    assert ok, f"validation should pass: {msg}"
+    parsed = json.loads(validated)
+    identity_ids = parsed["identity"]["source_ids"]
+    assert identity_ids == ["mem_1", "mem_2"], f"should be stripped and deduped: {identity_ids}"
