@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pytest
 import database
 import memory_ops
-from memory_ops import _RESOLVE_PATTERNS, _check_auto_resolve, _rrf_merge
+from memory_ops import _RESOLVE_PATTERNS, _check_auto_resolve, _matches_resolve_pattern, _rrf_merge
 
 EMBEDDING_DIM = 1024
 
@@ -367,3 +367,62 @@ def test_vector_search_exclude_superseded(fake_env):
     results = database.vector_search(vec, top_k=10, exclude_superseded=True)
     ids = [r["id"] for r in results]
     assert "mem_vec_old" not in ids
+
+
+# ════════════════════════════════════════════
+#  压力测试：大量 resolved 记忆下 recall 仍返回满额
+# ════════════════════════════════════════════
+
+def test_recall_returns_full_topk_despite_many_resolved(fake_env):
+    """100 条 resolved + 15 条 active → recall(top_k=10) 应从 active 里拿满 10 条。"""
+    for i in range(100):
+        _make_mem(fake_env, f"mem_resolved_{i}", f"resolved task number {i}",
+                  resolved=True, days_ago=i % 30)
+
+    for i in range(15):
+        _make_mem(fake_env, f"mem_active_{i}", f"active memory about cats number {i}",
+                  days_ago=i)
+
+    results = asyncio.run(memory_ops.recall("cats", top_k=10))
+    assert len(results) >= 10, f"Expected ≥10 results, got {len(results)}"
+    for r in results:
+        assert not r["id"].startswith("mem_resolved_"), \
+            f"Resolved memory {r['id']} leaked into results"
+
+
+# ════════════════════════════════════════════
+#  Block 6 补充：词边界防护反例
+# ════════════════════════════════════════════
+
+class TestResolveBoundaryGuards:
+    """触发词的否定前缀和疑问后缀应阻止触发。"""
+
+    def test_doubt_suffix_haoleba(self):
+        """'好了吧' — 疑问语气，不应触发。"""
+        assert not _matches_resolve_pattern("好了吧？")
+
+    def test_negation_prefix_mei(self):
+        """'还没好了' — 否定前缀，不应触发。"""
+        assert not _matches_resolve_pattern("还没好了")
+
+    def test_doubt_suffix_ma(self):
+        """'好了吗' — 疑问语气，不应触发。"""
+        assert not _matches_resolve_pattern("搞定了吗")
+
+    def test_negation_prefix_mei_you(self):
+        """'没好呢' — 否定，不应触发。"""
+        assert not _matches_resolve_pattern("没好呢")
+
+    def test_positive_still_works_after_guards(self):
+        """正常完成短语仍然触发。"""
+        assert _matches_resolve_pattern("那个 bug 修好了")
+        assert _matches_resolve_pattern("已经搞定了！")
+        assert _matches_resolve_pattern("done")
+
+    def test_sentence_ending_triggers(self):
+        """触发词在句尾（无后缀）应触发。"""
+        assert _matches_resolve_pattern("上次说的事情改完了")
+
+    def test_doubt_with_but(self):
+        """'好了但是' — 后缀不在疑问列表中，应触发。"""
+        assert _matches_resolve_pattern("好了但是还有问题")

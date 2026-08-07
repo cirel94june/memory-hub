@@ -553,8 +553,10 @@ def vector_search(
 
     query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
 
-    # Fetch extra candidates to allow for filtering
-    fetch_k = top_k * 4
+    # Fetch extra candidates to allow for filtering.
+    # When exclude flags are set, many candidates may be filtered out,
+    # so we fetch a larger buffer to ensure we can fill top_k.
+    fetch_k = top_k * 8 if (exclude_resolved or exclude_superseded) else top_k * 4
 
     try:
         vec_rows = conn.execute(
@@ -573,9 +575,32 @@ def vector_search(
     vec_rowids = [r[0] for r in vec_rows]
     distances = {r[0]: r[1] for r in vec_rows}
 
+    # Build SQL WHERE clause for memory filtering at DB layer
+    mem_where_parts = []
+    mem_params: list = []
+    if status is not None:
+        mem_where_parts.append("status = ?")
+        mem_params.append(status)
+    if room is not None:
+        mem_where_parts.append("room = ?")
+        mem_params.append(room)
+    if layer is not None:
+        mem_where_parts.append("layer = ?")
+        mem_params.append(layer)
+    if owner_ai is not None:
+        mem_where_parts.append("owner_ai = ?")
+        mem_params.append(owner_ai)
+    if exclude_resolved:
+        mem_where_parts.append("(resolved IS NULL OR resolved != 1)")
+    if exclude_superseded:
+        mem_where_parts.append("(superseded_by IS NULL OR superseded_by = '')")
+
+    mem_where = ""
+    if mem_where_parts:
+        mem_where = "AND " + " AND ".join(mem_where_parts)
+
     # Batch fetch memory IDs from vec_id_map
     results = []
-    # Process in batches of 500 to stay within SQLite variable limits
     for i in range(0, len(vec_rowids), 500):
         batch = vec_rowids[i:i + 500]
         placeholders = ", ".join(["?"] * len(batch))
@@ -592,31 +617,19 @@ def vector_search(
             if not mem_id:
                 continue
 
-            # Fetch the memory itself
             row = conn.execute(
-                "SELECT * FROM memories WHERE id = ?", (mem_id,)
+                f"SELECT * FROM memories WHERE id = ? {mem_where}",
+                [mem_id] + mem_params,
             ).fetchone()
             if row is None:
                 continue
 
             mem = _row_to_dict_no_embedding(row)
 
-            # Apply filters
-            if status is not None and mem.get("status") != status:
-                continue
-            if room is not None and mem.get("room") != room:
-                continue
+            # Room list filters stay in Python (dynamic IN-clause)
             if include_rooms and mem.get("room") not in include_rooms:
                 continue
             if exclude_rooms and mem.get("room") in exclude_rooms:
-                continue
-            if layer is not None and mem.get("layer") != layer:
-                continue
-            if owner_ai is not None and mem.get("owner_ai") != owner_ai:
-                continue
-            if exclude_resolved and mem.get("resolved") in (True, 1):
-                continue
-            if exclude_superseded and mem.get("superseded_by"):
                 continue
 
             mem["distance"] = distances[vec_rid]
@@ -650,36 +663,34 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     # Escape special FTS5 characters and build a safe query
     safe_query = _fts_escape(query)
 
+    # Build extra WHERE clauses for resolved/superseded filtering at SQL layer
+    extra_where = ""
+    if exclude_resolved:
+        extra_where += "AND (m.resolved IS NULL OR m.resolved != 1) "
+    if exclude_superseded:
+        extra_where += "AND (m.superseded_by IS NULL OR m.superseded_by = '') "
+
+    sql_tpl = (
+        "SELECT m.*, fts.rank "
+        "FROM memories_fts fts "
+        "JOIN memories m ON m.rowid = fts.rowid "
+        "WHERE memories_fts MATCH ? "
+        "AND m.status = ? "
+        f"{extra_where}"
+        "ORDER BY fts.rank "
+        "LIMIT ?"
+    )
+
     try:
-        rows = conn.execute(
-            "SELECT m.*, fts.rank "
-            "FROM memories_fts fts "
-            "JOIN memories m ON m.rowid = fts.rowid "
-            "WHERE memories_fts MATCH ? "
-            "AND m.status = ? "
-            "ORDER BY fts.rank "
-            "LIMIT ?",
-            (safe_query, status, top_k),
-        ).fetchall()
+        rows = conn.execute(sql_tpl, (safe_query, status, top_k)).fetchall()
     except sqlite3.OperationalError:
-        # If the query has syntax issues for FTS5, fall back to a simpler query
         logger.warning(f"FTS5 query failed for: {query!r}, trying fallback")
         try:
-            # Fallback: wrap each token in quotes
             tokens = query.strip().split()
             fallback = " OR ".join(f'"{_fts_escape_token(t)}"' for t in tokens if t)
             if not fallback:
                 return []
-            rows = conn.execute(
-                "SELECT m.*, fts.rank "
-                "FROM memories_fts fts "
-                "JOIN memories m ON m.rowid = fts.rowid "
-                "WHERE memories_fts MATCH ? "
-                "AND m.status = ? "
-                "ORDER BY fts.rank "
-                "LIMIT ?",
-                (fallback, status, top_k),
-            ).fetchall()
+            rows = conn.execute(sql_tpl, (fallback, status, top_k)).fetchall()
         except sqlite3.OperationalError:
             logger.exception("FTS5 fallback also failed")
             return []
@@ -687,10 +698,6 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     results = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
-        if exclude_resolved and mem.get("resolved") in (True, 1):
-            continue
-        if exclude_superseded and mem.get("superseded_by"):
-            continue
         mem["rank"] = row["rank"]
         results.append(mem)
 

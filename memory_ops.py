@@ -27,6 +27,9 @@ _RESOLVE_PATTERNS = (
     "finished", "fixed", "已经弄好",
 )
 
+_RESOLVE_NEGATION_PREFIXES = ("没", "还没", "不算", "未", "没有")
+_RESOLVE_DOUBT_SUFFIXES = ("吧", "吗", "呢", "么", "嘛", "?", "？")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -350,11 +353,30 @@ async def remember(
     return result
 
 
+def _matches_resolve_pattern(content: str) -> bool:
+    """Check if content contains a completion pattern with boundary guards."""
+    content_lower = content.lower()
+    for p in _RESOLVE_PATTERNS:
+        pl = p.lower()
+        idx = content_lower.find(pl)
+        if idx < 0:
+            continue
+        # Check negation prefix: "没好了" / "还没搞定了" should NOT trigger
+        pre = content_lower[:idx]
+        if any(pre.endswith(neg) for neg in _RESOLVE_NEGATION_PREFIXES):
+            continue
+        # Check doubt suffix: "好了吧" / "搞定了吗" should NOT trigger
+        after = content_lower[idx + len(pl):]
+        if after and after[0] in "".join(_RESOLVE_DOUBT_SUFFIXES):
+            continue
+        return True
+    return False
+
+
 def _check_auto_resolve(content: str, candidates: list[dict]) -> list[str]:
     """If content matches a completion pattern, auto-resolve related unresolved memories.
     Returns list of resolved memory IDs."""
-    content_lower = content.lower()
-    if not any(p.lower() in content_lower for p in _RESOLVE_PATTERNS):
+    if not _matches_resolve_pattern(content):
         return []
 
     resolved_ids = []
@@ -804,28 +826,13 @@ async def recall(
             store.set_memory(m)
             _time_ripple(m)
 
-    # ── 替换 superseded 记忆 ──
-    filtered_results = []
+    # Post-process: clean internal markers + map scores to confidence
     for r in results:
-        m = store.get_memory(r["id"])
-        if m and m.get("status") == "superseded":
-            new_id = m.get("superseded_by")
-            if new_id:
-                new_m = store.get_memory(new_id)
-                if new_m and new_m.get("status") == "active":
-                    r["id"] = new_m["id"]
-                    r["content"] = new_m["content"]
-                    r["superseded_from"] = m["id"]
-            else:
-                continue
-        # 清理内部标记
         r.pop("_unresolved", None)
-        # RRF 分数区间约 0~0.05，映射为可读置信度
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
-        filtered_results.append(r)
 
-    return filtered_results
+    return results
 
 
 # ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──
