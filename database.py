@@ -537,6 +537,8 @@ def vector_search(
     exclude_rooms: list[str] = None,
     layer: str = None,
     owner_ai: str = None,
+    exclude_resolved: bool = False,
+    exclude_superseded: bool = False,
 ) -> list[dict]:
     """Vector similarity search using sqlite-vec.
 
@@ -612,6 +614,10 @@ def vector_search(
                 continue
             if owner_ai is not None and mem.get("owner_ai") != owner_ai:
                 continue
+            if exclude_resolved and mem.get("resolved") in (True, 1):
+                continue
+            if exclude_superseded and mem.get("superseded_by"):
+                continue
 
             mem["distance"] = distances[vec_rid]
             results.append(mem)
@@ -629,7 +635,8 @@ def vector_search(
 #  Full-text search
 # ════════════════════════════════════════════
 
-def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict]:
+def fts_search(query: str, top_k: int = 50, status: str = "active",
+               exclude_resolved: bool = False, exclude_superseded: bool = False) -> list[dict]:
     """Full-text search using FTS5.
 
     Returns memories matching the query with a ``rank`` field
@@ -680,6 +687,10 @@ def fts_search(query: str, top_k: int = 50, status: str = "active") -> list[dict
     results = []
     for row in rows:
         mem = _row_to_dict_no_embedding(row)
+        if exclude_resolved and mem.get("resolved") in (True, 1):
+            continue
+        if exclude_superseded and mem.get("superseded_by"):
+            continue
         mem["rank"] = row["rank"]
         results.append(mem)
 

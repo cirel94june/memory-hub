@@ -19,6 +19,15 @@ import analyzer
 logger = logging.getLogger("memory_hub.ops")
 
 
+_RESOLVE_PATTERNS = (
+    "已完成", "搞定了", "做完了", "已解决", "完成了",
+    "已经做了", "办好了", "改了", "改完了", "好了",
+    "弄好了", "处理了", "处理完了", "OK了", "ok了",
+    "搞好了", "修好了", "解决了", "Done", "done",
+    "finished", "fixed", "已经弄好",
+)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -284,6 +293,8 @@ async def remember(
                         s_mem["superseded_by"] = mem_id
                         store.set_memory(s_mem)
 
+                auto_resolved = _check_auto_resolve(content, candidates)
+
                 result = {
                     "id": mem_id,
                     "status": "created",
@@ -292,6 +303,8 @@ async def remember(
                     "superseded": superseded_ids,
                     "linked": linked_ids,
                 }
+                if auto_resolved:
+                    result["auto_resolved"] = auto_resolved
                 if original_category and original_category != category:
                     result["original_category"] = original_category
                 return result
@@ -335,6 +348,29 @@ async def remember(
     if original_category and original_category != category:
         result["original_category"] = original_category
     return result
+
+
+def _check_auto_resolve(content: str, candidates: list[dict]) -> list[str]:
+    """If content matches a completion pattern, auto-resolve related unresolved memories.
+    Returns list of resolved memory IDs."""
+    content_lower = content.lower()
+    if not any(p.lower() in content_lower for p in _RESOLVE_PATTERNS):
+        return []
+
+    resolved_ids = []
+    now = _now()
+    for c in candidates:
+        mem = c.get("mem") or store.get_memory(c.get("id", ""))
+        if not mem:
+            continue
+        if mem.get("resolved") is not False:
+            continue
+        mem["resolved"] = True
+        mem["updated_at"] = now
+        store.set_memory(mem)
+        resolved_ids.append(mem["id"])
+        logger.info(f"Auto-resolved {mem['id']} triggered by completion phrase")
+    return resolved_ids
 
 
 def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:
@@ -637,7 +673,9 @@ async def recall(
     # ── 路径 1：向量搜索（语义匹配）──
     vec_results = []
     if query_vec:
-        raw_vec = database.vector_search(query_vec, top_k=50, status="active", **db_kwargs)
+        raw_vec = database.vector_search(query_vec, top_k=50, status="active",
+                                         exclude_resolved=True, exclude_superseded=True,
+                                         **db_kwargs)
 
         vec_scored = []
         for mem in raw_vec:
@@ -671,7 +709,8 @@ async def recall(
         vec_results = [_build_result(m, s) for m, s in vec_scored[:50]]
 
     # ── 路径 2：全文搜索（FTS5 BM25）──
-    raw_fts = database.fts_search(query, top_k=50, status="active")
+    raw_fts = database.fts_search(query, top_k=50, status="active",
+                                  exclude_resolved=True, exclude_superseded=True)
     kw_scored = []
     for mem in raw_fts:
         if not _passes_private_filter(mem):
@@ -720,6 +759,27 @@ async def recall(
 
     # ── RRF 融合三路结果 ──
     merged = _rrf_merge(vec_results, kw_results, exact_results)
+
+    # ── 新鲜度 boost（RRF 后、unresolved 浮现前）──
+    for item in merged:
+        try:
+            created = datetime.fromisoformat(item["created_at"])
+            days = max(0, (datetime.now(timezone.utc) - created).total_seconds() / 86400)
+        except Exception:
+            days = 90
+        recency_boost = 1 + 0.3 * math.exp(-days / 30)
+        item["score"] = item["score"] * recency_boost
+
+    # ── activation_count P95 顶端惩罚（≥20 条结果时）──
+    if len(merged) >= 20:
+        counts = sorted(item.get("activation_count", 0) for item in merged)
+        p95 = counts[int(len(counts) * 0.95)]
+        if p95 > 0:
+            for item in merged:
+                if item.get("activation_count", 0) > p95:
+                    item["score"] *= 0.7
+
+    merged.sort(key=lambda x: x["score"], reverse=True)
 
     # ── Unresolved 优先浮现（最多 2 条插到最前面）──
     unresolved = []
