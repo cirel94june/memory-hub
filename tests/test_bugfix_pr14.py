@@ -702,7 +702,7 @@ def test_m3_empty_provenance_not_excluded_by_cjk_like(db_env):
 def test_m3_sql_null_handling_defensive(db_env):
     """SQL clause uses IS NULL OR NOT IN — verify the SQL text is correct."""
     import inspect
-    source = inspect.getsource(database.fts_search)
+    source = inspect.getsource(database._fts_search_impl)
     assert "IS NULL OR" in source, "FTS must have IS NULL guard for defense in depth"
 
 
