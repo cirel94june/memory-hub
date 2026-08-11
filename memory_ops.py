@@ -603,15 +603,13 @@ _RESOLVE_CONDITIONAL_EN = re.compile(
 
 
 # Split on strong clause boundaries and English/Chinese transitional connectives.
-# NOTE: applied AFTER NFKC normalization, so ，；( ) all become halfwidth.
+# NOTE: applied AFTER NFKC normalization, so ，；() all become halfwidth.
+# Transitional connectives split whether or not a comma precedes them — they
+# introduce a new independent clause either way.
 _CLAUSE_SPLIT_RE = re.compile(
     r"[.!。！\n;]"
-    r"|,\s*but\s+"
-    r"|,\s*however\s+"
-    r"|,\s*但是"
-    r"|,\s*不过"
-    r"|,\s*可是"
-    r"|,\s*然而",
+    r"|\b(?:but|however)\b\s+"          # English: word-bounded, no comma required
+    r"|(?:但是|不过|可是|然而)",         # Chinese: substring split (no whitespace in CJK)
     re.IGNORECASE,
 )
 
@@ -688,6 +686,80 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
         except Exception:
             boost = 1.0
         item["score"] = round(item.get("score", 0) * boost, 6)
+
+
+def _touch_recalled_memories(ids: list[str]) -> None:
+    """Atomic activation_count increment for recalled memories, plus ±48h ripple.
+
+    All updates run in a single BEGIN IMMEDIATE transaction so concurrent recalls
+    cannot lose an increment. Ripple candidates are collected across all reference
+    timestamps first, deduplicated, capped globally at 5*N, then updated in one
+    UPDATE. Any exception is logged but never propagates — touch is best-effort.
+    """
+    if not ids:
+        return
+    try:
+        now = _now()
+        conn = database._get_conn()
+        placeholders = ",".join("?" * len(ids))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                f"UPDATE memories SET "
+                f"activation_count = COALESCE(activation_count, 0) + 1, "
+                f"last_activated = ? "
+                f"WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+            # Ripple: collect candidate ids across all reference timestamps,
+            # dedupe, exclude the recalled set, then global-cap to 5*N.
+            ripple_cap = 5 * len(ids)
+            ref_rows = conn.execute(
+                f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+                f"FROM memories WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            recalled_set = set(ids)
+            candidates: dict[str, None] = {}
+            for (ref_ts,) in ref_rows:
+                if not ref_ts:
+                    continue
+                try:
+                    base = datetime.fromisoformat(ref_ts)
+                    if base.tzinfo is None:
+                        base = base.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                lo = (base - timedelta(hours=48)).isoformat()
+                hi = (base + timedelta(hours=48)).isoformat()
+                rows = conn.execute(
+                    "SELECT id FROM memories "
+                    "WHERE status = 'active' AND created_at BETWEEN ? AND ?",
+                    (lo, hi),
+                ).fetchall()
+                for (mid,) in rows:
+                    if mid in recalled_set or mid in candidates:
+                        continue
+                    candidates[mid] = None
+                    if len(candidates) >= ripple_cap:
+                        break
+                if len(candidates) >= ripple_cap:
+                    break
+            if candidates:
+                ripple_ids = list(candidates.keys())
+                rph = ",".join("?" * len(ripple_ids))
+                conn.execute(
+                    f"UPDATE memories SET activation_count = "
+                    f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                    f"WHERE id IN ({rph})",
+                    ripple_ids,
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    except Exception as e:
+        logger.warning(f"recall touch failed (results still returned): {e}")
 
 
 def _apply_activation_penalty(items: list[dict]) -> None:
@@ -1777,57 +1849,7 @@ async def recall(
 
     # ── Touch：原子 UPDATE 避免并发丢失更新 + ±48h 时间涟漪，不能阻断返回 ──
     if results:
-        try:
-            now = _now()
-            ids = [r["id"] for r in results]
-            conn = database._get_conn()
-            placeholders = ",".join("?" * len(ids))
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                f"UPDATE memories SET "
-                f"activation_count = COALESCE(activation_count, 0) + 1, "
-                f"last_activated = ? "
-                f"WHERE id IN ({placeholders})",
-                (now, *ids),
-            )
-            # Time ripple: neighboring memories within ±48h of touched memories'
-            # event_date (fallback created_at) get +0.3 activation. Batched to a
-            # cap so a large recall doesn't ripple across the whole DB.
-            ripple_cap = 5 * len(ids)
-            ref_rows = conn.execute(
-                f"SELECT id, COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
-                f"FROM memories WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-            ref_ts_list = [r[1] for r in ref_rows if r[1]]
-            if ref_ts_list:
-                for ref_ts in ref_ts_list:
-                    try:
-                        base = datetime.fromisoformat(ref_ts)
-                        if base.tzinfo is None:
-                            base = base.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
-                    lo = (base - timedelta(hours=48)).isoformat()
-                    hi = (base + timedelta(hours=48)).isoformat()
-                    conn.execute(
-                        f"UPDATE memories SET activation_count = "
-                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
-                        f"WHERE status = 'active' "
-                        f"AND id NOT IN ({placeholders}) "
-                        f"AND created_at BETWEEN ? AND ? "
-                        f"AND rowid IN (SELECT rowid FROM memories "
-                        f"WHERE status = 'active' AND created_at BETWEEN ? AND ? "
-                        f"LIMIT ?)",
-                        (*ids, lo, hi, lo, hi, ripple_cap),
-                    )
-            conn.execute("COMMIT")
-        except Exception as e:
-            try:
-                database._get_conn().execute("ROLLBACK")
-            except Exception:
-                pass
-            logger.warning(f"recall touch failed (results still returned): {e}")
+        _touch_recalled_memories([r["id"] for r in results])
 
     # ── 结果后处理：confidence 标签 ──
     for r in results:

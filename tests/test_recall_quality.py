@@ -343,6 +343,13 @@ class TestBlock6ResolvePatterns:
         assert self._match("刚才没弄好，但是现在弄好了")
         assert self._match("if it was broken, but it is fixed now")
 
+    def test_positive_transitional_without_preceding_comma(self):
+        """Transitional connectives split even without a preceding comma."""
+        assert self._match("It was not fixed but now it is fixed.")
+        assert self._match("还没搞定不过现在真的搞定了")
+        assert self._match("It's broken however it is fixed now")
+        assert self._match("刚才没弄好但是现在弄好了")
+
 
 # ════════════════════════════════════════════
 #  M1: atomic auto-resolve
@@ -613,18 +620,29 @@ class TestM2AtomicTouch:
         ).fetchone()
         assert row[0] == 6
 
-    def test_concurrent_recall_no_lost_updates(self, db_env):
-        """Two independent connections racing on the same memory: final count == 2."""
+    def test_touch_helper_uses_atomic_sql(self):
+        """_touch_recalled_memories source uses UPDATE … COALESCE(... , 0) + 1,
+        not a read-modify-write pattern. Guards against silent regressions
+        that would reintroduce lost updates under concurrency."""
+        import inspect
+        from memory_ops import _touch_recalled_memories
+        src = inspect.getsource(_touch_recalled_memories)
+        assert "COALESCE(activation_count, 0) + 1" in src, \
+            "touch must use atomic SQL increment"
+        assert "get_memory(" not in src and "set_memory(" not in src, \
+            "touch must not read-modify-write memory objects"
+
+    def test_concurrent_atomic_increment_no_lost_updates(self, db_env):
+        """Two threads racing on the same row with atomic UPDATE end at count=2.
+        Verifies the SQL pattern the production helper uses (COALESCE + 1)
+        with truly independent connections in independent threads."""
         import threading
         conn = database._get_conn()
-        seed = "concurrent_seed"
         _insert_memory(conn, "conc_mem", "concurrent test memory",
-                       vec_seed=seed, activation_count=0)
+                       activation_count=0)
         db_path = str(database.DB_PATH)
 
         def worker():
-            # Use direct SQL UPDATE via a fresh connection — mirrors the
-            # production atomic increment path.
             c = sqlite3.connect(db_path, timeout=5.0)
             try:
                 c.execute("BEGIN IMMEDIATE")
@@ -646,7 +664,7 @@ class TestM2AtomicTouch:
             "SELECT activation_count FROM memories WHERE id = ?",
             ("conc_mem",),
         ).fetchone()
-        assert row[0] == 2, f"expected 2 with atomic UPDATE, got {row[0]}"
+        assert row[0] == 2, f"expected 2, got {row[0]}"
 
 
 # ════════════════════════════════════════════
@@ -654,6 +672,32 @@ class TestM2AtomicTouch:
 # ════════════════════════════════════════════
 
 class TestTimeRipple:
+    def test_ripple_global_cap_across_all_reference_ts(self, db_env):
+        """Ripple cap is 5*N total across all reference timestamps, not per-window."""
+        conn = database._get_conn()
+        base = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        # 2 recall targets, 40 nearby neighbors (all within ±48h of both).
+        # Global cap should be 5*2 = 10, not 5*2*2 = 20.
+        _insert_memory(conn, "tgt_a", "tgt a", created_at=base.isoformat(),
+                       activation_count=0)
+        _insert_memory(conn, "tgt_b", "tgt b",
+                       created_at=(base + timedelta(hours=1)).isoformat(),
+                       activation_count=0)
+        for i in range(40):
+            _insert_memory(conn, f"nb_{i}", f"neighbor {i}",
+                           created_at=(base + timedelta(hours=2 + i % 40)).isoformat(),
+                           activation_count=0)
+
+        from memory_ops import _touch_recalled_memories
+        _touch_recalled_memories(["tgt_a", "tgt_b"])
+
+        bumped = conn.execute(
+            "SELECT COUNT(*) FROM memories "
+            "WHERE id LIKE 'nb_%' AND activation_count > 0"
+        ).fetchone()[0]
+        assert bumped <= 10, f"global cap violated: bumped {bumped}, expected ≤ 10"
+        assert bumped >= 1, "at least some neighbors must ripple"
+
     def test_recall_ripples_to_neighbor_within_48h(self, db_env):
         conn = database._get_conn()
         base = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
