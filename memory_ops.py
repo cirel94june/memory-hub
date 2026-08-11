@@ -589,38 +589,103 @@ _RESOLVE_PATTERNS_EN = (
     "Done", "done", "finished", "fixed",
 )
 _RESOLVE_NEGATION_ZH = re.compile(r"(?:没|不|未|还没|没有|别|不要|还不|并没)")
+_RESOLVE_CONDITIONAL_ZH = re.compile(r"(?:如果|要是|假如|若|万一|是不是|不确定|可能|也许|或许|大概)")
 _RESOLVE_DOUBT_ZH = re.compile(r"(?:吗|吧|呢|么|嘛|？|\?)")
+
+_RESOLVE_NEGATION_EN = re.compile(
+    r"\b(?:not|never|haven'?t|hasn'?t|didn'?t|don'?t|doesn'?t|isn'?t|wasn'?t|un)\b",
+    re.IGNORECASE,
+)
+_RESOLVE_CONDITIONAL_EN = re.compile(
+    r"\b(?:if|whether|wonder|maybe|perhaps|might|could|would|should|possibly|probably|unsure|not sure)\b",
+    re.IGNORECASE,
+)
 
 
 def _matches_resolve_pattern(text: str) -> bool:
-    """Check if text positively matches a resolve pattern.
+    """Check if text POSITIVELY asserts completion — not just mentions it.
 
-    Uses NFKC normalization, word boundaries for English, and
-    negation/doubt window (5 chars before, 3 chars after) for Chinese.
+    Rejects: negation ("not done"), doubt ("done?"), conditionals ("if fixed"),
+    uncertainty ("maybe done"), and any sentence containing a question mark.
+    Uses NFKC normalization and word boundaries for English.
     """
     normalized = unicodedata.normalize("NFKC", text)
 
+    # Reject anything containing a question mark globally — resolve is an assertion.
+    if "?" in normalized or "？" in normalized:
+        return False
+
     for pat in _RESOLVE_PATTERNS_EN:
         for m in re.finditer(r'\b' + re.escape(pat) + r'\b', normalized, re.IGNORECASE):
-            start = max(0, m.start() - 20)
-            window_before = normalized[start:m.start()]
-            if not re.search(r'\b(?:not|never|haven\'t|hasn\'t|didn\'t|don\'t|isn\'t|wasn\'t|un)\b',
-                             window_before, re.IGNORECASE):
-                return True
+            # Search the whole sentence up to this point for negation/conditional.
+            sentence_start = max(
+                normalized.rfind(".", 0, m.start()) + 1,
+                normalized.rfind("!", 0, m.start()) + 1,
+                normalized.rfind("\n", 0, m.start()) + 1,
+                0,
+            )
+            window_before = normalized[sentence_start:m.start()]
+            if _RESOLVE_NEGATION_EN.search(window_before):
+                continue
+            if _RESOLVE_CONDITIONAL_EN.search(window_before):
+                continue
+            return True
 
     for pat in _RESOLVE_PATTERNS_ZH:
         for m in re.finditer(re.escape(pat), normalized):
-            before_start = max(0, m.start() - 5)
-            after_end = min(len(normalized), m.end() + 3)
-            window_before = normalized[before_start:m.start()]
-            window_after = normalized[m.end():after_end]
+            # Sentence-level window: from last CJK/ASCII terminator to match.
+            sentence_start = 0
+            for term in ("。", "！", "!", ".", "\n"):
+                idx = normalized.rfind(term, 0, m.start())
+                if idx + 1 > sentence_start:
+                    sentence_start = idx + 1
+            window_before = normalized[sentence_start:m.start()]
+            window_after = normalized[m.end():m.end() + 3]
             if _RESOLVE_NEGATION_ZH.search(window_before):
+                continue
+            if _RESOLVE_CONDITIONAL_ZH.search(window_before):
                 continue
             if _RESOLVE_DOUBT_ZH.search(window_after):
                 continue
             return True
 
     return False
+
+
+def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
+    """In-place: multiply score by (1 + 0.3 * exp(-days/30)) using created_at.
+
+    Future timestamps are clamped to days=0 to avoid runaway boosts.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    for item in items:
+        try:
+            created = datetime.fromisoformat(item.get("created_at", ""))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            days = max(0.0, (now_utc - created).total_seconds() / 86400)
+            boost = 1 + 0.3 * math.exp(-days / 30)
+        except Exception:
+            boost = 1.0
+        item["score"] = round(item.get("score", 0) * boost, 6)
+
+
+def _apply_activation_penalty(items: list[dict]) -> None:
+    """In-place: apply 0.7x penalty to items above P95 activation_count.
+
+    Only triggers when len(items) >= 20. Uses math.ceil for the P95 index.
+    """
+    if len(items) < 20:
+        return
+    counts = sorted([item.get("activation_count", 0) for item in items])
+    p95_idx = math.ceil(len(counts) * 0.95) - 1
+    p95 = counts[min(p95_idx, len(counts) - 1)]
+    if p95 <= 0:
+        return
+    for item in items:
+        if item.get("activation_count", 0) > p95:
+            item["score"] = round(item.get("score", 0) * 0.7, 6)
 
 
 def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) -> list[str]:
@@ -646,26 +711,42 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
         return []
 
     now = _now()
-    resolved_ids = []
+    resolved_ids: list[str] = []
     conn = database._get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
         for mem in to_resolve:
-            conn.execute(
-                "UPDATE memories SET resolved = 1, updated_at = ? WHERE id = ?",
+            # Conditional UPDATE: only touch rows still resolved=0/NULL.
+            # Prevents double-resolve under concurrent writers.
+            cur = conn.execute(
+                "UPDATE memories SET resolved = 1, updated_at = ? "
+                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
                 (now, mem["id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO maintenance_audit "
+                "(action, target_id, new_content, decision_reason, state_before, "
+                "state_after, model_id, auto_executed, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "resolve_thread", mem["id"], content,
+                    "auto-resolve: 内容匹配完成模式",
+                    json.dumps({"resolved": mem.get("resolved")}),
+                    json.dumps({"resolved": 1}),
+                    source_ai or "", 1, now,
+                ),
             )
             resolved_ids.append(mem["id"])
         conn.execute("COMMIT")
     except Exception as e:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         logger.warning(f"Atomic auto-resolve failed: {e}")
         return []
-
-    for mem_id in resolved_ids:
-        _write_audit("resolve_thread", mem_id, content,
-                     f"auto-resolve: 内容匹配完成模式",
-                     {}, {"resolved": 1}, True, source_ai)
 
     return resolved_ids
 
@@ -1605,29 +1686,12 @@ async def recall(
             merged = filtered
 
         # Block 2: 新鲜度 boost — RRF 合并后统一加权
-        _now_utc = datetime.now(timezone.utc)
-        for item in merged:
-            try:
-                created = datetime.fromisoformat(item.get("created_at", ""))
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                days = (_now_utc - created).total_seconds() / 86400
-                recency_boost = 1 + 0.3 * math.exp(-days / 30)
-            except Exception:
-                recency_boost = 1.0
-            item["score"] = round(item.get("score", 0) * recency_boost, 6)
+        _apply_recency_boost(merged)
         merged.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         # Block 3: activation_count P95 顶端惩罚（≥20 条结果才触发）
-        if len(merged) >= 20:
-            counts = sorted([item.get("activation_count", 0) for item in merged])
-            p95_idx = math.ceil(len(counts) * 0.95) - 1
-            p95 = counts[min(p95_idx, len(counts) - 1)]
-            if p95 > 0:
-                for item in merged:
-                    if item.get("activation_count", 0) > p95:
-                        item["score"] = round(item.get("score", 0) * 0.7, 6)
-                merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        _apply_activation_penalty(merged)
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         # 残缺正文降权（content_incomplete 由完整性审计标记）
         for item in merged:
@@ -1691,18 +1755,28 @@ async def recall(
     else:
         results = _db_search_all()
 
-    # ── Touch：更新 activation_count（写操作留在主线程，不能阻断返回） ──
-    try:
-        now = _now()
-        for r in results:
-            m = store.get_memory(r["id"])
-            if m:
-                m["activation_count"] = m.get("activation_count", 0) + 1
-                m["last_activated"] = now
-                store.set_memory(m)
-                _time_ripple(m)
-    except Exception as e:
-        logger.warning(f"recall touch failed (results still returned): {e}")
+    # ── Touch：原子 UPDATE 避免并发丢失更新，不能阻断返回 ──
+    if results:
+        try:
+            now = _now()
+            ids = [r["id"] for r in results]
+            conn = database._get_conn()
+            placeholders = ",".join("?" * len(ids))
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                f"UPDATE memories SET "
+                f"activation_count = COALESCE(activation_count, 0) + 1, "
+                f"last_activated = ? "
+                f"WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+            conn.execute("COMMIT")
+        except Exception as e:
+            try:
+                database._get_conn().execute("ROLLBACK")
+            except Exception:
+                pass
+            logger.warning(f"recall touch failed (results still returned): {e}")
 
     # ── 结果后处理：confidence 标签 ──
     for r in results:

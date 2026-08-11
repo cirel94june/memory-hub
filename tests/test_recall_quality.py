@@ -185,20 +185,46 @@ class TestBlock1SQLFiltering:
 # ════════════════════════════════════════════
 
 class TestBlock2RecencyBoost:
-    def test_recency_formula_1_day(self):
-        days = 1
-        boost = 1 + 0.3 * math.exp(-days / 30)
-        assert 1.28 < boost < 1.30
+    """Test the production _apply_recency_boost helper directly."""
 
-    def test_recency_formula_30_days(self):
-        days = 30
-        boost = 1 + 0.3 * math.exp(-days / 30)
-        assert 1.10 < boost < 1.12
+    def _boost(self, days_ago):
+        from memory_ops import _apply_recency_boost
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        created = (now - timedelta(days=days_ago)).isoformat()
+        item = {"score": 1.0, "created_at": created}
+        _apply_recency_boost([item], now_utc=now)
+        return item["score"]
 
-    def test_recency_formula_90_days(self):
-        days = 90
-        boost = 1 + 0.3 * math.exp(-days / 30)
-        assert 1.01 < boost < 1.02
+    def test_recency_1_day(self):
+        assert 1.28 < self._boost(1) < 1.30
+
+    def test_recency_30_days(self):
+        assert 1.10 < self._boost(30) < 1.12
+
+    def test_recency_90_days(self):
+        assert 1.01 < self._boost(90) < 1.02
+
+    def test_recency_future_timestamp_clamped(self):
+        """Future timestamps must not produce >1.30 boost (days clamped to 0)."""
+        from memory_ops import _apply_recency_boost
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        future = (now + timedelta(days=365)).isoformat()
+        item = {"score": 1.0, "created_at": future}
+        _apply_recency_boost([item], now_utc=now)
+        assert item["score"] == pytest.approx(1.3, abs=0.001)
+
+    def test_recency_invalid_timestamp_neutral(self):
+        from memory_ops import _apply_recency_boost
+        item = {"score": 1.0, "created_at": "not-a-date"}
+        _apply_recency_boost([item])
+        assert item["score"] == 1.0
+
+    def test_recency_naive_timestamp_handled(self):
+        from memory_ops import _apply_recency_boost
+        now = datetime(2026, 8, 11, tzinfo=timezone.utc)
+        item = {"score": 1.0, "created_at": "2026-07-11T00:00:00"}
+        _apply_recency_boost([item], now_utc=now)
+        assert 1.10 < item["score"] < 1.12
 
 
 # ════════════════════════════════════════════
@@ -206,24 +232,36 @@ class TestBlock2RecencyBoost:
 # ════════════════════════════════════════════
 
 class TestBlock3P95Penalty:
-    def test_p95_not_triggered_below_20(self):
-        items = [{"activation_count": i * 10, "score": 1.0} for i in range(19)]
-        assert len(items) < 20
+    """Test the production _apply_activation_penalty helper directly."""
 
-    def test_p95_boundary_uses_ceil(self):
-        counts = list(range(1, 21))
-        p95_idx = math.ceil(len(counts) * 0.95) - 1
-        p95 = counts[min(p95_idx, len(counts) - 1)]
-        assert p95 == counts[18]
-        assert counts[19] > p95
+    def test_below_20_no_penalty(self):
+        from memory_ops import _apply_activation_penalty
+        items = [{"activation_count": 100, "score": 1.0} for _ in range(19)]
+        _apply_activation_penalty(items)
+        assert all(item["score"] == 1.0 for item in items)
 
-    def test_p95_penalty_applied_to_outlier(self):
-        counts = [1] * 19 + [100]
-        p95_idx = math.ceil(len(counts) * 0.95) - 1
-        p95 = sorted(counts)[min(p95_idx, len(counts) - 1)]
-        assert 100 > p95
-        score = 1.0 * 0.7
-        assert score == pytest.approx(0.7)
+    def test_p95_boundary_exactly_20(self):
+        """20 items: P95 idx = ceil(19) - 1 = 18, only counts[19] should be penalized."""
+        from memory_ops import _apply_activation_penalty
+        items = [{"activation_count": i + 1, "score": 1.0} for i in range(20)]
+        _apply_activation_penalty(items)
+        below = [it for it in items if it["activation_count"] <= 19]
+        above = [it for it in items if it["activation_count"] == 20]
+        assert all(it["score"] == 1.0 for it in below)
+        assert all(it["score"] == pytest.approx(0.7) for it in above)
+
+    def test_outlier_penalized(self):
+        from memory_ops import _apply_activation_penalty
+        items = [{"activation_count": 1, "score": 1.0} for _ in range(19)]
+        items.append({"activation_count": 999, "score": 1.0})
+        _apply_activation_penalty(items)
+        assert items[-1]["score"] == pytest.approx(0.7)
+
+    def test_all_zero_activation_no_penalty(self):
+        from memory_ops import _apply_activation_penalty
+        items = [{"activation_count": 0, "score": 1.0} for _ in range(25)]
+        _apply_activation_penalty(items)
+        assert all(item["score"] == 1.0 for item in items)
 
 
 # ════════════════════════════════════════════
@@ -272,6 +310,31 @@ class TestBlock6ResolvePatterns:
     def test_nfkc_normalization(self):
         assert self._match("ＯＫ了")
 
+    def test_negative_english_conditional(self):
+        assert not self._match("if it is fixed, tell me")
+        assert not self._match("I wonder if this is fixed")
+        assert not self._match("maybe it is done")
+        assert not self._match("perhaps we finished")
+        assert not self._match("not sure whether it's done")
+
+    def test_negative_english_question(self):
+        assert not self._match("is it fixed?")
+        assert not self._match("are we done?")
+        assert not self._match("Did you fix it?")
+
+    def test_negative_chinese_conditional(self):
+        assert not self._match("如果修好了就告诉我")
+        assert not self._match("要是完成了记得说")
+        assert not self._match("是不是搞定了")
+        assert not self._match("可能已经修好了")
+        assert not self._match("也许弄好了")
+        assert not self._match("我不确定，但已经修好了")
+
+    def test_negative_chinese_question_anywhere(self):
+        assert not self._match("搞定了没?")
+        assert not self._match("完成了？")
+        assert not self._match("修好了？还是没修好？")
+
 
 # ════════════════════════════════════════════
 #  M1: atomic auto-resolve
@@ -308,6 +371,41 @@ class TestM1AtomicAutoResolve:
         row = conn.execute("SELECT resolved FROM memories WHERE id = ?",
                            ("task_x",)).fetchone()
         assert row[0] == 0
+
+    def test_audit_written_atomically_with_resolve(self, db_env):
+        conn = database._get_conn()
+        _insert_memory(conn, "task_audit", "buy milk", resolved=0)
+        mem = {"id": "task_audit", "resolved": 0, "info_type": "task"}
+
+        from memory_ops import _check_auto_resolve
+        resolved_ids = _check_auto_resolve("买牛奶搞定了", [mem], "cloudy")
+        assert resolved_ids == ["task_audit"]
+
+        # Both state change AND audit row must exist.
+        row = conn.execute("SELECT resolved FROM memories WHERE id = ?",
+                           ("task_audit",)).fetchone()
+        assert row[0] == 1
+        audit = conn.execute(
+            "SELECT action, target_id FROM maintenance_audit WHERE target_id = ?",
+            ("task_audit",),
+        ).fetchall()
+        assert len(audit) == 1
+        assert audit[0][0] == "resolve_thread"
+
+    def test_already_resolved_not_double_updated(self, db_env):
+        """Conditional UPDATE + rowcount check must skip rows already resolved."""
+        conn = database._get_conn()
+        _insert_memory(conn, "task_done", "already done", resolved=1)
+        mem = {"id": "task_done", "resolved": 0, "info_type": "task"}
+
+        from memory_ops import _check_auto_resolve
+        resolved_ids = _check_auto_resolve("搞定了", [mem], "cloudy")
+        assert resolved_ids == []
+        audit = conn.execute(
+            "SELECT COUNT(*) FROM maintenance_audit WHERE target_id = ?",
+            ("task_done",),
+        ).fetchone()
+        assert audit[0] == 0
 
 
 # ════════════════════════════════════════════
@@ -420,3 +518,51 @@ class TestROVariants:
                                             exclude_resolved=True)
         ids = {r["id"] for r in results}
         assert "rov_res" not in ids
+
+
+# ════════════════════════════════════════════
+#  H1: vector search adaptive expansion beyond old 2000 cap
+# ════════════════════════════════════════════
+
+class TestH1VectorAdaptiveExpansion:
+    def test_large_resolved_set_does_not_starve_active(self, db_env):
+        """2100 resolved + 10 active: recall must expand past old 2000 cap."""
+        conn = database._get_conn()
+        # Batch insert for speed
+        for i in range(2100):
+            _insert_memory(conn, f"big_res_{i}", f"topic beta {i}", resolved=1,
+                           vec_seed=f"beta_r_{i}")
+        for i in range(10):
+            _insert_memory(conn, f"big_act_{i}", f"topic beta active {i}",
+                           vec_seed=f"beta_a_{i}")
+        query_vec = _make_vec("beta_a_0")
+        results = database.vector_search(query_vec, top_k=10, status="active",
+                                         exclude_resolved=True)
+        assert len(results) == 10, f"expected 10, got {len(results)}"
+        for r in results:
+            assert r["id"].startswith("big_act_")
+
+
+# ════════════════════════════════════════════
+#  M2: atomic touch — no lost updates on concurrent recall
+# ════════════════════════════════════════════
+
+class TestM2AtomicTouch:
+    def test_touch_uses_atomic_sql_update(self, db_env):
+        """Touch should increment activation_count via SQL, not read-modify-write."""
+        conn = database._get_conn()
+        seed = "elephant"
+        _insert_memory(conn, "touch_atomic", "elephant memory", vec_seed=seed,
+                       activation_count=5)
+
+        import memory_ops
+        from unittest.mock import AsyncMock
+        mock_embed = AsyncMock(return_value=_make_vec(seed))
+        with patch("memory_ops.get_embedding", mock_embed):
+            asyncio.run(memory_ops.recall("elephant", skip_analyze=True))
+        # Fresh conn read from DB
+        row = conn.execute(
+            "SELECT activation_count FROM memories WHERE id = ?",
+            ("touch_atomic",),
+        ).fetchone()
+        assert row[0] == 6

@@ -994,9 +994,16 @@ def _vector_search_impl(
         exclude_resolved, exclude_superseded,
     )
 
-    # Adaptive expansion: double fetch limit until we fill top_k or exhaust index
-    fetch_limit = top_k * 4
-    max_fetch = 2000
+    # Adaptive expansion: double fetch limit until we fill top_k or exhaust index.
+    # max_fetch is derived from actual index size so we never silently give up
+    # while the index still has candidates left to try.
+    try:
+        index_size = conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0]
+    except sqlite3.Error:
+        index_size = 0
+    max_fetch = max(index_size, top_k * 4)
+
+    fetch_limit = min(top_k * 4, max_fetch) if max_fetch else top_k * 4
     results = []
     seen_rowids: set = set()
     prev_fetch = 0
@@ -1018,6 +1025,7 @@ def _vector_search_impl(
 
         new_rows = [(r[0], r[1]) for r in vec_rows if r[0] not in seen_rowids]
         if not new_rows:
+            # Reached natural end of index — no new candidates possible.
             break
         for r in new_rows:
             seen_rowids.add(r[0])
@@ -1061,6 +1069,8 @@ def _vector_search_impl(
                 if len(results) >= top_k:
                     return results
 
+        if fetch_limit >= max_fetch:
+            break
         fetch_limit = min(fetch_limit * 2, max_fetch)
 
     return results
@@ -1151,18 +1161,10 @@ def _fts_search_impl(conn, query, top_k, status, exclude_provenance,
 _CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
 
 
-def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
-                    exclude_provenance: list[str] = None,
-                    exclude_resolved: bool = False,
-                    exclude_superseded: bool = False,
-                    include_rooms: list[str] = None,
-                    exclude_rooms: list[str] = None) -> list[dict]:
-    """中文子串搜索（LIKE 路）。
-
-    FTS5 默认分词器不切中文——整段中文被当成一个 token，"妈妈"永远匹配不上
-    包含"我妈妈说"的记忆。这里把 query 里的中文段切成 2 字滑窗（我妈/妈妈/妈说），
-    用 LIKE 找包含这些片段的记忆，按命中片段数排序。作为混合召回的关键词路补充。
-    """
+def _cjk_like_search_impl(conn, query, top_k, status, exclude_provenance,
+                          exclude_resolved, exclude_superseded,
+                          include_rooms, exclude_rooms):
+    """Shared CJK LIKE search — used by both cjk_like_search and ro_cjk_like_search."""
     runs = _CJK_RUN_RE.findall(query or "")
     grams: list[str] = []
     seen: set[str] = set()
@@ -1176,7 +1178,6 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     if not grams:
         return []
 
-    conn = _get_conn()
     conds = " OR ".join(["content LIKE ?"] * len(grams))
     extra_clause = ""
     extra_params: list = []
@@ -1218,6 +1219,19 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
         mem["like_hits"] = hits
         results.append(mem)
     return results
+
+
+def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                    exclude_provenance: list[str] = None,
+                    exclude_resolved: bool = False,
+                    exclude_superseded: bool = False,
+                    include_rooms: list[str] = None,
+                    exclude_rooms: list[str] = None) -> list[dict]:
+    """中文子串搜索（LIKE 路）。委托到共享 impl。"""
+    return _cjk_like_search_impl(
+        _get_conn(), query, top_k, status, exclude_provenance,
+        exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
+    )
 
 
 def _fts_escape(query: str) -> str:
@@ -1386,54 +1400,15 @@ def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
                        exclude_superseded: bool = False,
                        include_rooms: list[str] = None,
                        exclude_rooms: list[str] = None) -> list[dict]:
-    """线程安全版 cjk_like_search。"""
-    conn = _get_read_conn()
-    CJK_RE = re.compile(r'[一-鿿㐀-䶿]+')
-    runs = CJK_RE.findall(query)
-    grams = []
-    for run in runs:
-        for i in range(len(run) - 1):
-            g = run[i:i+2]
-            if g not in grams:
-                grams.append(g)
-    if not grams:
-        return []
-    grams = grams[:8]
-    conds = " OR ".join(["content LIKE ?"] * len(grams))
-    extra_clause = ""
-    extra_params: list = []
-    if exclude_provenance:
-        ph = ",".join("?" * len(exclude_provenance))
-        extra_clause += f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
-        extra_params.extend(exclude_provenance)
-    if exclude_resolved:
-        extra_clause += " AND (resolved IS NULL OR resolved != 1)"
-    if exclude_superseded:
-        extra_clause += " AND (superseded_by IS NULL OR superseded_by = '')"
-    if include_rooms:
-        rph = ",".join("?" * len(include_rooms))
-        extra_clause += f" AND room IN ({rph})"
-        extra_params.extend(include_rooms)
-    if exclude_rooms:
-        rph = ",".join("?" * len(exclude_rooms))
-        extra_clause += f" AND room NOT IN ({rph})"
-        extra_params.extend(exclude_rooms)
+    """线程安全版 cjk_like_search — delegates to shared impl with read-only conn."""
     try:
-        rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}){extra_clause} LIMIT 400",
-            (status, *[f"%{g}%" for g in grams], *extra_params),
-        ).fetchall()
+        return _cjk_like_search_impl(
+            _get_read_conn(), query, top_k, status, exclude_provenance,
+            exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
+        )
     except Exception as e:
         logger.warning(f"ro_cjk_like_search failed: {e}")
         return []
-    results = []
-    for row in rows:
-        d = _row_to_dict_no_embedding(row)
-        hits = sum(1 for g in grams if g in d.get("content", ""))
-        d["like_hits"] = hits
-        results.append(d)
-    results.sort(key=lambda x: x.get("like_hits", 0), reverse=True)
-    return results[:top_k]
 
 
 def ro_get_memory(mem_id: str) -> dict | None:
