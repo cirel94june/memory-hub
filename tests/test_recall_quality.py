@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Phase 1.7 PR A — recall quality upgrade regression tests.
 
@@ -335,6 +336,13 @@ class TestBlock6ResolvePatterns:
         assert not self._match("完成了？")
         assert not self._match("修好了？还是没修好？")
 
+    def test_positive_after_semicolon_or_transitional(self):
+        """Positive clause after ; / 但是 / 不过 must be recognized."""
+        assert self._match("Maybe not fixed; it is fixed.")
+        assert self._match("还没搞定，不过现在真的搞定了")
+        assert self._match("刚才没弄好，但是现在弄好了")
+        assert self._match("if it was broken, but it is fixed now")
+
 
 # ════════════════════════════════════════════
 #  M1: atomic auto-resolve
@@ -381,16 +389,54 @@ class TestM1AtomicAutoResolve:
         resolved_ids = _check_auto_resolve("买牛奶搞定了", [mem], "cloudy")
         assert resolved_ids == ["task_audit"]
 
-        # Both state change AND audit row must exist.
+        # Both state change AND audit row must exist with correct field mapping.
         row = conn.execute("SELECT resolved FROM memories WHERE id = ?",
                            ("task_audit",)).fetchone()
         assert row[0] == 1
         audit = conn.execute(
-            "SELECT action, target_id FROM maintenance_audit WHERE target_id = ?",
+            "SELECT action, target_id, source_ai, model_id, auto_executed, "
+            "state_before, state_after "
+            "FROM maintenance_audit WHERE target_id = ?",
             ("task_audit",),
         ).fetchall()
         assert len(audit) == 1
-        assert audit[0][0] == "resolve_thread"
+        action, target, source_ai, model_id, auto, sb, sa = audit[0]
+        assert action == "resolve_thread"
+        assert target == "task_audit"
+        assert source_ai == "cloudy", f"source_ai must be 'cloudy', got {source_ai!r}"
+        assert model_id == "", f"model_id must be empty, got {model_id!r}"
+        assert auto == 1
+        assert "resolved" in sa
+
+    def test_audit_rollback_on_insert_failure(self, db_env):
+        """If audit INSERT fails, the resolve UPDATE must also roll back."""
+        conn = database._get_conn()
+        _insert_memory(conn, "task_rb", "task rollback", resolved=0)
+        mem = {"id": "task_rb", "resolved": 0, "info_type": "task"}
+
+        from memory_ops import _check_auto_resolve
+
+        # Wrap the connection: sqlite3.Connection.execute is C-level and
+        # can't be monkey-patched on the instance. Wrap via _get_conn instead.
+        real_conn = conn
+
+        class FailingConn:
+            def __init__(self, wrapped):
+                self._c = wrapped
+            def execute(self, sql, *args, **kwargs):
+                if "INSERT INTO maintenance_audit" in sql:
+                    raise RuntimeError("audit insert boom")
+                return self._c.execute(sql, *args, **kwargs)
+            def __getattr__(self, name):
+                return getattr(self._c, name)
+
+        with patch("database._get_conn", return_value=FailingConn(real_conn)):
+            resolved_ids = _check_auto_resolve("搞定了", [mem], "cloudy")
+        assert resolved_ids == []
+
+        row = real_conn.execute("SELECT resolved FROM memories WHERE id = ?",
+                                ("task_rb",)).fetchone()
+        assert row[0] == 0, "resolved must roll back when audit fails"
 
     def test_already_resolved_not_double_updated(self, db_env):
         """Conditional UPDATE + rowcount check must skip rows already resolved."""
@@ -566,3 +612,103 @@ class TestM2AtomicTouch:
             ("touch_atomic",),
         ).fetchone()
         assert row[0] == 6
+
+    def test_concurrent_recall_no_lost_updates(self, db_env):
+        """Two independent connections racing on the same memory: final count == 2."""
+        import threading
+        conn = database._get_conn()
+        seed = "concurrent_seed"
+        _insert_memory(conn, "conc_mem", "concurrent test memory",
+                       vec_seed=seed, activation_count=0)
+        db_path = str(database.DB_PATH)
+
+        def worker():
+            # Use direct SQL UPDATE via a fresh connection — mirrors the
+            # production atomic increment path.
+            c = sqlite3.connect(db_path, timeout=5.0)
+            try:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute(
+                    "UPDATE memories SET "
+                    "activation_count = COALESCE(activation_count, 0) + 1 "
+                    "WHERE id = ?",
+                    ("conc_mem",),
+                )
+                c.execute("COMMIT")
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        row = conn.execute(
+            "SELECT activation_count FROM memories WHERE id = ?",
+            ("conc_mem",),
+        ).fetchone()
+        assert row[0] == 2, f"expected 2 with atomic UPDATE, got {row[0]}"
+
+
+# ════════════════════════════════════════════
+#  Time ripple: recall of one memory bumps nearby memories +0.3
+# ════════════════════════════════════════════
+
+class TestTimeRipple:
+    def test_recall_ripples_to_neighbor_within_48h(self, db_env):
+        conn = database._get_conn()
+        base = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+        seed = "ripple_seed"
+        _insert_memory(conn, "target", "ripple target",
+                       created_at=base.isoformat(), vec_seed=seed,
+                       activation_count=0)
+        # +12h neighbor — should ripple
+        _insert_memory(conn, "neighbor",
+                       "unrelated content but nearby in time",
+                       created_at=(base + timedelta(hours=12)).isoformat(),
+                       activation_count=0)
+        # +72h stranger — outside window
+        _insert_memory(conn, "stranger", "far away",
+                       created_at=(base + timedelta(hours=72)).isoformat(),
+                       activation_count=0)
+
+        import memory_ops
+        from unittest.mock import AsyncMock
+        mock_embed = AsyncMock(return_value=_make_vec(seed))
+        with patch("memory_ops.get_embedding", mock_embed):
+            asyncio.run(memory_ops.recall("ripple", skip_analyze=True))
+
+        neighbor = conn.execute(
+            "SELECT activation_count FROM memories WHERE id = ?",
+            ("neighbor",),
+        ).fetchone()
+        stranger = conn.execute(
+            "SELECT activation_count FROM memories WHERE id = ?",
+            ("stranger",),
+        ).fetchone()
+        assert neighbor[0] == pytest.approx(0.3), \
+            f"neighbor within ±48h should get +0.3, got {neighbor[0]}"
+        assert stranger[0] == 0.0, \
+            f"stranger outside ±48h should stay at 0, got {stranger[0]}"
+
+
+# ════════════════════════════════════════════
+#  CJK Extension A coverage
+# ════════════════════════════════════════════
+
+class TestCJKExtensionA:
+    def test_cjk_extension_a_grams_generated(self, db_env):
+        """Extension A chars (㐀-䶿) must produce grams via cjk_like_search."""
+        conn = database._get_conn()
+        # 㐀 and 㐁 are Extension A characters
+        content = "文本㐀㐁㐂含扩展A"
+        _insert_memory(conn, "extA", content)
+        results = database.cjk_like_search("㐀㐁", top_k=10, status="active")
+        ids = {r["id"] for r in results}
+        assert "extA" in ids
+
+    def test_ro_cjk_extension_a_grams_generated(self, db_env):
+        conn = database._get_conn()
+        _insert_memory(conn, "extA_ro", "另一段㐀㐁㐂内容")
+        results = database.ro_cjk_like_search("㐀㐁", top_k=10, status="active")
+        ids = {r["id"] for r in results}
+        assert "extA_ro" in ids

@@ -9,7 +9,7 @@ import math
 import asyncio
 import logging
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
                     MERGE_SIMILARITY, ROOMS, get_room, AI_ALIASES, AI_ALIAS_GROUPS)
@@ -602,51 +602,70 @@ _RESOLVE_CONDITIONAL_EN = re.compile(
 )
 
 
+# Split on strong clause boundaries and English/Chinese transitional connectives.
+# NOTE: applied AFTER NFKC normalization, so ，；( ) all become halfwidth.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!。！\n;]"
+    r"|,\s*but\s+"
+    r"|,\s*however\s+"
+    r"|,\s*但是"
+    r"|,\s*不过"
+    r"|,\s*可是"
+    r"|,\s*然而",
+    re.IGNORECASE,
+)
+
+
 def _matches_resolve_pattern(text: str) -> bool:
     """Check if text POSITIVELY asserts completion — not just mentions it.
 
-    Rejects: negation ("not done"), doubt ("done?"), conditionals ("if fixed"),
-    uncertainty ("maybe done"), and any sentence containing a question mark.
-    Uses NFKC normalization and word boundaries for English.
+    Splits on strong clause boundaries (. ! 。 ！ ; ；) and transitional
+    connectives (but / 但是 / 不过 / 可是) so a positive clause after a
+    negative/conditional one is still recognized. Each clause must:
+      - contain no question mark (globally rejects doubt);
+      - contain no negation of the resolve verb;
+      - contain no conditional/uncertainty marker before the verb.
+    NFKC-normalized; English uses word boundaries.
     """
     normalized = unicodedata.normalize("NFKC", text)
 
-    # Reject anything containing a question mark globally — resolve is an assertion.
-    if "?" in normalized or "？" in normalized:
-        return False
+    clauses = _CLAUSE_SPLIT_RE.split(normalized)
+    for clause in clauses:
+        if not clause or not clause.strip():
+            continue
+        if "?" in clause or "？" in clause:
+            continue
 
-    for pat in _RESOLVE_PATTERNS_EN:
-        for m in re.finditer(r'\b' + re.escape(pat) + r'\b', normalized, re.IGNORECASE):
-            # Search the whole sentence up to this point for negation/conditional.
-            sentence_start = max(
-                normalized.rfind(".", 0, m.start()) + 1,
-                normalized.rfind("!", 0, m.start()) + 1,
-                normalized.rfind("\n", 0, m.start()) + 1,
-                0,
-            )
-            window_before = normalized[sentence_start:m.start()]
-            if _RESOLVE_NEGATION_EN.search(window_before):
-                continue
-            if _RESOLVE_CONDITIONAL_EN.search(window_before):
-                continue
+        matched = False
+        for pat in _RESOLVE_PATTERNS_EN:
+            for m in re.finditer(r'\b' + re.escape(pat) + r'\b', clause, re.IGNORECASE):
+                before = clause[:m.start()]
+                if _RESOLVE_NEGATION_EN.search(before):
+                    continue
+                if _RESOLVE_CONDITIONAL_EN.search(before):
+                    continue
+                matched = True
+                break
+            if matched:
+                break
+        if matched:
             return True
 
-    for pat in _RESOLVE_PATTERNS_ZH:
-        for m in re.finditer(re.escape(pat), normalized):
-            # Sentence-level window: from last CJK/ASCII terminator to match.
-            sentence_start = 0
-            for term in ("。", "！", "!", ".", "\n"):
-                idx = normalized.rfind(term, 0, m.start())
-                if idx + 1 > sentence_start:
-                    sentence_start = idx + 1
-            window_before = normalized[sentence_start:m.start()]
-            window_after = normalized[m.end():m.end() + 3]
-            if _RESOLVE_NEGATION_ZH.search(window_before):
-                continue
-            if _RESOLVE_CONDITIONAL_ZH.search(window_before):
-                continue
-            if _RESOLVE_DOUBT_ZH.search(window_after):
-                continue
+        for pat in _RESOLVE_PATTERNS_ZH:
+            for m in re.finditer(re.escape(pat), clause):
+                before = clause[:m.start()]
+                after = clause[m.end():m.end() + 3]
+                if _RESOLVE_NEGATION_ZH.search(before):
+                    continue
+                if _RESOLVE_CONDITIONAL_ZH.search(before):
+                    continue
+                if _RESOLVE_DOUBT_ZH.search(after):
+                    continue
+                matched = True
+                break
+            if matched:
+                break
+        if matched:
             return True
 
     return False
@@ -727,15 +746,16 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
                 continue
             conn.execute(
                 "INSERT INTO maintenance_audit "
-                "(action, target_id, new_content, decision_reason, state_before, "
-                "state_after, model_id, auto_executed, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(action, target_id, new_content, source_message_ids, "
+                "decision_reason, state_before, state_after, "
+                "model_id, source_ai, auto_executed, prompt_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    "resolve_thread", mem["id"], content,
+                    "resolve_thread", mem["id"], content, "[]",
                     "auto-resolve: 内容匹配完成模式",
-                    json.dumps({"resolved": mem.get("resolved")}),
-                    json.dumps({"resolved": 1}),
-                    source_ai or "", 1, now,
+                    json.dumps({"resolved": mem.get("resolved")}, ensure_ascii=False),
+                    json.dumps({"resolved": 1}, ensure_ascii=False),
+                    "", source_ai or "", 1, "", now,
                 ),
             )
             resolved_ids.append(mem["id"])
@@ -1755,7 +1775,7 @@ async def recall(
     else:
         results = _db_search_all()
 
-    # ── Touch：原子 UPDATE 避免并发丢失更新，不能阻断返回 ──
+    # ── Touch：原子 UPDATE 避免并发丢失更新 + ±48h 时间涟漪，不能阻断返回 ──
     if results:
         try:
             now = _now()
@@ -1770,6 +1790,37 @@ async def recall(
                 f"WHERE id IN ({placeholders})",
                 (now, *ids),
             )
+            # Time ripple: neighboring memories within ±48h of touched memories'
+            # event_date (fallback created_at) get +0.3 activation. Batched to a
+            # cap so a large recall doesn't ripple across the whole DB.
+            ripple_cap = 5 * len(ids)
+            ref_rows = conn.execute(
+                f"SELECT id, COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+                f"FROM memories WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            ref_ts_list = [r[1] for r in ref_rows if r[1]]
+            if ref_ts_list:
+                for ref_ts in ref_ts_list:
+                    try:
+                        base = datetime.fromisoformat(ref_ts)
+                        if base.tzinfo is None:
+                            base = base.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    lo = (base - timedelta(hours=48)).isoformat()
+                    hi = (base + timedelta(hours=48)).isoformat()
+                    conn.execute(
+                        f"UPDATE memories SET activation_count = "
+                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                        f"WHERE status = 'active' "
+                        f"AND id NOT IN ({placeholders}) "
+                        f"AND created_at BETWEEN ? AND ? "
+                        f"AND rowid IN (SELECT rowid FROM memories "
+                        f"WHERE status = 'active' AND created_at BETWEEN ? AND ? "
+                        f"LIMIT ?)",
+                        (*ids, lo, hi, lo, hi, ripple_cap),
+                    )
             conn.execute("COMMIT")
         except Exception as e:
             try:
@@ -1894,39 +1945,6 @@ async def resolve_memory(memory_id: str, resolved: bool = True) -> dict:
     mem["updated_at"] = _now()
     store.set_memory(mem)
     return {"id": memory_id, "status": "resolved" if resolved else "unresolved"}
-
-
-# ── 时间涟漪（触碰一条记忆时，时间上相邻的记忆轻微激活） ──
-
-def _time_ripple(touched_mem: dict, max_ripple: int = 5, hours: float = 48.0):
-    """被召回的记忆附近 ±48 小时创建的记忆也轻微唤醒 (+0.3)
-
-    NOTE: This still uses store.get_all_memories() which queries SQLite under the hood.
-    Could be optimized with a time-range SQL query, but ripple runs rarely and only
-    affects max 5 memories, so the current approach is acceptable.
-    """
-    try:
-        ref_time = datetime.fromisoformat(touched_mem.get("event_date") or touched_mem["created_at"])
-    except Exception:
-        return
-
-    rippled = 0
-    for mem in store.get_all_memories().values():
-        if rippled >= max_ripple:
-            break
-        if mem["id"] == touched_mem["id"]:
-            continue
-        if mem.get("status") != "active" or not mem.get("embedding"):
-            continue
-        try:
-            created = datetime.fromisoformat(mem["created_at"])
-            delta_hours = abs((ref_time - created).total_seconds()) / 3600
-            if delta_hours <= hours:
-                mem["activation_count"] = round(mem.get("activation_count", 0) + 0.3, 1)
-                store.set_memory(mem)
-                rippled += 1
-        except Exception:
-            continue
 
 
 # ── 获取客厅内容 ──

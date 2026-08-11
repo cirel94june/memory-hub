@@ -1158,7 +1158,7 @@ def _fts_search_impl(conn, query, top_k, status, exclude_provenance,
     return results
 
 
-_CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
+_CJK_RUN_RE = re.compile(r"[㐀-䶿一-鿿]{2,}")
 
 
 def _cjk_like_search_impl(conn, query, top_k, status, exclude_provenance,
