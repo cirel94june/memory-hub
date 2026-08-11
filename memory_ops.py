@@ -8,6 +8,7 @@ import time
 import math
 import asyncio
 import logging
+import threading
 import unicodedata
 from datetime import datetime, timezone, timedelta
 
@@ -608,8 +609,12 @@ _RESOLVE_CONDITIONAL_EN = re.compile(
 # introduce a new independent clause either way.
 _CLAUSE_SPLIT_RE = re.compile(
     r"[.!。！\n;]"
-    r"|\b(?:but|however)\b\s+"          # English: word-bounded, no comma required
-    r"|(?:但是|不过|可是|然而)",         # Chinese: substring split (no whitespace in CJK)
+    r"|\b(?:but|however)\b\s+"                   # English: word-bounded
+    # Chinese transitionals — with disambiguating negative lookaheads:
+    #   不过滤/不过分/不过是 (adverbial "not more than") must NOT split;
+    #   只不过 ("merely") should not treat 不过 as transitional either;
+    #   但是/可是/然而 have no common substring collisions.
+    r"|(?:但是|(?<!只)不过(?![滤分是不])|可是|然而)",
     re.IGNORECASE,
 )
 
@@ -688,13 +693,22 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
         item["score"] = round(item.get("score", 0) * boost, 6)
 
 
+# Serializes writes on the shared module-level sqlite connection. Two threads
+# cannot safely share one sqlite3.Connection for concurrent transactions
+# (`cannot start a transaction within a transaction`); BEGIN IMMEDIATE only
+# coordinates between distinct connections. This lock guarantees at most one
+# thread is inside a write transaction on the shared connection at a time.
+_TOUCH_LOCK = threading.Lock()
+
+
 def _touch_recalled_memories(ids: list[str]) -> None:
     """Atomic activation_count increment for recalled memories, plus ±48h ripple.
 
-    All updates run in a single BEGIN IMMEDIATE transaction so concurrent recalls
-    cannot lose an increment. Ripple candidates are collected across all reference
-    timestamps first, deduplicated, capped globally at 5*N, then updated in one
-    UPDATE. Any exception is logged but never propagates — touch is best-effort.
+    Serialized via `_TOUCH_LOCK` because the module shares one sqlite connection
+    across threads. Ripple candidates are collected across all reference
+    timestamps (each query bounded by the remaining budget via SQL LIMIT),
+    deduplicated, globally capped at 5*N, then updated in one UPDATE. Any
+    exception is logged but never propagates — touch is best-effort.
     """
     if not ids:
         return
@@ -702,62 +716,69 @@ def _touch_recalled_memories(ids: list[str]) -> None:
         now = _now()
         conn = database._get_conn()
         placeholders = ",".join("?" * len(ids))
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                f"UPDATE memories SET "
-                f"activation_count = COALESCE(activation_count, 0) + 1, "
-                f"last_activated = ? "
-                f"WHERE id IN ({placeholders})",
-                (now, *ids),
-            )
-            # Ripple: collect candidate ids across all reference timestamps,
-            # dedupe, exclude the recalled set, then global-cap to 5*N.
-            ripple_cap = 5 * len(ids)
-            ref_rows = conn.execute(
-                f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
-                f"FROM memories WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-            recalled_set = set(ids)
-            candidates: dict[str, None] = {}
-            for (ref_ts,) in ref_rows:
-                if not ref_ts:
-                    continue
-                try:
-                    base = datetime.fromisoformat(ref_ts)
-                    if base.tzinfo is None:
-                        base = base.replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-                lo = (base - timedelta(hours=48)).isoformat()
-                hi = (base + timedelta(hours=48)).isoformat()
-                rows = conn.execute(
-                    "SELECT id FROM memories "
-                    "WHERE status = 'active' AND created_at BETWEEN ? AND ?",
-                    (lo, hi),
-                ).fetchall()
-                for (mid,) in rows:
-                    if mid in recalled_set or mid in candidates:
-                        continue
-                    candidates[mid] = None
-                    if len(candidates) >= ripple_cap:
-                        break
-                if len(candidates) >= ripple_cap:
-                    break
-            if candidates:
-                ripple_ids = list(candidates.keys())
-                rph = ",".join("?" * len(ripple_ids))
+        with _TOUCH_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
-                    f"UPDATE memories SET activation_count = "
-                    f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
-                    f"WHERE id IN ({rph})",
-                    ripple_ids,
+                    f"UPDATE memories SET "
+                    f"activation_count = COALESCE(activation_count, 0) + 1, "
+                    f"last_activated = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (now, *ids),
                 )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+                ripple_cap = 5 * len(ids)
+                ref_rows = conn.execute(
+                    f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+                    f"FROM memories WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                recalled_set = set(ids)
+                candidates: dict[str, None] = {}
+                for (ref_ts,) in ref_rows:
+                    remaining = ripple_cap - len(candidates)
+                    if remaining <= 0:
+                        break
+                    if not ref_ts:
+                        continue
+                    try:
+                        base = datetime.fromisoformat(ref_ts)
+                        if base.tzinfo is None:
+                            base = base.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    lo = (base - timedelta(hours=48)).isoformat()
+                    hi = (base + timedelta(hours=48)).isoformat()
+                    # SQL-side LIMIT bounds the scan while the write tx holds
+                    # the lock. Over-fetch a bit (remaining + len(ids)) so
+                    # recalled ids filtered in Python don't shrink the budget.
+                    rows = conn.execute(
+                        "SELECT id FROM memories "
+                        "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
+                        "LIMIT ?",
+                        (lo, hi, remaining + len(ids)),
+                    ).fetchall()
+                    for (mid,) in rows:
+                        if mid in recalled_set or mid in candidates:
+                            continue
+                        candidates[mid] = None
+                        if len(candidates) >= ripple_cap:
+                            break
+                if candidates:
+                    ripple_ids = list(candidates.keys())
+                    rph = ",".join("?" * len(ripple_ids))
+                    conn.execute(
+                        f"UPDATE memories SET activation_count = "
+                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                        f"WHERE id IN ({rph})",
+                        ripple_ids,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
     except Exception as e:
         logger.warning(f"recall touch failed (results still returned): {e}")
 

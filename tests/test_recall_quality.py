@@ -350,6 +350,15 @@ class TestBlock6ResolvePatterns:
         assert self._match("It's broken however it is fixed now")
         assert self._match("刚才没弄好但是现在弄好了")
 
+    def test_negative_不过_not_a_transitional(self):
+        """'不过' followed by 滤/分/是/不, or preceded by 只, is NOT transitional.
+        Splitting it there would drop the negation and falsely auto-resolve."""
+        assert not self._match("这个过滤器不过滤已完成的任务")
+        assert not self._match("这里不是不过滤已完成项")
+        assert not self._match("如果不过滤已完成任务就会出现旧记忆")
+        assert not self._match("这只不过是没搞定的事")
+        assert not self._match("影响不过分明显，还没完成")
+
 
 # ════════════════════════════════════════════
 #  M1: atomic auto-resolve
@@ -632,39 +641,38 @@ class TestM2AtomicTouch:
         assert "get_memory(" not in src and "set_memory(" not in src, \
             "touch must not read-modify-write memory objects"
 
-    def test_concurrent_atomic_increment_no_lost_updates(self, db_env):
-        """Two threads racing on the same row with atomic UPDATE end at count=2.
-        Verifies the SQL pattern the production helper uses (COALESCE + 1)
-        with truly independent connections in independent threads."""
+    def test_concurrent_touch_via_production_helper(self, db_env):
+        """Two threads call the production _touch_recalled_memories directly on
+        the shared connection. The touch lock must serialize them so no
+        'transaction within a transaction' error and no lost updates.
+        Runs 10 iterations to catch races."""
         import threading
+        from memory_ops import _touch_recalled_memories
+
         conn = database._get_conn()
-        _insert_memory(conn, "conc_mem", "concurrent test memory",
-                       activation_count=0)
-        db_path = str(database.DB_PATH)
 
-        def worker():
-            c = sqlite3.connect(db_path, timeout=5.0)
-            try:
-                c.execute("BEGIN IMMEDIATE")
-                c.execute(
-                    "UPDATE memories SET "
-                    "activation_count = COALESCE(activation_count, 0) + 1 "
-                    "WHERE id = ?",
-                    ("conc_mem",),
-                )
-                c.execute("COMMIT")
-            finally:
-                c.close()
+        for iteration in range(10):
+            _insert_memory(conn, f"conc_{iteration}", f"iter {iteration}",
+                           activation_count=0)
+            errors = []
 
-        threads = [threading.Thread(target=worker) for _ in range(2)]
-        for t in threads: t.start()
-        for t in threads: t.join()
+            def worker():
+                try:
+                    _touch_recalled_memories([f"conc_{iteration}"])
+                except Exception as e:
+                    errors.append(e)
 
-        row = conn.execute(
-            "SELECT activation_count FROM memories WHERE id = ?",
-            ("conc_mem",),
-        ).fetchone()
-        assert row[0] == 2, f"expected 2, got {row[0]}"
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+
+            assert not errors, f"iter {iteration}: unexpected errors {errors}"
+            row = conn.execute(
+                "SELECT activation_count FROM memories WHERE id = ?",
+                (f"conc_{iteration}",),
+            ).fetchone()
+            assert row[0] == 2, \
+                f"iter {iteration}: expected 2 (no lost updates), got {row[0]}"
 
 
 # ════════════════════════════════════════════
