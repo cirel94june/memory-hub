@@ -1939,6 +1939,125 @@ async def dream_recall(
     return results
 
 
+# ── 最近互动直查（按人+时间窗+event，跳过 LLM）──
+
+async def recent_interaction(
+    with_person: str,
+    ai_id: str = "",
+    days: int = 30,
+    limit: int = 10,
+) -> dict:
+    """按人 + 时间窗 + info_type=event 查最近互动记忆，时间倒序。
+
+    快速直查（不走向量/FTS/analyzer），适合"周三跟 Lucien 聊了啥"这类
+    时间敏感的小问题。
+
+    TODO(future): with_person 扩展为 str | list[str]，支持多人联合查询
+    （例：recent_interaction(["Lucien", "Jasper"]) 找"都在场"的事件）。
+
+    Returns:
+        {
+          "with_person": "Lucien",
+          "resolved_to": "person_lucien_xxx",  # 或 None
+          "error": "",                          # 或 "alias_not_found"
+          "hint": "",                           # 出错时给 AI 一句人话提示
+          "days": 30,
+          "count": 3,
+          "items": [{id, content, created_at, room, importance,
+                     subject_id, source_actor_id}, ...]
+        }
+    """
+    from visibility import can_view
+
+    # 参数 clamp
+    days = max(1, min(int(days or 30), 365))
+    limit = max(1, min(int(limit or 10), 50))
+
+    result = {
+        "with_person": with_person,
+        "resolved_to": None,
+        "error": "",
+        "hint": "",
+        "days": days,
+        "count": 0,
+        "items": [],
+    }
+
+    if not with_person or not with_person.strip():
+        result["error"] = "empty_person"
+        result["hint"] = "with_person 参数为空，请传一个名字或别名"
+        return result
+
+    # Alias resolve — 用 scope="any" 尽量宽松，别名解不出来就明确报错
+    try:
+        alias_map = database.get_all_aliases(scope="any")
+    except Exception as e:
+        logger.warning(f"recent_interaction: get_all_aliases failed: {e}")
+        alias_map = {}
+
+    person_id = alias_map.get(with_person) or alias_map.get(with_person.lower()) \
+        or alias_map.get(with_person.strip())
+    if not person_id:
+        result["error"] = "alias_not_found"
+        # Suggest up to 5 known canonical names — help the AI ask the user
+        # to disambiguate, rather than silently returning empty.
+        known = sorted(set(alias_map.values()))[:5]
+        result["hint"] = (
+            f"没识别到「{with_person}」这个名字。"
+            + (f"已知的 person_id 前几个：{', '.join(known)}。" if known else "")
+            + "可以用 list_persons 查完整别名表，或直接问用户这个名字对应谁。"
+        )
+        logger.info(f"recent_interaction: unresolved alias {with_person!r}")
+        return result
+
+    result["resolved_to"] = person_id
+
+    # 计算时间窗下界（UTC ISO）
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    try:
+        conn = database._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM memories "
+            "WHERE status = 'active' "
+            "  AND info_type = 'event' "
+            "  AND (subject_id = ? OR source_actor_id = ?) "
+            "  AND created_at >= ? "
+            "  AND (resolved IS NULL OR resolved != 1) "
+            "  AND (superseded_by IS NULL OR superseded_by = '') "
+            "ORDER BY created_at DESC "
+            "LIMIT ?",
+            (person_id, person_id, cutoff, limit * 3),  # over-fetch for visibility
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"recent_interaction SQL failed: {e}")
+        result["error"] = "query_failed"
+        result["hint"] = "查询数据库时出错，请重试或联系管理员"
+        return result
+
+    items = []
+    for row in rows:
+        mem = database._row_to_dict_no_embedding(row) if hasattr(database, "_row_to_dict_no_embedding") \
+              else dict(row)
+        if not can_view(mem, ai_id):
+            continue
+        items.append({
+            "id": mem["id"],
+            "content": mem.get("content", ""),
+            "created_at": mem.get("created_at", ""),
+            "room": mem.get("room", ""),
+            "importance": _safe_float(mem.get("importance"), 0.5),
+            "subject_id": mem.get("subject_id", ""),
+            "source_actor_id": mem.get("source_actor_id", ""),
+        })
+        if len(items) >= limit:
+            break
+
+    result["count"] = len(items)
+    result["items"] = items
+    return result
+
+
 # ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──
 
 async def add_comment(

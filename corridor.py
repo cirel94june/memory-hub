@@ -10,6 +10,7 @@
   3. 重要记忆写入后
 """
 import json
+import math
 import logging
 from datetime import datetime, timezone
 
@@ -23,6 +24,105 @@ CORRIDOR_CACHE_TTL_MINUTES = 5
 _mem_cache: dict[str, dict] = {}  # ai_id -> {"text": str, "compiled_at": datetime}
 
 _DEDUP_SIM_THRESHOLD = 0.75
+
+# Recency weighting for section selection (Phase 1.7 块 7).
+# recent_share=0.3 is a starting point; observe 1-2 weeks and drop to 0.2
+# if important old memories get displaced.
+_RECENT_DAYS = 30
+_RECENT_SHARE = 0.3
+_RECENT_DECAY = 30.0  # e-fold days for recency_score = exp(-days/30)
+
+
+def _safe_float(val, default: float = 0.5) -> float:
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _days_ago(iso_ts: str, now_utc: datetime | None = None) -> float:
+    """Return days between iso_ts and now (naive treated as UTC, future clamped to 0)."""
+    if not iso_ts:
+        return float("inf")
+    try:
+        t = datetime.fromisoformat(iso_ts)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+    except Exception:
+        return float("inf")
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    return max(0.0, (now_utc - t).total_seconds() / 86400)
+
+
+def _recency_score(iso_ts: str, now_utc: datetime | None = None) -> float:
+    """exp(-days/30). Missing/invalid ts → 0 (treated as ancient)."""
+    d = _days_ago(iso_ts, now_utc)
+    if d == float("inf"):
+        return 0.0
+    return math.exp(-d / _RECENT_DECAY)
+
+
+def _pick_recency_weighted(
+    candidates: list[dict],
+    quota: int,
+    now_utc: datetime | None = None,
+    recent_days: int = _RECENT_DAYS,
+    recent_share: float = _RECENT_SHARE,
+) -> list[dict]:
+    """Pick up to `quota` memories, reserving ~recent_share for recent items.
+
+    Selection logic:
+      1. Split candidates into "recent pool" (created_at within recent_days)
+         and "old pool" (everything else).
+      2. Fill up to ceil(quota × recent_share) from recent pool, sorted by
+         recency_score × max(importance, 0.1) — importance floor prevents
+         zero-importance items from dominating just because they're new.
+      3. Fill remaining slots from old pool, sorted by
+         importance × recency_score — same age-aware ranking.
+      4. If recent pool has fewer than the reserved slots, the shortfall
+         moves to the old pool (no wasted slots).
+      5. No duplicates across pools (a memory is either recent or old).
+    """
+    if not candidates or quota <= 0:
+        return []
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    recent, old = [], []
+    for m in candidates:
+        d = _days_ago(m.get("created_at", ""), now_utc)
+        if d <= recent_days:
+            recent.append(m)
+        else:
+            old.append(m)
+
+    recent_quota = min(len(recent), math.ceil(quota * recent_share))
+
+    recent.sort(
+        key=lambda m: _recency_score(m.get("created_at", ""), now_utc)
+                      * max(_safe_float(m.get("importance"), 0.5), 0.1),
+        reverse=True,
+    )
+    picked_recent = recent[:recent_quota]
+
+    old.sort(
+        key=lambda m: _safe_float(m.get("importance"), 0.5)
+                      * _recency_score(m.get("created_at", ""), now_utc),
+        reverse=True,
+    )
+    remaining = quota - len(picked_recent)
+    picked_old = old[:remaining] if remaining > 0 else []
+
+    # If old pool can't fill remaining slots, use leftover recent items so
+    # we never waste quota just because the age distribution is skewed.
+    still_needed = quota - len(picked_recent) - len(picked_old)
+    picked_extra_recent = recent[recent_quota:recent_quota + still_needed] \
+        if still_needed > 0 else []
+
+    return picked_recent + picked_old + picked_extra_recent
 
 
 def _dedup_texts(texts: list[str], max_items: int = 0) -> list[str]:
@@ -56,24 +156,31 @@ async def build_corridor(ai_id: str) -> str:
     ai_id = _ALIASES.get(ai_id, ai_id)
     all_mems = store.get_all_memories()
 
-    # 1. 客厅要点（你是谁）
-    living = [m["content"] for m in all_mems.values()
-              if m.get("room") == "living_room" and m.get("status") == "active"]
+    now_utc = datetime.now(timezone.utc)
 
-    # 2. 该 AI 的关系记忆
-    relationship = [m["content"] for m in all_mems.values()
-                    if m.get("room") == "relationship" and m.get("owner_ai") == ai_id
-                    and m.get("status") == "active"]
+    # 1. 客厅要点（关于主人）— 8 条，recency-weighted (Phase 1.7 块 7)
+    living_mems = [m for m in all_mems.values()
+                   if m.get("room") == "living_room" and m.get("status") == "active"]
+    living_picked = _pick_recency_weighted(living_mems, quota=8, now_utc=now_utc)
+    living = [m["content"] for m in living_picked]
 
-    # 2.5. 共享人物/关系画像（常被提到的人、AI、昵称、关系边界）
-    shared_relationships = sorted(
-        [m for m in all_mems.values()
-         if m.get("room") == "relationships" and m.get("status") == "active"
-         and m.get("layer", "shared") == "shared"],
-        key=lambda x: (float(x.get("importance", 0) or 0), x.get("updated_at") or x.get("created_at") or ""),
-        reverse=True,
-    )[:8]
-    # 3. 该 AI 最近的日记/周记（最新3条）
+    # 2. 该 AI 的关系记忆 — 5 条，recency-weighted
+    relationship_mems = [m for m in all_mems.values()
+                         if m.get("room") == "relationship"
+                         and m.get("owner_ai") == ai_id
+                         and m.get("status") == "active"]
+    relationship_picked = _pick_recency_weighted(relationship_mems, quota=5, now_utc=now_utc)
+    relationship = [m["content"] for m in relationship_picked]
+
+    # 2.5. 共享人物/关系画像 — 8 条，recency-weighted
+    shared_rel_candidates = [m for m in all_mems.values()
+                             if m.get("room") == "relationships"
+                             and m.get("status") == "active"
+                             and m.get("layer", "shared") == "shared"]
+    shared_relationships = _pick_recency_weighted(
+        shared_rel_candidates, quota=8, now_utc=now_utc)
+
+    # 3. 该 AI 最近的日记/周记（保持 created_at DESC 3 条，本来就是纯时间序）
     diary = sorted(
         [m for m in all_mems.values()
          if m.get("room") == "diary" and m.get("owner_ai") == ai_id
@@ -82,10 +189,13 @@ async def build_corridor(ai_id: str) -> str:
         reverse=True,
     )[:3]
 
-    # 4. 该 AI 的自我认知
-    personality = [m["content"] for m in all_mems.values()
-                   if m.get("room") == "personality" and m.get("owner_ai") == ai_id
-                   and m.get("status") == "active"]
+    # 4. 该 AI 的自我认知 — 3 条，recency-weighted
+    personality_mems = [m for m in all_mems.values()
+                        if m.get("room") == "personality"
+                        and m.get("owner_ai") == ai_id
+                        and m.get("status") == "active"]
+    personality_picked = _pick_recency_weighted(personality_mems, quota=3, now_utc=now_utc)
+    personality = [m["content"] for m in personality_picked]
 
     # 5. 跨窗口摘要（通过 chat_digest 提供，不注入其他AI的完整记忆）
     # AI 在群聊中已亲眼看到发生的事，不需要再注入别人的记忆副本
@@ -96,9 +206,28 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
-    # 6. 基建状态（如果有）
-    infra = [m["content"] for m in all_mems.values()
-             if m.get("room") == "infra" and m.get("status") == "active"][:3]
+    # 6. 基建状态 — 3 条，recency-weighted
+    infra_mems = [m for m in all_mems.values()
+                  if m.get("room") == "infra" and m.get("status") == "active"]
+    infra_picked = _pick_recency_weighted(infra_mems, quota=3, now_utc=now_utc)
+    infra = [m["content"] for m in infra_picked]
+
+    # 6.5. 近期重要事件（14 天内 + importance≥0.6，跨房间兜底）
+    # 用于覆盖新写入的高价值记忆——它们如果不在 living_room/diary 就会漏进走廊。
+    # 走 visibility：private 记忆按 owner_ai 过滤；shared 全体可见。
+    try:
+        from visibility import can_view
+    except Exception:
+        can_view = lambda mem, aid: True  # fallback: 展示全部
+    recent_important_mems = sorted(
+        [m for m in all_mems.values()
+         if m.get("status") == "active"
+         and _safe_float(m.get("importance"), 0.5) >= 0.6
+         and _days_ago(m.get("created_at", ""), now_utc) <= 14
+         and can_view(m, ai_id)],
+        key=lambda m: m.get("created_at", ""),
+        reverse=True,
+    )[:5]
 
     # 组装走廊
     ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
@@ -168,6 +297,23 @@ async def build_corridor(ai_id: str) -> str:
 
     if diary:
         sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
+
+    # 6.5 (render) 近期重要事件——放在日记之后，跨房间兜底
+    if recent_important_mems:
+        _norm = lambda s: "".join(str(s).split()).lower()
+        already_shown = set()
+        for txt in living + relationship + personality + infra + [d["content"] for d in diary]:
+            already_shown.add(_norm(txt))
+        for m in shared_relationships:
+            already_shown.add(_norm(m.get("content", "")))
+        recent_lines = []
+        for m in recent_important_mems:
+            content = m.get("content", "")
+            if _norm(content) in already_shown:
+                continue
+            recent_lines.append(f"· {content[:240]}")
+        if recent_lines:
+            sections.append("【近期重要事件】\n" + "\n".join(recent_lines))
 
     if cross_window_digests:
         lines = [f"· {d['summary']}" for d in cross_window_digests]
