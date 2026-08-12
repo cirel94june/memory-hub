@@ -161,26 +161,51 @@ def _dedup_texts(texts: list[str], max_items: int = 0) -> list[str]:
     return kept
 
 
+class _CorridorAbort(Exception):
+    """Raised when a corridor build cannot proceed safely (e.g. visibility
+    module unavailable). Caller in get_corridor() should fall back to the
+    existing snapshot instead of overwriting it with an unfiltered build."""
+
+
 async def build_corridor(ai_id: str) -> str:
     """
     为指定 AI 编译走廊文档。
     返回一段自然语言文本，AI 读了就能"醒来"。
+
+    Fail-closed 隐私保护：所有 memory-derived 板块（living/relationship/
+    personality/infra/anchors/unresolved/近期重要事件）统一从 visible_mems
+    取数据。visibility 模块导入失败时立即中止本次编译，不覆盖旧 corridor，
+    避免把未过滤的 all_mems 泄露到别的 AI 的走廊。
     """
     # 归一化到 canonical id（cloudy→claude、gpt→lucien、gemini→jasper 等），
     # 否则用别名请求时 owner_ai 匹配不上，走廊会缺私有材料
     ai_id = _ALIASES.get(ai_id, ai_id)
+
+    # Fail-closed: 无 can_view 则中止编译，保留旧 corridor 快照
+    try:
+        from visibility import can_view
+    except Exception as e:
+        log.error(
+            "visibility module import failed — aborting corridor build for %s "
+            "to avoid leaking private memories: %s", ai_id, e)
+        raise _CorridorAbort(f"visibility unavailable: {e}") from e
+
     all_mems = store.get_all_memories()
+    # 一次性过滤：所有下游板块从 visible_mems 取数据，禁止再直接遍历 all_mems
+    visible_mems: dict = {
+        mid: m for mid, m in all_mems.items() if can_view(m, ai_id)
+    }
 
     now_utc = datetime.now(timezone.utc)
 
     # 1. 客厅要点（关于主人）— 8 条，recency-weighted (Phase 1.7 块 7)
-    living_mems = [m for m in all_mems.values()
+    living_mems = [m for m in visible_mems.values()
                    if m.get("room") == "living_room" and m.get("status") == "active"]
     living_picked = _pick_recency_weighted(living_mems, quota=8, now_utc=now_utc)
     living = [m["content"] for m in living_picked]
 
     # 2. 该 AI 的关系记忆 — 5 条，recency-weighted
-    relationship_mems = [m for m in all_mems.values()
+    relationship_mems = [m for m in visible_mems.values()
                          if m.get("room") == "relationship"
                          and m.get("owner_ai") == ai_id
                          and m.get("status") == "active"]
@@ -188,7 +213,7 @@ async def build_corridor(ai_id: str) -> str:
     relationship = [m["content"] for m in relationship_picked]
 
     # 2.5. 共享人物/关系画像 — 8 条，recency-weighted
-    shared_rel_candidates = [m for m in all_mems.values()
+    shared_rel_candidates = [m for m in visible_mems.values()
                              if m.get("room") == "relationships"
                              and m.get("status") == "active"
                              and m.get("layer", "shared") == "shared"]
@@ -197,7 +222,7 @@ async def build_corridor(ai_id: str) -> str:
 
     # 3. 该 AI 最近的日记/周记（保持 created_at DESC 3 条，本来就是纯时间序）
     diary = sorted(
-        [m for m in all_mems.values()
+        [m for m in visible_mems.values()
          if m.get("room") == "diary" and m.get("owner_ai") == ai_id
          and m.get("status") == "active"],
         key=lambda x: x.get("created_at", ""),
@@ -205,7 +230,7 @@ async def build_corridor(ai_id: str) -> str:
     )[:3]
 
     # 4. 该 AI 的自我认知 — 3 条，recency-weighted
-    personality_mems = [m for m in all_mems.values()
+    personality_mems = [m for m in visible_mems.values()
                         if m.get("room") == "personality"
                         and m.get("owner_ai") == ai_id
                         and m.get("status") == "active"]
@@ -222,67 +247,54 @@ async def build_corridor(ai_id: str) -> str:
         pass
 
     # 6. 基建状态 — 3 条，recency-weighted
-    infra_mems = [m for m in all_mems.values()
+    infra_mems = [m for m in visible_mems.values()
                   if m.get("room") == "infra" and m.get("status") == "active"]
     infra_picked = _pick_recency_weighted(infra_mems, quota=3, now_utc=now_utc)
     infra = [m["content"] for m in infra_picked]
 
-    # 提前计算 anchors，纳入「近期重要事件」的 already_shown 去重集合
-    # （否则近期 anchored event 可能同时出现在两个板块）
+    # 提前计算 anchors（从 visible_mems 取，避免其他 AI 的 anchor 泄露），
+    # 纳入「近期重要事件」的 seen 去重集合。
+    # 注意：visible_mems 已经处理了 can_view，包括 anchor 的 owner_ai='' +
+    # source_ai=other_ai 的 fallback 情况——统一在顶部过滤后，这里不需要再判断。
     anchor_contents: list[str] = []
-    for m in all_mems.values():
+    for m in visible_mems.values():
         if not (m.get("anchored") and m.get("status") == "active"):
-            continue
-        if m.get("owner_ai") and m.get("owner_ai") != ai_id:
             continue
         anchor_contents.append(m.get("content", ""))
 
     # 6.5. 近期重要事件（14 天内 + importance≥0.6，跨房间兜底）
     # 覆盖新写入的高价值记忆——它们如果不在 living_room/diary 就会漏进走廊。
-    # 走 visibility：private 记忆按 owner_ai 过滤；shared 全体可见。
-    #
-    # Fail-closed：visibility 模块导入失败时不展示任何内容，避免误泄露他人 private。
-    # Candidate-self-dedup：不能只排除其他板块的重复，还要在候选池内部
-    # 每接受一条就把 norm 加入 seen，否则 5 条全是同一句话仍然会挤掉第 6 条唯一事件。
-    try:
-        from visibility import can_view as _can_view
-    except Exception:
-        log.error("visibility module import failed — skipping 近期重要事件 (fail-closed)")
-        _can_view = None
+    # visibility 已经在顶部统一过滤过了，这里只做业务筛选。
+    # Candidate-self-dedup：按时间倒序遍历完整候选池，接受一条就加入 seen；
+    # 收满 5 条停止。这样 5 条同文不会全打印、6 条唯一也能补位。
+    _norm = lambda s: "".join(str(s).split()).lower()
+    seen_norms: set[str] = set()
+    for txt in living + relationship + personality + infra:
+        seen_norms.add(_norm(txt))
+    for d in diary:
+        seen_norms.add(_norm(d.get("content", "")))
+    for m in shared_relationships:
+        seen_norms.add(_norm(m.get("content", "")))
+    for txt in anchor_contents:
+        seen_norms.add(_norm(txt))
 
-    if _can_view is None:
-        recent_important_mems = []
-    else:
-        _norm = lambda s: "".join(str(s).split()).lower()
-        seen_norms: set[str] = set()
-        for txt in living + relationship + personality + infra:
-            seen_norms.add(_norm(txt))
-        for d in diary:
-            seen_norms.add(_norm(d.get("content", "")))
-        for m in shared_relationships:
-            seen_norms.add(_norm(m.get("content", "")))
-        for txt in anchor_contents:
-            seen_norms.add(_norm(txt))
+    pool = [
+        m for m in visible_mems.values()
+        if m.get("status") == "active"
+        and _safe_float(m.get("importance"), 0.5) >= 0.6
+        and _days_ago(m.get("created_at", ""), now_utc) <= 14
+    ]
+    pool.sort(key=lambda m: m.get("created_at", ""), reverse=True)
 
-        # 完整候选池，按时间倒序遍历，接受一条就加入 seen；收满 5 条停止
-        pool = [
-            m for m in all_mems.values()
-            if m.get("status") == "active"
-            and _safe_float(m.get("importance"), 0.5) >= 0.6
-            and _days_ago(m.get("created_at", ""), now_utc) <= 14
-            and _can_view(m, ai_id)
-        ]
-        pool.sort(key=lambda m: m.get("created_at", ""), reverse=True)
-
-        recent_important_mems = []
-        for m in pool:
-            n = _norm(m.get("content", ""))
-            if n in seen_norms:
-                continue
-            seen_norms.add(n)
-            recent_important_mems.append(m)
-            if len(recent_important_mems) >= 5:
-                break
+    recent_important_mems = []
+    for m in pool:
+        n = _norm(m.get("content", ""))
+        if n in seen_norms:
+            continue
+        seen_norms.add(n)
+        recent_important_mems.append(m)
+        if len(recent_important_mems) >= 5:
+            break
 
     # 组装走廊
     ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
@@ -369,7 +381,7 @@ async def build_corridor(ai_id: str) -> str:
 
     # 8. Unresolved 记忆（待办事项提醒）
     # 排除 auto_capture 来源的 social 记忆（社交互动不是待办）
-    unresolved_mems = [m for m in all_mems.values()
+    unresolved_mems = [m for m in visible_mems.values()
                        if m.get("resolved") == False and m.get("status") == "active"
                        and not (m.get("room") == "social" and "auto_capture" in (m.get("source_platform") or ""))]
     if unresolved_mems:
@@ -415,7 +427,21 @@ async def get_corridor(ai_id: str, force: bool = False) -> str:
             except Exception:
                 pass
 
-    text = await build_corridor(ai_id)
+    try:
+        text = await build_corridor(ai_id)
+    except _CorridorAbort:
+        # Visibility unavailable — do NOT overwrite the last good snapshot.
+        # Return any cached/GitHub-stored text if present; otherwise empty.
+        entry = _mem_cache.get(ai_id)
+        if entry and entry.get("text"):
+            return entry["text"]
+        try:
+            cached = await store._read_github_file(f"private/{ai_id}/_corridor.json")
+            if cached and isinstance(cached, dict) and cached.get("text"):
+                return cached["text"]
+        except Exception:
+            pass
+        return ""
     _mem_cache[ai_id] = {"text": text, "compiled_at": datetime.now(timezone.utc)}
     return text
 
@@ -423,4 +449,7 @@ async def get_corridor(ai_id: str, force: bool = False) -> str:
 async def rebuild_all_corridors():
     """重建所有 AI 的走廊"""
     for ai_id in AI_ROLES:
-        await build_corridor(ai_id)
+        try:
+            await build_corridor(ai_id)
+        except _CorridorAbort as e:
+            log.warning("skipping rebuild for %s: %s", ai_id, e)

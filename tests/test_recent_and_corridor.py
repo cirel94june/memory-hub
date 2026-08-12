@@ -361,15 +361,14 @@ class TestCorridorSnapshot:
         text = asyncio.run(corridor.build_corridor("claude"))
         assert "永远的原则" in text
 
-    def test_visibility_import_fail_closed(self, db_env, monkeypatch):
-        """When visibility import fails, 近期重要事件 section is skipped
-        entirely — must NOT default to showing everything (would leak private)."""
+    def test_visibility_import_fail_closed_aborts_build(self, db_env, monkeypatch):
+        """When visibility import fails, build_corridor must raise _CorridorAbort
+        so caller keeps the old snapshot instead of writing an unfiltered one."""
         _insert_event("jasper_private_hot", "jasper 私密热点",
                       room="social", importance=0.9,
                       layer="private", owner_ai="jasper",
                       created_at=(datetime.now(timezone.utc)
                                   - timedelta(days=2)).isoformat())
-        # Force the import inside build_corridor to fail
         import builtins
         real_import = builtins.__import__
 
@@ -379,9 +378,29 @@ class TestCorridorSnapshot:
             return real_import(name, *args, **kwargs)
         monkeypatch.setattr(builtins, "__import__", fake_import)
 
-        text = asyncio.run(corridor.build_corridor("claude"))
-        assert "【近期重要事件】" not in text
-        assert "jasper 私密热点" not in text
+        with pytest.raises(corridor._CorridorAbort):
+            asyncio.run(corridor.build_corridor("claude"))
+
+    def test_get_corridor_returns_cache_on_abort(self, db_env, monkeypatch):
+        """get_corridor(force=True) must fall back to cached snapshot when
+        build aborts — must NOT return unfiltered content or empty string
+        that replaces the old good one in the cache."""
+        # Prime the cache with a known good snapshot
+        corridor._mem_cache["claude"] = {
+            "text": "OLD GOOD SNAPSHOT",
+            "compiled_at": datetime.now(timezone.utc),
+        }
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "visibility":
+                raise ImportError("simulated visibility import failure")
+            return real_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        text = asyncio.run(corridor.get_corridor("claude", force=True))
+        assert text == "OLD GOOD SNAPSHOT"
 
     def test_new_section_dedup_before_truncate(self, db_env):
         """Reviewer M1: if first 5 recent+important items already appear in
@@ -418,6 +437,71 @@ class TestCorridorSnapshot:
         assert text.count("完全一样的内容") == 1, \
             "candidate self-dedup broken — same content printed multiple times"
         assert "唯一不同的内容" in text
+
+    def test_all_sections_hide_other_ai_private(self, db_env):
+        """Reviewer round-3 High: every memory-derived section must run
+        through can_view. Seed one Jasper-private per section, compile
+        Claude's corridor — none of them should surface.
+
+        Also covers the anchor fallback (owner_ai='', source_ai='jasper')
+        which the old anchor code missed because it only checked owner_ai.
+        """
+        now = datetime.now(timezone.utc)
+        recent = (now - timedelta(days=2)).isoformat()
+
+        # living_room private
+        _insert_event("liv_jasper_priv", "JASPER PRIVATE LIVING",
+                      room="living_room", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent)
+        # infra private
+        _insert_event("infra_jasper_priv", "JASPER PRIVATE INFRA",
+                      room="infra", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent)
+        # anchor via owner_ai
+        _insert_event("anchor_jasper_priv", "JASPER PRIVATE ANCHOR",
+                      room="misc", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent)
+        # anchor via source_ai fallback (owner_ai='' + source_ai='jasper')
+        _insert_event("anchor_fallback", "JASPER PRIVATE ANCHOR FALLBACK",
+                      room="misc", importance=0.9,
+                      layer="private", owner_ai="", source_ai="jasper",
+                      created_at=recent)
+        # unresolved private
+        _insert_event("todo_jasper_priv", "JASPER PRIVATE TODO",
+                      room="tasks", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent, resolved=0)
+        # personality private
+        _insert_event("pers_jasper_priv", "JASPER PRIVATE PERSONALITY",
+                      room="personality", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent)
+        # relationship private
+        _insert_event("rel_jasper_priv", "JASPER PRIVATE RELATIONSHIP",
+                      room="relationship", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=recent)
+        # anchor the two anchors via SQL
+        conn = database._get_conn()
+        conn.execute("UPDATE memories SET anchored = 1 WHERE id IN (?, ?)",
+                     ("anchor_jasper_priv", "anchor_fallback"))
+        conn.commit()
+
+        text = asyncio.run(corridor.build_corridor("claude"))
+        forbidden = [
+            "JASPER PRIVATE LIVING",
+            "JASPER PRIVATE INFRA",
+            "JASPER PRIVATE ANCHOR",
+            "JASPER PRIVATE ANCHOR FALLBACK",
+            "JASPER PRIVATE TODO",
+            "JASPER PRIVATE PERSONALITY",
+            "JASPER PRIVATE RELATIONSHIP",
+        ]
+        leaks = [s for s in forbidden if s in text]
+        assert not leaks, f"corridor leaked private to claude: {leaks}"
 
     def test_anchored_event_not_duplicated_in_recent_section(self, db_env):
         """A recent anchored high-importance event must appear in 【锚点·不变的事】
