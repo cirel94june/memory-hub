@@ -346,18 +346,26 @@ class TestBlock6ResolvePatterns:
     def test_positive_transitional_without_preceding_comma(self):
         """Transitional connectives split even without a preceding comma."""
         assert self._match("It was not fixed but now it is fixed.")
+        # 不过 followed by an explicit transition marker: split allowed
         assert self._match("还没搞定不过现在真的搞定了")
         assert self._match("It's broken however it is fixed now")
         assert self._match("刚才没弄好但是现在弄好了")
+        # 不过 preceded by punctuation: also allowed
+        assert self._match("还没搞定，不过后来搞定了")
 
     def test_negative_不过_not_a_transitional(self):
-        """'不过' followed by 滤/分/是/不, or preceded by 只, is NOT transitional.
-        Splitting it there would drop the negation and falsely auto-resolve."""
+        """'不过' inside compounds (不过滤/不过期/不过夜/不过分/不过是) or
+        after 只 must NOT be treated as a transitional. Dropping the negation
+        would falsely auto-resolve."""
         assert not self._match("这个过滤器不过滤已完成的任务")
         assert not self._match("这里不是不过滤已完成项")
         assert not self._match("如果不过滤已完成任务就会出现旧记忆")
         assert not self._match("这只不过是没搞定的事")
         assert not self._match("影响不过分明显，还没完成")
+        # Reviewer's H1 examples — expired/overnight compounds:
+        assert not self._match("如果任务不过期就保留已完成记录")
+        assert not self._match("如果数据不过夜就清理已完成缓存")
+        assert not self._match("配置不过期的话再看已解决列表")
 
 
 # ════════════════════════════════════════════
@@ -764,3 +772,53 @@ class TestCJKExtensionA:
         results = database.ro_cjk_like_search("㐀㐁", top_k=10, status="active")
         ids = {r["id"] for r in results}
         assert "extA_ro" in ids
+
+
+# ════════════════════════════════════════════
+#  Cross-writer concurrency: touch × auto-resolve share the same write lock
+# ════════════════════════════════════════════
+
+class TestSharedWriteLock:
+    def test_touch_and_auto_resolve_do_not_collide(self, db_env):
+        """Touch and auto-resolve both use BEGIN IMMEDIATE on the shared conn.
+        Without a shared lock they would race with 'cannot start a transaction
+        within a transaction'. Runs 10 iterations of parallel touch × resolve.
+        """
+        import threading
+        from memory_ops import _touch_recalled_memories, _check_auto_resolve
+
+        conn = database._get_conn()
+
+        for i in range(10):
+            tid = f"share_task_{i}"
+            _insert_memory(conn, tid, f"task {i}", resolved=0, activation_count=0)
+            errors = []
+            resolved_out = []
+
+            def touch_worker():
+                try:
+                    _touch_recalled_memories([tid])
+                except Exception as e:
+                    errors.append(("touch", e))
+
+            def resolve_worker():
+                try:
+                    mem = {"id": tid, "resolved": 0, "info_type": "task"}
+                    resolved_out.extend(
+                        _check_auto_resolve("搞定了", [mem], "cloudy")
+                    )
+                except Exception as e:
+                    errors.append(("resolve", e))
+
+            t1 = threading.Thread(target=touch_worker)
+            t2 = threading.Thread(target=resolve_worker)
+            t1.start(); t2.start(); t1.join(); t2.join()
+
+            assert not errors, f"iter {i}: {errors}"
+            row = conn.execute(
+                "SELECT resolved, activation_count FROM memories WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            assert row[0] == 1, f"iter {i}: expected resolved=1, got {row[0]}"
+            assert row[1] == 1, f"iter {i}: expected activation_count=1, got {row[1]}"
+            assert resolved_out == [tid], f"iter {i}: resolve should succeed"

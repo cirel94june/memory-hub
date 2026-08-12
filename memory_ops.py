@@ -610,11 +610,18 @@ _RESOLVE_CONDITIONAL_EN = re.compile(
 _CLAUSE_SPLIT_RE = re.compile(
     r"[.!。！\n;]"
     r"|\b(?:but|however)\b\s+"                   # English: word-bounded
-    # Chinese transitionals — with disambiguating negative lookaheads:
-    #   不过滤/不过分/不过是 (adverbial "not more than") must NOT split;
-    #   只不过 ("merely") should not treat 不过 as transitional either;
-    #   但是/可是/然而 have no common substring collisions.
-    r"|(?:但是|(?<!只)不过(?![滤分是不])|可是|然而)",
+    # Chinese transitionals — 但是/可是/然而 split unconditionally (no common
+    # substring collisions with normal usage). 不过 is deliberately restrictive
+    # because it forms many legit compounds (不过滤, 不过期, 不过夜, 不过分,
+    # 不过是, 只不过, ...). We only treat 不过 as a transitional connective when:
+    #   (a) it appears immediately after punctuation (well-punctuated text), OR
+    #   (b) it is followed by an explicit continuation marker
+    #       (现在/如今/后来/最终/这次/目前/终于/真的/之前/以前).
+    # Preferring false negatives over false positives — a missed auto-resolve
+    # is cheap, but auto-resolving a task that isn't done is not.
+    r"|(?:但是|可是|然而"
+    r"|(?<=[,，。.！!；;\s])不过"
+    r"|不过(?=现在|如今|后来|最终|这次|目前|终于|真的|之前|以前))",
     re.IGNORECASE,
 )
 
@@ -693,18 +700,19 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
         item["score"] = round(item.get("score", 0) * boost, 6)
 
 
-# Serializes writes on the shared module-level sqlite connection. Two threads
-# cannot safely share one sqlite3.Connection for concurrent transactions
-# (`cannot start a transaction within a transaction`); BEGIN IMMEDIATE only
-# coordinates between distinct connections. This lock guarantees at most one
-# thread is inside a write transaction on the shared connection at a time.
-_TOUCH_LOCK = threading.Lock()
+# Serializes ALL write transactions on the shared module-level sqlite
+# connection. Two threads cannot safely share one sqlite3.Connection for
+# concurrent transactions (`cannot start a transaction within a transaction`);
+# BEGIN IMMEDIATE only coordinates between distinct connections. Every
+# `BEGIN IMMEDIATE` on `database._get_conn()` in this module (touch, auto-
+# resolve, and any future writer) MUST hold this lock.
+_WRITE_LOCK = threading.Lock()
 
 
 def _touch_recalled_memories(ids: list[str]) -> None:
     """Atomic activation_count increment for recalled memories, plus ±48h ripple.
 
-    Serialized via `_TOUCH_LOCK` because the module shares one sqlite connection
+    Serialized via `_WRITE_LOCK` because the module shares one sqlite connection
     across threads. Ripple candidates are collected across all reference
     timestamps (each query bounded by the remaining budget via SQL LIMIT),
     deduplicated, globally capped at 5*N, then updated in one UPDATE. Any
@@ -716,7 +724,7 @@ def _touch_recalled_memories(ids: list[str]) -> None:
         now = _now()
         conn = database._get_conn()
         placeholders = ",".join("?" * len(ids))
-        with _TOUCH_LOCK:
+        with _WRITE_LOCK:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute(
@@ -826,7 +834,21 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
     resolved_ids: list[str] = []
     conn = database._get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        with _WRITE_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now,
+                                 resolved_ids)
+    except Exception as e:
+        logger.warning(f"Atomic auto-resolve failed: {e}")
+        return []
+    return resolved_ids
+
+
+def _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now, resolved_ids):
+    """Body of the auto-resolve transaction. Assumes caller holds _WRITE_LOCK
+    and has already issued BEGIN IMMEDIATE. Commits on success, rolls back on
+    any exception."""
+    try:
         for mem in to_resolve:
             # Conditional UPDATE: only touch rows still resolved=0/NULL.
             # Prevents double-resolve under concurrent writers.
@@ -853,15 +875,12 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
             )
             resolved_ids.append(mem["id"])
         conn.execute("COMMIT")
-    except Exception as e:
+    except Exception:
         try:
             conn.execute("ROLLBACK")
         except Exception:
             pass
-        logger.warning(f"Atomic auto-resolve failed: {e}")
-        return []
-
-    return resolved_ids
+        raise
 
 
 _REOPEN_PATTERNS = ("又出问题了", "没搞定", "还没完", "又复发", "重新开", "再来一次", "还是有问题", "又坏了")
