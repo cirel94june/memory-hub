@@ -400,6 +400,40 @@ class TestCorridorSnapshot:
         assert "【近期重要事件】" in text
         assert "唯一跨房间事件" in text
 
+    def test_new_section_self_dedup_within_candidates(self, db_env):
+        """Reviewer round-2 M2: if 5 candidates share the same content,
+        the section must not print it 5 times — and the 6th unique candidate
+        must fill the vacant slot."""
+        now = datetime.now(timezone.utc)
+        # 5 identical-content events, all qualifying
+        for i in range(5):
+            _insert_event(f"dup_ev_{i}", "完全一样的内容",
+                          room="social", importance=0.8,
+                          created_at=(now - timedelta(hours=i)).isoformat())
+        # 1 unique — must appear
+        _insert_event("uniq_ev", "唯一不同的内容",
+                      room="social", importance=0.8,
+                      created_at=(now - timedelta(days=1)).isoformat())
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert text.count("完全一样的内容") == 1, \
+            "candidate self-dedup broken — same content printed multiple times"
+        assert "唯一不同的内容" in text
+
+    def test_anchored_event_not_duplicated_in_recent_section(self, db_env):
+        """A recent anchored high-importance event must appear in 【锚点·不变的事】
+        exactly once — not also in 【近期重要事件】."""
+        now = datetime.now(timezone.utc)
+        _insert_event("anchor_recent", "锚点近期事件",
+                      room="misc", importance=0.9,
+                      created_at=(now - timedelta(days=3)).isoformat())
+        conn = database._get_conn()
+        conn.execute("UPDATE memories SET anchored = 1 WHERE id = ?",
+                     ("anchor_recent",))
+        conn.commit()
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert text.count("锚点近期事件") == 1, \
+            "anchored event duplicated across 【锚点】 and 【近期重要事件】"
+
 
 # ════════════════════════════════════════════
 #  Edge cases from Codex round-1 review
@@ -429,6 +463,45 @@ class TestVisibilitySQLPushdown:
             f"visibility SQL pushdown broken — got {result['count']}"
         for it in result["items"]:
             assert it["id"].startswith("shared_")
+
+    def test_whitespace_in_layer_field(self, db_env):
+        """Reviewer round-2 M1: dirty layer=' private ' — SQL and can_view must
+        agree. Otherwise SQL passes it through, can_view rejects it, LIMIT drained."""
+        _insert_person("person_lucien", "Lucien", ["lucien"])
+        now = datetime.now(timezone.utc)
+        # 10 recent with whitespace-wrapped 'private' (jasper's) — SHOULD be excluded
+        for i in range(10):
+            _insert_event(f"dirty_priv_{i}", f"脏私密{i}",
+                          subject_id="person_lucien",
+                          layer=" private ", owner_ai="jasper",
+                          created_at=(now - timedelta(hours=i)).isoformat())
+        # 10 older shared — SHOULD be returned
+        for i in range(10):
+            _insert_event(f"shared_{i}", f"共享{i}",
+                          subject_id="person_lucien",
+                          layer="shared",
+                          created_at=(now - timedelta(days=1 + i)).isoformat())
+        result = asyncio.run(
+            memory_ops.recent_interaction("Lucien", ai_id="claude", limit=10))
+        assert result["count"] == 10, \
+            f"whitespace TRIM broken — SQL & can_view disagree, got {result['count']}"
+        for it in result["items"]:
+            assert it["id"].startswith("shared_")
+
+    def test_whitespace_in_owner_ai_field(self, db_env):
+        """Dirty owner_ai=' claude ' for viewer=claude — must be visible via both
+        SQL and can_view. Otherwise SQL over-excludes and returns count=0."""
+        _insert_person("person_lucien", "Lucien", ["lucien"])
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            _insert_event(f"own_ws_{i}", f"owner脏{i}",
+                          subject_id="person_lucien",
+                          layer="private", owner_ai=" claude ",
+                          created_at=(now - timedelta(hours=i)).isoformat())
+        result = asyncio.run(
+            memory_ops.recent_interaction("Lucien", ai_id="claude", limit=10))
+        assert result["count"] == 5, \
+            f"whitespace owner_ai TRIM broken, got {result['count']}"
 
 
 class TestPickRecencyWeightedClamp:

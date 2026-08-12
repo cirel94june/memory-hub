@@ -2029,19 +2029,22 @@ async def recent_interaction(
     #   - layer == 'private' 且 owner_ai 在 viewer 别名组 → 可见
     #   - layer == 'private' 且 owner_ai 为空、source_ai 在别名组 → 可见
     #   - 其余不可见
+    # visibility.can_view() 会先 .strip() 所有字段，SQL 必须用 TRIM 保持等价，
+    # 否则 layer=' private ' 会被 SQL 视为非 private，最终 can_view 再排除，
+    # 就变成"SQL 看似过滤成功、Python 保险把 LIMIT 结果掏空"。
     viewer_set = sorted(viewer_ids(ai_id)) if ai_id else []
     if viewer_set:
         viz_ph = ",".join("?" * len(viewer_set))
         viz_clause = (
-            f" AND (COALESCE(layer, 'shared') != 'private' OR ("
-            f"     (owner_ai != '' AND owner_ai IN ({viz_ph}))"
-            f"     OR (owner_ai = '' AND source_ai IN ({viz_ph}))"
+            f" AND (TRIM(COALESCE(layer, 'shared')) != 'private' OR ("
+            f"     (TRIM(COALESCE(owner_ai, '')) != '' AND TRIM(COALESCE(owner_ai, '')) IN ({viz_ph}))"
+            f"     OR (TRIM(COALESCE(owner_ai, '')) = '' AND TRIM(COALESCE(source_ai, '')) IN ({viz_ph}))"
             f" ))"
         )
         viz_params: list = viewer_set + viewer_set
     else:
         # 未提供 ai_id：直接排除全部 private，避免匿名请求看到私有内容
-        viz_clause = " AND COALESCE(layer, 'shared') != 'private'"
+        viz_clause = " AND TRIM(COALESCE(layer, 'shared')) != 'private'"
         viz_params = []
 
     try:

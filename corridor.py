@@ -227,13 +227,23 @@ async def build_corridor(ai_id: str) -> str:
     infra_picked = _pick_recency_weighted(infra_mems, quota=3, now_utc=now_utc)
     infra = [m["content"] for m in infra_picked]
 
+    # 提前计算 anchors，纳入「近期重要事件」的 already_shown 去重集合
+    # （否则近期 anchored event 可能同时出现在两个板块）
+    anchor_contents: list[str] = []
+    for m in all_mems.values():
+        if not (m.get("anchored") and m.get("status") == "active"):
+            continue
+        if m.get("owner_ai") and m.get("owner_ai") != ai_id:
+            continue
+        anchor_contents.append(m.get("content", ""))
+
     # 6.5. 近期重要事件（14 天内 + importance≥0.6，跨房间兜底）
     # 覆盖新写入的高价值记忆——它们如果不在 living_room/diary 就会漏进走廊。
     # 走 visibility：private 记忆按 owner_ai 过滤；shared 全体可见。
     #
     # Fail-closed：visibility 模块导入失败时不展示任何内容，避免误泄露他人 private。
-    # Dedup-before-truncate：先过滤已展示内容再取 5 条，否则前 5 条全被别处展示会
-    # 让整个板块消失、第 6 条也进不来。
+    # Candidate-self-dedup：不能只排除其他板块的重复，还要在候选池内部
+    # 每接受一条就把 norm 加入 seen，否则 5 条全是同一句话仍然会挤掉第 6 条唯一事件。
     try:
         from visibility import can_view as _can_view
     except Exception:
@@ -244,24 +254,35 @@ async def build_corridor(ai_id: str) -> str:
         recent_important_mems = []
     else:
         _norm = lambda s: "".join(str(s).split()).lower()
-        already_shown_norms: set[str] = set()
+        seen_norms: set[str] = set()
         for txt in living + relationship + personality + infra:
-            already_shown_norms.add(_norm(txt))
+            seen_norms.add(_norm(txt))
         for d in diary:
-            already_shown_norms.add(_norm(d.get("content", "")))
+            seen_norms.add(_norm(d.get("content", "")))
         for m in shared_relationships:
-            already_shown_norms.add(_norm(m.get("content", "")))
+            seen_norms.add(_norm(m.get("content", "")))
+        for txt in anchor_contents:
+            seen_norms.add(_norm(txt))
 
-        candidates = [
+        # 完整候选池，按时间倒序遍历，接受一条就加入 seen；收满 5 条停止
+        pool = [
             m for m in all_mems.values()
             if m.get("status") == "active"
             and _safe_float(m.get("importance"), 0.5) >= 0.6
             and _days_ago(m.get("created_at", ""), now_utc) <= 14
             and _can_view(m, ai_id)
-            and _norm(m.get("content", "")) not in already_shown_norms
         ]
-        candidates.sort(key=lambda m: m.get("created_at", ""), reverse=True)
-        recent_important_mems = candidates[:5]
+        pool.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+
+        recent_important_mems = []
+        for m in pool:
+            n = _norm(m.get("content", ""))
+            if n in seen_norms:
+                continue
+            seen_norms.add(n)
+            recent_important_mems.append(m)
+            if len(recent_important_mems) >= 5:
+                break
 
     # 组装走廊
     ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
@@ -314,18 +335,10 @@ async def build_corridor(ai_id: str) -> str:
         sections.append("【你对自己的认知】\n" + "\n".join(f"· {x}" for x in personality[:3]))
 
     # 4.5. 锚点记忆（价值观/原则/重要关系，永不衰减的坐标系）
-    living_norms = {"".join(str(x).split()).lower() for x in living}
-    anchors = []
-    for m in all_mems.values():
-        if not (m.get("anchored") and m.get("status") == "active"):
-            continue
-        if m.get("owner_ai") and m.get("owner_ai") != ai_id:
-            continue
-        content = m.get("content", "")
-        norm = "".join(str(content).split()).lower()
-        if norm in living_norms:
-            continue
-        anchors.append(content)
+    # anchor_contents 上面已经收集过；这里只做和 living 的去重后渲染。
+    living_norms_set = {"".join(str(x).split()).lower() for x in living}
+    anchors = [c for c in anchor_contents
+               if "".join(str(c).split()).lower() not in living_norms_set]
     if anchors:
         sections.append("【锚点·不变的事】\n" + "\n".join(f"📌 {x[:200]}" for x in anchors[:10]))
 
