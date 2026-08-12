@@ -3,11 +3,14 @@
 基于 SQLite 持久化，通过 database.py 做搜索/查询，通过 github_store 做 CRUD
 """
 import json
+import re
 import time
 import math
 import asyncio
 import logging
-from datetime import datetime, timezone
+import threading
+import unicodedata
+from datetime import datetime, timezone, timedelta
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
                     MERGE_SIMILARITY, ROOMS, get_room, AI_ALIASES, AI_ALIAS_GROUPS)
@@ -577,7 +580,305 @@ def _triage_proposal(proposal: dict) -> str:
 
 _SAFE_AUTO_PROVENANCE = {"user_statement", "user_correction", "user_quote"}
 
-_RESOLVE_PATTERNS = ("已完成", "搞定了", "做完了", "已解决", "完成了", "已经做了", "办好了")
+_RESOLVE_PATTERNS_ZH = (
+    "已完成", "搞定了", "做完了", "已解决", "完成了",
+    "已经做了", "办好了", "改了", "改完了", "好了",
+    "弄好了", "处理了", "处理完了", "OK了", "ok了",
+    "搞好了", "修好了", "解决了", "已经弄好",
+)
+_RESOLVE_PATTERNS_EN = (
+    "Done", "done", "finished", "fixed",
+)
+_RESOLVE_NEGATION_ZH = re.compile(r"(?:没|不|未|还没|没有|别|不要|还不|并没)")
+_RESOLVE_CONDITIONAL_ZH = re.compile(r"(?:如果|要是|假如|若|万一|是不是|不确定|可能|也许|或许|大概)")
+_RESOLVE_DOUBT_ZH = re.compile(r"(?:吗|吧|呢|么|嘛|？|\?)")
+
+_RESOLVE_NEGATION_EN = re.compile(
+    r"\b(?:not|never|haven'?t|hasn'?t|didn'?t|don'?t|doesn'?t|isn'?t|wasn'?t|un)\b",
+    re.IGNORECASE,
+)
+_RESOLVE_CONDITIONAL_EN = re.compile(
+    r"\b(?:if|whether|wonder|maybe|perhaps|might|could|would|should|possibly|probably|unsure|not sure)\b",
+    re.IGNORECASE,
+)
+
+
+# Split on strong clause boundaries and English/Chinese transitional connectives.
+# NOTE: applied AFTER NFKC normalization, so ，；() all become halfwidth.
+# Transitional connectives split whether or not a comma precedes them — they
+# introduce a new independent clause either way.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!。！\n;]"
+    r"|\b(?:but|however)\b\s+"                   # English: word-bounded
+    # Chinese transitionals — 但是/可是/然而 split unconditionally (no common
+    # substring collisions with normal usage). 不过 is deliberately restrictive
+    # because it forms many legit compounds (不过滤/不过期/不过夜/不过分/
+    # 不过是/只不过, and "结果，不过是..." patterns where preceding punctuation
+    # does not disambiguate). 不过 only splits when followed by an explicit
+    # continuation marker — preferring false negatives over false positives,
+    # since a missed auto-resolve is cheap but a wrong auto-resolve is not.
+    r"|(?:但是|可是|然而"
+    r"|不过(?=现在|如今|后来|最终|这次|目前|终于|真的|之前|以前))",
+    re.IGNORECASE,
+)
+
+
+def _matches_resolve_pattern(text: str) -> bool:
+    """Check if text POSITIVELY asserts completion — not just mentions it.
+
+    Splits on strong clause boundaries (. ! 。 ！ ; ；) and transitional
+    connectives (but / 但是 / 不过 / 可是) so a positive clause after a
+    negative/conditional one is still recognized. Each clause must:
+      - contain no question mark (globally rejects doubt);
+      - contain no negation of the resolve verb;
+      - contain no conditional/uncertainty marker before the verb.
+    NFKC-normalized; English uses word boundaries.
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+
+    clauses = _CLAUSE_SPLIT_RE.split(normalized)
+    for clause in clauses:
+        if not clause or not clause.strip():
+            continue
+        if "?" in clause or "？" in clause:
+            continue
+
+        matched = False
+        for pat in _RESOLVE_PATTERNS_EN:
+            for m in re.finditer(r'\b' + re.escape(pat) + r'\b', clause, re.IGNORECASE):
+                before = clause[:m.start()]
+                if _RESOLVE_NEGATION_EN.search(before):
+                    continue
+                if _RESOLVE_CONDITIONAL_EN.search(before):
+                    continue
+                matched = True
+                break
+            if matched:
+                break
+        if matched:
+            return True
+
+        for pat in _RESOLVE_PATTERNS_ZH:
+            for m in re.finditer(re.escape(pat), clause):
+                before = clause[:m.start()]
+                after = clause[m.end():m.end() + 3]
+                if _RESOLVE_NEGATION_ZH.search(before):
+                    continue
+                if _RESOLVE_CONDITIONAL_ZH.search(before):
+                    continue
+                if _RESOLVE_DOUBT_ZH.search(after):
+                    continue
+                matched = True
+                break
+            if matched:
+                break
+        if matched:
+            return True
+
+    return False
+
+
+def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
+    """In-place: multiply score by (1 + 0.3 * exp(-days/30)) using created_at.
+
+    Future timestamps are clamped to days=0 to avoid runaway boosts.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    for item in items:
+        try:
+            created = datetime.fromisoformat(item.get("created_at", ""))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            days = max(0.0, (now_utc - created).total_seconds() / 86400)
+            boost = 1 + 0.3 * math.exp(-days / 30)
+        except Exception:
+            boost = 1.0
+        item["score"] = round(item.get("score", 0) * boost, 6)
+
+
+# Serializes ALL write transactions on the shared module-level sqlite
+# connection. Two threads cannot safely share one sqlite3.Connection for
+# concurrent transactions (`cannot start a transaction within a transaction`);
+# BEGIN IMMEDIATE only coordinates between distinct connections. Every
+# `BEGIN IMMEDIATE` on `database._get_conn()` in this module (touch, auto-
+# resolve, and any future writer) MUST hold this lock.
+_WRITE_LOCK = threading.Lock()
+
+
+def _touch_recalled_memories(ids: list[str]) -> None:
+    """Atomic activation_count increment for recalled memories, plus ±48h ripple.
+
+    Serialized via `_WRITE_LOCK` because the module shares one sqlite connection
+    across threads. Ripple candidates are collected across all reference
+    timestamps (each query bounded by the remaining budget via SQL LIMIT),
+    deduplicated, globally capped at 5*N, then updated in one UPDATE. Any
+    exception is logged but never propagates — touch is best-effort.
+    """
+    if not ids:
+        return
+    try:
+        now = _now()
+        conn = database._get_conn()
+        placeholders = ",".join("?" * len(ids))
+        with _WRITE_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    f"UPDATE memories SET "
+                    f"activation_count = COALESCE(activation_count, 0) + 1, "
+                    f"last_activated = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (now, *ids),
+                )
+                ripple_cap = 5 * len(ids)
+                ref_rows = conn.execute(
+                    f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+                    f"FROM memories WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                recalled_set = set(ids)
+                candidates: dict[str, None] = {}
+                for (ref_ts,) in ref_rows:
+                    remaining = ripple_cap - len(candidates)
+                    if remaining <= 0:
+                        break
+                    if not ref_ts:
+                        continue
+                    try:
+                        base = datetime.fromisoformat(ref_ts)
+                        if base.tzinfo is None:
+                            base = base.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    lo = (base - timedelta(hours=48)).isoformat()
+                    hi = (base + timedelta(hours=48)).isoformat()
+                    # SQL-side LIMIT bounds the scan while the write tx holds
+                    # the lock. Over-fetch a bit (remaining + len(ids)) so
+                    # recalled ids filtered in Python don't shrink the budget.
+                    rows = conn.execute(
+                        "SELECT id FROM memories "
+                        "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
+                        "LIMIT ?",
+                        (lo, hi, remaining + len(ids)),
+                    ).fetchall()
+                    for (mid,) in rows:
+                        if mid in recalled_set or mid in candidates:
+                            continue
+                        candidates[mid] = None
+                        if len(candidates) >= ripple_cap:
+                            break
+                if candidates:
+                    ripple_ids = list(candidates.keys())
+                    rph = ",".join("?" * len(ripple_ids))
+                    conn.execute(
+                        f"UPDATE memories SET activation_count = "
+                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                        f"WHERE id IN ({rph})",
+                        ripple_ids,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+    except Exception as e:
+        logger.warning(f"recall touch failed (results still returned): {e}")
+
+
+def _apply_activation_penalty(items: list[dict]) -> None:
+    """In-place: apply 0.7x penalty to items above P95 activation_count.
+
+    Only triggers when len(items) >= 20. Uses math.ceil for the P95 index.
+    """
+    if len(items) < 20:
+        return
+    counts = sorted([item.get("activation_count", 0) for item in items])
+    p95_idx = math.ceil(len(counts) * 0.95) - 1
+    p95 = counts[min(p95_idx, len(counts) - 1)]
+    if p95 <= 0:
+        return
+    for item in items:
+        if item.get("activation_count", 0) > p95:
+            item["score"] = round(item.get("score", 0) * 0.7, 6)
+
+
+def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) -> list[str]:
+    """Find related memories that should be resolved, and resolve them atomically.
+
+    Returns list of resolved memory IDs.
+    """
+    if not related_mems or not _matches_resolve_pattern(content):
+        return []
+
+    to_resolve = []
+    for mem in related_mems:
+        is_unresolved = (
+            mem.get("resolved") == 0
+            or (mem.get("info_type") == "task"
+                and mem.get("resolved") is not None
+                and not mem.get("resolved"))
+        )
+        if is_unresolved:
+            to_resolve.append(mem)
+
+    if not to_resolve:
+        return []
+
+    now = _now()
+    resolved_ids: list[str] = []
+    conn = database._get_conn()
+    try:
+        with _WRITE_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now,
+                                 resolved_ids)
+    except Exception as e:
+        logger.warning(f"Atomic auto-resolve failed: {e}")
+        return []
+    return resolved_ids
+
+
+def _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now, resolved_ids):
+    """Body of the auto-resolve transaction. Assumes caller holds _WRITE_LOCK
+    and has already issued BEGIN IMMEDIATE. Commits on success, rolls back on
+    any exception."""
+    try:
+        for mem in to_resolve:
+            # Conditional UPDATE: only touch rows still resolved=0/NULL.
+            # Prevents double-resolve under concurrent writers.
+            cur = conn.execute(
+                "UPDATE memories SET resolved = 1, updated_at = ? "
+                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
+                (now, mem["id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO maintenance_audit "
+                "(action, target_id, new_content, source_message_ids, "
+                "decision_reason, state_before, state_after, "
+                "model_id, source_ai, auto_executed, prompt_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "resolve_thread", mem["id"], content, "[]",
+                    "auto-resolve: 内容匹配完成模式",
+                    json.dumps({"resolved": mem.get("resolved")}, ensure_ascii=False),
+                    json.dumps({"resolved": 1}, ensure_ascii=False),
+                    "", source_ai or "", 1, "", now,
+                ),
+            )
+            resolved_ids.append(mem["id"])
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
 
 _REOPEN_PATTERNS = ("又出问题了", "没搞定", "还没完", "又复发", "重新开", "再来一次", "还是有问题", "又坏了")
 
@@ -815,16 +1116,13 @@ async def _create_proposal(
         logger.warning(f"Related memory search failed: {e}")
 
     # resolve_thread 检测：新内容匹配完成模式 + 相关记忆有未完成待办
-    if related_mems and any(p in content for p in _RESOLVE_PATTERNS):
-        for mem in related_mems:
-            if mem.get("resolved") == 0 or (mem.get("info_type") == "task" and mem.get("resolved") is not None and not mem.get("resolved")):
-                result = await _execute_maintenance_action(
-                    "resolve_thread", mem, content,
-                    f"内容匹配完成模式，关联待办 {mem['id']}",
-                    source_ai, provenance_type,
-                )
-                if result:
-                    return result
+    resolved_ids = _check_auto_resolve(content, related_mems, source_ai)
+    if resolved_ids:
+        return {
+            "id": prop_id, "status": "proposed",
+            "maintenance_action": "resolve_thread",
+            "resolved_ids": resolved_ids,
+        }
 
     # reopen_thread 检测：新内容匹配重开模式 + 相关记忆已完成
     if related_mems and any(p in content for p in _REOPEN_PATTERNS):
@@ -1364,6 +1662,8 @@ async def recall(
     elif exclude_isolated and isolated_rooms:
         db_kwargs["exclude_rooms"] = list(isolated_rooms)
     db_kwargs["exclude_provenance"] = ["dream"]
+    db_kwargs["exclude_resolved"] = True
+    db_kwargs["exclude_superseded"] = True
 
     def _build_result(mem, score):
         room = mem.get("room", "")
@@ -1429,6 +1729,8 @@ async def recall(
                     emotion_score = 0.5
                 try:
                     created = datetime.fromisoformat(mem["created_at"])
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
                     days = (datetime.now(timezone.utc) - created).total_seconds() / 86400
                     time_score = math.exp(-0.02 * days)
                 except Exception:
@@ -1443,15 +1745,14 @@ async def recall(
         # 路径 2：FTS5
         fts_fn = database.ro_fts_search if use_ro else database.fts_search
         raw_fts = fts_fn(query, top_k=50, status="active",
-                         exclude_provenance=db_kwargs.get("exclude_provenance"))
+                         exclude_provenance=db_kwargs.get("exclude_provenance"),
+                         exclude_resolved=db_kwargs.get("exclude_resolved", False),
+                         exclude_superseded=db_kwargs.get("exclude_superseded", False),
+                         include_rooms=db_kwargs.get("include_rooms"),
+                         exclude_rooms=db_kwargs.get("exclude_rooms"))
         kw_scored = []
         for mem in raw_fts:
             if not _passes_private_filter(mem):
-                continue
-            room = mem.get("room", "")
-            if exclude_isolated and room in isolated_rooms:
-                continue
-            if include_rooms and room not in include_rooms:
                 continue
             rank = mem.pop("rank", 0.0)
             bm25 = min(1.0, abs(rank) / 10.0) if rank else 0.0
@@ -1465,15 +1766,14 @@ async def recall(
         try:
             like_fn = database.ro_cjk_like_search if use_ro else database.cjk_like_search
             like_raw = like_fn(query, top_k=50, status="active",
-                               exclude_provenance=db_kwargs.get("exclude_provenance"))
+                               exclude_provenance=db_kwargs.get("exclude_provenance"),
+                               exclude_resolved=db_kwargs.get("exclude_resolved", False),
+                               exclude_superseded=db_kwargs.get("exclude_superseded", False),
+                               include_rooms=db_kwargs.get("include_rooms"),
+                               exclude_rooms=db_kwargs.get("exclude_rooms"))
             like_scored = []
             for mem in like_raw:
                 if not _passes_private_filter(mem):
-                    continue
-                room = mem.get("room", "")
-                if exclude_isolated and room in isolated_rooms:
-                    continue
-                if include_rooms and room not in include_rooms:
                     continue
                 like_scored.append((mem, min(1.0, mem.pop("like_hits", 1) / 5.0)))
             like_results = [_build_result(m, s) for m, s in like_scored[:50]]
@@ -1513,6 +1813,14 @@ async def recall(
                 if mem is not None and mem.get("provenance_type") not in _excl_prov:
                     filtered.append(item)
             merged = filtered
+
+        # Block 2: 新鲜度 boost — RRF 合并后统一加权
+        _apply_recency_boost(merged)
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # Block 3: activation_count P95 顶端惩罚（≥20 条结果才触发）
+        _apply_activation_penalty(merged)
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         # 残缺正文降权（content_incomplete 由完整性审计标记）
         for item in merged:
@@ -1576,36 +1884,17 @@ async def recall(
     else:
         results = _db_search_all()
 
-    # ── Touch：更新 activation_count（写操作留在主线程） ──
-    now = _now()
-    for r in results:
-        m = store.get_memory(r["id"])
-        if m:
-            m["activation_count"] = m.get("activation_count", 0) + 1
-            m["last_activated"] = now
-            store.set_memory(m)
-            _time_ripple(m)
+    # ── Touch：原子 UPDATE 避免并发丢失更新 + ±48h 时间涟漪，不能阻断返回 ──
+    if results:
+        _touch_recalled_memories([r["id"] for r in results])
 
-    # ── 替换 superseded 记忆 ──
-    filtered_results = []
+    # ── 结果后处理：confidence 标签 ──
     for r in results:
-        m = store.get_memory(r["id"])
-        if m and m.get("status") == "superseded":
-            new_id = m.get("superseded_by")
-            if new_id:
-                new_m = store.get_memory(new_id)
-                if new_m and new_m.get("status") == "active":
-                    r["id"] = new_m["id"]
-                    r["content"] = new_m["content"]
-                    r["superseded_from"] = m["id"]
-            else:
-                continue
         r.pop("_unresolved", None)
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
-        filtered_results.append(r)
 
-    return filtered_results
+    return results
 
 
 async def dream_recall(
@@ -1715,39 +2004,6 @@ async def resolve_memory(memory_id: str, resolved: bool = True) -> dict:
     mem["updated_at"] = _now()
     store.set_memory(mem)
     return {"id": memory_id, "status": "resolved" if resolved else "unresolved"}
-
-
-# ── 时间涟漪（触碰一条记忆时，时间上相邻的记忆轻微激活） ──
-
-def _time_ripple(touched_mem: dict, max_ripple: int = 5, hours: float = 48.0):
-    """被召回的记忆附近 ±48 小时创建的记忆也轻微唤醒 (+0.3)
-
-    NOTE: This still uses store.get_all_memories() which queries SQLite under the hood.
-    Could be optimized with a time-range SQL query, but ripple runs rarely and only
-    affects max 5 memories, so the current approach is acceptable.
-    """
-    try:
-        ref_time = datetime.fromisoformat(touched_mem.get("event_date") or touched_mem["created_at"])
-    except Exception:
-        return
-
-    rippled = 0
-    for mem in store.get_all_memories().values():
-        if rippled >= max_ripple:
-            break
-        if mem["id"] == touched_mem["id"]:
-            continue
-        if mem.get("status") != "active" or not mem.get("embedding"):
-            continue
-        try:
-            created = datetime.fromisoformat(mem["created_at"])
-            delta_hours = abs((ref_time - created).total_seconds()) / 3600
-            if delta_hours <= hours:
-                mem["activation_count"] = round(mem.get("activation_count", 0) + 0.3, 1)
-                store.set_memory(mem)
-                rippled += 1
-        except Exception:
-            continue
 
 
 # ── 获取客厅内容 ──

@@ -920,6 +920,40 @@ def delete_profile(profile_id: str) -> bool:
 #  Vector search
 # ════════════════════════════════════════════
 
+def _build_vec_mem_sql(
+    status, room, layer, owner_ai, exclude_provenance,
+    exclude_resolved, exclude_superseded,
+):
+    """Build parameterized WHERE clause for vector search memory lookup."""
+    parts = []
+    params: list = []
+    if status is not None:
+        parts.append("status = ?")
+        params.append(status)
+    if room is not None:
+        parts.append("room = ?")
+        params.append(room)
+    if layer is not None:
+        parts.append("layer = ?")
+        params.append(layer)
+    if owner_ai is not None:
+        parts.append("owner_ai = ?")
+        params.append(owner_ai)
+    if exclude_provenance:
+        ph = ",".join("?" * len(exclude_provenance))
+        parts.append(f"(provenance_type IS NULL OR provenance_type NOT IN ({ph}))")
+        params.extend(exclude_provenance)
+    if exclude_resolved:
+        parts.append("(resolved IS NULL OR resolved != 1)")
+    if exclude_superseded:
+        parts.append("(superseded_by IS NULL OR superseded_by = '')")
+
+    where = ""
+    if parts:
+        where = "AND " + " AND ".join(parts)
+    return where, params
+
+
 def vector_search(
     query_vec: list[float],
     top_k: int = 50,
@@ -930,92 +964,114 @@ def vector_search(
     layer: str = None,
     owner_ai: str = None,
     exclude_provenance: list[str] = None,
+    exclude_resolved: bool = False,
+    exclude_superseded: bool = False,
 ) -> list[dict]:
     """Vector similarity search using sqlite-vec.
 
-    Retrieves more candidates from the vec index than needed, then filters
-    by the requested criteria on the main table, returning up to ``top_k``
+    Retrieves candidates from the vec index in expanding batches, filters
+    by the requested criteria at the SQL layer, returning up to ``top_k``
     results with a ``distance`` field (lower is more similar).
     """
     conn = _get_conn()
+    return _vector_search_impl(
+        conn, query_vec, top_k, status, room, include_rooms, exclude_rooms,
+        layer, owner_ai, exclude_provenance, exclude_resolved, exclude_superseded,
+    )
 
+
+def _vector_search_impl(
+    conn, query_vec, top_k, status, room, include_rooms, exclude_rooms,
+    layer, owner_ai, exclude_provenance, exclude_resolved, exclude_superseded,
+):
     if len(query_vec) != EMBEDDING_DIM:
         raise ValueError(f"Expected {EMBEDDING_DIM}-dim vector, got {len(query_vec)}")
 
     query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
 
-    # Fetch extra candidates to allow for filtering
-    fetch_k = top_k * 4
+    mem_where, mem_params = _build_vec_mem_sql(
+        status, room, layer, owner_ai, exclude_provenance,
+        exclude_resolved, exclude_superseded,
+    )
 
+    # Adaptive expansion: double fetch limit until we fill top_k or exhaust index.
+    # max_fetch is derived from actual index size so we never silently give up
+    # while the index still has candidates left to try.
     try:
-        vec_rows = conn.execute(
-            "SELECT rowid, distance FROM memories_vec "
-            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, fetch_k),
-        ).fetchall()
+        index_size = conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0]
     except sqlite3.Error:
-        logger.exception("Vector search failed")
-        return []
+        index_size = 0
+    max_fetch = max(index_size, top_k * 4)
 
-    if not vec_rows:
-        return []
-
-    # Map vec rowids back to memory IDs
-    vec_rowids = [r[0] for r in vec_rows]
-    distances = {r[0]: r[1] for r in vec_rows}
-
-    # Batch fetch memory IDs from vec_id_map
+    fetch_limit = min(top_k * 4, max_fetch) if max_fetch else top_k * 4
     results = []
-    # Process in batches of 500 to stay within SQLite variable limits
-    for i in range(0, len(vec_rowids), 500):
-        batch = vec_rowids[i:i + 500]
-        placeholders = ", ".join(["?"] * len(batch))
-        map_rows = conn.execute(
-            f"SELECT vec_rowid, memory_id FROM vec_id_map "
-            f"WHERE vec_rowid IN ({placeholders})",
-            batch,
-        ).fetchall()
+    seen_rowids: set = set()
+    prev_fetch = 0
 
-        mem_ids = {r[0]: r[1] for r in map_rows}  # vec_rowid -> memory_id
+    while len(results) < top_k and fetch_limit <= max_fetch:
+        try:
+            vec_rows = conn.execute(
+                "SELECT rowid, distance FROM memories_vec "
+                "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                (query_blob, fetch_limit),
+            ).fetchall()
+        except sqlite3.Error:
+            logger.exception("Vector search failed")
+            return results
 
-        for vec_rid in batch:
-            mem_id = mem_ids.get(vec_rid)
-            if not mem_id:
-                continue
-
-            # Fetch the memory itself
-            row = conn.execute(
-                "SELECT * FROM memories WHERE id = ?", (mem_id,)
-            ).fetchone()
-            if row is None:
-                continue
-
-            mem = _row_to_dict_no_embedding(row)
-
-            # Apply filters
-            if status is not None and mem.get("status") != status:
-                continue
-            if room is not None and mem.get("room") != room:
-                continue
-            if include_rooms and mem.get("room") not in include_rooms:
-                continue
-            if exclude_rooms and mem.get("room") in exclude_rooms:
-                continue
-            if layer is not None and mem.get("layer") != layer:
-                continue
-            if owner_ai is not None and mem.get("owner_ai") != owner_ai:
-                continue
-            if exclude_provenance and mem.get("provenance_type") in exclude_provenance:
-                continue
-
-            mem["distance"] = distances[vec_rid]
-            results.append(mem)
-
-            if len(results) >= top_k:
-                break
-
-        if len(results) >= top_k:
+        if not vec_rows or len(vec_rows) == prev_fetch:
             break
+        prev_fetch = len(vec_rows)
+
+        new_rows = [(r[0], r[1]) for r in vec_rows if r[0] not in seen_rowids]
+        if not new_rows:
+            # Reached natural end of index — no new candidates possible.
+            break
+        for r in new_rows:
+            seen_rowids.add(r[0])
+
+        new_rowids = [r[0] for r in new_rows]
+        distances = {r[0]: r[1] for r in new_rows}
+
+        for i in range(0, len(new_rowids), 500):
+            batch = new_rowids[i:i + 500]
+            placeholders = ", ".join(["?"] * len(batch))
+            map_rows = conn.execute(
+                f"SELECT vec_rowid, memory_id FROM vec_id_map "
+                f"WHERE vec_rowid IN ({placeholders})",
+                batch,
+            ).fetchall()
+
+            mem_ids = {r[0]: r[1] for r in map_rows}
+
+            for vec_rid in batch:
+                mem_id = mem_ids.get(vec_rid)
+                if not mem_id:
+                    continue
+
+                row = conn.execute(
+                    f"SELECT * FROM memories WHERE id = ? {mem_where}",
+                    [mem_id] + mem_params,
+                ).fetchone()
+                if row is None:
+                    continue
+
+                mem = _row_to_dict_no_embedding(row)
+
+                if include_rooms and mem.get("room") not in include_rooms:
+                    continue
+                if exclude_rooms and mem.get("room") in exclude_rooms:
+                    continue
+
+                mem["distance"] = distances[vec_rid]
+                results.append(mem)
+
+                if len(results) >= top_k:
+                    return results
+
+        if fetch_limit >= max_fetch:
+            break
+        fetch_limit = min(fetch_limit * 2, max_fetch)
 
     return results
 
@@ -1025,39 +1081,62 @@ def vector_search(
 # ════════════════════════════════════════════
 
 def fts_search(query: str, top_k: int = 50, status: str = "active",
-               exclude_provenance: list[str] = None) -> list[dict]:
+               exclude_provenance: list[str] = None,
+               exclude_resolved: bool = False,
+               exclude_superseded: bool = False,
+               include_rooms: list[str] = None,
+               exclude_rooms: list[str] = None) -> list[dict]:
     """Full-text search using FTS5.
 
     Returns memories matching the query with a ``rank`` field
     (more negative = better match in FTS5 bm25 scoring).
     """
     conn = _get_conn()
+    return _fts_search_impl(conn, query, top_k, status, exclude_provenance,
+                            exclude_resolved, exclude_superseded,
+                            include_rooms, exclude_rooms)
 
+
+def _fts_search_impl(conn, query, top_k, status, exclude_provenance,
+                     exclude_resolved, exclude_superseded,
+                     include_rooms=None, exclude_rooms=None):
     if not query or not query.strip():
         return []
 
-    # Escape special FTS5 characters and build a safe query
     safe_query = _fts_escape(query)
 
-    prov_clause = ""
-    prov_params: list = []
+    extra_where = ""
+    extra_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
-        prov_params = list(exclude_provenance)
+        extra_where += f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
+        extra_params.extend(exclude_provenance)
+    if exclude_resolved:
+        extra_where += " AND (m.resolved IS NULL OR m.resolved != 1)"
+    if exclude_superseded:
+        extra_where += " AND (m.superseded_by IS NULL OR m.superseded_by = '')"
+    if include_rooms:
+        rph = ",".join("?" * len(include_rooms))
+        extra_where += f" AND m.room IN ({rph})"
+        extra_params.extend(include_rooms)
+    if exclude_rooms:
+        rph = ",".join("?" * len(exclude_rooms))
+        extra_where += f" AND m.room NOT IN ({rph})"
+        extra_params.extend(exclude_rooms)
+
+    sql_tpl = (
+        "SELECT m.*, fts.rank "
+        "FROM memories_fts fts "
+        "JOIN memories m ON m.rowid = fts.rowid "
+        "WHERE memories_fts MATCH ? "
+        "AND m.status = ? "
+        f"{extra_where} "
+        "ORDER BY fts.rank "
+        "LIMIT ?"
+    )
 
     try:
-        rows = conn.execute(
-            "SELECT m.*, fts.rank "
-            "FROM memories_fts fts "
-            "JOIN memories m ON m.rowid = fts.rowid "
-            "WHERE memories_fts MATCH ? "
-            "AND m.status = ? "
-            f"{prov_clause} "
-            "ORDER BY fts.rank "
-            "LIMIT ?",
-            (safe_query, status, *prov_params, top_k),
-        ).fetchall()
+        rows = conn.execute(sql_tpl, (safe_query, status, *extra_params, top_k)).fetchall()
     except sqlite3.OperationalError:
         logger.warning(f"FTS5 query failed for: {query!r}, trying fallback")
         try:
@@ -1065,17 +1144,7 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
             fallback = " OR ".join(f'"{_fts_escape_token(t)}"' for t in tokens if t)
             if not fallback:
                 return []
-            rows = conn.execute(
-                "SELECT m.*, fts.rank "
-                "FROM memories_fts fts "
-                "JOIN memories m ON m.rowid = fts.rowid "
-                "WHERE memories_fts MATCH ? "
-                "AND m.status = ? "
-                f"{prov_clause} "
-                "ORDER BY fts.rank "
-                "LIMIT ?",
-                (fallback, status, *prov_params, top_k),
-            ).fetchall()
+            rows = conn.execute(sql_tpl, (fallback, status, *extra_params, top_k)).fetchall()
         except sqlite3.OperationalError:
             logger.exception("FTS5 fallback also failed")
             return []
@@ -1089,17 +1158,13 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     return results
 
 
-_CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
+_CJK_RUN_RE = re.compile(r"[㐀-䶿一-鿿]{2,}")
 
 
-def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
-                    exclude_provenance: list[str] = None) -> list[dict]:
-    """中文子串搜索（LIKE 路）。
-
-    FTS5 默认分词器不切中文——整段中文被当成一个 token，"妈妈"永远匹配不上
-    包含"我妈妈说"的记忆。这里把 query 里的中文段切成 2 字滑窗（我妈/妈妈/妈说），
-    用 LIKE 找包含这些片段的记忆，按命中片段数排序。作为混合召回的关键词路补充。
-    """
+def _cjk_like_search_impl(conn, query, top_k, status, exclude_provenance,
+                          exclude_resolved, exclude_superseded,
+                          include_rooms, exclude_rooms):
+    """Shared CJK LIKE search — used by both cjk_like_search and ro_cjk_like_search."""
     runs = _CJK_RUN_RE.findall(query or "")
     grams: list[str] = []
     seen: set[str] = set()
@@ -1113,18 +1178,29 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
     if not grams:
         return []
 
-    conn = _get_conn()
     conds = " OR ".join(["content LIKE ?"] * len(grams))
-    prov_clause = ""
-    prov_params: list = []
+    extra_clause = ""
+    extra_params: list = []
     if exclude_provenance:
         ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
-        prov_params = list(exclude_provenance)
+        extra_clause += f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
+        extra_params.extend(exclude_provenance)
+    if exclude_resolved:
+        extra_clause += " AND (resolved IS NULL OR resolved != 1)"
+    if exclude_superseded:
+        extra_clause += " AND (superseded_by IS NULL OR superseded_by = '')"
+    if include_rooms:
+        rph = ",".join("?" * len(include_rooms))
+        extra_clause += f" AND room IN ({rph})"
+        extra_params.extend(include_rooms)
+    if exclude_rooms:
+        rph = ",".join("?" * len(exclude_rooms))
+        extra_clause += f" AND room NOT IN ({rph})"
+        extra_params.extend(exclude_rooms)
     try:
         rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
-            (status, *[f"%{g}%" for g in grams], *prov_params),
+            f"SELECT * FROM memories WHERE status = ? AND ({conds}){extra_clause} LIMIT 400",
+            (status, *[f"%{g}%" for g in grams], *extra_params),
         ).fetchall()
     except sqlite3.OperationalError:
         logger.exception("cjk_like_search failed")
@@ -1143,6 +1219,19 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
         mem["like_hits"] = hits
         results.append(mem)
     return results
+
+
+def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
+                    exclude_provenance: list[str] = None,
+                    exclude_resolved: bool = False,
+                    exclude_superseded: bool = False,
+                    include_rooms: list[str] = None,
+                    exclude_rooms: list[str] = None) -> list[dict]:
+    """中文子串搜索（LIKE 路）。委托到共享 impl。"""
+    return _cjk_like_search_impl(
+        _get_conn(), query, top_k, status, exclude_provenance,
+        exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
+    )
 
 
 def _fts_escape(query: str) -> str:
@@ -1274,142 +1363,52 @@ def ro_vector_search(
     exclude_rooms: list[str] = None,
     **kwargs,
 ) -> list[dict]:
-    """线程安全版 vector_search。"""
+    """线程安全版 vector_search — delegates to shared impl with read-only conn."""
     conn = _get_read_conn()
-    if len(query_vec) != EMBEDDING_DIM:
-        return []
-    query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
-    fetch_k = top_k * 4
     try:
-        vec_rows = conn.execute(
-            "SELECT rowid, distance FROM memories_vec "
-            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, fetch_k),
-        ).fetchall()
+        return _vector_search_impl(
+            conn, query_vec, top_k, status, None, include_rooms, exclude_rooms,
+            None, None, kwargs.get("exclude_provenance"),
+            kwargs.get("exclude_resolved", False),
+            kwargs.get("exclude_superseded", False),
+        )
     except Exception as e:
-        logger.warning(f"ro_vector_search vec query failed: {e}")
+        logger.warning(f"ro_vector_search failed: {e}")
         return []
-    if not vec_rows:
-        return []
-    rowid_dist = {r[0]: r[1] for r in vec_rows}
-    placeholders = ", ".join(["?"] * len(rowid_dist))
-    rowids = list(rowid_dist.keys())
-    id_rows = conn.execute(
-        f"SELECT vec_rowid, memory_id FROM vec_id_map WHERE vec_rowid IN ({placeholders})",
-        rowids,
-    ).fetchall()
-    id_map = {r[0]: r[1] for r in id_rows}
-    mem_ids = [id_map[rid] for rid in rowids if rid in id_map]
-    if not mem_ids:
-        return []
-    ph2 = ", ".join(["?"] * len(mem_ids))
-    clauses = [f"id IN ({ph2})"]
-    params: list = list(mem_ids)
-    if status:
-        clauses.append("status = ?")
-        params.append(status)
-    if include_rooms:
-        rph = ", ".join(["?"] * len(include_rooms))
-        clauses.append(f"room IN ({rph})")
-        params.extend(include_rooms)
-    if exclude_rooms:
-        rph = ", ".join(["?"] * len(exclude_rooms))
-        clauses.append(f"room NOT IN ({rph})")
-        params.extend(exclude_rooms)
-    exclude_prov = kwargs.get("exclude_provenance")
-    if exclude_prov:
-        pph = ", ".join(["?"] * len(exclude_prov))
-        clauses.append(f"(provenance_type IS NULL OR provenance_type NOT IN ({pph}))")
-        params.extend(exclude_prov)
-    where = " AND ".join(clauses)
-    mem_rows = conn.execute(f"SELECT * FROM memories WHERE {where}", params).fetchall()
-    results = []
-    for row in mem_rows:
-        d = _row_to_dict(row)
-        vec_rowid = next((rid for rid, mid in id_map.items() if mid == d["id"]), None)
-        if vec_rowid and vec_rowid in rowid_dist:
-            d["distance"] = rowid_dist[vec_rowid]
-        results.append(d)
-    results.sort(key=lambda x: x.get("distance", 999))
-    return results[:top_k]
 
 
 def ro_fts_search(query: str, top_k: int = 50, status: str = "active",
-                  exclude_provenance: list[str] = None) -> list[dict]:
-    """线程安全版 fts_search。"""
+                  exclude_provenance: list[str] = None,
+                  exclude_resolved: bool = False,
+                  exclude_superseded: bool = False,
+                  include_rooms: list[str] = None,
+                  exclude_rooms: list[str] = None) -> list[dict]:
+    """线程安全版 fts_search — delegates to shared impl with read-only conn."""
     conn = _get_read_conn()
-    if not query or not query.strip():
-        return []
-    safe = re.sub(r'[^\w\s一-鿿]', ' ', query).strip()
-    if not safe:
-        return []
-    terms = safe.split()
-    if not terms:
-        return []
-    fts_query = " OR ".join(f'"{t}"' for t in terms[:10])
-    prov_clause = ""
-    prov_params: list = []
-    if exclude_provenance:
-        ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND (m.provenance_type IS NULL OR m.provenance_type NOT IN ({ph}))"
-        prov_params = list(exclude_provenance)
     try:
-        rows = conn.execute(
-            "SELECT m.*, f.rank FROM memories_fts f "
-            "JOIN memories m ON m.rowid = f.rowid "
-            "WHERE memories_fts MATCH ? AND m.status = ? "
-            f"{prov_clause} "
-            "ORDER BY f.rank LIMIT ?",
-            (fts_query, status, *prov_params, top_k * 2),
-        ).fetchall()
+        return _fts_search_impl(conn, query, top_k, status, exclude_provenance,
+                                exclude_resolved, exclude_superseded,
+                                include_rooms, exclude_rooms)
     except Exception as e:
         logger.warning(f"ro_fts_search failed: {e}")
         return []
-    results = []
-    for r in rows:
-        d = _row_to_dict_no_embedding(r)
-        results.append(d)
-    return results[:top_k]
 
 
 def ro_cjk_like_search(query: str, top_k: int = 50, status: str = "active",
-                       exclude_provenance: list[str] = None) -> list[dict]:
-    """线程安全版 cjk_like_search。"""
-    conn = _get_read_conn()
-    CJK_RE = re.compile(r'[一-鿿㐀-䶿]+')
-    runs = CJK_RE.findall(query)
-    grams = []
-    for run in runs:
-        for i in range(len(run) - 1):
-            g = run[i:i+2]
-            if g not in grams:
-                grams.append(g)
-    if not grams:
-        return []
-    grams = grams[:8]
-    conds = " OR ".join(["content LIKE ?"] * len(grams))
-    prov_clause = ""
-    prov_params: list = []
-    if exclude_provenance:
-        ph = ",".join("?" * len(exclude_provenance))
-        prov_clause = f" AND (provenance_type IS NULL OR provenance_type NOT IN ({ph}))"
-        prov_params = list(exclude_provenance)
+                       exclude_provenance: list[str] = None,
+                       exclude_resolved: bool = False,
+                       exclude_superseded: bool = False,
+                       include_rooms: list[str] = None,
+                       exclude_rooms: list[str] = None) -> list[dict]:
+    """线程安全版 cjk_like_search — delegates to shared impl with read-only conn."""
     try:
-        rows = conn.execute(
-            f"SELECT * FROM memories WHERE status = ? AND ({conds}){prov_clause} LIMIT 400",
-            (status, *[f"%{g}%" for g in grams], *prov_params),
-        ).fetchall()
+        return _cjk_like_search_impl(
+            _get_read_conn(), query, top_k, status, exclude_provenance,
+            exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
+        )
     except Exception as e:
         logger.warning(f"ro_cjk_like_search failed: {e}")
         return []
-    results = []
-    for row in rows:
-        d = _row_to_dict_no_embedding(row)
-        hits = sum(1 for g in grams if g in d.get("content", ""))
-        d["like_hits"] = hits
-        results.append(d)
-    results.sort(key=lambda x: x.get("like_hits", 0), reverse=True)
-    return results[:top_k]
 
 
 def ro_get_memory(mem_id: str) -> dict | None:
