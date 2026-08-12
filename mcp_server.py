@@ -449,9 +449,21 @@ async def recent_interaction(
         limit: 最多返回条数（默认 10，clamp 到 1-50）
         source_ai: 谁在查（用于 visibility 权限过滤，默认 claude）
     """
-    result = await memory_ops.recent_interaction(
-        with_person=with_person, ai_id=source_ai, days=days, limit=limit,
-    )
+    try:
+        result = await memory_ops.recent_interaction(
+            with_person=with_person, ai_id=source_ai, days=days, limit=limit,
+        )
+    except Exception as e:
+        # 任何未预期异常都返回稳定的结构化错误，不让 MCP 客户端见到 traceback
+        result = {
+            "with_person": with_person,
+            "resolved_to": None,
+            "error": "internal_error",
+            "hint": f"内部错误：{type(e).__name__}",
+            "days": days,
+            "count": 0,
+            "items": [],
+        }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 

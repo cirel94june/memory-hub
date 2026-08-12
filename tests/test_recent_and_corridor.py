@@ -360,3 +360,134 @@ class TestCorridorSnapshot:
         conn.commit()
         text = asyncio.run(corridor.build_corridor("claude"))
         assert "永远的原则" in text
+
+    def test_visibility_import_fail_closed(self, db_env, monkeypatch):
+        """When visibility import fails, 近期重要事件 section is skipped
+        entirely — must NOT default to showing everything (would leak private)."""
+        _insert_event("jasper_private_hot", "jasper 私密热点",
+                      room="social", importance=0.9,
+                      layer="private", owner_ai="jasper",
+                      created_at=(datetime.now(timezone.utc)
+                                  - timedelta(days=2)).isoformat())
+        # Force the import inside build_corridor to fail
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "visibility":
+                raise ImportError("simulated visibility import failure")
+            return real_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【近期重要事件】" not in text
+        assert "jasper 私密热点" not in text
+
+    def test_new_section_dedup_before_truncate(self, db_env):
+        """Reviewer M1: if first 5 recent+important items already appear in
+        other sections, the 6th unique one must still be picked up."""
+        # 5 living_room items that will be shown in 【关于主人】
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            _insert_event(f"dup_liv_{i}", f"重复条目{i}",
+                          room="living_room", importance=0.8,
+                          created_at=(now - timedelta(days=1)).isoformat())
+        # 1 unique event in a random room that qualifies
+        _insert_event("unique_event", "唯一跨房间事件",
+                      room="social", importance=0.8,
+                      created_at=(now - timedelta(days=3)).isoformat())
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【近期重要事件】" in text
+        assert "唯一跨房间事件" in text
+
+
+# ════════════════════════════════════════════
+#  Edge cases from Codex round-1 review
+# ════════════════════════════════════════════
+
+class TestVisibilitySQLPushdown:
+    def test_many_invisible_before_visible_still_returns_visible(self, db_env):
+        """Reviewer H2: over-fetch × 3 was starving — with SQL pushdown, viewer
+        must get all visible memories even when many invisible ones sort earlier."""
+        _insert_person("person_lucien", "Lucien", ["lucien"])
+        now = datetime.now(timezone.utc)
+        # 30 invisible (jasper private), sorted newest first
+        for i in range(30):
+            _insert_event(f"j_priv_{i}", f"jasper私密{i}",
+                          subject_id="person_lucien",
+                          layer="private", owner_ai="jasper",
+                          created_at=(now - timedelta(hours=i)).isoformat())
+        # 10 visible shared, older
+        for i in range(10):
+            _insert_event(f"shared_{i}", f"共享{i}",
+                          subject_id="person_lucien",
+                          layer="shared",
+                          created_at=(now - timedelta(days=1 + i)).isoformat())
+        result = asyncio.run(
+            memory_ops.recent_interaction("Lucien", ai_id="claude", limit=10))
+        assert result["count"] == 10, \
+            f"visibility SQL pushdown broken — got {result['count']}"
+        for it in result["items"]:
+            assert it["id"].startswith("shared_")
+
+
+class TestPickRecencyWeightedClamp:
+    def _mem(self, mid, days_ago, importance=0.5):
+        now = datetime(2026, 8, 12, tzinfo=timezone.utc)
+        return {"id": mid, "content": mid, "importance": importance,
+                "created_at": (now - timedelta(days=days_ago)).isoformat()}
+
+    def test_recent_share_negative_clamped(self):
+        mems = [self._mem(f"m_{i}", days_ago=5) for i in range(5)]
+        picked = corridor._pick_recency_weighted(mems, quota=2, recent_share=-1)
+        assert len(picked) <= 2
+
+    def test_recent_share_above_one_clamped(self):
+        mems = [self._mem(f"m_{i}", days_ago=5) for i in range(5)]
+        picked = corridor._pick_recency_weighted(mems, quota=2, recent_share=2)
+        assert len(picked) <= 2
+
+    def test_quota_negative(self):
+        mems = [self._mem("m_1", 5)]
+        assert corridor._pick_recency_weighted(mems, quota=-5) == []
+
+    def test_non_numeric_inputs(self):
+        mems = [self._mem(f"m_{i}", 5) for i in range(3)]
+        # Should not raise, should fall back to defaults
+        picked = corridor._pick_recency_weighted(
+            mems, quota="abc", recent_share="foo", recent_days="bar")
+        assert isinstance(picked, list)
+
+
+class TestRecentInteractionRobustness:
+    def test_non_numeric_days_falls_back(self, db_env):
+        _insert_person("person_lucien", "Lucien", ["lucien"])
+        result = asyncio.run(memory_ops.recent_interaction(
+            "Lucien", days="abc", limit="xyz"))
+        assert result["days"] == 30  # fell back to default
+        assert result["error"] == ""
+
+    def test_alias_case_and_whitespace(self, db_env):
+        _insert_person("person_x", "Person", ["ceci"])
+        # Reviewer L1: strip + casefold
+        for probe in ["PERSON", " Person ", " PERSON ", "person"]:
+            result = asyncio.run(memory_ops.recent_interaction(probe))
+            assert result["resolved_to"] == "person_x", \
+                f"probe {probe!r} failed to resolve"
+
+    def test_mcp_wrapper_has_internal_error_guard(self):
+        """MCP wrapper source must include try/except that returns
+        error='internal_error' — guards against future refactor stripping it.
+        Works offline (no `mcp` module required)."""
+        with open("mcp_server.py", encoding="utf-8") as f:
+            src = f.read()
+        # Extract the recent_interaction tool body from source
+        marker = "async def recent_interaction("
+        idx = src.find(marker)
+        assert idx != -1, "recent_interaction MCP tool not found in mcp_server.py"
+        # Grab ~2000 chars after the marker (covers a typical tool body)
+        body = src[idx:idx + 2000]
+        assert "try:" in body and "except Exception" in body, \
+            "MCP wrapper missing try/except — internal error would leak traceback"
+        assert '"error": "internal_error"' in body, \
+            "MCP wrapper must return error='internal_error' on unexpected exceptions"

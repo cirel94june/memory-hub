@@ -1967,11 +1967,20 @@ async def recent_interaction(
                      subject_id, source_actor_id}, ...]
         }
     """
-    from visibility import can_view
+    from visibility import can_view, viewer_ids
 
-    # 参数 clamp
-    days = max(1, min(int(days or 30), 365))
-    limit = max(1, min(int(limit or 10), 50))
+    def _to_int(v, default):
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return default
+
+    def _norm_alias(s: str) -> str:
+        return s.strip().casefold() if isinstance(s, str) else ""
+
+    # 参数 clamp — 非数字输入回退到默认值，不抛异常
+    days = max(1, min(_to_int(days, 30), 365))
+    limit = max(1, min(_to_int(limit, 10), 50))
 
     result = {
         "with_person": with_person,
@@ -1983,24 +1992,24 @@ async def recent_interaction(
         "items": [],
     }
 
-    if not with_person or not with_person.strip():
+    if not with_person or not isinstance(with_person, str) or not with_person.strip():
         result["error"] = "empty_person"
         result["hint"] = "with_person 参数为空，请传一个名字或别名"
         return result
 
-    # Alias resolve — 用 scope="any" 尽量宽松，别名解不出来就明确报错
+    # Alias resolve — scope="any" 宽松匹配，用 strip().casefold() 统一规范化
     try:
         alias_map = database.get_all_aliases(scope="any")
     except Exception as e:
         logger.warning(f"recent_interaction: get_all_aliases failed: {e}")
         alias_map = {}
 
-    person_id = alias_map.get(with_person) or alias_map.get(with_person.lower()) \
-        or alias_map.get(with_person.strip())
+    # 建立规范化后的查找表，同时保留原表处理精确大小写敏感情况
+    alias_map_norm = {_norm_alias(k): v for k, v in alias_map.items() if k}
+    key = _norm_alias(with_person)
+    person_id = alias_map.get(with_person) or alias_map_norm.get(key)
     if not person_id:
         result["error"] = "alias_not_found"
-        # Suggest up to 5 known canonical names — help the AI ask the user
-        # to disambiguate, rather than silently returning empty.
         known = sorted(set(alias_map.values()))[:5]
         result["hint"] = (
             f"没识别到「{with_person}」这个名字。"
@@ -2012,8 +2021,28 @@ async def recent_interaction(
 
     result["resolved_to"] = person_id
 
-    # 计算时间窗下界（UTC ISO）
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # 把 visibility 条件下推到 SQL WHERE，避免过滤后 LIMIT 饥饿。
+    # 规则等价于 visibility.can_view()：
+    #   - layer != 'private'（含缺失，默认 shared）→ 可见
+    #   - layer == 'private' 且 owner_ai 在 viewer 别名组 → 可见
+    #   - layer == 'private' 且 owner_ai 为空、source_ai 在别名组 → 可见
+    #   - 其余不可见
+    viewer_set = sorted(viewer_ids(ai_id)) if ai_id else []
+    if viewer_set:
+        viz_ph = ",".join("?" * len(viewer_set))
+        viz_clause = (
+            f" AND (COALESCE(layer, 'shared') != 'private' OR ("
+            f"     (owner_ai != '' AND owner_ai IN ({viz_ph}))"
+            f"     OR (owner_ai = '' AND source_ai IN ({viz_ph}))"
+            f" ))"
+        )
+        viz_params: list = viewer_set + viewer_set
+    else:
+        # 未提供 ai_id：直接排除全部 private，避免匿名请求看到私有内容
+        viz_clause = " AND COALESCE(layer, 'shared') != 'private'"
+        viz_params = []
 
     try:
         conn = database._get_conn()
@@ -2025,9 +2054,10 @@ async def recent_interaction(
             "  AND created_at >= ? "
             "  AND (resolved IS NULL OR resolved != 1) "
             "  AND (superseded_by IS NULL OR superseded_by = '') "
-            "ORDER BY created_at DESC "
+            + viz_clause +
+            " ORDER BY created_at DESC "
             "LIMIT ?",
-            (person_id, person_id, cutoff, limit * 3),  # over-fetch for visibility
+            (person_id, person_id, cutoff, *viz_params, limit),
         ).fetchall()
     except Exception as e:
         logger.warning(f"recent_interaction SQL failed: {e}")
@@ -2039,6 +2069,7 @@ async def recent_interaction(
     for row in rows:
         mem = database._row_to_dict_no_embedding(row) if hasattr(database, "_row_to_dict_no_embedding") \
               else dict(row)
+        # 输出阶段再走一次 can_view 作为最后一道保险（防御 SQL 规则和函数漂移）
         if not can_view(mem, ai_id):
             continue
         items.append({
@@ -2050,8 +2081,6 @@ async def recent_interaction(
             "subject_id": mem.get("subject_id", ""),
             "source_actor_id": mem.get("source_actor_id", ""),
         })
-        if len(items) >= limit:
-            break
 
     result["count"] = len(items)
     result["items"] = items

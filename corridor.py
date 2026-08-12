@@ -86,6 +86,20 @@ def _pick_recency_weighted(
          moves to the old pool (no wasted slots).
       5. No duplicates across pools (a memory is either recent or old).
     """
+    # Clamp all numeric inputs so a bad caller can never return more than
+    # `quota` items or blow up on negative/oversized shares.
+    try:
+        quota = max(0, int(quota))
+    except (ValueError, TypeError):
+        quota = 0
+    try:
+        recent_days = max(0, int(recent_days))
+    except (ValueError, TypeError):
+        recent_days = _RECENT_DAYS
+    try:
+        recent_share = max(0.0, min(1.0, float(recent_share)))
+    except (ValueError, TypeError):
+        recent_share = _RECENT_SHARE
     if not candidates or quota <= 0:
         return []
     if now_utc is None:
@@ -122,7 +136,8 @@ def _pick_recency_weighted(
     picked_extra_recent = recent[recent_quota:recent_quota + still_needed] \
         if still_needed > 0 else []
 
-    return picked_recent + picked_old + picked_extra_recent
+    # Final cap belt: even if any branch above misbehaves, never exceed quota.
+    return (picked_recent + picked_old + picked_extra_recent)[:quota]
 
 
 def _dedup_texts(texts: list[str], max_items: int = 0) -> list[str]:
@@ -213,21 +228,40 @@ async def build_corridor(ai_id: str) -> str:
     infra = [m["content"] for m in infra_picked]
 
     # 6.5. 近期重要事件（14 天内 + importance≥0.6，跨房间兜底）
-    # 用于覆盖新写入的高价值记忆——它们如果不在 living_room/diary 就会漏进走廊。
+    # 覆盖新写入的高价值记忆——它们如果不在 living_room/diary 就会漏进走廊。
     # 走 visibility：private 记忆按 owner_ai 过滤；shared 全体可见。
+    #
+    # Fail-closed：visibility 模块导入失败时不展示任何内容，避免误泄露他人 private。
+    # Dedup-before-truncate：先过滤已展示内容再取 5 条，否则前 5 条全被别处展示会
+    # 让整个板块消失、第 6 条也进不来。
     try:
-        from visibility import can_view
+        from visibility import can_view as _can_view
     except Exception:
-        can_view = lambda mem, aid: True  # fallback: 展示全部
-    recent_important_mems = sorted(
-        [m for m in all_mems.values()
-         if m.get("status") == "active"
-         and _safe_float(m.get("importance"), 0.5) >= 0.6
-         and _days_ago(m.get("created_at", ""), now_utc) <= 14
-         and can_view(m, ai_id)],
-        key=lambda m: m.get("created_at", ""),
-        reverse=True,
-    )[:5]
+        log.error("visibility module import failed — skipping 近期重要事件 (fail-closed)")
+        _can_view = None
+
+    if _can_view is None:
+        recent_important_mems = []
+    else:
+        _norm = lambda s: "".join(str(s).split()).lower()
+        already_shown_norms: set[str] = set()
+        for txt in living + relationship + personality + infra:
+            already_shown_norms.add(_norm(txt))
+        for d in diary:
+            already_shown_norms.add(_norm(d.get("content", "")))
+        for m in shared_relationships:
+            already_shown_norms.add(_norm(m.get("content", "")))
+
+        candidates = [
+            m for m in all_mems.values()
+            if m.get("status") == "active"
+            and _safe_float(m.get("importance"), 0.5) >= 0.6
+            and _days_ago(m.get("created_at", ""), now_utc) <= 14
+            and _can_view(m, ai_id)
+            and _norm(m.get("content", "")) not in already_shown_norms
+        ]
+        candidates.sort(key=lambda m: m.get("created_at", ""), reverse=True)
+        recent_important_mems = candidates[:5]
 
     # 组装走廊
     ai_name = AI_ROLES.get(ai_id, {}).get("name", ai_id)
@@ -298,22 +332,11 @@ async def build_corridor(ai_id: str) -> str:
     if diary:
         sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
 
-    # 6.5 (render) 近期重要事件——放在日记之后，跨房间兜底
+    # 6.5 (render) 近期重要事件 — 放在日记之后，跨房间兜底
+    # dedup 已在候选筛选阶段完成，这里直接渲染。
     if recent_important_mems:
-        _norm = lambda s: "".join(str(s).split()).lower()
-        already_shown = set()
-        for txt in living + relationship + personality + infra + [d["content"] for d in diary]:
-            already_shown.add(_norm(txt))
-        for m in shared_relationships:
-            already_shown.add(_norm(m.get("content", "")))
-        recent_lines = []
-        for m in recent_important_mems:
-            content = m.get("content", "")
-            if _norm(content) in already_shown:
-                continue
-            recent_lines.append(f"· {content[:240]}")
-        if recent_lines:
-            sections.append("【近期重要事件】\n" + "\n".join(recent_lines))
+        recent_lines = [f"· {m.get('content', '')[:240]}" for m in recent_important_mems]
+        sections.append("【近期重要事件】\n" + "\n".join(recent_lines))
 
     if cross_window_digests:
         lines = [f"· {d['summary']}" for d in cross_window_digests]
