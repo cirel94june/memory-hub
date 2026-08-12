@@ -612,15 +612,12 @@ _CLAUSE_SPLIT_RE = re.compile(
     r"|\b(?:but|however)\b\s+"                   # English: word-bounded
     # Chinese transitionals — 但是/可是/然而 split unconditionally (no common
     # substring collisions with normal usage). 不过 is deliberately restrictive
-    # because it forms many legit compounds (不过滤, 不过期, 不过夜, 不过分,
-    # 不过是, 只不过, ...). We only treat 不过 as a transitional connective when:
-    #   (a) it appears immediately after punctuation (well-punctuated text), OR
-    #   (b) it is followed by an explicit continuation marker
-    #       (现在/如今/后来/最终/这次/目前/终于/真的/之前/以前).
-    # Preferring false negatives over false positives — a missed auto-resolve
-    # is cheap, but auto-resolving a task that isn't done is not.
+    # because it forms many legit compounds (不过滤/不过期/不过夜/不过分/
+    # 不过是/只不过, and "结果，不过是..." patterns where preceding punctuation
+    # does not disambiguate). 不过 only splits when followed by an explicit
+    # continuation marker — preferring false negatives over false positives,
+    # since a missed auto-resolve is cheap but a wrong auto-resolve is not.
     r"|(?:但是|可是|然而"
-    r"|(?<=[,，。.！!；;\s])不过"
     r"|不过(?=现在|如今|后来|最终|这次|目前|终于|真的|之前|以前))",
     re.IGNORECASE,
 )

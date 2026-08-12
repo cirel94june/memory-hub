@@ -366,6 +366,11 @@ class TestBlock6ResolvePatterns:
         assert not self._match("如果任务不过期就保留已完成记录")
         assert not self._match("如果数据不过夜就清理已完成缓存")
         assert not self._match("配置不过期的话再看已解决列表")
+        # Reviewer's H2 examples — punctuation-prefixed compounds:
+        # "不过是" (adverbial "just / merely") must not split even after ，
+        # "不过期" compound must not split even after ，
+        assert not self._match("这个结果，不过是已完成状态的展示")
+        assert not self._match("如果配置正常，不过期就保留已完成记录")
 
 
 # ════════════════════════════════════════════
