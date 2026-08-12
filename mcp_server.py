@@ -427,6 +427,47 @@ async def dream_recall(query: str, top_k: int = 3, source_ai: str = "claude") ->
 
 
 @mcp.tool()
+async def recent_interaction(
+    with_person: str,
+    days: int = 30,
+    limit: int = 10,
+    source_ai: str = "claude",
+) -> str:
+    """按人 + 时间窗查最近互动事件（快速直查，不走 LLM）。
+
+    适合"周三跟 X 聊了啥""最近和 Lucien 都发生了什么"这类时间敏感问题。
+    只返回 info_type=event 的记忆，跳过 identity/reflection/task 等；纯 SQL 查询
+    延迟 <200ms，不占用 embedding / analyzer 预算。
+
+    返回结构会明确区分"名字识别不出来"和"没有相关记忆"：
+    - alias_not_found + hint  → 名字错了，AI 应该问用户或用 list_persons
+    - count=0                  → 名字对了但那段时间没事发生
+
+    Args:
+        with_person: 名字或别名（Lucien/狗蛋/lucien 都行）
+        days: 时间窗（默认 30 天，clamp 到 1-365）
+        limit: 最多返回条数（默认 10，clamp 到 1-50）
+        source_ai: 谁在查（用于 visibility 权限过滤，默认 claude）
+    """
+    try:
+        result = await memory_ops.recent_interaction(
+            with_person=with_person, ai_id=source_ai, days=days, limit=limit,
+        )
+    except Exception as e:
+        # 任何未预期异常都返回稳定的结构化错误，不让 MCP 客户端见到 traceback
+        result = {
+            "with_person": with_person,
+            "resolved_to": None,
+            "error": "internal_error",
+            "hint": f"内部错误：{type(e).__name__}",
+            "days": days,
+            "count": 0,
+            "items": [],
+        }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def update_memory(
     memory_id: str,
     content: str = "",

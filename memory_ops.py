@@ -1939,6 +1939,157 @@ async def dream_recall(
     return results
 
 
+# ── 最近互动直查（按人+时间窗+event，跳过 LLM）──
+
+async def recent_interaction(
+    with_person: str,
+    ai_id: str = "",
+    days: int = 30,
+    limit: int = 10,
+) -> dict:
+    """按人 + 时间窗 + info_type=event 查最近互动记忆，时间倒序。
+
+    快速直查（不走向量/FTS/analyzer），适合"周三跟 Lucien 聊了啥"这类
+    时间敏感的小问题。
+
+    TODO(future): with_person 扩展为 str | list[str]，支持多人联合查询
+    （例：recent_interaction(["Lucien", "Jasper"]) 找"都在场"的事件）。
+
+    Returns:
+        {
+          "with_person": "Lucien",
+          "resolved_to": "person_lucien_xxx",  # 或 None
+          "error": "",                          # 或 "alias_not_found"
+          "hint": "",                           # 出错时给 AI 一句人话提示
+          "days": 30,
+          "count": 3,
+          "items": [{id, content, created_at, room, importance,
+                     subject_id, source_actor_id}, ...]
+        }
+    """
+    from visibility import can_view, viewer_ids
+
+    def _to_int(v, default):
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return default
+
+    def _norm_alias(s: str) -> str:
+        return s.strip().casefold() if isinstance(s, str) else ""
+
+    # 参数 clamp — 非数字输入回退到默认值，不抛异常
+    days = max(1, min(_to_int(days, 30), 365))
+    limit = max(1, min(_to_int(limit, 10), 50))
+
+    result = {
+        "with_person": with_person,
+        "resolved_to": None,
+        "error": "",
+        "hint": "",
+        "days": days,
+        "count": 0,
+        "items": [],
+    }
+
+    if not with_person or not isinstance(with_person, str) or not with_person.strip():
+        result["error"] = "empty_person"
+        result["hint"] = "with_person 参数为空，请传一个名字或别名"
+        return result
+
+    # Alias resolve — scope="any" 宽松匹配，用 strip().casefold() 统一规范化
+    try:
+        alias_map = database.get_all_aliases(scope="any")
+    except Exception as e:
+        logger.warning(f"recent_interaction: get_all_aliases failed: {e}")
+        alias_map = {}
+
+    # 建立规范化后的查找表，同时保留原表处理精确大小写敏感情况
+    alias_map_norm = {_norm_alias(k): v for k, v in alias_map.items() if k}
+    key = _norm_alias(with_person)
+    person_id = alias_map.get(with_person) or alias_map_norm.get(key)
+    if not person_id:
+        result["error"] = "alias_not_found"
+        known = sorted(set(alias_map.values()))[:5]
+        result["hint"] = (
+            f"没识别到「{with_person}」这个名字。"
+            + (f"已知的 person_id 前几个：{', '.join(known)}。" if known else "")
+            + "可以用 list_persons 查完整别名表，或直接问用户这个名字对应谁。"
+        )
+        logger.info(f"recent_interaction: unresolved alias {with_person!r}")
+        return result
+
+    result["resolved_to"] = person_id
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    # 把 visibility 条件下推到 SQL WHERE，避免过滤后 LIMIT 饥饿。
+    # 规则等价于 visibility.can_view()：
+    #   - layer != 'private'（含缺失，默认 shared）→ 可见
+    #   - layer == 'private' 且 owner_ai 在 viewer 别名组 → 可见
+    #   - layer == 'private' 且 owner_ai 为空、source_ai 在别名组 → 可见
+    #   - 其余不可见
+    # visibility.can_view() 会先 .strip() 所有字段，SQL 必须用 TRIM 保持等价，
+    # 否则 layer=' private ' 会被 SQL 视为非 private，最终 can_view 再排除，
+    # 就变成"SQL 看似过滤成功、Python 保险把 LIMIT 结果掏空"。
+    viewer_set = sorted(viewer_ids(ai_id)) if ai_id else []
+    if viewer_set:
+        viz_ph = ",".join("?" * len(viewer_set))
+        viz_clause = (
+            f" AND (TRIM(COALESCE(layer, 'shared')) != 'private' OR ("
+            f"     (TRIM(COALESCE(owner_ai, '')) != '' AND TRIM(COALESCE(owner_ai, '')) IN ({viz_ph}))"
+            f"     OR (TRIM(COALESCE(owner_ai, '')) = '' AND TRIM(COALESCE(source_ai, '')) IN ({viz_ph}))"
+            f" ))"
+        )
+        viz_params: list = viewer_set + viewer_set
+    else:
+        # 未提供 ai_id：直接排除全部 private，避免匿名请求看到私有内容
+        viz_clause = " AND TRIM(COALESCE(layer, 'shared')) != 'private'"
+        viz_params = []
+
+    try:
+        conn = database._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM memories "
+            "WHERE status = 'active' "
+            "  AND info_type = 'event' "
+            "  AND (subject_id = ? OR source_actor_id = ?) "
+            "  AND created_at >= ? "
+            "  AND (resolved IS NULL OR resolved != 1) "
+            "  AND (superseded_by IS NULL OR superseded_by = '') "
+            + viz_clause +
+            " ORDER BY created_at DESC "
+            "LIMIT ?",
+            (person_id, person_id, cutoff, *viz_params, limit),
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"recent_interaction SQL failed: {e}")
+        result["error"] = "query_failed"
+        result["hint"] = "查询数据库时出错，请重试或联系管理员"
+        return result
+
+    items = []
+    for row in rows:
+        mem = database._row_to_dict_no_embedding(row) if hasattr(database, "_row_to_dict_no_embedding") \
+              else dict(row)
+        # 输出阶段再走一次 can_view 作为最后一道保险（防御 SQL 规则和函数漂移）
+        if not can_view(mem, ai_id):
+            continue
+        items.append({
+            "id": mem["id"],
+            "content": mem.get("content", ""),
+            "created_at": mem.get("created_at", ""),
+            "room": mem.get("room", ""),
+            "importance": _safe_float(mem.get("importance"), 0.5),
+            "subject_id": mem.get("subject_id", ""),
+            "source_actor_id": mem.get("source_actor_id", ""),
+        })
+
+    result["count"] = len(items)
+    result["items"] = items
+    return result
+
+
 # ── 年轮评论（不改原文，追加感悟/反思/更新注记） ──
 
 async def add_comment(
