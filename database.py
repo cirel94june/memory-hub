@@ -12,6 +12,7 @@ import sqlite3
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterator, Callable, TypeVar
 
@@ -305,9 +306,22 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
         logger.info("Migrated: added 'info_type' column")
 
+    # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
+    if "client_request_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'client_request_id' column")
+    if "link_to_real_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'link_to_real_id' column")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
+    # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
+        "ON memories(client_request_id) WHERE client_request_id != ''"
+    )
 
     # ── Proposals table (MemoryProposal 候选区) ──
     conn.executescript("""
@@ -473,6 +487,102 @@ def get_memory(mem_id: str) -> dict | None:
     if row is None:
         return None
     return _row_to_dict(row)
+
+
+# ── PR C 块 8: async remember 支持 ──
+
+def get_memory_by_client_request_id(crq: str) -> dict | None:
+    """Idempotent lookup: find any memory with matching client_request_id
+    regardless of status (pending/active/replaced/failed)."""
+    if not crq:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM memories WHERE client_request_id = ? LIMIT 1", (crq,)
+    ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def insert_pending_memory(mem: dict) -> None:
+    """Insert a pending-status skeleton (no embedding, no analyzer fields).
+
+    Raises sqlite3.IntegrityError if the client_request_id collides with an
+    existing row — MCP layer catches this to return an idempotent response.
+    """
+    conn = _get_conn()
+    now = mem.get("created_at") or _now_iso()
+    conn.execute(
+        "INSERT INTO memories ("
+        "  id, content, layer, room, category, owner_ai, importance,"
+        "  source_ai, source_platform, event_date, source_context,"
+        "  status, client_request_id, created_at, updated_at, tags, domain"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
+            mem.get("room", "living_room"), mem.get("category", ""),
+            mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
+            mem.get("source_ai", ""), mem.get("source_platform", ""),
+            mem.get("event_date", ""), mem.get("source_context", ""),
+            mem.get("status", "pending"), mem.get("client_request_id", ""),
+            now, now, "[]", "[]",
+        ),
+    )
+    conn.commit()
+
+
+def update_memory_status(mem_id: str, status: str) -> None:
+    """Update status column only. For pipeline transitions
+    (pending → active | pending → failed)."""
+    conn = _get_conn()
+    now = _now_iso()
+    conn.execute(
+        "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
+        (status, now, mem_id),
+    )
+    conn.commit()
+
+
+def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
+    """Mark a pending skeleton as replaced when memory_ops.remember() returned
+    a different real_id (merge/supersede path). Skeleton is NOT deleted so
+    idempotency lookups by client_request_id still find it and can redirect
+    to the real memory via link_to_real_id.
+    """
+    if not skeleton_id or not link_to_real_id:
+        raise ValueError("mark_replaced requires both skeleton_id and link_to_real_id")
+    conn = _get_conn()
+    now = _now_iso()
+    conn.execute(
+        "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
+        "updated_at = ? WHERE id = ?",
+        (link_to_real_id, now, skeleton_id),
+    )
+    conn.commit()
+
+
+def list_memories_by_status(status: str, older_than_minutes: int = 0,
+                             limit: int = 500) -> list[dict]:
+    """Return memories in a specific status, optionally older than N minutes.
+    Used by the pending sweep to find stuck skeletons."""
+    conn = _get_conn()
+    if older_than_minutes > 0:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(minutes=older_than_minutes)).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE status = ? AND created_at <= ? "
+            "ORDER BY created_at LIMIT ?",
+            (status, cutoff, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE status = ? ORDER BY created_at LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def set_memory(mem: dict) -> None:

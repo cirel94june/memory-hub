@@ -678,8 +678,17 @@ def _matches_resolve_pattern(text: str) -> bool:
     return False
 
 
+# Recency boost coefficient (Phase 1.7 块 12).
+# 0.3 pushed irrelevant new memories to the front of recall; 0.15 preserves
+# a small recency signal without overwhelming semantic relevance.
+# New curve: 1 day → 1.145×, 30 days → 1.055×, 90 days → 1.007×.
+# Adjust here and update test_recency_* thresholds if tuning further.
+_RECENCY_BOOST_COEF = 0.15
+
+
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
-    """In-place: multiply score by (1 + 0.3 * exp(-days/30)) using created_at.
+    """In-place: multiply score by (1 + _RECENCY_BOOST_COEF * exp(-days/30))
+    using created_at.
 
     Future timestamps are clamped to days=0 to avoid runaway boosts.
     """
@@ -691,7 +700,7 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
             days = max(0.0, (now_utc - created).total_seconds() / 86400)
-            boost = 1 + 0.3 * math.exp(-days / 30)
+            boost = 1 + _RECENCY_BOOST_COEF * math.exp(-days / 30)
         except Exception:
             boost = 1.0
         item["score"] = round(item.get("score", 0) * boost, 6)

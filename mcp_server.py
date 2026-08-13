@@ -6,6 +6,9 @@ Memory Hub MCP Server
 import json
 import hashlib
 import inspect
+import asyncio
+import logging
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -253,6 +256,31 @@ def _read_recent_audit(limit: int = 20) -> list[dict]:
     return out
 
 
+_LOG = logging.getLogger("mcp_server")
+
+# Async remember helpers live in a mcp-free module so unit tests can exercise
+# them without the FastMCP dependency. We re-export _finalize_pending_memory
+# under this module's name so pending_sweep and tests can `from mcp_server
+# import _finalize_pending_memory` without needing to know it's a wrapper.
+from async_remember import _idempotent_response  # noqa: E402,F401
+
+
+async def _finalize_pending_memory(
+    skeleton_id: str, *, content: str, room: str, category: str,
+    importance: float, source_ai: str, event_date: str, force_create: bool,
+) -> None:
+    """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
+    All reconciliation logic (real_id match / mark_replaced / mark failed)
+    lives in async_remember._finalize_pending_memory for testability."""
+    from async_remember import _finalize_pending_memory as _core
+    await _core(
+        skeleton_id,
+        impl_fn=_safe_remember_impl,
+        content=content, room=room, category=category, importance=importance,
+        source_ai=source_ai, event_date=event_date, force_create=force_create,
+    )
+
+
 @mcp.tool()
 async def remember(
     content: str,
@@ -262,15 +290,27 @@ async def remember(
     source_ai: str = "claude",
     event_date: str = "",
     force_create: bool = False,
+    client_request_id: str = "",
 ) -> str:
-    """存储一条新记忆。系统会自动打标签，并智能检测是否需要更新/取代旧记忆。
+    """存储一条新记忆——**异步管线**，立即返回，后台跑 embedding + 分类 + 合并检测。
 
-    如果新记忆是对旧事实的更新（如"换了工作"），系统会自动：
-    - 标记旧记忆为 superseded（已过时）
-    - 在旧记忆上追加年轮注记说明被取代的原因
-    - 新记忆与旧记忆建立关联
+    ## 返回时间
+    - 传统同步管线要 30-70 秒，MCP 客户端会超时；这里在 <2 秒内返回 queued
+    - 完整 pipeline 完成后记忆变 active；期间该记忆不进 recall / corridor
 
-    房间选择：
+    ## 幂等（避免重试重复写入）
+    - 传 client_request_id（任意唯一字符串），系统按 crq 去重
+    - 同一 crq 的第二次调用返回 idempotent=True，不新建记忆
+    - 建议：AI 每次调用生成 UUID 或用可复现的哈希（如 hash(content + room)）
+
+    ## 后台管线
+    - remember() 走完全 pipeline，可能：
+      - 直接落成 status=active
+      - 触发 merge/supersede → 骨架标 status=replaced + link_to_real_id 指向真身
+      - 崩溃/被拦截 → status=failed
+    - daemon 每小时扫超过 10 分钟的 pending，重跑 pipeline；超过 60 分钟标 failed
+
+    ## 房间选择
     - living_room: 核心身份（永远注入）
     - career/psychology/health/learning/relationships/preferences: 各主题共享房间
     - work_tasks: 工作事务（快速衰减）
@@ -280,17 +320,56 @@ async def remember(
     Args:
         content: 记忆内容
         room: 房间ID
-        category: 分类标签（留空则由系统自动分类。如果你传了，系统不会覆盖）
+        category: 分类标签
         importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
-        event_date: 事件发生日期（可选，如 2026-06-01，区别于记忆创建时间）
-        force_create: 强制新建，跳过自动合并检测。当你确定这条记忆必须独立存在时使用
+        event_date: 事件发生日期（可选）
+        force_create: 强制新建，跳过自动合并
+        client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
     """
-    result = await _safe_remember_impl(
+    # 1. Idempotency lookup — a pre-existing crq short-circuits everything
+    if client_request_id:
+        existing = database.get_memory_by_client_request_id(client_request_id)
+        if existing:
+            return _idempotent_response(existing)
+
+    # 2. Insert pending skeleton
+    now = datetime.now(timezone.utc).isoformat()
+    skeleton_id = f"mem_{int(datetime.now(timezone.utc).timestamp() * 1000)}_" \
+                  f"{hashlib.md5((content + str(now)).encode()).hexdigest()[:6]}"
+    try:
+        database.insert_pending_memory({
+            "id": skeleton_id, "content": content, "room": room,
+            "category": category, "importance": importance,
+            "source_ai": source_ai, "event_date": event_date,
+            "source_platform": "mcp", "status": "pending",
+            "client_request_id": client_request_id,
+            "created_at": now,
+        })
+    except sqlite3.IntegrityError:
+        # Race: another request with the same crq committed while we were
+        # between our lookup and this INSERT. Re-query and return idempotent
+        # response — never let IntegrityError bubble to the MCP client.
+        if client_request_id:
+            existing = database.get_memory_by_client_request_id(client_request_id)
+            if existing:
+                return _idempotent_response(existing)
+        # If we can't find it or crq was empty, re-raise (unexpected UNIQUE hit)
+        raise
+
+    # 3. Kick off background pipeline (fire-and-forget)
+    asyncio.create_task(_finalize_pending_memory(
+        skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
-    )
-    return json.dumps(result, ensure_ascii=False)
+    ))
+
+    # 4. Return immediately (<2s target)
+    return json.dumps({
+        "status": "queued",
+        "memory_id": skeleton_id,
+        "client_request_id": client_request_id,
+    }, ensure_ascii=False)
 
 
 @mcp.tool()
