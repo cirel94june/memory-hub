@@ -118,15 +118,26 @@ def _scan_room(
     return pairs
 
 
-async def _classify_and_execute(pairs: list[dict], max_pairs: int) -> dict:
+# Only actions that actually REDUCE the number of active memories count as
+# dedup. annotate/supplement just append comments — they don't dedup, and
+# running them here would mis-attribute "dedup" work while leaving duplicates
+# in place. Ceci should decide manually whether to merge those.
+_DEDUP_ACTIONS = {"supersede", "update"}
+_REPORT_ONLY_ACTIONS = {"supplement", "annotate", "correct", "no_change"}
+
+
+async def _classify_and_execute(pairs: list[dict], max_pairs: int,
+                                 report_only_out: list[dict]) -> dict:
     """For each pair, call analyzer.classify_relation and route through
-    MemoryMaintenanceDecision. Writes maintenance_audit for every action.
-    Returns per-action counts."""
+    MemoryMaintenanceDecision. Only supersede/update actually run in DB;
+    annotate/supplement/correct are collected into report_only_out for Ceci
+    to review manually. Writes maintenance_audit for every executed action.
+    """
     import analyzer
     import memory_ops
 
-    counts = {"supersede": 0, "supplement": 0, "annotate": 0,
-              "no_change": 0, "skip": 0, "error": 0}
+    counts = {"supersede": 0, "update": 0,
+              "report_only": 0, "no_change": 0, "skip": 0, "error": 0}
     for idx, pair in enumerate(pairs[:max_pairs]):
         b = database.get_memory(pair["b_id"])
         a = database.get_memory(pair["a_id"])
@@ -147,12 +158,8 @@ async def _classify_and_execute(pairs: list[dict], max_pairs: int) -> dict:
                   f"{pair['a_id']} × {pair['b_id']} → {action} "
                   f"(sim={pair['similarity']})")
 
-            if action == "no_change":
-                counts["no_change"] += 1
-            elif action in ("supersede", "update", "supplement", "annotate",
-                            "correct"):
-                # Route through the same maintenance executor the write
-                # pipeline uses so audit/history is consistent.
+            if action in _DEDUP_ACTIONS:
+                # These actually dedup — safe to execute automatically.
                 result = await memory_ops._execute_maintenance_action(
                     action, a, b["content"],
                     reason=f"legacy_dedup_script sim={pair['similarity']}",
@@ -160,10 +167,18 @@ async def _classify_and_execute(pairs: list[dict], max_pairs: int) -> dict:
                     provenance_type=b.get("provenance_type", ""),
                 )
                 if result:
-                    counts[action if action in counts else "skip"] = \
-                        counts.get(action if action in counts else "skip", 0) + 1
+                    counts[action] += 1
                 else:
                     counts["skip"] += 1
+            elif action in _REPORT_ONLY_ACTIONS:
+                # Not real dedup — accumulate for the report, don't touch DB.
+                report_only_out.append({
+                    **pair, "proposed_action": action,
+                    "reason": r0.get("reason", ""),
+                })
+                counts["report_only"] += 1
+            elif action == "no_change":
+                counts["no_change"] += 1
             else:
                 counts["skip"] += 1
         except Exception as e:
@@ -255,8 +270,30 @@ async def main() -> int:
 
     print(f"\n[dedup_legacy] executing on {min(len(flat_pairs), args.max_pairs)} "
           f"pairs (of {len(flat_pairs)} total)...")
-    action_counts = await _classify_and_execute(flat_pairs, args.max_pairs)
+    report_only: list[dict] = []
+    action_counts = await _classify_and_execute(
+        flat_pairs, args.max_pairs, report_only)
     print(f"\n[dedup_legacy] execute complete: {action_counts}")
+
+    # P0-4: pairs the classifier called annotate/supplement/correct are NOT
+    # dedup — surface them to the operator so a human can decide what to do.
+    if report_only:
+        report_path = args.output or (
+            f"data/dedup_report_only_"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "note": ("These pairs matched semantically but the classifier "
+                         "suggested annotate/supplement/correct — actions that "
+                         "do NOT reduce duplicate count. Review manually and "
+                         "decide whether to merge, supersede, or leave alone."),
+                "count": len(report_only),
+                "pairs": report_only,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"[dedup_legacy] {len(report_only)} pairs need manual review → "
+              f"{report_path}")
     return 0
 
 

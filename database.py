@@ -477,6 +477,7 @@ _ALL_COLUMNS = [
     "comments", "embedding", "status", "created_at", "updated_at",
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
     "subject_id", "source_actor_id", "info_type",
+    "client_request_id", "link_to_real_id",
 ]
 
 
@@ -530,15 +531,34 @@ def insert_pending_memory(mem: dict) -> None:
     conn.commit()
 
 
-def update_memory_status(mem_id: str, status: str) -> None:
-    """Update status column only. For pipeline transitions
-    (pending → active | pending → failed)."""
+def update_memory_status(mem_id: str, status: str,
+                         source_platform_suffix: str = "") -> None:
+    """Update status column only, optionally appending a suffix to
+    source_platform so downstream can tell WHY the row is in this state
+    (e.g. ':gated' vs ':pipeline_error' vs ':sweep_timeout').
+
+    The suffix is idempotent: if source_platform already ends with the same
+    suffix we don't double-append.
+    """
     conn = _get_conn()
     now = _now_iso()
-    conn.execute(
-        "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
-        (status, now, mem_id),
-    )
+    if source_platform_suffix:
+        # Only touch source_platform if it doesn't already have this suffix
+        suffix = source_platform_suffix if source_platform_suffix.startswith(":") \
+                 else ":" + source_platform_suffix
+        conn.execute(
+            "UPDATE memories SET status = ?, updated_at = ?, "
+            "source_platform = CASE "
+            "  WHEN source_platform LIKE '%' || ? THEN source_platform "
+            "  ELSE source_platform || ? END "
+            "WHERE id = ?",
+            (status, now, suffix, suffix, mem_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, mem_id),
+        )
     conn.commit()
 
 
@@ -617,12 +637,26 @@ def set_memory(mem: dict) -> None:
     cols = ", ".join(_ALL_COLUMNS)
     # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
     # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
-    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）
-    update_set = ", ".join(
-        f"{c} = COALESCE(excluded.{c}, memories.{c})" if c == "embedding"
-        else f"{c} = excluded.{c}"
-        for c in _ALL_COLUMNS if c != "id"
-    )
+    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
+    # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
+    # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
+    # 已存在的 crq/link，否则骨架幂等追踪失效。
+    _preserve_on_empty = {"client_request_id", "link_to_real_id"}
+    update_set_parts = []
+    for c in _ALL_COLUMNS:
+        if c == "id":
+            continue
+        if c == "embedding":
+            update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
+        elif c in _preserve_on_empty:
+            # 只在 excluded 值非空时覆盖，为空则保留已有值
+            update_set_parts.append(
+                f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
+                f"ELSE memories.{c} END"
+            )
+        else:
+            update_set_parts.append(f"{c} = excluded.{c}")
+    update_set = ", ".join(update_set_parts)
 
     sql = (
         f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "

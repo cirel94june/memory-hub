@@ -66,6 +66,11 @@ async def lifespan(app: FastAPI):
         lag_task = asyncio.create_task(_event_loop_lag_monitor())
         bg_worker_task = asyncio.create_task(_bg_worker())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
+
+        # PR C 块 8: async remember 卡死 pending 骨架清扫（每 10 min，独立高频）
+        from pending_sweep import start_sweep_loop
+        sweep_task = start_sweep_loop()
+        print("[Memory Hub] Pending sweep loop started (every 10min)")
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -80,6 +85,7 @@ async def lifespan(app: FastAPI):
             daemon_task.cancel()
             lag_task.cancel()
             bg_worker_task.cancel()
+            sweep_task.cancel()
 
 
 def _seconds_until_next_run() -> int:

@@ -232,6 +232,8 @@ async def remember(
     subject_id: str = "",
     source_actor_id: str = "",
     info_type: str = "",
+    existing_id: str = "",
+    client_request_id: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
 
@@ -380,8 +382,8 @@ async def remember(
                     elif rel["relation"] in ("supplements", "same_topic"):
                         linked_ids.append(target_id)
 
-                # 新建记忆并关联
-                mem_id = _gen_id()
+                # 新建记忆并关联（PR C 块 8: 复用 existing_id 消除双行）
+                mem_id = existing_id or _gen_id()
                 now = _now()
 
                 mem = {
@@ -413,6 +415,7 @@ async def remember(
                     "comments": [],
                     "embedding": pack_embedding(query_vec) if query_vec else None,
                     "status": "active",
+                    "client_request_id": client_request_id,
                     "created_at": now,
                     "updated_at": now,
                     "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
@@ -439,8 +442,8 @@ async def remember(
                     result["original_category"] = original_category
                 return result
 
-    # Step 3: 新建记忆（无关联）
-    mem_id = _gen_id()
+    # Step 3: 新建记忆（无关联）（PR C 块 8: 复用 existing_id 消除双行）
+    mem_id = existing_id or _gen_id()
     now = _now()
     vec = await get_embedding(content)
 
@@ -456,8 +459,8 @@ async def remember(
         "valence": valence,
         "domain": json.dumps(domain),
         "decay_score": 1.0,
-                    "provenance_type": provenance_type,
-                    "fact_confidence": fact_confidence,
+        "provenance_type": provenance_type,
+        "fact_confidence": fact_confidence,
         "activation_count": 0,
         "last_activated": "",
         "source_ai": source_ai,
@@ -473,6 +476,7 @@ async def remember(
         "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
         "status": "active",
+        "client_request_id": client_request_id,
         "created_at": now,
         "updated_at": now,
         "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],

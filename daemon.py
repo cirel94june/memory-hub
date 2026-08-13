@@ -1116,13 +1116,10 @@ async def _run_full_maintenance_inner() -> dict:
     # 7.5 限时任务过期清理（event_date 过了 2 天的轻记忆自动归档）
     await run_step("expire_dated", "Expire dated tasks", expire_dated_tasks)
 
-    # 7.6 Async remember 卡死 pending 骨架清扫（Phase 1.7 块 8）
-    try:
-        from pending_sweep import sweep_stuck_pending
-        await run_step("pending_sweep", "Sweep stuck pending memories",
-                       sweep_stuck_pending)
-    except Exception as e:
-        log.warning(f"  Pending sweep failed: {e}")
+    # NOTE: Async pending memory sweep runs on its own 10-minute schedule via
+    # pending_sweep.start_sweep_loop() (kicked off in main.py lifespan).
+    # It is NOT part of the nightly full maintenance — 10-min retry SLA needs
+    # high frequency, not once a day.
 
     # 8. 刷新对话捕获缓冲区（确保残留对话不丢）
     try:

@@ -3,6 +3,7 @@ Memory Hub MCP Server
 远程 MCP 端点，直接调用内存中的函数（不走 HTTP 自调自己）
 通过 mount 到 FastAPI 应用提供 streamable HTTP transport
 """
+import os
 import json
 import hashlib
 import inspect
@@ -204,6 +205,8 @@ async def _safe_remember_impl(
     owner_ai: str = "",
     source_platform: str = "mcp",
     retry_on_fail: bool = True,
+    existing_id: str = "",
+    client_request_id: str = "",
 ) -> dict:
     original = str(content or "")
     neutral = _compact_content(original)
@@ -213,6 +216,7 @@ async def _safe_remember_impl(
             content=neutral, room=room, category=category, importance=importance,
             source_ai=source_ai, source_platform=source_platform, event_date=event_date,
             force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai,
+            existing_id=existing_id, client_request_id=client_request_id,
         )
         _audit("remember_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(neutral))
         return {"safe_write": "original_or_compact", **result}
@@ -230,6 +234,7 @@ async def _safe_remember_impl(
                 content=safe_content, room=room, category=category, importance=min(float(importance or 0.5), 0.7),
                 source_ai=source_ai, source_platform=f"{source_platform}:safe_retry", event_date=event_date,
                 force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai, auto_merge=False,
+                existing_id=existing_id, client_request_id=client_request_id,
             )
             _audit("remember_safe_retry_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(safe_content))
             return {"safe_write": "neutral_summary_retry", "original_error": str(exc), **result}
@@ -258,6 +263,27 @@ def _read_recent_audit(limit: int = 20) -> list[dict]:
 
 _LOG = logging.getLogger("mcp_server")
 
+# GC-safe registry for fire-and-forget background tasks.
+# asyncio holds only weakrefs to tasks; if we drop the returned Task the
+# coroutine may be garbage-collected mid-flight and vanish silently.
+# See https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+# ("Save a reference to the result of this function, to avoid a task
+#  disappearing mid-execution") and CPython issue 91887.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background_task(coro):
+    """asyncio.create_task with GC protection.
+
+    Adds the task to a module-level set so it isn't garbage-collected while
+    running; removes it on completion via done_callback. Never raises.
+    """
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
 # Async remember helpers live in a mcp-free module so unit tests can exercise
 # them without the FastMCP dependency. We re-export _finalize_pending_memory
 # under this module's name so pending_sweep and tests can `from mcp_server
@@ -268,6 +294,7 @@ from async_remember import _idempotent_response  # noqa: E402,F401
 async def _finalize_pending_memory(
     skeleton_id: str, *, content: str, room: str, category: str,
     importance: float, source_ai: str, event_date: str, force_create: bool,
+    client_request_id: str = "",
 ) -> None:
     """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
     All reconciliation logic (real_id match / mark_replaced / mark failed)
@@ -278,6 +305,7 @@ async def _finalize_pending_memory(
         impl_fn=_safe_remember_impl,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
+        client_request_id=client_request_id,
     )
 
 
@@ -333,35 +361,58 @@ async def remember(
         if existing:
             return _idempotent_response(existing)
 
-    # 2. Insert pending skeleton
+    # 2. Insert pending skeleton — try up to N times, regenerating the
+    #    skeleton_id if it collides (very rare hash birthday) while still
+    #    treating a crq collision as an idempotent hit.
     now = datetime.now(timezone.utc).isoformat()
-    skeleton_id = f"mem_{int(datetime.now(timezone.utc).timestamp() * 1000)}_" \
-                  f"{hashlib.md5((content + str(now)).encode()).hexdigest()[:6]}"
-    try:
-        database.insert_pending_memory({
-            "id": skeleton_id, "content": content, "room": room,
-            "category": category, "importance": importance,
-            "source_ai": source_ai, "event_date": event_date,
-            "source_platform": "mcp", "status": "pending",
-            "client_request_id": client_request_id,
-            "created_at": now,
-        })
-    except sqlite3.IntegrityError:
-        # Race: another request with the same crq committed while we were
-        # between our lookup and this INSERT. Re-query and return idempotent
-        # response — never let IntegrityError bubble to the MCP client.
-        if client_request_id:
-            existing = database.get_memory_by_client_request_id(client_request_id)
-            if existing:
-                return _idempotent_response(existing)
-        # If we can't find it or crq was empty, re-raise (unexpected UNIQUE hit)
-        raise
 
-    # 3. Kick off background pipeline (fire-and-forget)
-    asyncio.create_task(_finalize_pending_memory(
+    def _new_skeleton_id() -> str:
+        ts = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+        h = hashlib.md5(
+            (content + str(ts) + os.urandom(8).hex()).encode()
+        ).hexdigest()[:8]
+        return f"mem_{ts}_{h}"
+
+    skeleton_id = _new_skeleton_id()
+    _MAX_ID_RETRIES = 3
+    for attempt in range(_MAX_ID_RETRIES + 1):
+        try:
+            database.insert_pending_memory({
+                "id": skeleton_id, "content": content, "room": room,
+                "category": category, "importance": importance,
+                "source_ai": source_ai, "event_date": event_date,
+                "source_platform": "mcp", "status": "pending",
+                "client_request_id": client_request_id,
+                "created_at": now,
+            })
+            break
+        except sqlite3.IntegrityError:
+            # Two possible causes:
+            #   (a) crq UNIQUE index collision — another request with the
+            #       same crq committed between our lookup and this INSERT.
+            #       Re-query and return the idempotent response.
+            #   (b) skeleton_id PK collision — extremely rare id-birthday.
+            #       Regenerate id and retry.
+            # Never let IntegrityError bubble to the MCP client — it would
+            # look like a failed write and trigger further retries.
+            if client_request_id:
+                existing = database.get_memory_by_client_request_id(client_request_id)
+                if existing:
+                    return _idempotent_response(existing)
+            # crq wasn't the cause → id collision. Regenerate and retry.
+            if attempt < _MAX_ID_RETRIES:
+                skeleton_id = _new_skeleton_id()
+                continue
+            _LOG.error("skeleton_id collision after %d retries; giving up",
+                       _MAX_ID_RETRIES)
+            raise
+
+    # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference
+    _spawn_background_task(_finalize_pending_memory(
         skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
+        client_request_id=client_request_id,
     ))
 
     # 4. Return immediately (<2s target)

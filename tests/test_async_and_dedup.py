@@ -260,21 +260,132 @@ class TestAsyncRememberHelpers:
 
     def test_mcp_wrapper_has_idempotency_and_integrity_guards(self):
         """Source-inspection guard: the MCP wrapper must contain the
-        idempotency query, the sqlite3.IntegrityError catch, and the
-        asyncio.create_task background dispatch. Works offline (no mcp)."""
+        idempotency query, the sqlite3.IntegrityError catch, and a
+        GC-safe background dispatch. Works offline (no mcp)."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
         idx = src.find("async def remember(")
         assert idx != -1, "remember MCP tool not found"
-        body = src[idx:idx + 3500]
+        body = src[idx:idx + 4500]
         assert "get_memory_by_client_request_id" in body, \
             "MCP wrapper missing idempotency lookup"
         assert "sqlite3.IntegrityError" in body, \
             "MCP wrapper missing IntegrityError catch — race would leak error"
-        assert "asyncio.create_task" in body, \
-            "MCP wrapper missing background dispatch — request would block"
+        # P0-1: must use the GC-safe helper, not raw asyncio.create_task
+        assert "_spawn_background_task" in body, \
+            "MCP wrapper missing GC-safe background dispatch — task may be " \
+            "garbage-collected mid-flight"
+        assert "asyncio.create_task" not in body, \
+            "MCP wrapper uses raw asyncio.create_task — Task ref may be " \
+            "GC'd; use _spawn_background_task"
         assert "_finalize_pending_memory" in body, \
             "MCP wrapper missing finalize dispatch"
+
+    def test_no_double_row_after_normal_create(self, db_env):
+        """P0-2 regression: skeleton_id must be REUSED by the pipeline when
+        remember() takes the plain 'create new memory' path. Before the fix,
+        every MCP remember left two rows (skeleton replaced + real active)."""
+        database.insert_pending_memory({
+            "id": "skel_reuse", "content": "brand new", "room": "living_room",
+            "client_request_id": "crq_reuse", "status": "pending",
+        })
+
+        async def fake_impl(**kw):
+            # Simulate memory_ops.remember creating a new row using existing_id
+            assert kw.get("existing_id") == "skel_reuse", \
+                "pipeline was not told to reuse skeleton id"
+            assert kw.get("client_request_id") == "crq_reuse", \
+                "pipeline was not told the crq"
+            # In real remember() this is the "Step 3 新建记忆" path — it uses
+            # existing_id and set_memory() UPSERTs the skeleton row in place.
+            # No new row is created.
+            return {"id": "skel_reuse", "status": "created"}
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_reuse", impl_fn=fake_impl,
+            content="brand new", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_reuse",
+        ))
+
+        # Count all rows carrying this crq — must be exactly 1
+        conn = database._get_conn()
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE client_request_id = ?",
+            ("crq_reuse",),
+        ).fetchone()[0]
+        assert cnt == 1, f"P0-2 regressed: {cnt} rows for one crq"
+        row = database.get_memory("skel_reuse")
+        assert row["status"] == "active"
+        assert row["link_to_real_id"] == ""
+
+    def test_failed_gated_response_marks_retry_safe(self, db_env):
+        """应改 3: failed skeleton with :gated suffix → retry_safe=true."""
+        database.insert_pending_memory({
+            "id": "skel_g", "content": "spam", "room": "living_room",
+            "client_request_id": "crq_g", "status": "pending",
+        })
+
+        async def gated_impl(**kw):
+            return {"id": "", "status": "gated", "reason": "write_gate blocked"}
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_g", impl_fn=gated_impl,
+            content="spam", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_g",
+        ))
+
+        got = database.get_memory("skel_g")
+        assert got["status"] == "failed"
+        assert got["source_platform"].endswith(":gated")
+
+        # Round-trip through _idempotent_response
+        from async_remember import _idempotent_response
+        resp = json.loads(_idempotent_response(got))
+        assert resp["status"] == "failed"
+        assert resp["retry_safe"] is True
+
+    def test_failed_pipeline_error_marks_retry_unsafe(self, db_env):
+        """应改 3: failed skeleton from pipeline crash → retry_safe=false."""
+        database.insert_pending_memory({
+            "id": "skel_e", "content": "crash", "room": "living_room",
+            "client_request_id": "crq_e", "status": "pending",
+        })
+
+        async def raising_impl(**kw):
+            raise RuntimeError("mid-pipeline crash")
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_e", impl_fn=raising_impl,
+            content="crash", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_e",
+        ))
+
+        got = database.get_memory("skel_e")
+        assert got["status"] == "failed"
+        assert got["source_platform"].endswith(":pipeline_error")
+
+        from async_remember import _idempotent_response
+        resp = json.loads(_idempotent_response(got))
+        assert resp["status"] == "failed"
+        assert resp["retry_safe"] is False
+        assert "hint" in resp
+
+    def test_gc_safe_background_task_helper_exists(self):
+        """P0-1: mcp_server and pending_sweep must define a set-backed
+        create_task wrapper so background coroutines can't be GC'd."""
+        for path in ("mcp_server.py", "pending_sweep.py"):
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            assert "_BACKGROUND_TASKS" in src or "set()" in src, \
+                f"{path} missing GC-protection set for background tasks"
+            assert "add_done_callback" in src, \
+                f"{path} missing done_callback to drain the task set"
 
     def test_pending_memory_not_returned_by_default_status_queries(self, db_env):
         """Pending skeletons must not appear in status='active' queries used
@@ -343,6 +454,41 @@ class TestPendingSweep:
         result = asyncio.run(pending_sweep.sweep_stuck_pending())
         assert result["failed"] >= 1
         assert database.get_memory("sweep_dead")["status"] == "failed"
+
+    def test_p0_3_primary_defense_crq_unique_index(self, db_env):
+        """P0-3 primary defense: the UNIQUE(client_request_id) index makes it
+        physically impossible for two rows to share a crq. With P0-2 fix
+        propagating crq through the pipeline into merge/supersede-created
+        rows, this alone prevents \"second real memory\" duplication.
+
+        Verifies the index actually rejects a second row with the same crq.
+        """
+        database.insert_pending_memory({
+            "id": "first", "content": "a", "room": "living_room",
+            "client_request_id": "crq_shared", "status": "pending",
+        })
+        # Try to make a second row (real memory) with the same crq — must fail.
+        with pytest.raises(sqlite3.IntegrityError):
+            database.insert_pending_memory({
+                "id": "second", "content": "b", "room": "living_room",
+                "client_request_id": "crq_shared", "status": "active",
+            })
+        # get_memory_by_client_request_id returns exactly one row
+        assert database.get_memory_by_client_request_id("crq_shared")["id"] == "first"
+
+    def test_sweep_link_helper_returns_none_when_crq_unique(self, db_env):
+        """The _find_completed_by_crq helper is defense-in-depth for the
+        (structurally impossible in this codebase, but possible from
+        pre-fix data) case where a real memory somehow shares the
+        skeleton's crq. Since the UNIQUE index forbids that, this helper
+        returns None in the healthy path — verify it does so cleanly."""
+        database.insert_pending_memory({
+            "id": "skel_only", "content": "solo", "room": "living_room",
+            "client_request_id": "crq_solo", "status": "pending",
+        })
+        import pending_sweep
+        assert pending_sweep._find_completed_by_crq(
+            "crq_solo", exclude_id="skel_only") is None
 
     def test_sweep_ignores_fresh_pending(self, db_env):
         """< 10 min old: don't touch."""
