@@ -33,28 +33,32 @@ logger = logging.getLogger("memory_hub.async_remember")
 # variable if the API tier changes.
 _FINALIZE_MAX_CONCURRENCY = int(
     os.environ.get("MEMORY_HUB_FINALIZE_CONCURRENCY", "4"))
-_FINALIZE_SEMAPHORE: asyncio.Semaphore | None = None
+# M1 round-4: semaphore is loop-local. asyncio.Semaphore binds to the event
+# loop that first calls acquire(); reusing across loops throws
+# "Semaphore ... is bound to a different event loop". Keyed by id(loop)
+# so per-test-loop fixtures each get their own semaphore automatically.
+_FINALIZE_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
 
 
 def get_finalize_semaphore() -> asyncio.Semaphore:
-    """Lazy-init the semaphore inside the running event loop.
+    """Return the finalize semaphore bound to the current event loop.
 
-    asyncio.Semaphore() constructed at module import time binds to
-    whatever loop happens to be running (or None), which in tests causes
-    'attached to a different loop' errors. Constructing on first access
-    binds it to the current loop.
+    Multiple loops (test fixtures, embedded interpreters) each get their
+    own instance to avoid cross-loop binding errors.
     """
-    global _FINALIZE_SEMAPHORE
-    if _FINALIZE_SEMAPHORE is None:
-        _FINALIZE_SEMAPHORE = asyncio.Semaphore(_FINALIZE_MAX_CONCURRENCY)
-    return _FINALIZE_SEMAPHORE
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _FINALIZE_SEMAPHORES.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(_FINALIZE_MAX_CONCURRENCY)
+        _FINALIZE_SEMAPHORES[key] = sem
+    return sem
 
 
 def _reset_finalize_semaphore_for_tests() -> None:
-    """Test-only: drop the singleton so pytest's per-loop fixtures don't
-    trip 'attached to a different loop' errors."""
-    global _FINALIZE_SEMAPHORE
-    _FINALIZE_SEMAPHORE = None
+    """Test-only: drop all cached semaphores so pytest's per-loop fixtures
+    start fresh. Safe to call between tests."""
+    _FINALIZE_SEMAPHORES.clear()
 
 
 def _idempotent_response(existing: dict) -> str:
@@ -159,13 +163,25 @@ async def _finalize_pending_memory_inner(
     """Inner (post-semaphore) body — split so the semaphore acquire happens
     at the outer layer only, keeping the transactional logic testable
     independently."""
-    # H2: ledger short-circuit. If a previous finalize already committed a
-    # terminal state (e.g. sweep retry finding this ledger row), apply it
-    # to the skeleton and DO NOT re-run the pipeline. This is the
-    # crash-recovery safety net: prevents double-merge into a target memory.
-    prior = database.get_ledger(skeleton_id)
-    if prior:
-        _apply_ledger_to_skeleton(skeleton_id, prior)
+    # H2 round-4: two-phase ledger to catch merge-crash-then-retry.
+    # write_intent_ledger atomically claims the in_flight slot BEFORE any
+    # side effect. If it returns 'in_flight' another pipeline is running
+    # (or previously crashed) — back off; sweep will handle timeout.
+    # If it returns a terminal state, apply it and skip pipeline entirely.
+    intent = database.write_intent_ledger(skeleton_id, client_request_id)
+    if intent in ("active", "replaced", "failed"):
+        prior = database.get_ledger(skeleton_id)
+        if prior:
+            _apply_ledger_to_skeleton(skeleton_id, prior)
+        return
+    if intent == "in_flight":
+        # Another pipeline holds the intent slot. Do NOT re-run — that
+        # would risk duplicating a partial merge. Sweep will re-evaluate
+        # on the next tick; if the holder crashed, the stale-claim window
+        # will let sweep take over.
+        logger.info(
+            "finalize skipping %s: intent ledger already in_flight",
+            skeleton_id)
         return
 
     try:

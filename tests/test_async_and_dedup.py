@@ -567,6 +567,139 @@ class TestAsyncRememberHelpers:
         assert 'effective_crq = (f"{source_ai}::{client_request_id}"' in src, \
             "MCP wrapper missing source_ai namespace on effective_crq"
 
+    def test_critical_sweep_no_double_semaphore_deadlock(self, db_env):
+        """Critical round-4 regression: sweep must not wrap the finalize
+        call in the semaphore (finalize acquires it internally). Otherwise
+        a batch larger than semaphore capacity deadlocks."""
+        import pending_sweep
+        import inspect
+        src = inspect.getsource(pending_sweep._run_finalize_bounded)
+        assert "get_finalize_semaphore" not in src, \
+            "sweep wraps finalize in semaphore — will deadlock at batch > capacity"
+
+    def test_h1_two_sweeps_claim_only_once(self, db_env, monkeypatch):
+        """H1 round-4 regression: two concurrent sweeps must not both
+        spawn a finalize for the same skeleton (real atomic claim, not
+        pending→pending no-op)."""
+        age = (datetime.now(timezone.utc)
+               - timedelta(minutes=20)).isoformat()
+        database.insert_pending_memory({
+            "id": "dup_skel", "content": "x", "room": "living_room",
+            "client_request_id": "crq_dup", "status": "pending",
+            "created_at": age,
+        })
+        # Both sweeps see the same snapshot
+        snapshot = database.list_memories_by_status(
+            "pending", older_than_minutes=10)
+
+        stub = type(sys)("mcp_server")
+        finalize_calls: list[str] = []
+
+        async def fake_finalize(mem_id, **kw):
+            finalize_calls.append(mem_id)
+
+        stub._finalize_pending_memory = fake_finalize
+
+        import pending_sweep
+        saved = sys.modules.get("mcp_server")
+        sys.modules["mcp_server"] = stub
+        monkeypatch.setattr(
+            pending_sweep.database, "list_memories_by_status",
+            lambda status, **kw: snapshot,
+        )
+        try:
+            r1 = asyncio.run(pending_sweep.sweep_stuck_pending())
+            r2 = asyncio.run(pending_sweep.sweep_stuck_pending())
+        finally:
+            if saved is not None:
+                sys.modules["mcp_server"] = saved
+            else:
+                sys.modules.pop("mcp_server", None)
+
+        # Exactly one sweep should have won the claim
+        total_retried = r1["retried"] + r2["retried"]
+        total_skipped = r1["skipped_claimed"] + r2["skipped_claimed"]
+        assert total_retried == 1, \
+            f"H1 regressed: both sweeps claimed {finalize_calls}"
+        assert total_skipped >= 1, "loser sweep did not report skipped_claimed"
+
+    def test_h2_intent_ledger_blocks_recursive_run(self, db_env):
+        """H2 round-4: if an in_flight ledger row exists (previous crashed
+        pipeline held it), a fresh finalize call must back off — NOT re-run
+        the pipeline (which would risk re-merging a target memory)."""
+        database.insert_pending_memory({
+            "id": "skel_iflight", "content": "x", "room": "living_room",
+            "client_request_id": "crq_if", "status": "pending",
+        })
+        # Simulate: prior pipeline crashed after writing in_flight
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at) "
+            "VALUES (?, ?, 'in_flight', '', ?)",
+            ("skel_iflight", "crq_if",
+             datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+        pipeline_calls: list[dict] = []
+
+        async def crash_if_called(**kw):
+            pipeline_calls.append(kw)
+            raise RuntimeError("must not run when in_flight ledger present")
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_iflight", impl_fn=crash_if_called,
+            content="x", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_if",
+        ))
+        assert pipeline_calls == [], \
+            "H2 regressed: pipeline ran despite in_flight ledger"
+
+    def test_h3_drift_check_rolls_back(self, db_env):
+        """H3 round-4: commit_maintenance_atomic must reject a stale
+        expected_updated_at with MaintenanceDrift and roll back — NOT
+        clobber the concurrently-updated row."""
+        # Seed a row
+        now = datetime.now(timezone.utc).isoformat()
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO memories (id, content, room, status, layer, "
+            "  created_at, updated_at) "
+            "VALUES ('drift_target', 'orig', 'living_room', 'active', "
+            "        'shared', ?, ?)",
+            (now, now),
+        )
+        conn.commit()
+
+        stale_snapshot_updated_at = now
+        # Concurrent writer moves updated_at forward
+        conn.execute(
+            "UPDATE memories SET updated_at = ? WHERE id = 'drift_target'",
+            (datetime.now(timezone.utc).isoformat() + "_later",),
+        )
+        conn.commit()
+
+        with pytest.raises(database.MaintenanceDrift):
+            database.commit_maintenance_atomic(
+                memory_id="drift_target",
+                memory_updates={"status": "superseded"},
+                audit_row={
+                    "action": "supersede", "target_id": "drift_target",
+                    "decision_reason": "test",
+                },
+                expected_status="active",
+                expected_updated_at=stale_snapshot_updated_at,
+            )
+        # Row must NOT be superseded (drift caused rollback)
+        assert database.get_memory("drift_target")["status"] == "active"
+        # No audit row either
+        audits = database.list_audits(action="supersede")
+        assert not any(a["target_id"] == "drift_target" for a in audits)
+
     def test_gc_safe_background_task_helper_exists(self):
         """P0-1: mcp_server and pending_sweep must define a set-backed
         create_task wrapper so background coroutines can't be GC'd."""

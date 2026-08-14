@@ -313,6 +313,14 @@ async def init_db(db_path: str = None) -> None:
     if "link_to_real_id" not in existing_cols:
         conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated: added 'link_to_real_id' column")
+    # PR C round-4 H1: real atomic claim for sweep retries. Without this,
+    # two concurrent sweeps can both spawn a finalize for the same skeleton.
+    if "finalize_claim_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'finalize_claim_id' column")
+    if "finalize_claim_at" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'finalize_claim_at' column")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
@@ -496,6 +504,7 @@ _ALL_COLUMNS = [
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
     "subject_id", "source_actor_id", "info_type",
     "client_request_id", "link_to_real_id",
+    "finalize_claim_id", "finalize_claim_at",
 ]
 
 
@@ -622,6 +631,51 @@ def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
     conn.commit()
 
 
+def write_intent_ledger(skeleton_id: str, client_request_id: str) -> str:
+    """H2 round-4: two-phase ledger. Write an 'in_flight' entry BEFORE any
+    side effect so a crash between memory mutation and terminal ledger
+    write cannot cause a duplicate re-run.
+
+    Returns:
+      - 'created'    → this caller wrote a fresh in_flight row; proceed
+      - 'in_flight'  → another finalize is already running; caller should back off
+      - 'active' | 'replaced' | 'failed' → terminal state exists; caller must
+        apply it via _apply_ledger_to_skeleton and NOT re-run pipeline.
+
+    Uses INSERT OR IGNORE — ON CONFLICT DO NOTHING semantics. Never
+    clobbers an existing row. Read-after-write to determine outcome.
+    """
+    if not skeleton_id:
+        return "created"  # no idempotency requested
+    conn = _get_conn()
+    now = _now_iso()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at) "
+            "VALUES (?, ?, 'in_flight', '', ?)",
+            (skeleton_id, client_request_id, now),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("write_intent_ledger failed for %s", skeleton_id)
+        return "created"  # best-effort; let caller proceed
+
+    # Read back — either our new row, or a pre-existing one
+    row = conn.execute(
+        "SELECT terminal_state, committed_at FROM async_remember_ledger "
+        "WHERE skeleton_id = ?", (skeleton_id,),
+    ).fetchone()
+    if not row:
+        return "created"
+    state, committed_at = row
+    if state == "in_flight":
+        # Same tick as our INSERT? Compare committed_at
+        return "created" if committed_at == now else "in_flight"
+    return state  # terminal
+
+
 def get_ledger(skeleton_id: str) -> dict | None:
     """H2: look up the ledger entry for a skeleton. Returns None if the
     pipeline hasn't committed a terminal state yet."""
@@ -641,6 +695,44 @@ def get_ledger(skeleton_id: str) -> dict | None:
         "terminal_state": row[2], "result_memory_id": row[3],
         "committed_at": row[4],
     }
+
+
+def try_claim_finalize(skeleton_id: str, claim_token: str,
+                       stale_after_minutes: int = 30) -> bool:
+    """H1: atomically claim a pending skeleton for finalize. Returns True
+    if this caller won the claim, False if another sweep/finalize already
+    holds it. Atomic single-row UPDATE with rowcount check.
+
+    A claim is takeable if:
+      - finalize_claim_id is empty (never claimed), OR
+      - the previous claim is older than stale_after_minutes (crashed
+        holder — take over).
+    """
+    if not skeleton_id or not claim_token:
+        return False
+    conn = _get_conn()
+    now = _now_iso()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=stale_after_minutes)).isoformat()
+    cur = conn.execute(
+        "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
+        "WHERE id = ? AND status = 'pending' "
+        "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
+        (claim_token, now, skeleton_id, cutoff),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def release_finalize_claim(skeleton_id: str) -> None:
+    """H1: release a claim after finalize completes (successful or terminal
+    failure). Called from commit_finalize_atomic in the same transaction.
+    Standalone helper for the rare non-terminal cleanup paths."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
+        "WHERE id = ?", (skeleton_id,))
+    conn.commit()
 
 
 def commit_finalize_atomic(
@@ -669,9 +761,12 @@ def commit_finalize_atomic(
     now = _now_iso()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # Ledger is idempotent — INSERT OR REPLACE lets a retry after
-        # partial commit still succeed (same skeleton_id can only ever
-        # have one terminal state; race-losing writer just no-ops).
+        # H2 round-4: use ON CONFLICT DO NOTHING so a race-losing terminal
+        # writer cannot clobber the winner. Callers must consult the ledger
+        # after commit if they need to know which value stuck.
+        # Two-phase pattern: rows may pre-exist with terminal_state='in_flight'
+        # (written by _write_intent_ledger). We UPDATE those to the real
+        # terminal state only if they're still in_flight.
         conn.execute(
             "INSERT INTO async_remember_ledger "
             "(skeleton_id, client_request_id, terminal_state, "
@@ -680,14 +775,21 @@ def commit_finalize_atomic(
             "ON CONFLICT(skeleton_id) DO UPDATE SET "
             "terminal_state=excluded.terminal_state, "
             "result_memory_id=excluded.result_memory_id, "
-            "committed_at=excluded.committed_at",
+            "committed_at=excluded.committed_at "
+            "WHERE async_remember_ledger.terminal_state = 'in_flight'",
             (skeleton_id, client_request_id, terminal_state,
              result_memory_id, now),
         )
 
         if skeleton_update:
             # Build UPDATE dynamically for the requested fields.
-            set_clauses = ["updated_at = ?"]
+            # H1: also release finalize_claim so a future sweep can retry
+            # if this row somehow ends up back in pending.
+            set_clauses = [
+                "updated_at = ?",
+                "finalize_claim_id = ''",
+                "finalize_claim_at = ''",
+            ]
             params: list = [now]
             for key, val in skeleton_update.items():
                 if key == "source_platform_suffix":
@@ -716,14 +818,27 @@ def commit_finalize_atomic(
         raise
 
 
+class MaintenanceDrift(RuntimeError):
+    """Raised when commit_maintenance_atomic finds the target row has drifted
+    (status or updated_at changed since the caller captured the snapshot).
+    Transaction is rolled back; no audit is written; caller should skip."""
+
+
 def commit_maintenance_atomic(
     memory_id: str,
     memory_updates: dict,
     audit_row: dict,
+    expected_status: str | None = None,
+    expected_updated_at: str | None = None,
 ) -> None:
     """H4: apply a maintenance action and write the audit row in ONE
     BEGIN IMMEDIATE transaction. If either fails, both roll back so the
     target memory can't be left in a modified state without an audit trail.
+
+    H3 round-4: expected_status / expected_updated_at gate the UPDATE inside
+    the transaction. If either doesn't match at UPDATE time (concurrent
+    writer changed the row between plan and execute), rowcount==0 and we
+    raise MaintenanceDrift so the whole tx rolls back with NO audit written.
 
     memory_updates: fields to UPDATE on the memory row. `comments` and
     `history` are serialized to JSON if list/dict.
@@ -740,7 +855,15 @@ def commit_maintenance_atomic(
             val = json.dumps(val, ensure_ascii=False)
         set_clauses.append(f"{key} = ?")
         params.append(val)
-    params.append(memory_id)
+
+    where_clauses = ["id = ?"]
+    where_params: list = [memory_id]
+    if expected_status is not None:
+        where_clauses.append("status = ?")
+        where_params.append(expected_status)
+    if expected_updated_at is not None:
+        where_clauses.append("updated_at = ?")
+        where_params.append(expected_updated_at)
 
     # Ensure required audit columns are present
     audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
@@ -753,16 +876,28 @@ def commit_maintenance_atomic(
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
-            params,
+        cur = conn.execute(
+            f"UPDATE memories SET {', '.join(set_clauses)} "
+            f"WHERE {' AND '.join(where_clauses)}",
+            params + where_params,
         )
+        if cur.rowcount != 1:
+            # Drift detected — someone modified the row between snapshot
+            # and now. Rollback both memory UPDATE (no-op) and skip audit.
+            conn.execute("ROLLBACK")
+            raise MaintenanceDrift(
+                f"target {memory_id} drifted "
+                f"(expected status={expected_status!r}, "
+                f"updated_at={expected_updated_at!r}); rowcount={cur.rowcount}"
+            )
         conn.execute(
             f"INSERT INTO maintenance_audit ({audit_cols_str}) "
             f"VALUES ({audit_placeholders})",
             audit_values,
         )
         conn.commit()
+    except MaintenanceDrift:
+        raise
     except Exception:
         try:
             conn.execute("ROLLBACK")

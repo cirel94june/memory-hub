@@ -189,24 +189,33 @@ def test_execute_no_change(fake_env):
 
 def test_execute_annotate(fake_env):
     mem = _make_memory(fake_env)
+    # M3 round-4: annotate now uses commit_maintenance_atomic which reads
+    # from the real DB. Seed it.
+    database.set_memory(mem)
     result = asyncio.run(_execute_maintenance_action(
         "annotate", mem, "一些补充", "同话题补注", "claude",
     ))
     assert result["status"] == "annotated"
-    updated = fake_env["m1"]
-    assert len(updated["comments"]) == 1
-    assert updated["comments"][0]["kind"] == "annotation"
+    # Read comments from DB (source of truth after atomic tx)
+    updated = database.get_memory("m1")
+    comments = json.loads(updated["comments"]) if isinstance(
+        updated["comments"], str) else updated["comments"]
+    assert len(comments) == 1
+    assert comments[0]["kind"] == "annotation"
 
 
 def test_execute_supplement(fake_env):
     mem = _make_memory(fake_env)
+    database.set_memory(mem)
     result = asyncio.run(_execute_maintenance_action(
         "supplement", mem, "详细补充", "添加细节", "claude",
     ))
     assert result["status"] == "supplemented"
-    updated = fake_env["m1"]
-    assert len(updated["comments"]) == 1
-    assert updated["comments"][0]["kind"] == "supplement"
+    updated = database.get_memory("m1")
+    comments = json.loads(updated["comments"]) if isinstance(
+        updated["comments"], str) else updated["comments"]
+    assert len(comments) == 1
+    assert comments[0]["kind"] == "supplement"
 
 
 def test_execute_resolve_thread(fake_env):
@@ -353,6 +362,7 @@ def test_h4_supersede_and_audit_atomic_rollback(fake_env, monkeypatch):
 def test_state_before_stores_full_content(fake_env):
     long_content = "这是一段很长的记忆内容" * 50
     mem = _make_memory(fake_env, content=long_content)
+    database.set_memory(mem)  # M3 round-4: annotate is atomic on DB
     asyncio.run(_execute_maintenance_action(
         "annotate", mem, "补充", "测试完整存储", "claude",
     ))

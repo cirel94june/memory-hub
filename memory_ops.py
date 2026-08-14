@@ -970,38 +970,46 @@ async def _execute_maintenance_action(
         _write_audit("no_change", target_id, new_content, reason, state_before, state_before, True, source_ai)
         return {"id": target_id, "status": "no_change", "maintenance_action": "no_change", "reason": reason}
 
-    if action == "annotate":
+    if action in ("annotate", "supplement"):
+        # M3 round-4: comment append + audit in one atomic tx (matches
+        # supersede/resolve pattern) so an audit failure doesn't leave the
+        # target with an orphan comment.
+        kind = "annotation" if action == "annotate" else "supplement"
+        result_status = "annotated" if action == "annotate" else "supplemented"
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
         comments.append({
             "date": now, "author": source_ai or "system",
-            "kind": "annotation", "content": new_content[:300],
+            "kind": kind, "content": new_content[:300],
         })
-        target_mem["comments"] = comments
-        target_mem["updated_at"] = now
-        store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
-        _write_audit("annotate", target_id, new_content, reason, state_before, state_after, True, source_ai)
-        return {"id": target_id, "status": "annotated", "maintenance_action": "annotate"}
-
-    if action == "supplement":
-        comments = target_mem.get("comments", [])
-        if not isinstance(comments, list):
-            comments = []
-        comments.append({
-            "date": now, "author": source_ai or "system",
-            "kind": "supplement", "content": new_content[:300],
-        })
-        target_mem["comments"] = comments
-        target_mem["updated_at"] = now
-        store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
-        _write_audit("supplement", target_id, new_content, reason, state_before, state_after, True, source_ai)
-        return {"id": target_id, "status": "supplemented", "maintenance_action": "supplement"}
+        state_after = {"content": target_mem["content"],
+                       "comments_count": len(comments)}
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"comments": comments},
+                audit_row={
+                    "action": action, "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("%s skipped due to drift: %s", action, drift)
+            return None
+        return {"id": target_id, "status": result_status,
+                "maintenance_action": action}
 
     if action == "resolve_thread":
-        # H4: same-tx state change + audit (see supersede branch).
+        # H4 + H3: same-tx state change + audit + drift check.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1010,24 +1018,30 @@ async def _execute_maintenance_action(
             "kind": "resolve", "content": f"自动完成: {new_content[:100]}",
         })
         state_after = {"resolved": True}
-        database.commit_maintenance_atomic(
-            memory_id=target_id,
-            memory_updates={"resolved": 1, "comments": comments},
-            audit_row={
-                "action": "resolve_thread", "target_id": target_id,
-                "new_content": new_content,
-                "source_message_ids": "[]",
-                "decision_reason": reason,
-                "state_before": json.dumps(state_before, ensure_ascii=False),
-                "state_after": json.dumps(state_after, ensure_ascii=False),
-                "source_ai": source_ai or "",
-                "auto_executed": 1,
-            },
-        )
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"resolved": 1, "comments": comments},
+                audit_row={
+                    "action": "resolve_thread", "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("resolve_thread skipped due to drift: %s", drift)
+            return None
         return {"id": target_id, "status": "resolved", "maintenance_action": "resolve_thread"}
 
     if action == "reopen_thread":
-        # H4: same-tx state change + audit (see supersede branch).
+        # H4 + H3: same-tx state change + audit + drift check.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1036,20 +1050,26 @@ async def _execute_maintenance_action(
             "kind": "reopen", "content": f"重新打开: {new_content[:100]}",
         })
         state_after = {"resolved": False}
-        database.commit_maintenance_atomic(
-            memory_id=target_id,
-            memory_updates={"resolved": 0, "comments": comments},
-            audit_row={
-                "action": "reopen_thread", "target_id": target_id,
-                "new_content": new_content,
-                "source_message_ids": "[]",
-                "decision_reason": reason,
-                "state_before": json.dumps(state_before, ensure_ascii=False),
-                "state_after": json.dumps(state_after, ensure_ascii=False),
-                "source_ai": source_ai or "",
-                "auto_executed": 0,
-            },
-        )
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"resolved": 0, "comments": comments},
+                audit_row={
+                    "action": "reopen_thread", "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 0,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("reopen_thread skipped due to drift: %s", drift)
+            return None
         return {"id": target_id, "status": "reopened", "maintenance_action": "reopen_thread"}
 
     if action in ("update", "supersede"):
@@ -1060,8 +1080,10 @@ async def _execute_maintenance_action(
 
         # H4: supersede is the highest-impact maintenance action (permanently
         # takes a memory out of recall). It MUST be atomic with the audit row.
-        # Before, an audit INSERT failure would leave the memory superseded
-        # with no audit trail — an invisible data mutation.
+        # H3 round-4: pass the target's snapshotted status + updated_at into
+        # the same tx so a concurrent writer that mutated the row between
+        # our read and this UPDATE causes a MaintenanceDrift, not a
+        # silent overwrite.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1071,20 +1093,26 @@ async def _execute_maintenance_action(
             "content": f"被新记忆取代（{action}）: {reason}",
         })
         state_after = {"status": "superseded", "reason": reason}
-        database.commit_maintenance_atomic(
-            memory_id=target_id,
-            memory_updates={"status": "superseded", "comments": comments},
-            audit_row={
-                "action": action, "target_id": target_id,
-                "new_content": new_content,
-                "source_message_ids": "[]",
-                "decision_reason": reason,
-                "state_before": json.dumps(state_before, ensure_ascii=False),
-                "state_after": json.dumps(state_after, ensure_ascii=False),
-                "source_ai": source_ai or "",
-                "auto_executed": 1,
-            },
-        )
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"status": "superseded", "comments": comments},
+                audit_row={
+                    "action": action, "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("supersede skipped due to drift: %s", drift)
+            return None
         return {"superseded_id": target_id, "status": "superseded", "maintenance_action": action}
 
     return None

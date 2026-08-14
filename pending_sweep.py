@@ -19,6 +19,7 @@ This module runs periodically (called from daemon.run_full_maintenance) and:
 Not the same as `merge_similar` or `distill_psychology` — those transform
 active memories. This one only unsticks pending skeletons.
 """
+import os
 import json
 import logging
 import asyncio
@@ -48,15 +49,18 @@ def _spawn_bg(coro):
 
 
 async def _run_finalize_bounded(finalize_fn, skeleton_id: str, **kwargs) -> None:
-    """Wrap the finalize call in the shared semaphore so concurrent sweep
-    retries and MCP background pipelines share the same concurrency budget.
+    """Trampoline that just forwards to the finalizer.
 
-    Without this, a sweep tick can trigger MAX_RETRIES_PER_SWEEP pipelines
-    simultaneously while MCP is also spawning fresh ones — DeepSeek limits
-    get hit fast.
+    IMPORTANT: do NOT acquire the semaphore here. `_finalize_pending_memory`
+    already acquires it internally; taking it a second time in the outer
+    layer causes a deadlock once sweep batch > semaphore capacity: outer
+    waiters hold N permits, inner tasks block on the same semaphore, and no
+    one ever releases.
+
+    (This wrapper is retained so the semantic "sweep dispatches with the
+    same shape as MCP" stays obvious to readers — but no double-acquire.)
     """
-    async with async_remember.get_finalize_semaphore():
-        await finalize_fn(skeleton_id, **kwargs)
+    await finalize_fn(skeleton_id, **kwargs)
 
 
 async def sweep_stuck_pending() -> dict:
@@ -93,10 +97,9 @@ async def sweep_stuck_pending() -> dict:
         age_min = _age_minutes(skel.get("created_at", ""), now)
 
         if age_min > FAIL_AFTER_MINUTES:
-            # Give up — pipeline dead too long. Atomic claim: only mark
-            # failed if the row is STILL pending (a concurrent finalize
-            # may have just marked it active). update_memory_status
-            # returns rowcount; 0 means someone else won the race.
+            # Give up — pipeline dead too long. Atomic claim via
+            # require_status='pending' + rowcount check ensures we don't
+            # clobber a concurrent finalize that just marked it active.
             try:
                 rc = database.update_memory_status(
                     skel["id"], "failed",
@@ -134,22 +137,20 @@ async def sweep_stuck_pending() -> dict:
                     "aborting this sweep")
                 break
 
+        # H1 round-4: real atomic claim via finalize_claim_id column.
+        # Two concurrent sweeps race for the claim; only the winner
+        # (rowcount==1) proceeds. Stale claims (>30min) get reclaimed.
+        claim_token = f"sweep_{os.getpid()}_{id(skel)}"
+        if not database.try_claim_finalize(skel["id"], claim_token):
+            result["skipped_claimed"] += 1
+            continue
+
         # P0-3: crq-based defense (see _find_completed_by_crq docstring).
         crq = skel.get("client_request_id", "")
         if crq:
             other = _find_completed_by_crq(crq, exclude_id=skel["id"])
             if other:
                 try:
-                    # Atomic claim: only relink if still pending.
-                    # mark_replaced does its own UPDATE; guard it by first
-                    # atomically transitioning to a sentinel state.
-                    rc = database.update_memory_status(
-                        skel["id"], "pending",   # no-op status, just claim
-                        require_status="pending",
-                    )
-                    if rc != 1:
-                        result["skipped_claimed"] += 1
-                        continue
                     database.mark_replaced(
                         skel["id"], link_to_real_id=other["id"])
                     _write_audit(
@@ -166,17 +167,9 @@ async def sweep_stuck_pending() -> dict:
                     result["still_pending"] += 1
                 continue
 
-        # Atomic claim for retry: transition pending → pending with a
-        # source_platform marker so we can tell "sweep already spawned a
-        # finalize for this row" — but the marker path also serves as the
-        # claim. We use require_status='pending' + a source_platform check.
-        # Simpler: rely on the finalize being idempotent (uses existing_id)
-        # and only spawn once per sweep tick by tracking spawned ids locally.
+        # We hold the claim. Spawn finalize; it will release claim on
+        # terminal transition via commit_finalize_atomic.
         try:
-            # No status change needed at spawn — but we DO need to ensure
-            # this sweep only spawns one finalize per skeleton per tick.
-            # (Sweep runs every 10min so cross-tick duplicate spawns are
-            # bounded by RETRY_AFTER_MINUTES > sleep interval.)
             _spawn_bg(_run_finalize_bounded(
                 finalize_fn,
                 skel["id"],
@@ -198,6 +191,11 @@ async def sweep_stuck_pending() -> dict:
         except Exception:
             logger.exception("sweep retry crashed for %s", skel["id"])
             result["still_pending"] += 1
+            # Best-effort: release claim so a future sweep can retry.
+            try:
+                database.release_finalize_claim(skel["id"])
+            except Exception:
+                pass
 
     return result
 
