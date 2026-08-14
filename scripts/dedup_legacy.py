@@ -221,11 +221,19 @@ async def _execute_plan(plan_entries: list[dict]) -> dict:
             continue
 
         try:
+            # H3 round-6: B is load-bearing for the supersede decision even
+            # though we only mutate A. Pass B's snapshot to the atomic
+            # helper so the tx rolls back if B drifted since plan time.
             result = await memory_ops._execute_maintenance_action(
                 action, a, b["content"],
                 reason=f"legacy_dedup_script: {entry['reason']}",
                 source_ai="dedup_script",
                 provenance_type=entry.get("b_provenance", ""),
+                companion_expected_rows=[{
+                    "id": entry["b_id"],
+                    "status": entry.get("b_status_snapshot", ""),
+                    "updated_at": entry.get("b_updated_at_snapshot", ""),
+                }],
             )
             if result:
                 counts["applied"] += 1

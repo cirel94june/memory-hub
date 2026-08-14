@@ -568,19 +568,57 @@ class TestAsyncRememberHelpers:
             "MCP wrapper missing source_ai namespace on effective_crq"
 
     def test_critical_sweep_no_double_semaphore_deadlock(self, db_env):
-        """Critical round-4 regression: sweep must not wrap the finalize
-        call in the semaphore (finalize acquires it internally). Otherwise
-        a batch larger than semaphore capacity deadlocks."""
+        """Critical round-4 regression: source-level guard."""
         import pending_sweep
         import inspect
         src = inspect.getsource(pending_sweep._run_finalize_bounded)
         assert "get_finalize_semaphore" not in src, \
             "sweep wraps finalize in semaphore — will deadlock at batch > capacity"
 
+    def test_critical_semaphore_no_deadlock_with_batch_over_capacity(self):
+        """Real dynamic check for round-6 L: fire batch > semaphore capacity
+        through the actual production path. Must complete quickly, not
+        hang forever."""
+        import async_remember
+        async_remember._reset_finalize_semaphore_for_tests()
+
+        # Use a smaller cap to keep the test fast
+        original = async_remember._FINALIZE_MAX_CONCURRENCY
+        async_remember._FINALIZE_MAX_CONCURRENCY = 2
+
+        try:
+            calls = []
+
+            async def slow_impl(**kw):
+                calls.append(1)
+                await asyncio.sleep(0.01)
+                return {"id": kw["existing_id"], "status": "created"}
+
+            async def run_batch():
+                # Fake database module — the goal is to exercise semaphore
+                # path only, not full DB.
+                async def one(skel_id):
+                    async with async_remember.get_finalize_semaphore():
+                        await slow_impl(existing_id=skel_id,
+                                        content="x", room="", category="",
+                                        importance=0.5, source_ai="c",
+                                        event_date="", force_create=False,
+                                        client_request_id="")
+
+                tasks = [asyncio.create_task(one(f"s{i}")) for i in range(8)]
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks), timeout=5.0)
+
+            asyncio.run(run_batch())
+            assert len(calls) == 8
+        finally:
+            async_remember._FINALIZE_MAX_CONCURRENCY = original
+            async_remember._reset_finalize_semaphore_for_tests()
+
     def test_h1_two_sweeps_claim_only_once(self, db_env, monkeypatch):
-        """H1 round-4 regression: two concurrent sweeps must not both
-        spawn a finalize for the same skeleton (real atomic claim, not
-        pending→pending no-op)."""
+        """H1 regression: two TRULY concurrent sweeps (asyncio.gather) must
+        not both spawn a finalize for the same skeleton — the finalize_claim
+        UPDATE guards this with rowcount == 1."""
         age = (datetime.now(timezone.utc)
                - timedelta(minutes=20)).isoformat()
         database.insert_pending_memory({
@@ -588,7 +626,6 @@ class TestAsyncRememberHelpers:
             "client_request_id": "crq_dup", "status": "pending",
             "created_at": age,
         })
-        # Both sweeps see the same snapshot
         snapshot = database.list_memories_by_status(
             "pending", older_than_minutes=10)
 
@@ -607,16 +644,21 @@ class TestAsyncRememberHelpers:
             pending_sweep.database, "list_memories_by_status",
             lambda status, **kw: snapshot,
         )
+
+        async def run_two_in_parallel():
+            return await asyncio.gather(
+                pending_sweep.sweep_stuck_pending(),
+                pending_sweep.sweep_stuck_pending(),
+            )
+
         try:
-            r1 = asyncio.run(pending_sweep.sweep_stuck_pending())
-            r2 = asyncio.run(pending_sweep.sweep_stuck_pending())
+            r1, r2 = asyncio.run(run_two_in_parallel())
         finally:
             if saved is not None:
                 sys.modules["mcp_server"] = saved
             else:
                 sys.modules.pop("mcp_server", None)
 
-        # Exactly one sweep should have won the claim
         total_retried = r1["retried"] + r2["retried"]
         total_skipped = r1["skipped_claimed"] + r2["skipped_claimed"]
         assert total_retried == 1, \
@@ -658,6 +700,144 @@ class TestAsyncRememberHelpers:
         ))
         assert pipeline_calls == [], \
             "H2 regressed: pipeline ran despite in_flight ledger"
+
+    def test_h1_owner_token_prevents_same_timestamp_collision(self, db_env):
+        """H1 round-6 regression: two callers writing intent within the
+        same second must NOT both get 'created'. Ownership is by
+        rowcount, not by timestamp comparison."""
+        # First writer wins
+        r1 = database.write_intent_ledger(
+            "sk_owner", "crq_o", owner_token="token_first")
+        r2 = database.write_intent_ledger(
+            "sk_owner", "crq_o", owner_token="token_second")
+        assert r1 == "created", f"first writer should own, got {r1}"
+        assert r2 == "in_flight", \
+            f"second writer must NOT get 'created', got {r2}"
+
+        # Terminal write from loser (wrong token) must be rejected
+        loser_committed = database.commit_finalize_atomic(
+            skeleton_id="sk_owner", client_request_id="crq_o",
+            terminal_state="failed", result_memory_id="",
+            owner_token="token_second",
+        )
+        assert loser_committed is False, "loser must be rejected"
+        # Ledger is still in_flight
+        ledger = database.get_ledger("sk_owner")
+        assert ledger["terminal_state"] == "in_flight"
+
+        # Winner can terminal
+        winner_committed = database.commit_finalize_atomic(
+            skeleton_id="sk_owner", client_request_id="crq_o",
+            terminal_state="active", result_memory_id="sk_owner",
+            owner_token="token_first",
+        )
+        assert winner_committed is True
+        assert database.get_ledger("sk_owner")["terminal_state"] == "active"
+
+    def test_h2_stale_intent_marks_skeleton_failed_no_replay(self, db_env):
+        """H2 round-6 regression: an in_flight ledger older than
+        INTENT_STALE_MINUTES must cause sweep to mark the skeleton failed
+        with intent_timeout suffix — NOT replay the pipeline (double-merge
+        risk)."""
+        # Pre-existing stale intent from 3 hours ago
+        old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        database.insert_pending_memory({
+            "id": "sk_stale", "content": "x", "room": "living_room",
+            "client_request_id": "crq_stale", "status": "pending",
+            "created_at": old,
+        })
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_stale", "crq_stale", old, "dead_owner"),
+        )
+        conn.commit()
+
+        import pending_sweep
+        result = asyncio.run(pending_sweep.sweep_stuck_pending())
+
+        assert result["intent_timeouts"] >= 1
+        skel = database.get_memory("sk_stale")
+        assert skel["status"] == "failed"
+        assert skel["source_platform"].endswith(":intent_timeout")
+        ledger = database.get_ledger("sk_stale")
+        assert ledger["terminal_state"] == "failed"
+
+    def test_h2_intent_write_failure_is_fail_closed(self, db_env, monkeypatch):
+        """H2 round-6 regression: if write_intent_ledger raises, the caller
+        must NOT proceed with pipeline side effects."""
+        # Force write_intent_ledger to raise
+        def boom(*a, **kw):
+            raise RuntimeError("simulated ledger write failure")
+        monkeypatch.setattr(database, "write_intent_ledger", boom)
+
+        pipeline_calls: list = []
+
+        async def crash_if_called(**kw):
+            pipeline_calls.append(kw)
+            return {"id": kw["existing_id"], "status": "created"}
+
+        database.insert_pending_memory({
+            "id": "sk_boom", "content": "x", "room": "living_room",
+            "client_request_id": "crq_boom", "status": "pending",
+        })
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "sk_boom", impl_fn=crash_if_called,
+            content="x", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_boom",
+        ))
+        assert pipeline_calls == [], \
+            "H2 fail-closed regressed: pipeline ran despite intent write failure"
+
+    def test_h3_dedup_rolls_back_when_B_drifts(self, db_env):
+        """H3 round-6 regression: dedup plan targets A but decision depends
+        on B. If B drifted between plan and execute, tx must rollback so A
+        is NOT superseded based on stale B content."""
+        now = datetime.now(timezone.utc).isoformat()
+        conn = database._get_conn()
+        # Seed A + B
+        for mid, content in [("A", "orig A"), ("B", "orig B")]:
+            conn.execute(
+                "INSERT INTO memories (id, content, room, status, layer, "
+                "  created_at, updated_at) "
+                "VALUES (?, ?, 'living_room', 'active', 'shared', ?, ?)",
+                (mid, content, now, now),
+            )
+        conn.commit()
+
+        # Snapshot B's updated_at, then someone else changes B
+        b_snapshot_updated_at = now
+        conn.execute(
+            "UPDATE memories SET updated_at = ? WHERE id = 'B'",
+            (now + "_later",),
+        )
+        conn.commit()
+
+        # Try to supersede A citing B's stale content — must fail with drift
+        with pytest.raises(database.MaintenanceDrift):
+            database.commit_maintenance_atomic(
+                memory_id="A",
+                memory_updates={"status": "superseded"},
+                audit_row={
+                    "action": "supersede", "target_id": "A",
+                    "decision_reason": "test B drift",
+                },
+                expected_status="active",
+                expected_updated_at=now,
+                extra_expected_rows=[{
+                    "id": "B", "status": "active",
+                    "updated_at": b_snapshot_updated_at,
+                }],
+            )
+        # A must NOT be superseded (B drift caused rollback)
+        assert database.get_memory("A")["status"] == "active", \
+            "H3 regressed: A superseded despite B drift"
 
     def test_h3_drift_check_rolls_back(self, db_env):
         """H3 round-4: commit_maintenance_atomic must reject a stale

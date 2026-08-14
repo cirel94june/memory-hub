@@ -958,8 +958,16 @@ def _write_audit(action: str, target_id: str, new_content: str, reason: str,
 async def _execute_maintenance_action(
     action: str, target_mem: dict, new_content: str,
     reason: str, source_ai: str, provenance_type: str = "",
+    companion_expected_rows: list[dict] | None = None,
     **extra,
 ) -> dict:
+    """
+    companion_expected_rows: H3 round-6. Rows whose current status/updated_at
+    are load-bearing for this decision but which won't be UPDATE'd by us.
+    Passed to commit_maintenance_atomic so drift on B (dedup source) also
+    triggers rollback, not just drift on A (dedup target).
+    Each entry: {'id': str, 'status': str, 'updated_at': str}.
+    """
     """Execute a safe maintenance action on an existing memory. Returns result dict."""
     target_id = target_mem["id"]
     now = _now()
@@ -1109,6 +1117,7 @@ async def _execute_maintenance_action(
                 },
                 expected_status=target_mem.get("status"),
                 expected_updated_at=target_mem.get("updated_at"),
+                extra_expected_rows=companion_expected_rows,
             )
         except database.MaintenanceDrift as drift:
             logger.info("supersede skipped due to drift: %s", drift)

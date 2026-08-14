@@ -17,6 +17,7 @@ The MCP tool wrapper (in mcp_server.py) handles:
 """
 import os
 import json
+import uuid
 import asyncio
 import logging
 from typing import Callable, Awaitable
@@ -163,25 +164,36 @@ async def _finalize_pending_memory_inner(
     """Inner (post-semaphore) body — split so the semaphore acquire happens
     at the outer layer only, keeping the transactional logic testable
     independently."""
-    # H2 round-4: two-phase ledger to catch merge-crash-then-retry.
-    # write_intent_ledger atomically claims the in_flight slot BEFORE any
-    # side effect. If it returns 'in_flight' another pipeline is running
-    # (or previously crashed) — back off; sweep will handle timeout.
-    # If it returns a terminal state, apply it and skip pipeline entirely.
-    intent = database.write_intent_ledger(skeleton_id, client_request_id)
+    # H2 round-4 + H1 round-6: two-phase ledger with owner_token.
+    # write_intent_ledger atomically INSERTs an 'in_flight' row keyed on
+    # skeleton_id; rowcount==1 means we own it. Another concurrent writer
+    # with a different token would see rowcount==0 and get 'in_flight' back.
+    # If we see a terminal state, another pipeline already finished — apply
+    # it to the skeleton and return without running the pipeline.
+    owner_token = uuid.uuid4().hex
+    try:
+        intent = database.write_intent_ledger(
+            skeleton_id, client_request_id, owner_token)
+    except Exception:
+        # H2 round-6 fail-closed: DB error means we don't know the ledger
+        # state — do NOT proceed with side effects. Sweep will retry later.
+        logger.exception(
+            "write_intent_ledger failed for %s — refusing to run pipeline",
+            skeleton_id)
+        return
     if intent in ("active", "replaced", "failed"):
         prior = database.get_ledger(skeleton_id)
         if prior:
             _apply_ledger_to_skeleton(skeleton_id, prior)
         return
     if intent == "in_flight":
-        # Another pipeline holds the intent slot. Do NOT re-run — that
+        # Another owner_token holds the intent slot. Do NOT re-run — that
         # would risk duplicating a partial merge. Sweep will re-evaluate
-        # on the next tick; if the holder crashed, the stale-claim window
-        # will let sweep take over.
+        # on the next tick; a stale in_flight will be handled by
+        # pending_sweep's intent-timeout policy (fail-safe, no rerun).
         logger.info(
-            "finalize skipping %s: intent ledger already in_flight",
-            skeleton_id)
+            "finalize skipping %s: intent ledger already in_flight "
+            "(different owner)", skeleton_id)
         return
 
     try:
@@ -195,18 +207,25 @@ async def _finalize_pending_memory_inner(
         if real_id == skeleton_id:
             # Common case: skeleton became the real memory in-place.
             # Ledger + status atomic commit (H4).
-            database.commit_finalize_atomic(
+            committed = database.commit_finalize_atomic(
                 skeleton_id=skeleton_id,
                 client_request_id=client_request_id,
                 terminal_state="active",
                 result_memory_id=real_id,
                 skeleton_update={"status": "active"},
+                owner_token=owner_token,
             )
+            if not committed:
+                # Race: another owner terminaled first. Read their result
+                # and apply to skeleton so caller sees a consistent state.
+                prior = database.get_ledger(skeleton_id)
+                if prior:
+                    _apply_ledger_to_skeleton(skeleton_id, prior)
         elif real_id:
             # Merge path: content matched an existing memory. Skeleton
             # becomes tombstone with redirect pointer, all atomic with
             # ledger commit (H2: prevents crash-between-merge-and-mark).
-            database.commit_finalize_atomic(
+            committed = database.commit_finalize_atomic(
                 skeleton_id=skeleton_id,
                 client_request_id=client_request_id,
                 terminal_state="replaced",
@@ -215,11 +234,16 @@ async def _finalize_pending_memory_inner(
                     "status": "replaced",
                     "link_to_real_id": real_id,
                 },
+                owner_token=owner_token,
             )
+            if not committed:
+                prior = database.get_ledger(skeleton_id)
+                if prior:
+                    _apply_ledger_to_skeleton(skeleton_id, prior)
         else:
             # No id returned. MCP always calls with quick=False so we
             # treat missing id as pipeline error (unknown side effects).
-            database.commit_finalize_atomic(
+            committed = database.commit_finalize_atomic(
                 skeleton_id=skeleton_id,
                 client_request_id=client_request_id,
                 terminal_state="failed",
@@ -228,12 +252,17 @@ async def _finalize_pending_memory_inner(
                     "status": "failed",
                     "source_platform_suffix": "pipeline_error",
                 },
+                owner_token=owner_token,
             )
+            if not committed:
+                prior = database.get_ledger(skeleton_id)
+                if prior:
+                    _apply_ledger_to_skeleton(skeleton_id, prior)
     except Exception:
         # Exception mid-pipeline: partial state possible → NOT retry_safe.
         logger.exception("pending finalize crashed for skeleton %s", skeleton_id)
         try:
-            database.commit_finalize_atomic(
+            committed = database.commit_finalize_atomic(
                 skeleton_id=skeleton_id,
                 client_request_id=client_request_id,
                 terminal_state="failed",
@@ -242,7 +271,12 @@ async def _finalize_pending_memory_inner(
                     "status": "failed",
                     "source_platform_suffix": "pipeline_error",
                 },
+                owner_token=owner_token,
             )
+            if not committed:
+                prior = database.get_ledger(skeleton_id)
+                if prior:
+                    _apply_ledger_to_skeleton(skeleton_id, prior)
         except Exception:
             logger.exception("failed to mark skeleton failed: %s", skeleton_id)
 

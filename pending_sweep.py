@@ -36,6 +36,11 @@ SWEEP_INTERVAL_SECONDS = 600  # 10 min — high-freq, independent of nightly dae
 # H3: cap batch size per sweep tick. Sweep must not fan out hundreds of
 # analyzer/embedding pipelines at once — that DDoSes DeepSeek + SQLite.
 MAX_RETRIES_PER_SWEEP = 20
+# H2 round-6: intent ledger stale timeout. After this, the intent's owner
+# is assumed dead. We do NOT replay the pipeline — replaying would risk
+# double-merge into a target memory the crashed run already partially
+# updated. Instead, close the intent + mark skeleton failed for human review.
+INTENT_STALE_MINUTES = 30
 
 # GC-safe registry (see mcp_server._spawn_background_task).
 _BACKGROUND_TASKS: set = set()
@@ -78,7 +83,42 @@ async def sweep_stuck_pending() -> dict:
         "failed": 0,
         "still_pending": 0,
         "skipped_claimed": 0,
+        "intent_timeouts": 0,
     }
+
+    # H2 round-6: BEFORE looking at pending skeletons, close out any stale
+    # in_flight intent ledgers. Those represent crashed pipelines whose
+    # target-memory side effects are unknown; we must NOT replay them, only
+    # mark their skeletons failed so humans can review.
+    stale_intents = database.list_stale_intent_ledgers(
+        older_than_minutes=INTENT_STALE_MINUTES)
+    for stale in stale_intents:
+        skel_id = stale["skeleton_id"]
+        token = stale["owner_token"]
+        try:
+            if not database.close_stale_intent(skel_id, token):
+                # Owner came back and terminaled it — nothing to do.
+                continue
+            # Mark skeleton failed with intent_timeout suffix so
+            # _idempotent_response can emit retry_safe=false.
+            database.update_memory_status(
+                skel_id, "failed",
+                source_platform_suffix="intent_timeout",
+                require_status="pending",
+            )
+            _write_audit(
+                skel_id, "sweep_fail",
+                reason=f"stale intent > {INTENT_STALE_MINUTES}min: "
+                       f"pipeline crashed with unknown side effects, "
+                       f"NOT retrying (double-merge risk)",
+            )
+            result["intent_timeouts"] += 1
+            logger.warning(
+                "pending sweep: closed stale intent %s (owner=%s) — "
+                "skeleton marked failed", skel_id, token[:8])
+        except Exception:
+            logger.exception(
+                "sweep failed to close stale intent %s", skel_id)
 
     # Snapshot candidate ids; each transition is then re-validated atomically.
     stuck = database.list_memories_by_status(
