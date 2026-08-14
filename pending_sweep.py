@@ -86,39 +86,42 @@ async def sweep_stuck_pending() -> dict:
         "intent_timeouts": 0,
     }
 
-    # H2 round-6: BEFORE looking at pending skeletons, close out any stale
-    # in_flight intent ledgers. Those represent crashed pipelines whose
-    # target-memory side effects are unknown; we must NOT replay them, only
-    # mark their skeletons failed so humans can review.
+    # H2 round-6 + H round-7: BEFORE looking at pending skeletons, close
+    # out any stale in_flight intent ledgers via an atomic reconciliation
+    # against the skeleton row (see close_stale_intent_atomic docstring).
+    # This handles the case where the pipeline reused the skeleton (create
+    # path → skeleton='active'), or merged into another target (→
+    # 'replaced'), or genuinely died mid-pipeline (→ 'failed'). The single
+    # atomic helper prevents the ledger/skeleton mismatch class of bugs.
     stale_intents = database.list_stale_intent_ledgers(
         older_than_minutes=INTENT_STALE_MINUTES)
     for stale in stale_intents:
         skel_id = stale["skeleton_id"]
         token = stale["owner_token"]
         try:
-            if not database.close_stale_intent(skel_id, token):
-                # Owner came back and terminaled it — nothing to do.
+            outcome = database.close_stale_intent_atomic(
+                skel_id, token,
+                reason=(f"stale intent > {INTENT_STALE_MINUTES}min: "
+                        f"pipeline crashed with unknown side effects, "
+                        f"reconciled based on skeleton status"),
+            )
+            if not outcome.get("transitioned"):
+                # Either owner beat us to it, or skeleton is in an
+                # inconsistent state — leave for human review.
+                logger.info(
+                    "pending sweep: stale intent %s not transitioned "
+                    "(disposition=%s, skel_status=%s)",
+                    skel_id, outcome.get("disposition"),
+                    outcome.get("skeleton_status"))
                 continue
-            # Mark skeleton failed with intent_timeout suffix so
-            # _idempotent_response can emit retry_safe=false.
-            database.update_memory_status(
-                skel_id, "failed",
-                source_platform_suffix="intent_timeout",
-                require_status="pending",
-            )
-            _write_audit(
-                skel_id, "sweep_fail",
-                reason=f"stale intent > {INTENT_STALE_MINUTES}min: "
-                       f"pipeline crashed with unknown side effects, "
-                       f"NOT retrying (double-merge risk)",
-            )
             result["intent_timeouts"] += 1
             logger.warning(
-                "pending sweep: closed stale intent %s (owner=%s) — "
-                "skeleton marked failed", skel_id, token[:8])
+                "pending sweep: reconciled stale intent %s (owner=%s, "
+                "disposition=%s)",
+                skel_id, token[:8], outcome.get("disposition"))
         except Exception:
             logger.exception(
-                "sweep failed to close stale intent %s", skel_id)
+                "sweep failed to reconcile stale intent %s", skel_id)
 
     # Snapshot candidate ids; each transition is then re-validated atomically.
     stuck = database.list_memories_by_status(

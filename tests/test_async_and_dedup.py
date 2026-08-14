@@ -839,6 +839,135 @@ class TestAsyncRememberHelpers:
         assert database.get_memory("A")["status"] == "active", \
             "H3 regressed: A superseded despite B drift"
 
+    def test_h_r7_stale_intent_active_skeleton_ledger_catches_up(self, db_env):
+        """Round-7 H: pipeline reused skeleton (status=active) but crashed
+        before terminal ledger. Sweep must NOT mark active skeleton failed;
+        instead, ledger catches up to active."""
+        now = datetime.now(timezone.utc)
+        stale = (now - timedelta(hours=3)).isoformat()
+        # Skeleton is already active (create pipeline committed set_memory)
+        database.insert_pending_memory({
+            "id": "sk_active", "content": "x", "room": "living_room",
+            "client_request_id": "crq_active", "status": "pending",
+        })
+        conn = database._get_conn()
+        conn.execute("UPDATE memories SET status='active' WHERE id=?",
+                     ("sk_active",))
+        # Stale in_flight ledger (terminal ledger never committed)
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_active", "crq_active", stale, "ghost_owner"),
+        )
+        conn.commit()
+
+        outcome = database.close_stale_intent_atomic(
+            "sk_active", "ghost_owner", reason="test")
+        assert outcome["disposition"] == "already_active"
+        assert outcome["transitioned"] is True
+        # Skeleton stays active — sweep did NOT clobber it
+        assert database.get_memory("sk_active")["status"] == "active"
+        # Ledger caught up
+        ledger = database.get_ledger("sk_active")
+        assert ledger["terminal_state"] == "active"
+        assert ledger["result_memory_id"] == "sk_active"
+
+    def test_h_r7_stale_intent_replaced_skeleton(self, db_env):
+        """Round-7 H: merge path committed link_to_real_id but crashed
+        before terminal ledger. Sweep reconciles ledger→replaced with
+        result_memory_id from the link."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        database.insert_pending_memory({
+            "id": "sk_repl", "content": "x", "room": "living_room",
+            "client_request_id": "crq_repl", "status": "pending",
+        })
+        database.insert_pending_memory({
+            "id": "real_target_of_repl", "content": "target",
+            "room": "living_room",
+            "client_request_id": "", "status": "active",
+        })
+        conn = database._get_conn()
+        conn.execute(
+            "UPDATE memories SET status='replaced', link_to_real_id=? "
+            "WHERE id=?",
+            ("real_target_of_repl", "sk_repl"),
+        )
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_repl", "crq_repl", stale, "gh"),
+        )
+        conn.commit()
+
+        outcome = database.close_stale_intent_atomic(
+            "sk_repl", "gh", reason="test")
+        assert outcome["disposition"] == "already_replaced"
+        ledger = database.get_ledger("sk_repl")
+        assert ledger["terminal_state"] == "replaced"
+        assert ledger["result_memory_id"] == "real_target_of_repl"
+
+    def test_h_r7_stale_intent_pending_skeleton_fails_both(self, db_env):
+        """Round-7 H: normal stale-intent case — skeleton still pending,
+        no side effects. Both ledger + skeleton → failed atomically, and
+        an audit row is written."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        database.insert_pending_memory({
+            "id": "sk_pend", "content": "x", "room": "living_room",
+            "client_request_id": "crq_pend", "status": "pending",
+        })
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_pend", "crq_pend", stale, "gh"),
+        )
+        conn.commit()
+
+        outcome = database.close_stale_intent_atomic(
+            "sk_pend", "gh", reason="stale intent test")
+        assert outcome["disposition"] == "failed"
+        assert database.get_memory("sk_pend")["status"] == "failed"
+        assert database.get_ledger("sk_pend")["terminal_state"] == "failed"
+        # Audit written
+        audits = [a for a in database.list_audits(action="sweep_fail")
+                  if a["target_id"] == "sk_pend"]
+        assert len(audits) == 1
+
+    def test_h_r7_wrong_owner_token_no_op(self, db_env):
+        """Round-7 H: close_stale_intent_atomic guards by owner_token. A
+        caller with the wrong token must NOT close the intent (defends
+        against confused sweeps or restarted daemons)."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        database.insert_pending_memory({
+            "id": "sk_own", "content": "x", "room": "living_room",
+            "client_request_id": "crq_own", "status": "pending",
+        })
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_own", "crq_own", stale, "real_owner"),
+        )
+        conn.commit()
+
+        outcome = database.close_stale_intent_atomic(
+            "sk_own", "wrong_owner", reason="test")
+        assert outcome["transitioned"] is False
+        assert outcome["disposition"] == "already_terminaled"
+        assert database.get_ledger("sk_own")["terminal_state"] == "in_flight"
+        assert database.get_memory("sk_own")["status"] == "pending"
+
     def test_h3_drift_check_rolls_back(self, db_env):
         """H3 round-4: commit_maintenance_atomic must reject a stale
         expected_updated_at with MaintenanceDrift and roll back — NOT

@@ -716,13 +716,9 @@ def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
 
 
 def close_stale_intent(skeleton_id: str, owner_token: str) -> bool:
-    """H2 round-6: atomically transition a stale in_flight ledger to
-    terminal_state='failed'. Guarded by owner_token so if the original
-    owner comes back online they see the ledger is closed.
-
-    Returns True if we closed it, False if it was already terminaled by
-    someone else (raced with a delayed owner).
-    """
+    """DEPRECATED: kept for backwards compat. Prefer
+    close_stale_intent_atomic which reconciles ledger + skeleton + audit
+    in one transaction."""
     conn = _get_conn()
     now = _now_iso()
     cur = conn.execute(
@@ -734,6 +730,140 @@ def close_stale_intent(skeleton_id: str, owner_token: str) -> bool:
     )
     conn.commit()
     return cur.rowcount == 1
+
+
+def close_stale_intent_atomic(
+    skeleton_id: str, owner_token: str, reason: str,
+) -> dict:
+    """H round-7: atomic reconciliation of a stale intent ledger with the
+    skeleton row.
+
+    A crashed pipeline may have completed *some* side effects before dying.
+    The skeleton row is the source of truth for what actually happened:
+
+      - skeleton status='pending'   → no side effects committed →
+        ledger + skeleton → 'failed'; write intent_timeout audit.
+      - skeleton status='active'    → create pipeline reused the skeleton
+        and committed set_memory() but crashed before terminal ledger →
+        ledger → 'active' (catches up); result_memory_id = skeleton_id.
+      - skeleton status='replaced'  → merge pipeline committed and set
+        link_to_real_id but crashed before terminal ledger →
+        ledger → 'replaced' (catches up); result_memory_id from link.
+      - any other status            → leave ledger in_flight for human
+        review (return dict with disposition='needs_review').
+
+    Every branch runs inside ONE BEGIN IMMEDIATE. If anything fails, all
+    rows roll back — no partial ledger/skeleton/audit state.
+
+    Returns: {"disposition": ..., "transitioned": bool, "skeleton_status": ...}
+    """
+    conn = _get_conn()
+    now = _now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # 1. Re-verify ledger is still our stale in_flight (defense against
+        #    race where the ledger raced between our list_stale_* snapshot
+        #    and this close attempt).
+        ledger_row = conn.execute(
+            "SELECT terminal_state, owner_token FROM async_remember_ledger "
+            "WHERE skeleton_id = ?", (skeleton_id,),
+        ).fetchone()
+        if not ledger_row or ledger_row[0] != "in_flight" \
+                or ledger_row[1] != owner_token:
+            conn.execute("ROLLBACK")
+            return {"disposition": "already_terminaled",
+                    "transitioned": False, "skeleton_status": None}
+
+        # 2. Read skeleton current status.
+        skel_row = conn.execute(
+            "SELECT status, link_to_real_id, source_platform "
+            "FROM memories WHERE id = ?", (skeleton_id,),
+        ).fetchone()
+        if not skel_row:
+            # Skeleton was hard-deleted somehow — close ledger to failed
+            # and move on. No audit target.
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='failed', "
+                "committed_at=? WHERE skeleton_id=?", (now, skeleton_id))
+            conn.commit()
+            return {"disposition": "skeleton_missing",
+                    "transitioned": True, "skeleton_status": None}
+        skel_status = skel_row[0]
+        skel_link = skel_row[1] or ""
+
+        # 3. Reconcile based on skeleton state.
+        if skel_status == "pending":
+            # Nothing committed. Both → failed with audit.
+            _audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
+            _audit_defaults.update({
+                "action": "sweep_fail", "target_id": skeleton_id,
+                "decision_reason": reason,
+                "state_before": json.dumps({"status": "pending",
+                                            "ledger": "in_flight"},
+                                           ensure_ascii=False),
+                "state_after": json.dumps({"status": "failed",
+                                           "ledger": "failed"},
+                                          ensure_ascii=False),
+                "auto_executed": 1, "created_at": now,
+            })
+            audit_vals = [_audit_defaults.get(c, "") for c in _AUDIT_COLUMNS]
+            audit_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='failed', "
+                "committed_at=? WHERE skeleton_id=?", (now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET status='failed', updated_at=?, "
+                "source_platform = CASE "
+                "  WHEN source_platform LIKE '%:intent_timeout' "
+                "    THEN source_platform "
+                "  ELSE source_platform || ':intent_timeout' END, "
+                "finalize_claim_id='', finalize_claim_at='' "
+                "WHERE id=? AND status='pending'",
+                (now, skeleton_id))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) "
+                f"VALUES ({audit_ph})",
+                audit_vals)
+            conn.commit()
+            return {"disposition": "failed", "transitioned": True,
+                    "skeleton_status": "pending"}
+
+        if skel_status == "active":
+            # Create pipeline reused skeleton and committed set_memory
+            # but crashed before terminal ledger. Ledger catches up.
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='active', "
+                "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
+                (skeleton_id, now, skeleton_id))
+            conn.commit()
+            return {"disposition": "already_active", "transitioned": True,
+                    "skeleton_status": "active"}
+
+        if skel_status == "replaced":
+            # Merge pipeline set link_to_real_id but crashed before terminal.
+            # Ledger catches up using the link.
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='replaced', "
+                "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
+                (skel_link, now, skeleton_id))
+            conn.commit()
+            return {"disposition": "already_replaced", "transitioned": True,
+                    "skeleton_status": "replaced"}
+
+        # Any other status (failed, superseded, ...) — inconsistent. Leave
+        # for human review; do not close ledger.
+        conn.execute("ROLLBACK")
+        return {"disposition": "needs_review", "transitioned": False,
+                "skeleton_status": skel_status}
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
 
 
 def get_ledger(skeleton_id: str) -> dict | None:
