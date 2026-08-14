@@ -96,8 +96,11 @@ async def sweep_stuck_pending() -> dict:
         try:
             from mcp_server import _finalize_pending_memory
         except Exception:
-            logger.exception("cannot import _finalize_pending_memory")
-            continue
+            # 可延: if the import fails once it will fail for every skeleton
+            # in this sweep — break instead of flooding the log.
+            logger.exception(
+                "cannot import _finalize_pending_memory — aborting this sweep")
+            break
 
         # P0-3: before retrying, check whether a previous crashed run
         # already produced a real memory with this crq. If yes, just
@@ -160,9 +163,18 @@ def _age_minutes(iso_ts: str, now: datetime) -> float:
 
 
 def _find_completed_by_crq(crq: str, exclude_id: str) -> dict | None:
-    """P0-3: look for any non-pending, non-failed memory with matching crq
-    that isn't the skeleton itself. If one exists, a prior crashed pipeline
-    already produced a real memory — we must NOT re-run the pipeline.
+    """P0-3 defense-in-depth: look for any non-pending, non-failed memory
+    with matching crq that isn't the skeleton itself. If one exists, a
+    prior crashed pipeline already produced a real memory — sweep must
+    NOT re-run the pipeline (that would duplicate).
+
+    Note: with the UNIQUE(client_request_id) partial index (added in the
+    same PR), it is *structurally impossible* for two rows to share a crq
+    inside a healthy DB — the skeleton claims the crq slot the moment
+    it's written. This helper is dead code in the healthy path; it survives
+    only to catch pre-fix legacy rows (crq assigned before the index) or
+    manual DB surgery. Do not remove — the safety cost is a single lookup
+    per stuck skeleton (once per 10 min).
     """
     if not crq:
         return None

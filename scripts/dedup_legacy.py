@@ -51,9 +51,16 @@ DEFAULT_ROOMS = [
 
 
 def _parse_ts(s: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp. Handles the 'Z' suffix for UTC (Python
+    3.10 datetime.fromisoformat rejects it; 3.11+ accepts). Legacy rows
+    stored with 'Z' would otherwise silently skip dedup on older interpreters.
+    """
     if not s:
         return None
     try:
+        # Normalize trailing 'Z' → '+00:00' for compat with 3.10.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
         t = datetime.fromisoformat(s)
         return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
     except Exception:

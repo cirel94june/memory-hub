@@ -32,12 +32,13 @@ def _idempotent_response(existing: dict) -> str:
       - pending  → still queued (client can poll again)
       - replaced → redirect to link_to_real_id (real memory that
                    memory_ops.remember created via merge/supersede)
-      - failed   → tell the caller, plus retry_safe:
-          * retry_safe=true  → content was rejected by the write gate (never
-            touched real memory tables); a differently-worded retry is safe.
-          * retry_safe=false → pipeline crashed or sweep timed out mid-flight
-            (may have partial state); retry could duplicate. Escalate to
-            operator or drop the request.
+      - failed   → tell the caller, plus retry_safe. Currently the MCP path
+                   only produces :pipeline_error and :sweep_timeout failures
+                   (never :gated — write_gate runs on quick=True only, and
+                   MCP always calls with quick=False). Both are treated as
+                   retry_safe=false because they mean the pipeline may have
+                   partially written state. A future gated path would be
+                   distinguishable by source_platform ending in :gated.
     """
     status = existing.get("status", "unknown")
     if status == "replaced":
@@ -52,10 +53,11 @@ def _idempotent_response(existing: dict) -> str:
         "idempotent": True,
     }
     if status == "failed":
-        # source_platform gets a suffix marker whenever we know why a
-        # skeleton failed. Only "gated" (content rejected upstream, no side
-        # effects) is safe to retry; everything else is opaque.
         platform = (existing.get("source_platform") or "").lower()
+        # Only :gated failures (content rejected before any write) are safe
+        # to retry. In the current MCP flow this suffix is never applied,
+        # so the effective answer is always False. Keep the check so the
+        # semantics stay correct if the gated path is reintroduced.
         payload["retry_safe"] = platform.endswith(":gated")
         if not payload["retry_safe"]:
             payload["hint"] = (
@@ -115,13 +117,13 @@ async def _finalize_pending_memory(
             # idempotent lookups for the same crq don't miss.
             database.mark_replaced(skeleton_id, link_to_real_id=real_id)
         else:
-            # No id returned. Distinguish "gated" (write_gate rejected content
-            # cleanly, no side effects) from other blocked/failed reasons.
-            # Only gated is retry_safe — content-level, no partial state.
-            reason = (result or {}).get("status", "").lower()
-            suffix = "gated" if reason in ("gated", "blocked") else "pipeline_error"
+            # No id returned. write_gate only runs on quick=True; MCP always
+            # calls memory_ops.remember with quick=False, so we should never
+            # see a "gated" status here in practice. Any missing id from the
+            # MCP path is treated as a pipeline error (unknown side effects).
             database.update_memory_status(
-                skeleton_id, "failed", source_platform_suffix=suffix)
+                skeleton_id, "failed",
+                source_platform_suffix="pipeline_error")
     except Exception:
         # Exception mid-pipeline: partial state possible → NOT retry_safe.
         logger.exception("pending finalize crashed for skeleton %s", skeleton_id)

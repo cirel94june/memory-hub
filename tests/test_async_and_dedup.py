@@ -266,7 +266,9 @@ class TestAsyncRememberHelpers:
             src = f.read()
         idx = src.find("async def remember(")
         assert idx != -1, "remember MCP tool not found"
-        body = src[idx:idx + 4500]
+        # Body needs to cover: docstring + idempotency lookup + INSERT loop
+        # with IntegrityError catch + id-collision return + background dispatch.
+        body = src[idx:idx + 6000]
         assert "get_memory_by_client_request_id" in body, \
             "MCP wrapper missing idempotency lookup"
         assert "sqlite3.IntegrityError" in body, \
@@ -320,33 +322,54 @@ class TestAsyncRememberHelpers:
         assert row["status"] == "active"
         assert row["link_to_real_id"] == ""
 
-    def test_failed_gated_response_marks_retry_safe(self, db_env):
-        """应改 3: failed skeleton with :gated suffix → retry_safe=true."""
+    def test_idempotent_response_gated_marker_is_retry_safe(self, db_env):
+        """应改 3 + 必修 3: MCP path no longer emits :gated (write_gate only
+        runs on quick=True). But _idempotent_response must still classify
+        :gated as retry_safe=true if the marker ever appears (e.g. from a
+        future gate path or manually flagged row)."""
         database.insert_pending_memory({
             "id": "skel_g", "content": "spam", "room": "living_room",
             "client_request_id": "crq_g", "status": "pending",
         })
-
-        async def gated_impl(**kw):
-            return {"id": "", "status": "gated", "reason": "write_gate blocked"}
-
-        from async_remember import _finalize_pending_memory as _core
-        asyncio.run(_core(
-            "skel_g", impl_fn=gated_impl,
-            content="spam", room="living_room", category="",
-            importance=0.5, source_ai="claude", event_date="",
-            force_create=False, client_request_id="crq_g",
-        ))
+        # Force the :gated suffix directly — MCP flow won't produce this.
+        database.update_memory_status(
+            "skel_g", "failed", source_platform_suffix="gated")
 
         got = database.get_memory("skel_g")
         assert got["status"] == "failed"
         assert got["source_platform"].endswith(":gated")
 
-        # Round-trip through _idempotent_response
         from async_remember import _idempotent_response
         resp = json.loads(_idempotent_response(got))
         assert resp["status"] == "failed"
         assert resp["retry_safe"] is True
+
+    def test_mcp_path_no_id_marks_pipeline_error_not_gated(self, db_env):
+        """必修 3: even if impl_fn returns status='gated', MCP path treats it
+        as pipeline_error because write_gate isn't in this path — we don't
+        trust the string."""
+        database.insert_pending_memory({
+            "id": "skel_g2", "content": "x", "room": "living_room",
+            "client_request_id": "crq_g2", "status": "pending",
+        })
+
+        async def gated_impl(**kw):
+            return {"id": "", "status": "gated", "reason": "?"}
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_g2", impl_fn=gated_impl,
+            content="x", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_g2",
+        ))
+        got = database.get_memory("skel_g2")
+        assert got["status"] == "failed"
+        assert got["source_platform"].endswith(":pipeline_error")
+
+        from async_remember import _idempotent_response
+        resp = json.loads(_idempotent_response(got))
+        assert resp["retry_safe"] is False
 
     def test_failed_pipeline_error_marks_retry_unsafe(self, db_env):
         """应改 3: failed skeleton from pipeline crash → retry_safe=false."""
@@ -375,6 +398,68 @@ class TestAsyncRememberHelpers:
         assert resp["status"] == "failed"
         assert resp["retry_safe"] is False
         assert "hint" in resp
+
+    def test_mcp_wrapper_returns_error_dict_on_id_collision(self):
+        """必修 2: after 3 skeleton_id retries, MCP wrapper must return a
+        structured error dict, NOT re-raise IntegrityError (violates the
+        'never bubble' contract)."""
+        with open("mcp_server.py", encoding="utf-8") as f:
+            src = f.read()
+        idx = src.find("async def remember(")
+        body = src[idx:idx + 6000]
+        assert '"error": "id_collision_max_retry"' in body, \
+            "MCP wrapper missing id_collision_max_retry error path"
+        # The MCP wrapper's INSERT loop must not have a raw `raise` on the
+        # id-collision branch. The only `raise` allowed is inside the
+        # IntegrityError handler (the CRQ-lookup fallback) that we now
+        # replaced with the structured error return.
+        insert_loop_start = body.find("for attempt in range")
+        insert_loop_end = body.find("if not inserted:")
+        assert insert_loop_start != -1 and insert_loop_end != -1, \
+            "id-collision loop shape changed unexpectedly"
+        loop_body = body[insert_loop_start:insert_loop_end]
+        assert "raise" not in loop_body, \
+            "id-collision loop still raises — violates 'never bubble' contract"
+
+    def test_created_at_preserved_across_upsert(self, db_env):
+        """应改 3: pipeline UPSERT at completion must not overwrite the
+        skeleton's created_at — else recency boost sees the memory as
+        just-created instead of 10min-old."""
+        original_ts = "2026-08-11T12:00:00+00:00"
+        database.insert_pending_memory({
+            "id": "skel_ts", "content": "check ts", "room": "living_room",
+            "client_request_id": "crq_ts", "status": "pending",
+            "created_at": original_ts,
+        })
+        assert database.get_memory("skel_ts")["created_at"] == original_ts
+
+        # Simulate the pipeline UPSERT with a new created_at (this is what
+        # memory_ops.remember does when reusing existing_id).
+        database.set_memory({
+            "id": "skel_ts", "content": "check ts", "room": "living_room",
+            "layer": "shared", "status": "active",
+            "created_at": "2026-08-11T13:00:00+00:00",  # newer — must be ignored
+            "updated_at": "2026-08-11T13:00:00+00:00",
+            "client_request_id": "crq_ts",
+        })
+        got = database.get_memory("skel_ts")
+        assert got["created_at"] == original_ts, \
+            f"created_at was overwritten: {got['created_at']}"
+        # updated_at should be the new value
+        assert got["updated_at"] == "2026-08-11T13:00:00+00:00"
+
+    def test_insert_pending_honors_tags_and_domain(self, db_env):
+        """应改 3 (database): insert_pending_memory used to hard-code [] and
+        silently drop caller-supplied tags/domain."""
+        database.insert_pending_memory({
+            "id": "skel_tags", "content": "x", "room": "living_room",
+            "client_request_id": "crq_tags", "status": "pending",
+            "tags": ["foo", "bar"],
+            "domain": ["work"],
+        })
+        got = database.get_memory("skel_tags")
+        assert "foo" in got.get("tags", "") or "foo" in json.loads(got.get("tags", "[]"))
+        assert "work" in got.get("domain", "") or "work" in json.loads(got.get("domain", "[]"))
 
     def test_gc_safe_background_task_helper_exists(self):
         """P0-1: mcp_server and pending_sweep must define a set-backed

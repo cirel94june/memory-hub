@@ -336,7 +336,8 @@ async def remember(
       - 直接落成 status=active
       - 触发 merge/supersede → 骨架标 status=replaced + link_to_real_id 指向真身
       - 崩溃/被拦截 → status=failed
-    - daemon 每小时扫超过 10 分钟的 pending，重跑 pipeline；超过 60 分钟标 failed
+    - 独立 sweep 任务每 10 分钟检查一次：超过 10 分钟的 pending 会重跑 pipeline，
+      超过 60 分钟仍是 pending 会被标 failed
 
     ## 房间选择
     - living_room: 核心身份（永远注入）
@@ -375,6 +376,7 @@ async def remember(
 
     skeleton_id = _new_skeleton_id()
     _MAX_ID_RETRIES = 3
+    inserted = False
     for attempt in range(_MAX_ID_RETRIES + 1):
         try:
             database.insert_pending_memory({
@@ -385,6 +387,7 @@ async def remember(
                 "client_request_id": client_request_id,
                 "created_at": now,
             })
+            inserted = True
             break
         except sqlite3.IntegrityError:
             # Two possible causes:
@@ -393,7 +396,7 @@ async def remember(
             #       Re-query and return the idempotent response.
             #   (b) skeleton_id PK collision — extremely rare id-birthday.
             #       Regenerate id and retry.
-            # Never let IntegrityError bubble to the MCP client — it would
+            # NEVER let IntegrityError bubble to the MCP client — it would
             # look like a failed write and trigger further retries.
             if client_request_id:
                 existing = database.get_memory_by_client_request_id(client_request_id)
@@ -403,9 +406,21 @@ async def remember(
             if attempt < _MAX_ID_RETRIES:
                 skeleton_id = _new_skeleton_id()
                 continue
-            _LOG.error("skeleton_id collision after %d retries; giving up",
+            # Give up honoring the "never bubble IntegrityError" contract:
+            # return a structured error the MCP client can handle instead of
+            # re-raising and getting an opaque write failure.
+            _LOG.error("skeleton_id collision after %d retries; returning error",
                        _MAX_ID_RETRIES)
-            raise
+    if not inserted:
+        return json.dumps({
+            "status": "error",
+            "error": "id_collision_max_retry",
+            "memory_id": "",
+            "client_request_id": client_request_id,
+            "hint": ("Failed to allocate a unique skeleton_id after "
+                     f"{_MAX_ID_RETRIES + 1} attempts. Retry the request "
+                     "with a slightly different content or wait a moment."),
+        }, ensure_ascii=False)
 
     # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference
     _spawn_background_task(_finalize_pending_memory(

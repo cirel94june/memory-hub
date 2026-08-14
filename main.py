@@ -68,9 +68,16 @@ async def lifespan(app: FastAPI):
         print("[Memory Hub] Daemon scheduler started (every 12h)")
 
         # PR C 块 8: async remember 卡死 pending 骨架清扫（每 10 min，独立高频）
-        from pending_sweep import start_sweep_loop
-        sweep_task = start_sweep_loop()
-        print("[Memory Hub] Pending sweep loop started (every 10min)")
+        # sweep_task 先初始化为 None——如果 pending_sweep import 失败，finally
+        # 里的 sweep_task.cancel() 就不会 NameError 掩盖原始异常。
+        sweep_task = None
+        try:
+            from pending_sweep import start_sweep_loop
+            sweep_task = start_sweep_loop()
+            print("[Memory Hub] Pending sweep loop started (every 10min)")
+        except Exception as e:
+            logging.getLogger("main").exception(
+                "pending_sweep failed to start (continuing without it): %s", e)
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -85,7 +92,8 @@ async def lifespan(app: FastAPI):
             daemon_task.cancel()
             lag_task.cancel()
             bg_worker_task.cancel()
-            sweep_task.cancel()
+            if sweep_task is not None:
+                sweep_task.cancel()
 
 
 def _seconds_until_next_run() -> int:

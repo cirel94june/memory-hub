@@ -509,9 +509,22 @@ def insert_pending_memory(mem: dict) -> None:
 
     Raises sqlite3.IntegrityError if the client_request_id collides with an
     existing row — MCP layer catches this to return an idempotent response.
+
+    tags / domain: honored from mem if provided (as JSON string OR list).
+    Historically this method hard-coded '[]' which silently dropped any
+    caller-provided values.
     """
     conn = _get_conn()
     now = mem.get("created_at") or _now_iso()
+
+    def _as_json_list(val):
+        if val is None or val == "":
+            return "[]"
+        if isinstance(val, (list, tuple)):
+            return json.dumps(list(val), ensure_ascii=False)
+        # Already-serialized string
+        return val
+
     conn.execute(
         "INSERT INTO memories ("
         "  id, content, layer, room, category, owner_ai, importance,"
@@ -525,7 +538,9 @@ def insert_pending_memory(mem: dict) -> None:
             mem.get("source_ai", ""), mem.get("source_platform", ""),
             mem.get("event_date", ""), mem.get("source_context", ""),
             mem.get("status", "pending"), mem.get("client_request_id", ""),
-            now, now, "[]", "[]",
+            now, now,
+            _as_json_list(mem.get("tags")),
+            _as_json_list(mem.get("domain")),
         ),
     )
     conn.commit()
@@ -641,13 +656,23 @@ def set_memory(mem: dict) -> None:
     # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
     # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
     # 已存在的 crq/link，否则骨架幂等追踪失效。
+    # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
+    # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
+    # "刚刚创建"，破 recency boost、破 sweep 判 age）。
     _preserve_on_empty = {"client_request_id", "link_to_real_id"}
+    _preserve_always = {"created_at"}
     update_set_parts = []
     for c in _ALL_COLUMNS:
         if c == "id":
             continue
         if c == "embedding":
             update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
+        elif c in _preserve_always:
+            # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
+            update_set_parts.append(
+                f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
+                f"ELSE excluded.{c} END"
+            )
         elif c in _preserve_on_empty:
             # 只在 excluded 值非空时覆盖，为空则保留已有值
             update_set_parts.append(
