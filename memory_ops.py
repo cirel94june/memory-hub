@@ -1001,8 +1001,7 @@ async def _execute_maintenance_action(
         return {"id": target_id, "status": "supplemented", "maintenance_action": "supplement"}
 
     if action == "resolve_thread":
-        target_mem["resolved"] = 1
-        target_mem["updated_at"] = now
+        # H4: same-tx state change + audit (see supersede branch).
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1010,15 +1009,25 @@ async def _execute_maintenance_action(
             "date": now, "author": source_ai or "system",
             "kind": "resolve", "content": f"自动完成: {new_content[:100]}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"resolved": True}
-        _write_audit("resolve_thread", target_id, new_content, reason, state_before, state_after, True, source_ai)
+        database.commit_maintenance_atomic(
+            memory_id=target_id,
+            memory_updates={"resolved": 1, "comments": comments},
+            audit_row={
+                "action": "resolve_thread", "target_id": target_id,
+                "new_content": new_content,
+                "source_message_ids": "[]",
+                "decision_reason": reason,
+                "state_before": json.dumps(state_before, ensure_ascii=False),
+                "state_after": json.dumps(state_after, ensure_ascii=False),
+                "source_ai": source_ai or "",
+                "auto_executed": 1,
+            },
+        )
         return {"id": target_id, "status": "resolved", "maintenance_action": "resolve_thread"}
 
     if action == "reopen_thread":
-        target_mem["resolved"] = 0
-        target_mem["updated_at"] = now
+        # H4: same-tx state change + audit (see supersede branch).
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1026,10 +1035,21 @@ async def _execute_maintenance_action(
             "date": now, "author": source_ai or "system",
             "kind": "reopen", "content": f"重新打开: {new_content[:100]}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"resolved": False}
-        _write_audit("reopen_thread", target_id, new_content, reason, state_before, state_after, False, source_ai)
+        database.commit_maintenance_atomic(
+            memory_id=target_id,
+            memory_updates={"resolved": 0, "comments": comments},
+            audit_row={
+                "action": "reopen_thread", "target_id": target_id,
+                "new_content": new_content,
+                "source_message_ids": "[]",
+                "decision_reason": reason,
+                "state_before": json.dumps(state_before, ensure_ascii=False),
+                "state_after": json.dumps(state_after, ensure_ascii=False),
+                "source_ai": source_ai or "",
+                "auto_executed": 0,
+            },
+        )
         return {"id": target_id, "status": "reopened", "maintenance_action": "reopen_thread"}
 
     if action in ("update", "supersede"):
@@ -1038,8 +1058,10 @@ async def _execute_maintenance_action(
                          state_before, state_before, False, source_ai)
             return None
 
-        target_mem["status"] = "superseded"
-        target_mem["updated_at"] = now
+        # H4: supersede is the highest-impact maintenance action (permanently
+        # takes a memory out of recall). It MUST be atomic with the audit row.
+        # Before, an audit INSERT failure would leave the memory superseded
+        # with no audit trail — an invisible data mutation.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1048,10 +1070,21 @@ async def _execute_maintenance_action(
             "kind": "supersede_note",
             "content": f"被新记忆取代（{action}）: {reason}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"status": "superseded", "reason": reason}
-        _write_audit(action, target_id, new_content, reason, state_before, state_after, True, source_ai)
+        database.commit_maintenance_atomic(
+            memory_id=target_id,
+            memory_updates={"status": "superseded", "comments": comments},
+            audit_row={
+                "action": action, "target_id": target_id,
+                "new_content": new_content,
+                "source_message_ids": "[]",
+                "decision_reason": reason,
+                "state_before": json.dumps(state_before, ensure_ascii=False),
+                "state_after": json.dumps(state_after, ensure_ascii=False),
+                "source_ai": source_ai or "",
+                "auto_executed": 1,
+            },
+        )
         return {"superseded_id": target_id, "status": "superseded", "maintenance_action": action}
 
     return None

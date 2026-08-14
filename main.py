@@ -89,11 +89,31 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
-            daemon_task.cancel()
-            lag_task.cancel()
-            bg_worker_task.cancel()
+            # L: cancel + await so tasks fully unwind. Without the await,
+            # asyncio can print "task was destroyed but it is pending" and
+            # in-flight DB writes may not commit before shutdown.
+            cancel_list = [daemon_task, lag_task, bg_worker_task]
             if sweep_task is not None:
-                sweep_task.cancel()
+                cancel_list.append(sweep_task)
+            for t in cancel_list:
+                t.cancel()
+            await asyncio.gather(*cancel_list, return_exceptions=True)
+            # Also flush the module-level bg task sets from mcp_server /
+            # pending_sweep so in-flight finalize/sweep-retry pipelines
+            # get a chance to complete or cancel cleanly.
+            try:
+                import mcp_server as _mcp_mod
+                import pending_sweep as _sweep_mod
+                for tset in (getattr(_mcp_mod, "_BACKGROUND_TASKS", None),
+                             getattr(_sweep_mod, "_BACKGROUND_TASKS", None)):
+                    if not tset:
+                        continue
+                    for t in list(tset):
+                        t.cancel()
+                    await asyncio.gather(*list(tset), return_exceptions=True)
+            except Exception:
+                logging.getLogger("main").exception(
+                    "bg task drain during shutdown failed")
 
 
 def _seconds_until_next_run() -> int:

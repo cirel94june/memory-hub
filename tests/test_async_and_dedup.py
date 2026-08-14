@@ -268,7 +268,7 @@ class TestAsyncRememberHelpers:
         assert idx != -1, "remember MCP tool not found"
         # Body needs to cover: docstring + idempotency lookup + INSERT loop
         # with IntegrityError catch + id-collision return + background dispatch.
-        body = src[idx:idx + 6000]
+        body = src[idx:idx + 10000]
         assert "get_memory_by_client_request_id" in body, \
             "MCP wrapper missing idempotency lookup"
         assert "sqlite3.IntegrityError" in body, \
@@ -406,7 +406,7 @@ class TestAsyncRememberHelpers:
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
         idx = src.find("async def remember(")
-        body = src[idx:idx + 6000]
+        body = src[idx:idx + 10000]
         assert '"error": "id_collision_max_retry"' in body, \
             "MCP wrapper missing id_collision_max_retry error path"
         # The MCP wrapper's INSERT loop must not have a raw `raise` on the
@@ -460,6 +460,112 @@ class TestAsyncRememberHelpers:
         got = database.get_memory("skel_tags")
         assert "foo" in got.get("tags", "") or "foo" in json.loads(got.get("tags", "[]"))
         assert "work" in got.get("domain", "") or "work" in json.loads(got.get("domain", "[]"))
+
+    def test_h1_atomic_sweep_claim_no_clobber(self, db_env, monkeypatch):
+        """H1 regression: sweep MUST NOT mark 'failed' a skeleton that a
+        concurrent finalize has already transitioned to 'active'.
+
+        Simulates the race by returning a stale snapshot from
+        list_memories_by_status (row was pending when snapshotted, but got
+        transitioned to active before sweep runs its status-change UPDATE)."""
+        age = (datetime.now(timezone.utc)
+               - timedelta(minutes=90)).isoformat()  # > FAIL_AFTER_MINUTES
+        database.insert_pending_memory({
+            "id": "skel_race", "content": "x", "room": "living_room",
+            "client_request_id": "crq_race", "status": "pending",
+            "created_at": age,
+        })
+        # Stale snapshot: sweep sees the row as pending, but it's since
+        # been marked active by a concurrent finalize.
+        stale_snapshot = database.list_memories_by_status(
+            "pending", older_than_minutes=10)
+        database.update_memory_status("skel_race", "active")
+
+        import pending_sweep
+        monkeypatch.setattr(
+            pending_sweep.database, "list_memories_by_status",
+            lambda status, **kw: stale_snapshot,
+        )
+        result = asyncio.run(pending_sweep.sweep_stuck_pending())
+        assert database.get_memory("skel_race")["status"] == "active", \
+            "sweep clobbered active memory back to failed"
+        assert result.get("skipped_claimed", 0) >= 1
+
+    def test_h2_ledger_short_circuit_prevents_double_pipeline(self, db_env):
+        """H2 regression: if a prior pipeline committed a ledger entry
+        (crash-and-recover scenario), a repeat finalize call MUST NOT
+        re-run the pipeline. It should just apply the ledger's terminal
+        state to the skeleton."""
+        database.insert_pending_memory({
+            "id": "skel_ledger", "content": "x", "room": "living_room",
+            "client_request_id": "crq_ledger", "status": "pending",
+        })
+        # Pre-committed ledger — pretends a previous pipeline succeeded.
+        database.commit_finalize_atomic(
+            skeleton_id="skel_ledger",
+            client_request_id="crq_ledger",
+            terminal_state="active",
+            result_memory_id="skel_ledger",
+            skeleton_update={"status": "active"},
+        )
+
+        pipeline_calls = []
+
+        async def crash_if_called(**kw):
+            pipeline_calls.append(kw)
+            raise RuntimeError("pipeline must not run when ledger exists")
+
+        from async_remember import _finalize_pending_memory as _core
+        asyncio.run(_core(
+            "skel_ledger", impl_fn=crash_if_called,
+            content="x", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="crq_ledger",
+        ))
+
+        assert pipeline_calls == [], \
+            "ledger short-circuit broken — pipeline was re-invoked"
+        assert database.get_memory("skel_ledger")["status"] == "active"
+
+    def test_h3_finalize_semaphore_bounded(self):
+        """H3 sanity: semaphore lazily constructs and reports the configured
+        bound. Concurrent finalize calls must respect it."""
+        import async_remember
+        async_remember._reset_finalize_semaphore_for_tests()
+
+        async def _grab():
+            sem = async_remember.get_finalize_semaphore()
+            # First call constructs; second returns same instance
+            sem2 = async_remember.get_finalize_semaphore()
+            assert sem is sem2
+            return sem._value
+
+        val = asyncio.run(_grab())
+        assert val == async_remember._FINALIZE_MAX_CONCURRENCY
+
+    def test_m1_crq_content_fingerprint_conflict(self):
+        """M1: reusing the same crq with different content must produce
+        a crq_content_conflict error, not silently return the first row's id."""
+        # Test the fingerprint logic directly by inspecting the response
+        # path — the full MCP tool is unavailable locally (needs mcp module).
+        # Read the source to verify the fingerprint check is present.
+        with open("mcp_server.py", encoding="utf-8") as f:
+            src = f.read()
+        idx = src.find("async def remember(")
+        body = src[idx:idx + 10000]
+        assert "content_fingerprint" in body, \
+            "MCP wrapper missing content fingerprint compute"
+        assert '"error": "crq_content_conflict"' in body, \
+            "MCP wrapper missing crq_content_conflict error path"
+        assert "existing_fp != content_fingerprint" in body, \
+            "MCP wrapper missing fingerprint comparison"
+
+    def test_m1_effective_crq_namespaces_by_source_ai(self):
+        """M1: effective_crq must include source_ai to prevent cross-AI collision."""
+        with open("mcp_server.py", encoding="utf-8") as f:
+            src = f.read()
+        assert 'effective_crq = (f"{source_ai}::{client_request_id}"' in src, \
+            "MCP wrapper missing source_ai namespace on effective_crq"
 
     def test_gc_safe_background_task_helper_exists(self):
         """P0-1: mcp_server and pending_sweep must define a set-backed

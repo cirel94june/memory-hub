@@ -356,10 +356,35 @@ async def remember(
         force_create: 强制新建，跳过自动合并
         client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
     """
-    # 1. Idempotency lookup — a pre-existing crq short-circuits everything
-    if client_request_id:
-        existing = database.get_memory_by_client_request_id(client_request_id)
+    # M1: namespace the client_request_id by source_ai so two different AIs
+    # can safely reuse the same client-side counter. Compute a content
+    # fingerprint so an accidental collision (same crq + same source_ai but
+    # different payload — the reviewer's scenario) returns a conflict
+    # instead of silently returning the first row's id.
+    effective_crq = (f"{source_ai}::{client_request_id}"
+                     if client_request_id else "")
+    content_fingerprint = hashlib.sha256(
+        (content or "").encode("utf-8")).hexdigest()[:16]
+
+    # 1. Idempotency lookup — a pre-existing crq short-circuits everything.
+    #    Verify the content fingerprint matches; else return a conflict so
+    #    the caller can tell they reused a key for a different payload.
+    if effective_crq:
+        existing = database.get_memory_by_client_request_id(effective_crq)
         if existing:
+            existing_fp = hashlib.sha256(
+                (existing.get("content") or "").encode("utf-8")).hexdigest()[:16]
+            if existing_fp != content_fingerprint:
+                return json.dumps({
+                    "status": "error",
+                    "error": "crq_content_conflict",
+                    "memory_id": "",
+                    "client_request_id": client_request_id,
+                    "hint": ("Reusing client_request_id with a different "
+                             "content payload. Pick a new key, or send the "
+                             "exact same content to get the idempotent "
+                             "response for the original."),
+                }, ensure_ascii=False)
             return _idempotent_response(existing)
 
     # 2. Insert pending skeleton — try up to N times, regenerating the
@@ -384,7 +409,7 @@ async def remember(
                 "category": category, "importance": importance,
                 "source_ai": source_ai, "event_date": event_date,
                 "source_platform": "mcp", "status": "pending",
-                "client_request_id": client_request_id,
+                "client_request_id": effective_crq,
                 "created_at": now,
             })
             inserted = True
@@ -398,9 +423,22 @@ async def remember(
             #       Regenerate id and retry.
             # NEVER let IntegrityError bubble to the MCP client — it would
             # look like a failed write and trigger further retries.
-            if client_request_id:
-                existing = database.get_memory_by_client_request_id(client_request_id)
+            if effective_crq:
+                existing = database.get_memory_by_client_request_id(effective_crq)
                 if existing:
+                    # M1: same fingerprint check in the race path.
+                    existing_fp = hashlib.sha256(
+                        (existing.get("content") or "").encode("utf-8")
+                    ).hexdigest()[:16]
+                    if existing_fp != content_fingerprint:
+                        return json.dumps({
+                            "status": "error",
+                            "error": "crq_content_conflict",
+                            "memory_id": "",
+                            "client_request_id": client_request_id,
+                            "hint": ("Reusing client_request_id with a "
+                                     "different content payload."),
+                        }, ensure_ascii=False)
                     return _idempotent_response(existing)
             # crq wasn't the cause → id collision. Regenerate and retry.
             if attempt < _MAX_ID_RETRIES:
@@ -422,15 +460,18 @@ async def remember(
                      "with a slightly different content or wait a moment."),
         }, ensure_ascii=False)
 
-    # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference
+    # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference.
+    # _finalize_pending_memory acquires the shared semaphore internally, so
+    # bursts of MCP requests + sweep retries share one bounded queue.
     _spawn_background_task(_finalize_pending_memory(
         skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
-        client_request_id=client_request_id,
+        client_request_id=effective_crq,
     ))
 
-    # 4. Return immediately (<2s target)
+    # 4. Return immediately (<2s target). Return the original crq the caller
+    # sent (not the namespaced one) so the client sees what it sent.
     return json.dumps({
         "status": "queued",
         "memory_id": skeleton_id,

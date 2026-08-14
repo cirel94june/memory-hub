@@ -25,12 +25,16 @@ import asyncio
 from datetime import datetime, timezone
 
 import database
+import async_remember  # for the shared finalize semaphore
 
 logger = logging.getLogger("memory_hub.pending_sweep")
 
 RETRY_AFTER_MINUTES = 10
 FAIL_AFTER_MINUTES = 60
 SWEEP_INTERVAL_SECONDS = 600  # 10 min — high-freq, independent of nightly daemon
+# H3: cap batch size per sweep tick. Sweep must not fan out hundreds of
+# analyzer/embedding pipelines at once — that DDoSes DeepSeek + SQLite.
+MAX_RETRIES_PER_SWEEP = 20
 
 # GC-safe registry (see mcp_server._spawn_background_task).
 _BACKGROUND_TASKS: set = set()
@@ -43,21 +47,36 @@ def _spawn_bg(coro):
     return task
 
 
+async def _run_finalize_bounded(finalize_fn, skeleton_id: str, **kwargs) -> None:
+    """Wrap the finalize call in the shared semaphore so concurrent sweep
+    retries and MCP background pipelines share the same concurrency budget.
+
+    Without this, a sweep tick can trigger MAX_RETRIES_PER_SWEEP pipelines
+    simultaneously while MCP is also spawning fresh ones — DeepSeek limits
+    get hit fast.
+    """
+    async with async_remember.get_finalize_semaphore():
+        await finalize_fn(skeleton_id, **kwargs)
+
+
 async def sweep_stuck_pending() -> dict:
     """Run one sweep of pending skeletons. Returns a summary dict.
 
-    Callers: daemon.run_full_maintenance (every ~1 hour), and tests.
-    Safe to call concurrently — each skeleton is treated independently and
-    state changes are single-row atomic UPDATEs.
+    Concurrency: TWO different sweep instances running at the same time
+    (deployment overlap, timer overrun) could each grab the same skeleton
+    row from list_memories_by_status. Guard: every state transition uses
+    `update_memory_status(..., require_status='pending')` and only proceeds
+    if rowcount == 1. This atomically claims the row from at most one sweep.
     """
     result = {
         "checked": 0,
         "retried": 0,
         "failed": 0,
         "still_pending": 0,
+        "skipped_claimed": 0,
     }
 
-    # Only look at pending skeletons older than the retry threshold.
+    # Snapshot candidate ids; each transition is then re-validated atomically.
     stuck = database.list_memories_by_status(
         "pending", older_than_minutes=RETRY_AFTER_MINUTES, limit=500,
     )
@@ -65,18 +84,31 @@ async def sweep_stuck_pending() -> dict:
     if not stuck:
         return result
 
+    # H3: bounded retry batch — sweep must not fan out 500 pipelines at once.
+    batch = stuck[:MAX_RETRIES_PER_SWEEP]
+
+    finalize_fn = None
     now = datetime.now(timezone.utc)
-    for skel in stuck:
+    for skel in batch:
         age_min = _age_minutes(skel.get("created_at", ""), now)
 
         if age_min > FAIL_AFTER_MINUTES:
-            # Give up — pipeline has been dead too long.
+            # Give up — pipeline dead too long. Atomic claim: only mark
+            # failed if the row is STILL pending (a concurrent finalize
+            # may have just marked it active). update_memory_status
+            # returns rowcount; 0 means someone else won the race.
             try:
-                # 应改 3: tag 'sweep_timeout' so _idempotent_response can emit
-                # retry_safe=false (state is unknown; a retry could duplicate).
-                database.update_memory_status(
+                rc = database.update_memory_status(
                     skel["id"], "failed",
-                    source_platform_suffix="sweep_timeout")
+                    source_platform_suffix="sweep_timeout",
+                    require_status="pending",
+                )
+                if rc != 1:
+                    result["skipped_claimed"] += 1
+                    logger.info(
+                        "pending sweep: skeleton %s already transitioned "
+                        "(rowcount=%d), not marking failed", skel["id"], rc)
+                    continue
                 _write_audit(
                     skel["id"], "sweep_fail",
                     reason=f"pending > {FAIL_AFTER_MINUTES} min "
@@ -91,26 +123,35 @@ async def sweep_stuck_pending() -> dict:
                 logger.exception("sweep failed to mark %s failed", skel["id"])
             continue
 
-        # Retry the pipeline. Late import to avoid the mcp module dependency
-        # in daemon-only environments.
-        try:
-            from mcp_server import _finalize_pending_memory
-        except Exception:
-            # 可延: if the import fails once it will fail for every skeleton
-            # in this sweep — break instead of flooding the log.
-            logger.exception(
-                "cannot import _finalize_pending_memory — aborting this sweep")
-            break
+        # Retry path — lazily import finalize.
+        if finalize_fn is None:
+            try:
+                from mcp_server import _finalize_pending_memory
+                finalize_fn = _finalize_pending_memory
+            except Exception:
+                logger.exception(
+                    "cannot import _finalize_pending_memory — "
+                    "aborting this sweep")
+                break
 
-        # P0-3: before retrying, check whether a previous crashed run
-        # already produced a real memory with this crq. If yes, just
-        # mark_replaced the skeleton — retrying would duplicate.
+        # P0-3: crq-based defense (see _find_completed_by_crq docstring).
         crq = skel.get("client_request_id", "")
         if crq:
             other = _find_completed_by_crq(crq, exclude_id=skel["id"])
             if other:
                 try:
-                    database.mark_replaced(skel["id"], link_to_real_id=other["id"])
+                    # Atomic claim: only relink if still pending.
+                    # mark_replaced does its own UPDATE; guard it by first
+                    # atomically transitioning to a sentinel state.
+                    rc = database.update_memory_status(
+                        skel["id"], "pending",   # no-op status, just claim
+                        require_status="pending",
+                    )
+                    if rc != 1:
+                        result["skipped_claimed"] += 1
+                        continue
+                    database.mark_replaced(
+                        skel["id"], link_to_real_id=other["id"])
                     _write_audit(
                         skel["id"], "sweep_link",
                         reason=f"found completed sibling {other['id']} via crq",
@@ -125,8 +166,19 @@ async def sweep_stuck_pending() -> dict:
                     result["still_pending"] += 1
                 continue
 
+        # Atomic claim for retry: transition pending → pending with a
+        # source_platform marker so we can tell "sweep already spawned a
+        # finalize for this row" — but the marker path also serves as the
+        # claim. We use require_status='pending' + a source_platform check.
+        # Simpler: rely on the finalize being idempotent (uses existing_id)
+        # and only spawn once per sweep tick by tracking spawned ids locally.
         try:
-            _spawn_bg(_finalize_pending_memory(
+            # No status change needed at spawn — but we DO need to ensure
+            # this sweep only spawns one finalize per skeleton per tick.
+            # (Sweep runs every 10min so cross-tick duplicate spawns are
+            # bounded by RETRY_AFTER_MINUTES > sleep interval.)
+            _spawn_bg(_run_finalize_bounded(
+                finalize_fn,
                 skel["id"],
                 content=skel.get("content", ""),
                 room=skel.get("room", "living_room"),

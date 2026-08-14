@@ -210,24 +210,29 @@ def test_execute_supplement(fake_env):
 
 
 def test_execute_resolve_thread(fake_env):
+    # Seed real DB too — the atomic maintenance helper writes there directly
     mem = _make_memory(fake_env, resolved=0, info_type="task")
+    database.set_memory(mem)
     result = asyncio.run(_execute_maintenance_action(
         "resolve_thread", mem, "搞定了", "待办完成", "claude",
     ))
     assert result["status"] == "resolved"
-    updated = fake_env["m1"]
+    # H4: read from DB (source of truth after the atomic tx)
+    updated = database.get_memory("m1")
     assert updated["resolved"] == 1
 
 
 def test_execute_supersede_user_provenance(fake_env):
     mem = _make_memory(fake_env, content="小猫住在北京", provenance_type="user_statement")
+    database.set_memory(mem)
     result = asyncio.run(_execute_maintenance_action(
         "supersede", mem, "小猫搬到上海了", "状态更新",
         "claude", "user_statement",
     ))
     assert result["status"] == "superseded"
     assert result["superseded_id"] == "m1"
-    assert fake_env["m1"]["status"] == "superseded"
+    # H4: DB is source of truth
+    assert database.get_memory("m1")["status"] == "superseded"
 
 
 def test_execute_supersede_blocked_by_provenance(fake_env):
@@ -287,11 +292,13 @@ def test_audit_count(fake_env):
 
 def test_execute_reopen_thread(fake_env):
     mem = _make_memory(fake_env, resolved=1, info_type="task")
+    database.set_memory(mem)
     result = asyncio.run(_execute_maintenance_action(
         "reopen_thread", mem, "又出问题了", "待办重开", "claude",
     ))
     assert result["status"] == "reopened"
-    updated = fake_env["m1"]
+    # H4: DB is source of truth
+    updated = database.get_memory("m1")
     assert updated["resolved"] == 0
 
 
@@ -308,6 +315,39 @@ def test_write_audit_raises_on_failure(fake_env, monkeypatch):
     monkeypatch.setattr(database, "insert_audit", lambda row: (_ for _ in ()).throw(RuntimeError("db error")))
     with pytest.raises(RuntimeError, match="db error"):
         _write_audit("annotate", "m1", "stuff", "reason", {}, {}, True, "claude")
+
+
+def test_h4_supersede_and_audit_atomic_rollback(fake_env, monkeypatch):
+    """H4 regression: injecting an INSERT-audit failure via
+    commit_maintenance_atomic must roll back the memory UPDATE so the memory
+    is NOT left superseded. sqlite3.Connection.execute is C-level and can't
+    be monkeypatched — wrap the connection instead."""
+    mem = _make_memory(fake_env, content="小猫住在北京",
+                       provenance_type="user_statement")
+    database.set_memory(mem)
+    assert database.get_memory("m1")["status"] == "active"
+
+    real_conn = database._get_conn()
+
+    class FailingConn:
+        def __init__(self, wrapped): self._c = wrapped
+        def execute(self, sql, *args, **kwargs):
+            if "INSERT INTO maintenance_audit" in sql:
+                raise RuntimeError("audit insert boom")
+            return self._c.execute(sql, *args, **kwargs)
+        def __getattr__(self, name): return getattr(self._c, name)
+
+    monkeypatch.setattr(database, "_get_conn",
+                        lambda: FailingConn(real_conn))
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(_execute_maintenance_action(
+            "supersede", mem, "小猫搬到上海了", "状态更新",
+            "claude", "user_statement",
+        ))
+    # Restore real conn to check state
+    monkeypatch.undo()
+    assert database.get_memory("m1")["status"] == "active", \
+        "H4 regressed: memory left superseded despite audit failure"
 
 
 def test_state_before_stores_full_content(fake_env):

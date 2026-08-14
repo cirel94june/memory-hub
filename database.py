@@ -406,6 +406,24 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
+    # ── PR C H2: async_remember_ledger ──
+    # Records the terminal outcome of each async remember pipeline. Written
+    # in the SAME transaction as the memory changes (via _commit_ledger),
+    # so a mid-flight crash cannot leave the ledger and memory tables out
+    # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
+    # state exists, sweep applies it without re-running the pipeline.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS async_remember_ledger (
+            skeleton_id       TEXT PRIMARY KEY,
+            client_request_id TEXT NOT NULL DEFAULT '',
+            terminal_state    TEXT NOT NULL,   -- 'active' | 'replaced' | 'failed'
+            result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
+            committed_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_crq
+            ON async_remember_ledger(client_request_id);
+    """)
+
     # ── Profiles table migration ──
     try:
         profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
@@ -547,34 +565,43 @@ def insert_pending_memory(mem: dict) -> None:
 
 
 def update_memory_status(mem_id: str, status: str,
-                         source_platform_suffix: str = "") -> None:
-    """Update status column only, optionally appending a suffix to
-    source_platform so downstream can tell WHY the row is in this state
-    (e.g. ':gated' vs ':pipeline_error' vs ':sweep_timeout').
+                         source_platform_suffix: str = "",
+                         require_status: str | None = None) -> int:
+    """Atomic status update. Returns the number of rows affected (0 or 1).
 
-    The suffix is idempotent: if source_platform already ends with the same
-    suffix we don't double-append.
+    require_status: if set, add `AND status = ?` to the WHERE clause. Use
+    this to atomically claim/transition a row only when it is still in the
+    expected state — critical for the pending sweep, which must not clobber
+    a row that a concurrent finalize just marked 'active'.
+
+    source_platform_suffix: optionally append a suffix to source_platform
+    so downstream can tell WHY the row is in this state
+    (e.g. ':pipeline_error' vs ':sweep_timeout'). Idempotent.
     """
     conn = _get_conn()
     now = _now_iso()
     if source_platform_suffix:
-        # Only touch source_platform if it doesn't already have this suffix
         suffix = source_platform_suffix if source_platform_suffix.startswith(":") \
                  else ":" + source_platform_suffix
-        conn.execute(
+        sql = (
             "UPDATE memories SET status = ?, updated_at = ?, "
             "source_platform = CASE "
             "  WHEN source_platform LIKE '%' || ? THEN source_platform "
             "  ELSE source_platform || ? END "
-            "WHERE id = ?",
-            (status, now, suffix, suffix, mem_id),
+            "WHERE id = ?"
         )
+        params: list = [status, now, suffix, suffix, mem_id]
     else:
-        conn.execute(
-            "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?",
-            (status, now, mem_id),
-        )
+        sql = "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?"
+        params = [status, now, mem_id]
+
+    if require_status is not None:
+        sql += " AND status = ?"
+        params.append(require_status)
+
+    cur = conn.execute(sql, params)
     conn.commit()
+    return cur.rowcount
 
 
 def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
@@ -593,6 +620,155 @@ def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
         (link_to_real_id, now, skeleton_id),
     )
     conn.commit()
+
+
+def get_ledger(skeleton_id: str) -> dict | None:
+    """H2: look up the ledger entry for a skeleton. Returns None if the
+    pipeline hasn't committed a terminal state yet."""
+    if not skeleton_id:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT skeleton_id, client_request_id, terminal_state, "
+        "       result_memory_id, committed_at "
+        "FROM async_remember_ledger WHERE skeleton_id = ?",
+        (skeleton_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "skeleton_id": row[0], "client_request_id": row[1],
+        "terminal_state": row[2], "result_memory_id": row[3],
+        "committed_at": row[4],
+    }
+
+
+def commit_finalize_atomic(
+    skeleton_id: str,
+    client_request_id: str,
+    terminal_state: str,
+    result_memory_id: str,
+    skeleton_update: dict | None = None,
+) -> None:
+    """H2 + H4: atomically write the ledger entry AND transition the
+    skeleton row. Both go in one BEGIN IMMEDIATE — if either fails, both
+    roll back so sweep never sees a half-completed pipeline.
+
+    skeleton_update: extra fields to SET on the skeleton row. Common cases:
+      - {'status': 'active'}
+      - {'status': 'replaced', 'link_to_real_id': real_id}
+      - {'status': 'failed', 'source_platform': 'mcp:pipeline_error'}
+
+    result_memory_id: the actual final memory id — same as skeleton_id
+    when pipeline reused it, else the merge target.
+    """
+    if terminal_state not in ("active", "replaced", "failed"):
+        raise ValueError(f"invalid terminal_state: {terminal_state}")
+
+    conn = _get_conn()
+    now = _now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Ledger is idempotent — INSERT OR REPLACE lets a retry after
+        # partial commit still succeed (same skeleton_id can only ever
+        # have one terminal state; race-losing writer just no-ops).
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(skeleton_id) DO UPDATE SET "
+            "terminal_state=excluded.terminal_state, "
+            "result_memory_id=excluded.result_memory_id, "
+            "committed_at=excluded.committed_at",
+            (skeleton_id, client_request_id, terminal_state,
+             result_memory_id, now),
+        )
+
+        if skeleton_update:
+            # Build UPDATE dynamically for the requested fields.
+            set_clauses = ["updated_at = ?"]
+            params: list = [now]
+            for key, val in skeleton_update.items():
+                if key == "source_platform_suffix":
+                    # Special: append-if-not-present pattern
+                    suffix = val if val.startswith(":") else ":" + val
+                    set_clauses.append(
+                        "source_platform = CASE "
+                        "  WHEN source_platform LIKE '%' || ? THEN source_platform "
+                        "  ELSE source_platform || ? END"
+                    )
+                    params.extend([suffix, suffix])
+                else:
+                    set_clauses.append(f"{key} = ?")
+                    params.append(val)
+            params.append(skeleton_id)
+            conn.execute(
+                f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
+                params,
+            )
+        conn.commit()
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def commit_maintenance_atomic(
+    memory_id: str,
+    memory_updates: dict,
+    audit_row: dict,
+) -> None:
+    """H4: apply a maintenance action and write the audit row in ONE
+    BEGIN IMMEDIATE transaction. If either fails, both roll back so the
+    target memory can't be left in a modified state without an audit trail.
+
+    memory_updates: fields to UPDATE on the memory row. `comments` and
+    `history` are serialized to JSON if list/dict.
+    audit_row: dict with keys matching _AUDIT_COLUMNS.
+    """
+    conn = _get_conn()
+    now = _now_iso()
+
+    # Build memory UPDATE
+    set_clauses = ["updated_at = ?"]
+    params: list = [now]
+    for key, val in memory_updates.items():
+        if key in ("comments", "history") and isinstance(val, (list, dict)):
+            val = json.dumps(val, ensure_ascii=False)
+        set_clauses.append(f"{key} = ?")
+        params.append(val)
+    params.append(memory_id)
+
+    # Ensure required audit columns are present
+    audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
+    audit_defaults["auto_executed"] = 1
+    audit_defaults["created_at"] = now
+    audit_defaults.update(audit_row)
+    audit_values = [audit_defaults.get(c, "") for c in _AUDIT_COLUMNS]
+    audit_placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+    audit_cols_str = ", ".join(_AUDIT_COLUMNS)
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
+            params,
+        )
+        conn.execute(
+            f"INSERT INTO maintenance_audit ({audit_cols_str}) "
+            f"VALUES ({audit_placeholders})",
+            audit_values,
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
 
 
 def list_memories_by_status(status: str, older_than_minutes: int = 0,

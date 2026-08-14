@@ -133,65 +133,9 @@ _DEDUP_ACTIONS = {"supersede", "update"}
 _REPORT_ONLY_ACTIONS = {"supplement", "annotate", "correct", "no_change"}
 
 
-async def _classify_and_execute(pairs: list[dict], max_pairs: int,
-                                 report_only_out: list[dict]) -> dict:
-    """For each pair, call analyzer.classify_relation and route through
-    MemoryMaintenanceDecision. Only supersede/update actually run in DB;
-    annotate/supplement/correct are collected into report_only_out for Ceci
-    to review manually. Writes maintenance_audit for every executed action.
-    """
-    import analyzer
-    import memory_ops
-
-    counts = {"supersede": 0, "update": 0,
-              "report_only": 0, "no_change": 0, "skip": 0, "error": 0}
-    for idx, pair in enumerate(pairs[:max_pairs]):
-        b = database.get_memory(pair["b_id"])
-        a = database.get_memory(pair["a_id"])
-        if not a or not b:
-            counts["skip"] += 1
-            continue
-        try:
-            rel = await analyzer.classify_relation(b["content"], [a])
-            relations = rel.get("relations", [])
-            if not relations:
-                counts["no_change"] += 1
-                continue
-            r0 = relations[0]
-            action = memory_ops._map_relation_to_action(
-                r0, b.get("provenance_type", ""), a,
-            )
-            print(f"  [{idx+1}/{min(len(pairs), max_pairs)}] "
-                  f"{pair['a_id']} × {pair['b_id']} → {action} "
-                  f"(sim={pair['similarity']})")
-
-            if action in _DEDUP_ACTIONS:
-                # These actually dedup — safe to execute automatically.
-                result = await memory_ops._execute_maintenance_action(
-                    action, a, b["content"],
-                    reason=f"legacy_dedup_script sim={pair['similarity']}",
-                    source_ai="dedup_script",
-                    provenance_type=b.get("provenance_type", ""),
-                )
-                if result:
-                    counts[action] += 1
-                else:
-                    counts["skip"] += 1
-            elif action in _REPORT_ONLY_ACTIONS:
-                # Not real dedup — accumulate for the report, don't touch DB.
-                report_only_out.append({
-                    **pair, "proposed_action": action,
-                    "reason": r0.get("reason", ""),
-                })
-                counts["report_only"] += 1
-            elif action == "no_change":
-                counts["no_change"] += 1
-            else:
-                counts["skip"] += 1
-        except Exception as e:
-            print(f"  ERROR on {pair['a_id']} × {pair['b_id']}: {e}")
-            counts["error"] += 1
-    return counts
+# Old _classify_and_execute removed (H5): replaced by _classify_plan +
+# _execute_plan below to guarantee the operator's approval matches what
+# actually runs. See docstrings of those functions.
 
 
 def _summarize(pairs_by_room: dict[str, list[dict]]) -> dict:
@@ -200,13 +144,108 @@ def _summarize(pairs_by_room: dict[str, list[dict]]) -> dict:
     return {"total_pairs": total, "per_room": per_room}
 
 
+async def _classify_plan(flat_pairs: list[dict], max_pairs: int) -> dict:
+    """H5 plan phase: call LLM classifier for each pair and build an
+    IMMUTABLE plan. The plan records the exact action, target snapshot
+    (updated_at, status) at scan time, and the reason — so --execute can
+    verify preconditions haven't drifted before touching data."""
+    import analyzer
+    import memory_ops
+
+    executable: list[dict] = []
+    report_only: list[dict] = []
+    for idx, pair in enumerate(flat_pairs[:max_pairs]):
+        b = database.get_memory(pair["b_id"])
+        a = database.get_memory(pair["a_id"])
+        if not a or not b:
+            continue
+        try:
+            rel = await analyzer.classify_relation(b["content"], [a])
+            relations = rel.get("relations", [])
+            if not relations:
+                continue
+            r0 = relations[0]
+            action = memory_ops._map_relation_to_action(
+                r0, b.get("provenance_type", ""), a,
+            )
+            print(f"  [{idx+1}/{min(len(flat_pairs), max_pairs)}] "
+                  f"{a['id']} × {b['id']} → {action} "
+                  f"(sim={pair['similarity']})")
+
+            entry = {
+                **pair, "action": action,
+                "reason": r0.get("reason", "")[:200],
+                "a_updated_at_snapshot": a.get("updated_at", ""),
+                "b_updated_at_snapshot": b.get("updated_at", ""),
+                "a_status_snapshot": a.get("status", ""),
+                "b_status_snapshot": b.get("status", ""),
+                "b_provenance": b.get("provenance_type", ""),
+            }
+            if action in _DEDUP_ACTIONS:
+                executable.append(entry)
+            elif action in _REPORT_ONLY_ACTIONS:
+                report_only.append(entry)
+        except Exception as e:
+            print(f"  ERROR on {pair['a_id']} × {pair['b_id']}: {e}")
+
+    return {"executable": executable, "report_only": report_only}
+
+
+async def _execute_plan(plan_entries: list[dict]) -> dict:
+    """H5 execute phase: consume the immutable plan. For each entry, verify
+    that both memories are still active AND their updated_at matches the
+    snapshot — else skip that entry (someone else touched the row). NEVER
+    calls the LLM classifier; the action was decided at plan time."""
+    import memory_ops
+    counts = {"applied": 0, "skipped_drift": 0, "skipped_missing": 0,
+              "error": 0}
+    for entry in plan_entries:
+        action = entry["action"]
+        if action not in _DEDUP_ACTIONS:
+            counts["skipped_drift"] += 1
+            continue
+
+        a = database.get_memory(entry["a_id"])
+        b = database.get_memory(entry["b_id"])
+        if not a or not b:
+            counts["skipped_missing"] += 1
+            continue
+
+        # Precondition: both rows still active, updated_at unchanged since scan
+        if (a.get("status") != "active" or b.get("status") != "active"
+                or a.get("updated_at", "") != entry.get("a_updated_at_snapshot")
+                or b.get("updated_at", "") != entry.get("b_updated_at_snapshot")):
+            counts["skipped_drift"] += 1
+            print(f"  SKIP {entry['a_id']} × {entry['b_id']}: "
+                  f"drift detected since scan")
+            continue
+
+        try:
+            result = await memory_ops._execute_maintenance_action(
+                action, a, b["content"],
+                reason=f"legacy_dedup_script: {entry['reason']}",
+                source_ai="dedup_script",
+                provenance_type=entry.get("b_provenance", ""),
+            )
+            if result:
+                counts["applied"] += 1
+            else:
+                counts["skipped_drift"] += 1
+        except Exception as e:
+            print(f"  ERROR on {entry['a_id']} × {entry['b_id']}: {e}")
+            counts["error"] += 1
+    return counts
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Legacy memory dedup scan")
     ap.add_argument("--dry-run", action="store_true", default=True,
-                    help="default: scan + report only, no data change")
+                    help="default: scan + LLM classify + write plan; no DB changes")
     ap.add_argument("--execute", action="store_true",
-                    help="actually run the merge/supersede via "
-                         "MemoryMaintenanceDecision. Overrides --dry-run.")
+                    help="apply a pre-generated plan (requires --plan-file)")
+    ap.add_argument("--plan-file", default="",
+                    help="path to a plan JSON produced by --dry-run "
+                         "(required for --execute)")
     ap.add_argument("--room", default="",
                     help="only process this room (empty = all default rooms)")
     ap.add_argument("--sim-threshold", type=float, default=0.85,
@@ -215,26 +254,43 @@ async def main() -> int:
                     help="only compare pairs within this many days apart "
                          "(default 3)")
     ap.add_argument("--max-pairs", type=int, default=200,
-                    help="cap on pairs processed in --execute mode "
-                         "(default 200, resume by rerunning)")
+                    help="cap on pairs classified per run (default 200)")
     ap.add_argument("--output", default="",
-                    help="write dry-run report to this path (JSON)")
+                    help="write scan-phase plan to this path (JSON)")
+    ap.add_argument("--db-path", default="",
+                    help="M2: override DB_PATH (for tests / dry-run on a copy)")
     args = ap.parse_args()
 
-    is_execute = args.execute
-    mode = "EXECUTE" if is_execute else "DRY-RUN"
+    if args.db_path:
+        # M2: honor override BEFORE init_db so migrations touch the right file
+        database.DB_PATH = Path(args.db_path)
 
-    print(f"[dedup_legacy] mode={mode} sim>={args.sim_threshold} "
-          f"window={args.window_days}d")
-    if is_execute:
-        print("[dedup_legacy] WARNING: will run maintenance actions "
-              "(no hard deletes; audit logged)")
+    is_execute = args.execute
+    mode = "EXECUTE" if is_execute else "PLAN"
+
+    print(f"[dedup_legacy] mode={mode} db={database.DB_PATH} "
+          f"sim>={args.sim_threshold} window={args.window_days}d")
 
     # Ensure database is initialized so migrations & connection exist.
     await database.init_db(str(database.DB_PATH))
-
     conn = database._get_conn()
 
+    if is_execute:
+        # H5: execute consumes a pre-generated plan, does NOT call LLM.
+        if not args.plan_file:
+            print("[dedup_legacy] --execute requires --plan-file (produced by "
+                  "an earlier plan run)")
+            return 2
+        with open(args.plan_file, encoding="utf-8") as f:
+            plan = json.load(f)
+        executable = plan.get("executable", [])
+        print(f"[dedup_legacy] applying {len(executable)} planned actions "
+              f"(pre-classified, no LLM call)...")
+        counts = await _execute_plan(executable)
+        print(f"[dedup_legacy] execute complete: {counts}")
+        return 0
+
+    # PLAN path: scan → classify → write immutable plan
     rooms = [args.room] if args.room else DEFAULT_ROOMS
     pairs_by_room: dict[str, list[dict]] = {}
     for room in rooms:
@@ -250,57 +306,46 @@ async def main() -> int:
     summary = _summarize(pairs_by_room)
     print(f"\n[dedup_legacy] scan complete: {summary}")
 
-    report = {
+    flat_pairs = [p for room_pairs in pairs_by_room.values() for p in room_pairs]
+    plan_result = await _classify_plan(flat_pairs, args.max_pairs) \
+        if flat_pairs else {"executable": [], "report_only": []}
+
+    plan_doc = {
         "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "db_path": str(database.DB_PATH),
         "sim_threshold": args.sim_threshold,
         "window_days": args.window_days,
         "summary": summary,
-        "pairs_by_room": pairs_by_room,
+        "executable": plan_result["executable"],
+        "report_only": plan_result["report_only"],
     }
 
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-        print(f"[dedup_legacy] report written to {args.output}")
+    out_path = args.output or (
+        f"data/dedup_plan_"
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(plan_doc, f, ensure_ascii=False, indent=2)
+    print(f"[dedup_legacy] plan written to {out_path}")
+    print("[dedup_legacy] plan-only run — no changes made. "
+          f"Review then: python scripts/dedup_legacy.py --execute --plan-file {out_path}")
 
-    if not is_execute:
-        print("[dedup_legacy] dry-run only — no changes made. "
-              "Review the report and run with --execute to apply.")
-        return 0
-
-    # EXECUTE path
-    flat_pairs = [p for room_pairs in pairs_by_room.values() for p in room_pairs]
-    if not flat_pairs:
-        print("[dedup_legacy] nothing to do")
-        return 0
-
-    print(f"\n[dedup_legacy] executing on {min(len(flat_pairs), args.max_pairs)} "
-          f"pairs (of {len(flat_pairs)} total)...")
-    report_only: list[dict] = []
-    action_counts = await _classify_and_execute(
-        flat_pairs, args.max_pairs, report_only)
-    print(f"\n[dedup_legacy] execute complete: {action_counts}")
-
-    # P0-4: pairs the classifier called annotate/supplement/correct are NOT
-    # dedup — surface them to the operator so a human can decide what to do.
-    if report_only:
-        report_path = args.output or (
-            f"data/dedup_report_only_"
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
-        )
-        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    # Kept-for-backcompat: emit a separate report_only listing too
+    if plan_result["report_only"]:
+        report_path = (out_path.replace(".json", "_report_only.json")
+                       if out_path.endswith(".json") else out_path + ".report_only.json")
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump({
                 "note": ("These pairs matched semantically but the classifier "
                          "suggested annotate/supplement/correct — actions that "
                          "do NOT reduce duplicate count. Review manually and "
                          "decide whether to merge, supersede, or leave alone."),
-                "count": len(report_only),
-                "pairs": report_only,
+                "count": len(plan_result["report_only"]),
+                "pairs": plan_result["report_only"],
             }, f, ensure_ascii=False, indent=2)
-        print(f"[dedup_legacy] {len(report_only)} pairs need manual review → "
-              f"{report_path}")
+        print(f"[dedup_legacy] {len(plan_result['report_only'])} pairs need "
+              f"manual review → {report_path}")
     return 0
 
 
