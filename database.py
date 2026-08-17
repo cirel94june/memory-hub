@@ -12,6 +12,7 @@ import sqlite3
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterator, Callable, TypeVar
 
@@ -305,9 +306,30 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
         logger.info("Migrated: added 'info_type' column")
 
+    # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
+    if "client_request_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'client_request_id' column")
+    if "link_to_real_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'link_to_real_id' column")
+    # PR C round-4 H1: real atomic claim for sweep retries. Without this,
+    # two concurrent sweeps can both spawn a finalize for the same skeleton.
+    if "finalize_claim_id" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'finalize_claim_id' column")
+    if "finalize_claim_at" not in existing_cols:
+        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated: added 'finalize_claim_at' column")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
+    # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
+        "ON memories(client_request_id) WHERE client_request_id != ''"
+    )
 
     # ── Proposals table (MemoryProposal 候选区) ──
     conn.executescript("""
@@ -392,6 +414,34 @@ async def init_db(db_path: str = None) -> None:
         conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
         logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
+    # ── PR C H2: async_remember_ledger ──
+    # Records the terminal outcome of each async remember pipeline. Written
+    # in the SAME transaction as the memory changes (via _commit_ledger),
+    # so a mid-flight crash cannot leave the ledger and memory tables out
+    # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
+    # state exists, sweep applies it without re-running the pipeline.
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS async_remember_ledger (
+            skeleton_id       TEXT PRIMARY KEY,
+            client_request_id TEXT NOT NULL DEFAULT '',
+            terminal_state    TEXT NOT NULL,   -- 'in_flight' | 'active' | 'replaced' | 'failed'
+            result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
+            committed_at      TEXT NOT NULL,
+            owner_token       TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_crq
+            ON async_remember_ledger(client_request_id);
+    """)
+
+    # H1 round-6: owner_token migration for pre-existing ledger tables.
+    ledger_cols = {row[1] for row in conn.execute(
+        "PRAGMA table_info(async_remember_ledger)").fetchall()}
+    if "owner_token" not in ledger_cols:
+        conn.execute(
+            "ALTER TABLE async_remember_ledger "
+            "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
+        logger.info("Migrated async_remember_ledger: added 'owner_token'")
+
     # ── Profiles table migration ──
     try:
         profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
@@ -463,6 +513,8 @@ _ALL_COLUMNS = [
     "comments", "embedding", "status", "created_at", "updated_at",
     "history", "resolved", "anchored", "provenance_type", "fact_confidence",
     "subject_id", "source_actor_id", "info_type",
+    "client_request_id", "link_to_real_id",
+    "finalize_claim_id", "finalize_claim_at",
 ]
 
 
@@ -473,6 +525,710 @@ def get_memory(mem_id: str) -> dict | None:
     if row is None:
         return None
     return _row_to_dict(row)
+
+
+# ── PR C 块 8: async remember 支持 ──
+
+def get_memory_by_client_request_id(crq: str) -> dict | None:
+    """Idempotent lookup: find any memory with matching client_request_id
+    regardless of status (pending/active/replaced/failed)."""
+    if not crq:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM memories WHERE client_request_id = ? LIMIT 1", (crq,)
+    ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def insert_pending_memory(mem: dict) -> None:
+    """Insert a pending-status skeleton (no embedding, no analyzer fields).
+
+    Raises sqlite3.IntegrityError if the client_request_id collides with an
+    existing row — MCP layer catches this to return an idempotent response.
+
+    tags / domain: honored from mem if provided (as JSON string OR list).
+    Historically this method hard-coded '[]' which silently dropped any
+    caller-provided values.
+    """
+    conn = _get_conn()
+    now = mem.get("created_at") or _now_iso()
+
+    def _as_json_list(val):
+        if val is None or val == "":
+            return "[]"
+        if isinstance(val, (list, tuple)):
+            return json.dumps(list(val), ensure_ascii=False)
+        # Already-serialized string
+        return val
+
+    conn.execute(
+        "INSERT INTO memories ("
+        "  id, content, layer, room, category, owner_ai, importance,"
+        "  source_ai, source_platform, event_date, source_context,"
+        "  status, client_request_id, created_at, updated_at, tags, domain"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
+            mem.get("room", "living_room"), mem.get("category", ""),
+            mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
+            mem.get("source_ai", ""), mem.get("source_platform", ""),
+            mem.get("event_date", ""), mem.get("source_context", ""),
+            mem.get("status", "pending"), mem.get("client_request_id", ""),
+            now, now,
+            _as_json_list(mem.get("tags")),
+            _as_json_list(mem.get("domain")),
+        ),
+    )
+    conn.commit()
+
+
+def update_memory_status(mem_id: str, status: str,
+                         source_platform_suffix: str = "",
+                         require_status: str | None = None) -> int:
+    """Atomic status update. Returns the number of rows affected (0 or 1).
+
+    require_status: if set, add `AND status = ?` to the WHERE clause. Use
+    this to atomically claim/transition a row only when it is still in the
+    expected state — critical for the pending sweep, which must not clobber
+    a row that a concurrent finalize just marked 'active'.
+
+    source_platform_suffix: optionally append a suffix to source_platform
+    so downstream can tell WHY the row is in this state
+    (e.g. ':pipeline_error' vs ':sweep_timeout'). Idempotent.
+    """
+    conn = _get_conn()
+    now = _now_iso()
+    if source_platform_suffix:
+        suffix = source_platform_suffix if source_platform_suffix.startswith(":") \
+                 else ":" + source_platform_suffix
+        sql = (
+            "UPDATE memories SET status = ?, updated_at = ?, "
+            "source_platform = CASE "
+            "  WHEN source_platform LIKE '%' || ? THEN source_platform "
+            "  ELSE source_platform || ? END "
+            "WHERE id = ?"
+        )
+        params: list = [status, now, suffix, suffix, mem_id]
+    else:
+        sql = "UPDATE memories SET status = ?, updated_at = ? WHERE id = ?"
+        params = [status, now, mem_id]
+
+    if require_status is not None:
+        sql += " AND status = ?"
+        params.append(require_status)
+
+    cur = conn.execute(sql, params)
+    conn.commit()
+    return cur.rowcount
+
+
+def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
+    """Mark a pending skeleton as replaced when memory_ops.remember() returned
+    a different real_id (merge/supersede path). Skeleton is NOT deleted so
+    idempotency lookups by client_request_id still find it and can redirect
+    to the real memory via link_to_real_id.
+    """
+    if not skeleton_id or not link_to_real_id:
+        raise ValueError("mark_replaced requires both skeleton_id and link_to_real_id")
+    conn = _get_conn()
+    now = _now_iso()
+    conn.execute(
+        "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
+        "updated_at = ? WHERE id = ?",
+        (link_to_real_id, now, skeleton_id),
+    )
+    conn.commit()
+
+
+def write_intent_ledger(skeleton_id: str, client_request_id: str,
+                        owner_token: str) -> str:
+    """H2 round-4 + H1 round-6: two-phase ledger with owner_token so
+    concurrent attempts don't misclaim ownership via matching timestamps.
+
+    Returns:
+      - 'created'    → this caller (identified by owner_token) wrote a fresh
+                       in_flight row; safe to proceed.
+      - 'in_flight'  → another finalize is already running; caller MUST back off.
+      - 'active' | 'replaced' | 'failed' → terminal state exists; caller MUST
+                       apply it via _apply_ledger_to_skeleton and NOT re-run
+                       pipeline.
+
+    Ownership via cursor.rowcount from INSERT OR IGNORE (SQLite semantics:
+    rowcount == 1 on real insert, 0 on conflict). Owner_token also stored
+    so commit_finalize_atomic can guard the terminal UPDATE.
+
+    fail-closed (H2 round-6): if the DB write raises, raise the exception so
+    the caller does NOT proceed with pipeline side effects.
+    """
+    if not skeleton_id:
+        return "created"  # no idempotency requested for this call
+    if not owner_token:
+        raise ValueError("write_intent_ledger requires a non-empty owner_token")
+    conn = _get_conn()
+    now = _now_iso()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO async_remember_ledger "
+        "(skeleton_id, client_request_id, terminal_state, "
+        " result_memory_id, committed_at, owner_token) "
+        "VALUES (?, ?, 'in_flight', '', ?, ?)",
+        (skeleton_id, client_request_id, now, owner_token),
+    )
+    conn.commit()
+    if cur.rowcount == 1:
+        # We inserted the row — we own the intent.
+        return "created"
+
+    # INSERT ignored — a row already exists. Read the winner's state.
+    row = conn.execute(
+        "SELECT terminal_state FROM async_remember_ledger "
+        "WHERE skeleton_id = ?", (skeleton_id,),
+    ).fetchone()
+    if not row:
+        # Extremely unlikely: no row despite INSERT OR IGNORE not inserting.
+        # Fail-closed: treat as unknown; caller should NOT proceed.
+        return "in_flight"
+    return row[0] if row[0] else "in_flight"
+
+
+def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
+    """H2 round-6: find in_flight ledger entries whose owner has been silent
+    too long. These skeletons must be marked failed (NOT retried) because
+    we can't tell whether the crashed pipeline already mutated the target
+    memory — replaying would risk double-merge.
+
+    Sweep should mark each returned skeleton failed + close out the ledger.
+    """
+    conn = _get_conn()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=older_than_minutes)).isoformat()
+    rows = conn.execute(
+        "SELECT skeleton_id, client_request_id, committed_at, owner_token "
+        "FROM async_remember_ledger "
+        "WHERE terminal_state = 'in_flight' AND committed_at <= ?",
+        (cutoff,),
+    ).fetchall()
+    return [
+        {"skeleton_id": r[0], "client_request_id": r[1],
+         "committed_at": r[2], "owner_token": r[3]}
+        for r in rows
+    ]
+
+
+def close_stale_intent(skeleton_id: str, owner_token: str) -> bool:
+    """DEPRECATED: kept for backwards compat. Prefer
+    close_stale_intent_atomic which reconciles ledger + skeleton + audit
+    in one transaction."""
+    conn = _get_conn()
+    now = _now_iso()
+    cur = conn.execute(
+        "UPDATE async_remember_ledger "
+        "SET terminal_state = 'failed', committed_at = ? "
+        "WHERE skeleton_id = ? AND terminal_state = 'in_flight' "
+        "  AND owner_token = ?",
+        (now, skeleton_id, owner_token),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def close_stale_intent_atomic(
+    skeleton_id: str, owner_token: str, reason: str,
+) -> dict:
+    """H round-7: atomic reconciliation of a stale intent ledger with the
+    skeleton row.
+
+    A crashed pipeline may have completed *some* side effects before dying.
+    The skeleton row is the source of truth for what actually happened:
+
+      - skeleton status='pending'   → no side effects committed →
+        ledger + skeleton → 'failed'; write intent_timeout audit.
+      - skeleton status='active'    → create pipeline reused the skeleton
+        and committed set_memory() but crashed before terminal ledger →
+        ledger → 'active' (catches up); result_memory_id = skeleton_id.
+      - skeleton status='replaced'  → merge pipeline committed and set
+        link_to_real_id but crashed before terminal ledger →
+        ledger → 'replaced' (catches up); result_memory_id from link.
+      - any other status            → leave ledger in_flight for human
+        review (return dict with disposition='needs_review').
+
+    Every branch runs inside ONE BEGIN IMMEDIATE. If anything fails, all
+    rows roll back — no partial ledger/skeleton/audit state.
+
+    Returns: {"disposition": ..., "transitioned": bool, "skeleton_status": ...}
+    """
+    conn = _get_conn()
+    now = _now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # 1. Re-verify ledger is still our stale in_flight (defense against
+        #    race where the ledger raced between our list_stale_* snapshot
+        #    and this close attempt).
+        ledger_row = conn.execute(
+            "SELECT terminal_state, owner_token FROM async_remember_ledger "
+            "WHERE skeleton_id = ?", (skeleton_id,),
+        ).fetchone()
+        if not ledger_row or ledger_row[0] != "in_flight" \
+                or ledger_row[1] != owner_token:
+            conn.execute("ROLLBACK")
+            return {"disposition": "already_terminaled",
+                    "transitioned": False, "skeleton_status": None}
+
+        # 2. Read skeleton current status.
+        skel_row = conn.execute(
+            "SELECT status, link_to_real_id, source_platform "
+            "FROM memories WHERE id = ?", (skeleton_id,),
+        ).fetchone()
+        if not skel_row:
+            # Skeleton was hard-deleted somehow. Close ledger to failed
+            # and audit the anomaly — target row no longer exists but the
+            # audit trail should still record what happened.
+            # (Low round-8: skeleton_missing writes audit.)
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='failed', "
+                "committed_at=? WHERE skeleton_id=?", (now, skeleton_id))
+            _sm_audit = {c: "" for c in _AUDIT_COLUMNS}
+            _sm_audit.update({
+                "action": "sweep_fail", "target_id": skeleton_id,
+                "decision_reason": reason + " (skeleton row missing)",
+                "state_before": json.dumps({"ledger": "in_flight",
+                                            "skeleton": "MISSING"},
+                                           ensure_ascii=False),
+                "state_after": json.dumps({"ledger": "failed",
+                                           "skeleton": "MISSING"},
+                                          ensure_ascii=False),
+                "auto_executed": 1, "created_at": now,
+            })
+            _sm_vals = [_sm_audit.get(c, "") for c in _AUDIT_COLUMNS]
+            _sm_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_sm_ph})",
+                _sm_vals)
+            conn.commit()
+            return {"disposition": "skeleton_missing",
+                    "transitioned": True, "skeleton_status": None}
+        skel_status = skel_row[0]
+        skel_link = skel_row[1] or ""
+
+        # 3. Reconcile based on skeleton state.
+        if skel_status == "pending":
+            # Nothing committed. Both → failed with audit.
+            _audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
+            _audit_defaults.update({
+                "action": "sweep_fail", "target_id": skeleton_id,
+                "decision_reason": reason,
+                "state_before": json.dumps({"status": "pending",
+                                            "ledger": "in_flight"},
+                                           ensure_ascii=False),
+                "state_after": json.dumps({"status": "failed",
+                                           "ledger": "failed"},
+                                          ensure_ascii=False),
+                "auto_executed": 1, "created_at": now,
+            })
+            audit_vals = [_audit_defaults.get(c, "") for c in _AUDIT_COLUMNS]
+            audit_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='failed', "
+                "committed_at=? WHERE skeleton_id=?", (now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET status='failed', updated_at=?, "
+                "source_platform = CASE "
+                "  WHEN source_platform LIKE '%:intent_timeout' "
+                "    THEN source_platform "
+                "  ELSE source_platform || ':intent_timeout' END, "
+                "finalize_claim_id='', finalize_claim_at='' "
+                "WHERE id=? AND status='pending'",
+                (now, skeleton_id))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) "
+                f"VALUES ({audit_ph})",
+                audit_vals)
+            conn.commit()
+            return {"disposition": "failed", "transitioned": True,
+                    "skeleton_status": "pending"}
+
+        if skel_status == "active":
+            # Create pipeline reused skeleton and committed set_memory
+            # but crashed before terminal ledger. Ledger catches up.
+            # Low round-8: also clear stale finalize_claim in same tx.
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='active', "
+                "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
+                (skeleton_id, now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET finalize_claim_id='', "
+                "finalize_claim_at='' WHERE id=?", (skeleton_id,))
+            conn.commit()
+            return {"disposition": "already_active", "transitioned": True,
+                    "skeleton_status": "active"}
+
+        if skel_status == "replaced":
+            # Merge pipeline set link_to_real_id but crashed before terminal.
+            # Ledger catches up using the link.
+            conn.execute(
+                "UPDATE async_remember_ledger SET terminal_state='replaced', "
+                "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
+                (skel_link, now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET finalize_claim_id='', "
+                "finalize_claim_at='' WHERE id=?", (skeleton_id,))
+            conn.commit()
+            return {"disposition": "already_replaced", "transitioned": True,
+                    "skeleton_status": "replaced"}
+
+        # Any other status (failed, superseded, ...) — inconsistent.
+        # Medium round-8: write ONE audit row per skeleton so ops has a
+        # durable signal (log alone gets rotated). Use INSERT OR IGNORE
+        # keyed on (action, target_id) to prevent spam every sweep tick.
+        # We identify the row by putting the skeleton_id in the audit
+        # target_id and using a fixed action string.
+        existing_audit = conn.execute(
+            "SELECT COUNT(*) FROM maintenance_audit "
+            "WHERE action = 'intent_needs_review' AND target_id = ?",
+            (skeleton_id,),
+        ).fetchone()
+        if existing_audit and existing_audit[0] == 0:
+            _nr_audit = {c: "" for c in _AUDIT_COLUMNS}
+            _nr_audit.update({
+                "action": "intent_needs_review", "target_id": skeleton_id,
+                "decision_reason": (
+                    f"{reason} — skeleton status={skel_status!r} + ledger "
+                    f"in_flight; cannot auto-reconcile"),
+                "state_before": json.dumps({
+                    "ledger": "in_flight",
+                    "skeleton": skel_status,
+                }, ensure_ascii=False),
+                "state_after": json.dumps({
+                    "ledger": "in_flight",  # unchanged
+                    "skeleton": skel_status,  # unchanged
+                    "needs_manual_review": True,
+                }, ensure_ascii=False),
+                "auto_executed": 0, "created_at": now,
+            })
+            _nr_vals = [_nr_audit.get(c, "") for c in _AUDIT_COLUMNS]
+            _nr_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_nr_ph})",
+                _nr_vals)
+            conn.commit()
+        else:
+            # Already audited this skeleton — nothing new to record.
+            conn.execute("ROLLBACK")
+        return {"disposition": "needs_review", "transitioned": False,
+                "skeleton_status": skel_status}
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def get_ledger(skeleton_id: str) -> dict | None:
+    """H2: look up the ledger entry for a skeleton. Returns None if the
+    pipeline hasn't committed a terminal state yet."""
+    if not skeleton_id:
+        return None
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT skeleton_id, client_request_id, terminal_state, "
+        "       result_memory_id, committed_at "
+        "FROM async_remember_ledger WHERE skeleton_id = ?",
+        (skeleton_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "skeleton_id": row[0], "client_request_id": row[1],
+        "terminal_state": row[2], "result_memory_id": row[3],
+        "committed_at": row[4],
+    }
+
+
+def try_claim_finalize(skeleton_id: str, claim_token: str,
+                       stale_after_minutes: int = 30) -> bool:
+    """H1: atomically claim a pending skeleton for finalize. Returns True
+    if this caller won the claim, False if another sweep/finalize already
+    holds it. Atomic single-row UPDATE with rowcount check.
+
+    A claim is takeable if:
+      - finalize_claim_id is empty (never claimed), OR
+      - the previous claim is older than stale_after_minutes (crashed
+        holder — take over).
+    """
+    if not skeleton_id or not claim_token:
+        return False
+    conn = _get_conn()
+    now = _now_iso()
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(minutes=stale_after_minutes)).isoformat()
+    cur = conn.execute(
+        "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
+        "WHERE id = ? AND status = 'pending' "
+        "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
+        (claim_token, now, skeleton_id, cutoff),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def release_finalize_claim(skeleton_id: str) -> None:
+    """H1: release a claim after finalize completes (successful or terminal
+    failure). Called from commit_finalize_atomic in the same transaction.
+    Standalone helper for the rare non-terminal cleanup paths."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
+        "WHERE id = ?", (skeleton_id,))
+    conn.commit()
+
+
+def commit_finalize_atomic(
+    skeleton_id: str,
+    client_request_id: str,
+    terminal_state: str,
+    result_memory_id: str,
+    skeleton_update: dict | None = None,
+    owner_token: str = "",
+) -> bool:
+    """H2 + H4 + H1 round-6: atomically write the ledger entry AND
+    transition the skeleton row. Both go in one BEGIN IMMEDIATE — if either
+    fails, both roll back so sweep never sees a half-completed pipeline.
+
+    owner_token: MUST match the token this caller passed to
+    write_intent_ledger. If it doesn't match the ledger's current owner
+    (another worker took over via stale-intent takeover, or shouldn't
+    happen), the ledger UPDATE affects 0 rows and this function returns
+    False WITHOUT touching the skeleton row. Caller should read the
+    winner's terminal via get_ledger() and apply that instead.
+
+    Returns True if this caller successfully committed the terminal state
+    (and the skeleton was updated), False if another owner won.
+    """
+    if terminal_state not in ("active", "replaced", "failed"):
+        raise ValueError(f"invalid terminal_state: {terminal_state}")
+
+    conn = _get_conn()
+    now = _now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # H2 + H1 round-6: race-losing terminal writer cannot clobber
+        # winner. Two constraints on the UPDATE branch:
+        #   - terminal_state must still be 'in_flight' (nobody terminaled yet)
+        #   - owner_token must match ours (we're the intent holder)
+        # If either fails, ledger stays as-is and skeleton is NOT touched.
+        cur = conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(skeleton_id) DO UPDATE SET "
+            "terminal_state=excluded.terminal_state, "
+            "result_memory_id=excluded.result_memory_id, "
+            "committed_at=excluded.committed_at "
+            "WHERE async_remember_ledger.terminal_state = 'in_flight' "
+            "  AND (async_remember_ledger.owner_token = excluded.owner_token "
+            "       OR async_remember_ledger.owner_token = '')",
+            (skeleton_id, client_request_id, terminal_state,
+             result_memory_id, now, owner_token),
+        )
+        # H1 round-6: if the ledger UPDATE did not affect our row (someone
+        # else already terminaled or owns a different token), do NOT touch
+        # the skeleton. Rollback and return False; caller must reconcile.
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            return False
+
+        if skeleton_update:
+            # Build UPDATE dynamically for the requested fields.
+            # H1: also release finalize_claim so a future sweep can retry
+            # if this row somehow ends up back in pending.
+            set_clauses = [
+                "updated_at = ?",
+                "finalize_claim_id = ''",
+                "finalize_claim_at = ''",
+            ]
+            params: list = [now]
+            for key, val in skeleton_update.items():
+                if key == "source_platform_suffix":
+                    # Special: append-if-not-present pattern
+                    suffix = val if val.startswith(":") else ":" + val
+                    set_clauses.append(
+                        "source_platform = CASE "
+                        "  WHEN source_platform LIKE '%' || ? THEN source_platform "
+                        "  ELSE source_platform || ? END"
+                    )
+                    params.extend([suffix, suffix])
+                else:
+                    set_clauses.append(f"{key} = ?")
+                    params.append(val)
+            params.append(skeleton_id)
+            conn.execute(
+                f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
+                params,
+            )
+        conn.commit()
+        return True
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+class MaintenanceDrift(RuntimeError):
+    """Raised when commit_maintenance_atomic finds the target row has drifted
+    (status or updated_at changed since the caller captured the snapshot).
+    Transaction is rolled back; no audit is written; caller should skip."""
+
+
+def commit_maintenance_atomic(
+    memory_id: str,
+    memory_updates: dict,
+    audit_row: dict,
+    expected_status: str | None = None,
+    expected_updated_at: str | None = None,
+    extra_expected_rows: list[dict] | None = None,
+) -> None:
+    """H4: apply a maintenance action and write the audit row in ONE
+    BEGIN IMMEDIATE transaction. If either fails, both roll back so the
+    target memory can't be left in a modified state without an audit trail.
+
+    H3 round-4: expected_status / expected_updated_at gate the UPDATE inside
+    the transaction. If either doesn't match at UPDATE time (concurrent
+    writer changed the row between plan and execute), rowcount==0 and we
+    raise MaintenanceDrift so the whole tx rolls back with NO audit written.
+
+    memory_updates: fields to UPDATE on the memory row. `comments` and
+    `history` are serialized to JSON if list/dict.
+    audit_row: dict with keys matching _AUDIT_COLUMNS.
+    """
+    conn = _get_conn()
+    now = _now_iso()
+
+    # Build memory UPDATE
+    set_clauses = ["updated_at = ?"]
+    params: list = [now]
+    for key, val in memory_updates.items():
+        if key in ("comments", "history") and isinstance(val, (list, dict)):
+            val = json.dumps(val, ensure_ascii=False)
+        set_clauses.append(f"{key} = ?")
+        params.append(val)
+
+    where_clauses = ["id = ?"]
+    where_params: list = [memory_id]
+    if expected_status is not None:
+        where_clauses.append("status = ?")
+        where_params.append(expected_status)
+    if expected_updated_at is not None:
+        where_clauses.append("updated_at = ?")
+        where_params.append(expected_updated_at)
+
+    # Ensure required audit columns are present
+    audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
+    audit_defaults["auto_executed"] = 1
+    audit_defaults["created_at"] = now
+    audit_defaults.update(audit_row)
+    audit_values = [audit_defaults.get(c, "") for c in _AUDIT_COLUMNS]
+    audit_placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+    audit_cols_str = ", ".join(_AUDIT_COLUMNS)
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # H3 round-6: validate ALL rows the decision depends on — not just
+        # the target A being mutated. dedup plans use A+B: if B drifted
+        # between plan generation and execute, the mutation of A based on
+        # B's old content is stale and must not commit.
+        if extra_expected_rows:
+            for expect in extra_expected_rows:
+                exp_id = expect.get("id")
+                if not exp_id:
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        "extra_expected_rows entry missing 'id'")
+                sel = conn.execute(
+                    "SELECT status, updated_at FROM memories WHERE id = ?",
+                    (exp_id,),
+                ).fetchone()
+                if not sel:
+                    conn.execute("ROLLBACK")
+                    raise MaintenanceDrift(
+                        f"companion row {exp_id} not found")
+                cur_status, cur_updated = sel[0], sel[1]
+                if ("status" in expect
+                        and expect["status"] != cur_status):
+                    conn.execute("ROLLBACK")
+                    raise MaintenanceDrift(
+                        f"companion {exp_id} drifted: expected "
+                        f"status={expect['status']!r}, got {cur_status!r}")
+                if ("updated_at" in expect
+                        and expect["updated_at"] != cur_updated):
+                    conn.execute("ROLLBACK")
+                    raise MaintenanceDrift(
+                        f"companion {exp_id} drifted: expected "
+                        f"updated_at={expect['updated_at']!r}, "
+                        f"got {cur_updated!r}")
+
+        cur = conn.execute(
+            f"UPDATE memories SET {', '.join(set_clauses)} "
+            f"WHERE {' AND '.join(where_clauses)}",
+            params + where_params,
+        )
+        if cur.rowcount != 1:
+            # Drift detected — someone modified the row between snapshot
+            # and now. Rollback both memory UPDATE (no-op) and skip audit.
+            conn.execute("ROLLBACK")
+            raise MaintenanceDrift(
+                f"target {memory_id} drifted "
+                f"(expected status={expected_status!r}, "
+                f"updated_at={expected_updated_at!r}); rowcount={cur.rowcount}"
+            )
+        conn.execute(
+            f"INSERT INTO maintenance_audit ({audit_cols_str}) "
+            f"VALUES ({audit_placeholders})",
+            audit_values,
+        )
+        conn.commit()
+    except MaintenanceDrift:
+        raise
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def list_memories_by_status(status: str, older_than_minutes: int = 0,
+                             limit: int = 500) -> list[dict]:
+    """Return memories in a specific status, optionally older than N minutes.
+    Used by the pending sweep to find stuck skeletons."""
+    conn = _get_conn()
+    if older_than_minutes > 0:
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(minutes=older_than_minutes)).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE status = ? AND created_at <= ? "
+            "ORDER BY created_at LIMIT ?",
+            (status, cutoff, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM memories WHERE status = ? ORDER BY created_at LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def set_memory(mem: dict) -> None:
@@ -507,12 +1263,42 @@ def set_memory(mem: dict) -> None:
     cols = ", ".join(_ALL_COLUMNS)
     # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
     # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
-    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）
-    update_set = ", ".join(
-        f"{c} = COALESCE(excluded.{c}, memories.{c})" if c == "embedding"
-        else f"{c} = excluded.{c}"
-        for c in _ALL_COLUMNS if c != "id"
-    )
+    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
+    # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
+    # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
+    # 已存在的 crq/link，否则骨架幂等追踪失效。
+    # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
+    # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
+    # "刚刚创建"，破 recency boost、破 sweep 判 age）。
+    # M1 round-6: finalize_claim_id/at are runtime coordination columns —
+    # generic UPSERT (activation touch, comment append) must NEVER clobber
+    # them. Callers write these ONLY via try_claim_finalize /
+    # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
+    # dict lacks the field, keep the DB's current value.
+    _preserve_on_empty = {"client_request_id", "link_to_real_id",
+                          "finalize_claim_id", "finalize_claim_at"}
+    _preserve_always = {"created_at"}
+    update_set_parts = []
+    for c in _ALL_COLUMNS:
+        if c == "id":
+            continue
+        if c == "embedding":
+            update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
+        elif c in _preserve_always:
+            # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
+            update_set_parts.append(
+                f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
+                f"ELSE excluded.{c} END"
+            )
+        elif c in _preserve_on_empty:
+            # 只在 excluded 值非空时覆盖，为空则保留已有值
+            update_set_parts.append(
+                f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
+                f"ELSE memories.{c} END"
+            )
+        else:
+            update_set_parts.append(f"{c} = excluded.{c}")
+    update_set = ", ".join(update_set_parts)
 
     sql = (
         f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "

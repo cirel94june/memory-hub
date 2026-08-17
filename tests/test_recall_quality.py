@@ -196,23 +196,27 @@ class TestBlock2RecencyBoost:
         _apply_recency_boost([item], now_utc=now)
         return item["score"]
 
+    # PR C 块 12: coefficient tightened from 0.3 → 0.15 to stop irrelevant new
+    # memories from dominating recall. New curve: 1 day ≈ 1.145, 30 days ≈ 1.055,
+    # 90 days ≈ 1.007.
+
     def test_recency_1_day(self):
-        assert 1.28 < self._boost(1) < 1.30
+        assert 1.14 < self._boost(1) < 1.15
 
     def test_recency_30_days(self):
-        assert 1.10 < self._boost(30) < 1.12
+        assert 1.05 < self._boost(30) < 1.06
 
     def test_recency_90_days(self):
-        assert 1.01 < self._boost(90) < 1.02
+        assert 1.005 < self._boost(90) < 1.010
 
     def test_recency_future_timestamp_clamped(self):
-        """Future timestamps must not produce >1.30 boost (days clamped to 0)."""
-        from memory_ops import _apply_recency_boost
+        """Future timestamps must not exceed the max boost (days clamped to 0)."""
+        from memory_ops import _apply_recency_boost, _RECENCY_BOOST_COEF
         now = datetime(2026, 8, 11, tzinfo=timezone.utc)
         future = (now + timedelta(days=365)).isoformat()
         item = {"score": 1.0, "created_at": future}
         _apply_recency_boost([item], now_utc=now)
-        assert item["score"] == pytest.approx(1.3, abs=0.001)
+        assert item["score"] == pytest.approx(1 + _RECENCY_BOOST_COEF, abs=0.001)
 
     def test_recency_invalid_timestamp_neutral(self):
         from memory_ops import _apply_recency_boost
@@ -225,7 +229,12 @@ class TestBlock2RecencyBoost:
         now = datetime(2026, 8, 11, tzinfo=timezone.utc)
         item = {"score": 1.0, "created_at": "2026-07-11T00:00:00"}
         _apply_recency_boost([item], now_utc=now)
-        assert 1.10 < item["score"] < 1.12
+        assert 1.05 < item["score"] < 1.06
+
+    def test_recency_coefficient_is_module_constant(self):
+        """块 12 抽出的常量必须存在且为 0.15；改动它前请更新上面的曲线断言。"""
+        from memory_ops import _RECENCY_BOOST_COEF
+        assert _RECENCY_BOOST_COEF == 0.15
 
 
 # ════════════════════════════════════════════

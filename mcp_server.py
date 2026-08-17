@@ -3,9 +3,13 @@ Memory Hub MCP Server
 远程 MCP 端点，直接调用内存中的函数（不走 HTTP 自调自己）
 通过 mount 到 FastAPI 应用提供 streamable HTTP transport
 """
+import os
 import json
 import hashlib
 import inspect
+import asyncio
+import logging
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -201,6 +205,8 @@ async def _safe_remember_impl(
     owner_ai: str = "",
     source_platform: str = "mcp",
     retry_on_fail: bool = True,
+    existing_id: str = "",
+    client_request_id: str = "",
 ) -> dict:
     original = str(content or "")
     neutral = _compact_content(original)
@@ -210,6 +216,7 @@ async def _safe_remember_impl(
             content=neutral, room=room, category=category, importance=importance,
             source_ai=source_ai, source_platform=source_platform, event_date=event_date,
             force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai,
+            existing_id=existing_id, client_request_id=client_request_id,
         )
         _audit("remember_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(neutral))
         return {"safe_write": "original_or_compact", **result}
@@ -227,6 +234,7 @@ async def _safe_remember_impl(
                 content=safe_content, room=room, category=category, importance=min(float(importance or 0.5), 0.7),
                 source_ai=source_ai, source_platform=f"{source_platform}:safe_retry", event_date=event_date,
                 force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai, auto_merge=False,
+                existing_id=existing_id, client_request_id=client_request_id,
             )
             _audit("remember_safe_retry_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(safe_content))
             return {"safe_write": "neutral_summary_retry", "original_error": str(exc), **result}
@@ -253,6 +261,54 @@ def _read_recent_audit(limit: int = 20) -> list[dict]:
     return out
 
 
+_LOG = logging.getLogger("mcp_server")
+
+# GC-safe registry for fire-and-forget background tasks.
+# asyncio holds only weakrefs to tasks; if we drop the returned Task the
+# coroutine may be garbage-collected mid-flight and vanish silently.
+# See https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+# ("Save a reference to the result of this function, to avoid a task
+#  disappearing mid-execution") and CPython issue 91887.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background_task(coro):
+    """asyncio.create_task with GC protection.
+
+    Adds the task to a module-level set so it isn't garbage-collected while
+    running; removes it on completion via done_callback. Never raises.
+    """
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+# Async remember helpers live in a mcp-free module so unit tests can exercise
+# them without the FastMCP dependency. We re-export _finalize_pending_memory
+# under this module's name so pending_sweep and tests can `from mcp_server
+# import _finalize_pending_memory` without needing to know it's a wrapper.
+from async_remember import _idempotent_response  # noqa: E402,F401
+
+
+async def _finalize_pending_memory(
+    skeleton_id: str, *, content: str, room: str, category: str,
+    importance: float, source_ai: str, event_date: str, force_create: bool,
+    client_request_id: str = "",
+) -> None:
+    """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
+    All reconciliation logic (real_id match / mark_replaced / mark failed)
+    lives in async_remember._finalize_pending_memory for testability."""
+    from async_remember import _finalize_pending_memory as _core
+    await _core(
+        skeleton_id,
+        impl_fn=_safe_remember_impl,
+        content=content, room=room, category=category, importance=importance,
+        source_ai=source_ai, event_date=event_date, force_create=force_create,
+        client_request_id=client_request_id,
+    )
+
+
 @mcp.tool()
 async def remember(
     content: str,
@@ -262,15 +318,28 @@ async def remember(
     source_ai: str = "claude",
     event_date: str = "",
     force_create: bool = False,
+    client_request_id: str = "",
 ) -> str:
-    """存储一条新记忆。系统会自动打标签，并智能检测是否需要更新/取代旧记忆。
+    """存储一条新记忆——**异步管线**，立即返回，后台跑 embedding + 分类 + 合并检测。
 
-    如果新记忆是对旧事实的更新（如"换了工作"），系统会自动：
-    - 标记旧记忆为 superseded（已过时）
-    - 在旧记忆上追加年轮注记说明被取代的原因
-    - 新记忆与旧记忆建立关联
+    ## 返回时间
+    - 传统同步管线要 30-70 秒，MCP 客户端会超时；这里在 <2 秒内返回 queued
+    - 完整 pipeline 完成后记忆变 active；期间该记忆不进 recall / corridor
 
-    房间选择：
+    ## 幂等（避免重试重复写入）
+    - 传 client_request_id（任意唯一字符串），系统按 crq 去重
+    - 同一 crq 的第二次调用返回 idempotent=True，不新建记忆
+    - 建议：AI 每次调用生成 UUID 或用可复现的哈希（如 hash(content + room)）
+
+    ## 后台管线
+    - remember() 走完全 pipeline，可能：
+      - 直接落成 status=active
+      - 触发 merge/supersede → 骨架标 status=replaced + link_to_real_id 指向真身
+      - 崩溃/被拦截 → status=failed
+    - 独立 sweep 任务每 10 分钟检查一次：超过 10 分钟的 pending 会重跑 pipeline，
+      超过 60 分钟仍是 pending 会被标 failed
+
+    ## 房间选择
     - living_room: 核心身份（永远注入）
     - career/psychology/health/learning/relationships/preferences: 各主题共享房间
     - work_tasks: 工作事务（快速衰减）
@@ -280,17 +349,134 @@ async def remember(
     Args:
         content: 记忆内容
         room: 房间ID
-        category: 分类标签（留空则由系统自动分类。如果你传了，系统不会覆盖）
+        category: 分类标签
         importance: 重要度 0-1
         source_ai: 来源AI（claude/gemini/gpt）
-        event_date: 事件发生日期（可选，如 2026-06-01，区别于记忆创建时间）
-        force_create: 强制新建，跳过自动合并检测。当你确定这条记忆必须独立存在时使用
+        event_date: 事件发生日期（可选）
+        force_create: 强制新建，跳过自动合并
+        client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
     """
-    result = await _safe_remember_impl(
+    # M1: namespace the client_request_id by source_ai so two different AIs
+    # can safely reuse the same client-side counter. Compute a content
+    # fingerprint so an accidental collision (same crq + same source_ai but
+    # different payload — the reviewer's scenario) returns a conflict
+    # instead of silently returning the first row's id.
+    effective_crq = (f"{source_ai}::{client_request_id}"
+                     if client_request_id else "")
+    content_fingerprint = hashlib.sha256(
+        (content or "").encode("utf-8")).hexdigest()[:16]
+
+    # 1. Idempotency lookup — a pre-existing crq short-circuits everything.
+    #    Verify the content fingerprint matches; else return a conflict so
+    #    the caller can tell they reused a key for a different payload.
+    if effective_crq:
+        existing = database.get_memory_by_client_request_id(effective_crq)
+        if existing:
+            existing_fp = hashlib.sha256(
+                (existing.get("content") or "").encode("utf-8")).hexdigest()[:16]
+            if existing_fp != content_fingerprint:
+                return json.dumps({
+                    "status": "error",
+                    "error": "crq_content_conflict",
+                    "memory_id": "",
+                    "client_request_id": client_request_id,
+                    "hint": ("Reusing client_request_id with a different "
+                             "content payload. Pick a new key, or send the "
+                             "exact same content to get the idempotent "
+                             "response for the original."),
+                }, ensure_ascii=False)
+            return _idempotent_response(existing)
+
+    # 2. Insert pending skeleton — try up to N times, regenerating the
+    #    skeleton_id if it collides (very rare hash birthday) while still
+    #    treating a crq collision as an idempotent hit.
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _new_skeleton_id() -> str:
+        ts = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+        h = hashlib.md5(
+            (content + str(ts) + os.urandom(8).hex()).encode()
+        ).hexdigest()[:8]
+        return f"mem_{ts}_{h}"
+
+    skeleton_id = _new_skeleton_id()
+    _MAX_ID_RETRIES = 3
+    inserted = False
+    for attempt in range(_MAX_ID_RETRIES + 1):
+        try:
+            database.insert_pending_memory({
+                "id": skeleton_id, "content": content, "room": room,
+                "category": category, "importance": importance,
+                "source_ai": source_ai, "event_date": event_date,
+                "source_platform": "mcp", "status": "pending",
+                "client_request_id": effective_crq,
+                "created_at": now,
+            })
+            inserted = True
+            break
+        except sqlite3.IntegrityError:
+            # Two possible causes:
+            #   (a) crq UNIQUE index collision — another request with the
+            #       same crq committed between our lookup and this INSERT.
+            #       Re-query and return the idempotent response.
+            #   (b) skeleton_id PK collision — extremely rare id-birthday.
+            #       Regenerate id and retry.
+            # NEVER let IntegrityError bubble to the MCP client — it would
+            # look like a failed write and trigger further retries.
+            if effective_crq:
+                existing = database.get_memory_by_client_request_id(effective_crq)
+                if existing:
+                    # M1: same fingerprint check in the race path.
+                    existing_fp = hashlib.sha256(
+                        (existing.get("content") or "").encode("utf-8")
+                    ).hexdigest()[:16]
+                    if existing_fp != content_fingerprint:
+                        return json.dumps({
+                            "status": "error",
+                            "error": "crq_content_conflict",
+                            "memory_id": "",
+                            "client_request_id": client_request_id,
+                            "hint": ("Reusing client_request_id with a "
+                                     "different content payload."),
+                        }, ensure_ascii=False)
+                    return _idempotent_response(existing)
+            # crq wasn't the cause → id collision. Regenerate and retry.
+            if attempt < _MAX_ID_RETRIES:
+                skeleton_id = _new_skeleton_id()
+                continue
+            # Give up honoring the "never bubble IntegrityError" contract:
+            # return a structured error the MCP client can handle instead of
+            # re-raising and getting an opaque write failure.
+            _LOG.error("skeleton_id collision after %d retries; returning error",
+                       _MAX_ID_RETRIES)
+    if not inserted:
+        return json.dumps({
+            "status": "error",
+            "error": "id_collision_max_retry",
+            "memory_id": "",
+            "client_request_id": client_request_id,
+            "hint": ("Failed to allocate a unique skeleton_id after "
+                     f"{_MAX_ID_RETRIES + 1} attempts. Retry the request "
+                     "with a slightly different content or wait a moment."),
+        }, ensure_ascii=False)
+
+    # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference.
+    # _finalize_pending_memory acquires the shared semaphore internally, so
+    # bursts of MCP requests + sweep retries share one bounded queue.
+    _spawn_background_task(_finalize_pending_memory(
+        skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
-    )
-    return json.dumps(result, ensure_ascii=False)
+        client_request_id=effective_crq,
+    ))
+
+    # 4. Return immediately (<2s target). Return the original crq the caller
+    # sent (not the namespaced one) so the client sees what it sent.
+    return json.dumps({
+        "status": "queued",
+        "memory_id": skeleton_id,
+        "client_request_id": client_request_id,
+    }, ensure_ascii=False)
 
 
 @mcp.tool()

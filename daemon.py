@@ -1116,6 +1116,11 @@ async def _run_full_maintenance_inner() -> dict:
     # 7.5 限时任务过期清理（event_date 过了 2 天的轻记忆自动归档）
     await run_step("expire_dated", "Expire dated tasks", expire_dated_tasks)
 
+    # NOTE: Async pending memory sweep runs on its own 10-minute schedule via
+    # pending_sweep.start_sweep_loop() (kicked off in main.py lifespan).
+    # It is NOT part of the nightly full maintenance — 10-min retry SLA needs
+    # high frequency, not once a day.
+
     # 8. 刷新对话捕获缓冲区（确保残留对话不丢）
     try:
         from conversation_capture import force_extract

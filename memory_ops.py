@@ -232,6 +232,8 @@ async def remember(
     subject_id: str = "",
     source_actor_id: str = "",
     info_type: str = "",
+    existing_id: str = "",
+    client_request_id: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
 
@@ -380,8 +382,8 @@ async def remember(
                     elif rel["relation"] in ("supplements", "same_topic"):
                         linked_ids.append(target_id)
 
-                # 新建记忆并关联
-                mem_id = _gen_id()
+                # 新建记忆并关联（PR C 块 8: 复用 existing_id 消除双行）
+                mem_id = existing_id or _gen_id()
                 now = _now()
 
                 mem = {
@@ -413,6 +415,7 @@ async def remember(
                     "comments": [],
                     "embedding": pack_embedding(query_vec) if query_vec else None,
                     "status": "active",
+                    "client_request_id": client_request_id,
                     "created_at": now,
                     "updated_at": now,
                     "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
@@ -439,8 +442,8 @@ async def remember(
                     result["original_category"] = original_category
                 return result
 
-    # Step 3: 新建记忆（无关联）
-    mem_id = _gen_id()
+    # Step 3: 新建记忆（无关联）（PR C 块 8: 复用 existing_id 消除双行）
+    mem_id = existing_id or _gen_id()
     now = _now()
     vec = await get_embedding(content)
 
@@ -456,8 +459,8 @@ async def remember(
         "valence": valence,
         "domain": json.dumps(domain),
         "decay_score": 1.0,
-                    "provenance_type": provenance_type,
-                    "fact_confidence": fact_confidence,
+        "provenance_type": provenance_type,
+        "fact_confidence": fact_confidence,
         "activation_count": 0,
         "last_activated": "",
         "source_ai": source_ai,
@@ -473,6 +476,7 @@ async def remember(
         "comments": [],
         "embedding": pack_embedding(vec) if vec else None,
         "status": "active",
+        "client_request_id": client_request_id,
         "created_at": now,
         "updated_at": now,
         "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
@@ -678,8 +682,17 @@ def _matches_resolve_pattern(text: str) -> bool:
     return False
 
 
+# Recency boost coefficient (Phase 1.7 块 12).
+# 0.3 pushed irrelevant new memories to the front of recall; 0.15 preserves
+# a small recency signal without overwhelming semantic relevance.
+# New curve: 1 day → 1.145×, 30 days → 1.055×, 90 days → 1.007×.
+# Adjust here and update test_recency_* thresholds if tuning further.
+_RECENCY_BOOST_COEF = 0.15
+
+
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
-    """In-place: multiply score by (1 + 0.3 * exp(-days/30)) using created_at.
+    """In-place: multiply score by (1 + _RECENCY_BOOST_COEF * exp(-days/30))
+    using created_at.
 
     Future timestamps are clamped to days=0 to avoid runaway boosts.
     """
@@ -691,7 +704,7 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
             days = max(0.0, (now_utc - created).total_seconds() / 86400)
-            boost = 1 + 0.3 * math.exp(-days / 30)
+            boost = 1 + _RECENCY_BOOST_COEF * math.exp(-days / 30)
         except Exception:
             boost = 1.0
         item["score"] = round(item.get("score", 0) * boost, 6)
@@ -945,8 +958,16 @@ def _write_audit(action: str, target_id: str, new_content: str, reason: str,
 async def _execute_maintenance_action(
     action: str, target_mem: dict, new_content: str,
     reason: str, source_ai: str, provenance_type: str = "",
+    companion_expected_rows: list[dict] | None = None,
     **extra,
 ) -> dict:
+    """
+    companion_expected_rows: H3 round-6. Rows whose current status/updated_at
+    are load-bearing for this decision but which won't be UPDATE'd by us.
+    Passed to commit_maintenance_atomic so drift on B (dedup source) also
+    triggers rollback, not just drift on A (dedup target).
+    Each entry: {'id': str, 'status': str, 'updated_at': str}.
+    """
     """Execute a safe maintenance action on an existing memory. Returns result dict."""
     target_id = target_mem["id"]
     now = _now()
@@ -957,39 +978,46 @@ async def _execute_maintenance_action(
         _write_audit("no_change", target_id, new_content, reason, state_before, state_before, True, source_ai)
         return {"id": target_id, "status": "no_change", "maintenance_action": "no_change", "reason": reason}
 
-    if action == "annotate":
+    if action in ("annotate", "supplement"):
+        # M3 round-4: comment append + audit in one atomic tx (matches
+        # supersede/resolve pattern) so an audit failure doesn't leave the
+        # target with an orphan comment.
+        kind = "annotation" if action == "annotate" else "supplement"
+        result_status = "annotated" if action == "annotate" else "supplemented"
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
         comments.append({
             "date": now, "author": source_ai or "system",
-            "kind": "annotation", "content": new_content[:300],
+            "kind": kind, "content": new_content[:300],
         })
-        target_mem["comments"] = comments
-        target_mem["updated_at"] = now
-        store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
-        _write_audit("annotate", target_id, new_content, reason, state_before, state_after, True, source_ai)
-        return {"id": target_id, "status": "annotated", "maintenance_action": "annotate"}
-
-    if action == "supplement":
-        comments = target_mem.get("comments", [])
-        if not isinstance(comments, list):
-            comments = []
-        comments.append({
-            "date": now, "author": source_ai or "system",
-            "kind": "supplement", "content": new_content[:300],
-        })
-        target_mem["comments"] = comments
-        target_mem["updated_at"] = now
-        store.set_memory(target_mem)
-        state_after = {"content": target_mem["content"], "comments_count": len(comments)}
-        _write_audit("supplement", target_id, new_content, reason, state_before, state_after, True, source_ai)
-        return {"id": target_id, "status": "supplemented", "maintenance_action": "supplement"}
+        state_after = {"content": target_mem["content"],
+                       "comments_count": len(comments)}
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"comments": comments},
+                audit_row={
+                    "action": action, "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("%s skipped due to drift: %s", action, drift)
+            return None
+        return {"id": target_id, "status": result_status,
+                "maintenance_action": action}
 
     if action == "resolve_thread":
-        target_mem["resolved"] = 1
-        target_mem["updated_at"] = now
+        # H4 + H3: same-tx state change + audit + drift check.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -997,15 +1025,31 @@ async def _execute_maintenance_action(
             "date": now, "author": source_ai or "system",
             "kind": "resolve", "content": f"自动完成: {new_content[:100]}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"resolved": True}
-        _write_audit("resolve_thread", target_id, new_content, reason, state_before, state_after, True, source_ai)
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"resolved": 1, "comments": comments},
+                audit_row={
+                    "action": "resolve_thread", "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("resolve_thread skipped due to drift: %s", drift)
+            return None
         return {"id": target_id, "status": "resolved", "maintenance_action": "resolve_thread"}
 
     if action == "reopen_thread":
-        target_mem["resolved"] = 0
-        target_mem["updated_at"] = now
+        # H4 + H3: same-tx state change + audit + drift check.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1013,10 +1057,27 @@ async def _execute_maintenance_action(
             "date": now, "author": source_ai or "system",
             "kind": "reopen", "content": f"重新打开: {new_content[:100]}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"resolved": False}
-        _write_audit("reopen_thread", target_id, new_content, reason, state_before, state_after, False, source_ai)
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"resolved": 0, "comments": comments},
+                audit_row={
+                    "action": "reopen_thread", "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 0,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("reopen_thread skipped due to drift: %s", drift)
+            return None
         return {"id": target_id, "status": "reopened", "maintenance_action": "reopen_thread"}
 
     if action in ("update", "supersede"):
@@ -1025,8 +1086,12 @@ async def _execute_maintenance_action(
                          state_before, state_before, False, source_ai)
             return None
 
-        target_mem["status"] = "superseded"
-        target_mem["updated_at"] = now
+        # H4: supersede is the highest-impact maintenance action (permanently
+        # takes a memory out of recall). It MUST be atomic with the audit row.
+        # H3 round-4: pass the target's snapshotted status + updated_at into
+        # the same tx so a concurrent writer that mutated the row between
+        # our read and this UPDATE causes a MaintenanceDrift, not a
+        # silent overwrite.
         comments = target_mem.get("comments", [])
         if not isinstance(comments, list):
             comments = []
@@ -1035,10 +1100,28 @@ async def _execute_maintenance_action(
             "kind": "supersede_note",
             "content": f"被新记忆取代（{action}）: {reason}",
         })
-        target_mem["comments"] = comments
-        store.set_memory(target_mem)
         state_after = {"status": "superseded", "reason": reason}
-        _write_audit(action, target_id, new_content, reason, state_before, state_after, True, source_ai)
+        try:
+            database.commit_maintenance_atomic(
+                memory_id=target_id,
+                memory_updates={"status": "superseded", "comments": comments},
+                audit_row={
+                    "action": action, "target_id": target_id,
+                    "new_content": new_content,
+                    "source_message_ids": "[]",
+                    "decision_reason": reason,
+                    "state_before": json.dumps(state_before, ensure_ascii=False),
+                    "state_after": json.dumps(state_after, ensure_ascii=False),
+                    "source_ai": source_ai or "",
+                    "auto_executed": 1,
+                },
+                expected_status=target_mem.get("status"),
+                expected_updated_at=target_mem.get("updated_at"),
+                extra_expected_rows=companion_expected_rows,
+            )
+        except database.MaintenanceDrift as drift:
+            logger.info("supersede skipped due to drift: %s", drift)
+            return None
         return {"superseded_id": target_id, "status": "superseded", "maintenance_action": action}
 
     return None
