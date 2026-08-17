@@ -56,10 +56,19 @@ def get_finalize_semaphore() -> asyncio.Semaphore:
     return sem
 
 
-def _reset_finalize_semaphore_for_tests() -> None:
-    """Test-only: drop all cached semaphores so pytest's per-loop fixtures
-    start fresh. Safe to call between tests."""
+def clear_finalize_semaphores() -> None:
+    """Drop all cached loop-local semaphores.
+
+    Called from main.py lifespan shutdown to prevent long-lived dict
+    entries in embedded/hot-reload setups. Also called between tests to
+    prevent 'bound to a different loop' errors from per-test loops.
+    """
     _FINALIZE_SEMAPHORES.clear()
+
+
+# Backwards-compat alias — old code (tests, older lifespans) used the
+# test-flavored name. Points to the same function.
+_reset_finalize_semaphore_for_tests = clear_finalize_semaphores
 
 
 def _idempotent_response(existing: dict) -> str:

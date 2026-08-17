@@ -781,11 +781,31 @@ def close_stale_intent_atomic(
             "FROM memories WHERE id = ?", (skeleton_id,),
         ).fetchone()
         if not skel_row:
-            # Skeleton was hard-deleted somehow — close ledger to failed
-            # and move on. No audit target.
+            # Skeleton was hard-deleted somehow. Close ledger to failed
+            # and audit the anomaly — target row no longer exists but the
+            # audit trail should still record what happened.
+            # (Low round-8: skeleton_missing writes audit.)
             conn.execute(
                 "UPDATE async_remember_ledger SET terminal_state='failed', "
                 "committed_at=? WHERE skeleton_id=?", (now, skeleton_id))
+            _sm_audit = {c: "" for c in _AUDIT_COLUMNS}
+            _sm_audit.update({
+                "action": "sweep_fail", "target_id": skeleton_id,
+                "decision_reason": reason + " (skeleton row missing)",
+                "state_before": json.dumps({"ledger": "in_flight",
+                                            "skeleton": "MISSING"},
+                                           ensure_ascii=False),
+                "state_after": json.dumps({"ledger": "failed",
+                                           "skeleton": "MISSING"},
+                                          ensure_ascii=False),
+                "auto_executed": 1, "created_at": now,
+            })
+            _sm_vals = [_sm_audit.get(c, "") for c in _AUDIT_COLUMNS]
+            _sm_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_sm_ph})",
+                _sm_vals)
             conn.commit()
             return {"disposition": "skeleton_missing",
                     "transitioned": True, "skeleton_status": None}
@@ -834,10 +854,14 @@ def close_stale_intent_atomic(
         if skel_status == "active":
             # Create pipeline reused skeleton and committed set_memory
             # but crashed before terminal ledger. Ledger catches up.
+            # Low round-8: also clear stale finalize_claim in same tx.
             conn.execute(
                 "UPDATE async_remember_ledger SET terminal_state='active', "
                 "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
                 (skeleton_id, now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET finalize_claim_id='', "
+                "finalize_claim_at='' WHERE id=?", (skeleton_id,))
             conn.commit()
             return {"disposition": "already_active", "transitioned": True,
                     "skeleton_status": "active"}
@@ -849,13 +873,52 @@ def close_stale_intent_atomic(
                 "UPDATE async_remember_ledger SET terminal_state='replaced', "
                 "result_memory_id=?, committed_at=? WHERE skeleton_id=?",
                 (skel_link, now, skeleton_id))
+            conn.execute(
+                "UPDATE memories SET finalize_claim_id='', "
+                "finalize_claim_at='' WHERE id=?", (skeleton_id,))
             conn.commit()
             return {"disposition": "already_replaced", "transitioned": True,
                     "skeleton_status": "replaced"}
 
-        # Any other status (failed, superseded, ...) — inconsistent. Leave
-        # for human review; do not close ledger.
-        conn.execute("ROLLBACK")
+        # Any other status (failed, superseded, ...) — inconsistent.
+        # Medium round-8: write ONE audit row per skeleton so ops has a
+        # durable signal (log alone gets rotated). Use INSERT OR IGNORE
+        # keyed on (action, target_id) to prevent spam every sweep tick.
+        # We identify the row by putting the skeleton_id in the audit
+        # target_id and using a fixed action string.
+        existing_audit = conn.execute(
+            "SELECT COUNT(*) FROM maintenance_audit "
+            "WHERE action = 'intent_needs_review' AND target_id = ?",
+            (skeleton_id,),
+        ).fetchone()
+        if existing_audit and existing_audit[0] == 0:
+            _nr_audit = {c: "" for c in _AUDIT_COLUMNS}
+            _nr_audit.update({
+                "action": "intent_needs_review", "target_id": skeleton_id,
+                "decision_reason": (
+                    f"{reason} — skeleton status={skel_status!r} + ledger "
+                    f"in_flight; cannot auto-reconcile"),
+                "state_before": json.dumps({
+                    "ledger": "in_flight",
+                    "skeleton": skel_status,
+                }, ensure_ascii=False),
+                "state_after": json.dumps({
+                    "ledger": "in_flight",  # unchanged
+                    "skeleton": skel_status,  # unchanged
+                    "needs_manual_review": True,
+                }, ensure_ascii=False),
+                "auto_executed": 0, "created_at": now,
+            })
+            _nr_vals = [_nr_audit.get(c, "") for c in _AUDIT_COLUMNS]
+            _nr_ph = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+            conn.execute(
+                f"INSERT INTO maintenance_audit "
+                f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_nr_ph})",
+                _nr_vals)
+            conn.commit()
+        else:
+            # Already audited this skeleton — nothing new to record.
+            conn.execute("ROLLBACK")
         return {"disposition": "needs_review", "transitioned": False,
                 "skeleton_status": skel_status}
     except Exception:

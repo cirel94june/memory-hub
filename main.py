@@ -115,10 +115,11 @@ async def lifespan(app: FastAPI):
                 logging.getLogger("main").exception(
                     "bg task drain during shutdown failed")
             # Round-7 Low: drop the loop-local semaphore dict so a fresh
-            # loop (test process, hot reload) doesn't inherit stale entries.
+            # loop (hot reload, embedded interpreter) doesn't inherit
+            # stale entries.
             try:
                 import async_remember as _ar
-                _ar._reset_finalize_semaphore_for_tests()
+                _ar.clear_finalize_semaphores()
             except Exception:
                 pass
 

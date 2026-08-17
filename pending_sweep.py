@@ -83,7 +83,13 @@ async def sweep_stuck_pending() -> dict:
         "failed": 0,
         "still_pending": 0,
         "skipped_claimed": 0,
-        "intent_timeouts": 0,
+        # Low round-8: split intent_timeouts into precise sub-counters
+        # so ops can tell auto-reconciliation from real failure.
+        "intent_failed": 0,
+        "intent_reconciled_active": 0,
+        "intent_reconciled_replaced": 0,
+        "intent_missing": 0,
+        "intent_needs_review": 0,
     }
 
     # H2 round-6 + H round-7: BEFORE looking at pending skeletons, close
@@ -105,20 +111,49 @@ async def sweep_stuck_pending() -> dict:
                         f"pipeline crashed with unknown side effects, "
                         f"reconciled based on skeleton status"),
             )
-            if not outcome.get("transitioned"):
-                # Either owner beat us to it, or skeleton is in an
-                # inconsistent state — leave for human review.
-                logger.info(
-                    "pending sweep: stale intent %s not transitioned "
-                    "(disposition=%s, skel_status=%s)",
-                    skel_id, outcome.get("disposition"),
-                    outcome.get("skeleton_status"))
+            disposition = outcome.get("disposition", "")
+            skel_status = outcome.get("skeleton_status")
+
+            if disposition == "needs_review":
+                # Low round-8: precise counter + warning + audit already
+                # written inside close_stale_intent_atomic (dedup-guarded
+                # so we don't spam every sweep tick).
+                result["intent_needs_review"] += 1
+                logger.warning(
+                    "pending sweep: stale intent NEEDS REVIEW — "
+                    "skel=%s status=%s owner=%s (audit row written)",
+                    skel_id, skel_status, token[:8])
                 continue
-            result["intent_timeouts"] += 1
-            logger.warning(
-                "pending sweep: reconciled stale intent %s (owner=%s, "
-                "disposition=%s)",
-                skel_id, token[:8], outcome.get("disposition"))
+
+            if not outcome.get("transitioned"):
+                # already_terminaled — owner beat us. Not a problem.
+                logger.info(
+                    "pending sweep: stale intent %s already terminaled "
+                    "(disposition=%s)", skel_id, disposition)
+                continue
+
+            # Precise counter per disposition (Low round-8: don't mix
+            # auto-reconciliation with real failure).
+            if disposition == "failed":
+                result["intent_failed"] += 1
+                logger.warning(
+                    "pending sweep: intent timed out to failed — "
+                    "skel=%s owner=%s", skel_id, token[:8])
+            elif disposition == "already_active":
+                result["intent_reconciled_active"] += 1
+                logger.info(
+                    "pending sweep: intent reconciled to active — "
+                    "skel=%s (create pipeline had committed)", skel_id)
+            elif disposition == "already_replaced":
+                result["intent_reconciled_replaced"] += 1
+                logger.info(
+                    "pending sweep: intent reconciled to replaced — "
+                    "skel=%s (merge pipeline had committed)", skel_id)
+            elif disposition == "skeleton_missing":
+                result["intent_missing"] += 1
+                logger.warning(
+                    "pending sweep: stale intent skeleton missing — "
+                    "skel=%s owner=%s", skel_id, token[:8])
         except Exception:
             logger.exception(
                 "sweep failed to reconcile stale intent %s", skel_id)

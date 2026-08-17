@@ -759,7 +759,10 @@ class TestAsyncRememberHelpers:
         import pending_sweep
         result = asyncio.run(pending_sweep.sweep_stuck_pending())
 
-        assert result["intent_timeouts"] >= 1
+        # Low round-8: intent_timeouts split into precise sub-counters.
+        # A stale in_flight over a still-pending skeleton counts as
+        # intent_failed (the sweep marked both ledger+skeleton failed).
+        assert result["intent_failed"] >= 1
         skel = database.get_memory("sk_stale")
         assert skel["status"] == "failed"
         assert skel["source_platform"].endswith(":intent_timeout")
@@ -940,6 +943,134 @@ class TestAsyncRememberHelpers:
         audits = [a for a in database.list_audits(action="sweep_fail")
                   if a["target_id"] == "sk_pend"]
         assert len(audits) == 1
+
+    def test_r8_needs_review_writes_dedup_audit(self, db_env):
+        """Medium round-8: needs_review disposition must produce an
+        observable signal (audit row) — not just an info log. And
+        subsequent sweep ticks on the same skeleton must NOT spam."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        # Skeleton in an inconsistent state that the helper leaves alone
+        database.insert_pending_memory({
+            "id": "sk_nr", "content": "x", "room": "living_room",
+            "client_request_id": "crq_nr", "status": "pending",
+        })
+        conn = database._get_conn()
+        conn.execute("UPDATE memories SET status='superseded' WHERE id=?",
+                     ("sk_nr",))
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_nr", "crq_nr", stale, "gh"),
+        )
+        conn.commit()
+
+        # First close attempt writes an audit
+        out1 = database.close_stale_intent_atomic(
+            "sk_nr", "gh", reason="test needs_review")
+        assert out1["disposition"] == "needs_review"
+        audits = [a for a in database.list_audits(action="intent_needs_review")
+                  if a["target_id"] == "sk_nr"]
+        assert len(audits) == 1
+
+        # Second close attempt must NOT write a duplicate audit
+        out2 = database.close_stale_intent_atomic(
+            "sk_nr", "gh", reason="test needs_review 2")
+        assert out2["disposition"] == "needs_review"
+        audits_after = [a for a in database.list_audits(action="intent_needs_review")
+                        if a["target_id"] == "sk_nr"]
+        assert len(audits_after) == 1, \
+            "needs_review audit must be deduplicated per skeleton"
+        # Ledger still in_flight (helper never terminaled it)
+        assert database.get_ledger("sk_nr")["terminal_state"] == "in_flight"
+
+    def test_r8_skeleton_missing_writes_audit(self, db_env):
+        """Low round-8: skeleton hard-deleted (defensive path) still
+        produces an audit row so ops can trace what happened."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        conn = database._get_conn()
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("ghost_skel", "crq_ghost", stale, "gh"),
+        )
+        conn.commit()
+
+        out = database.close_stale_intent_atomic(
+            "ghost_skel", "gh", reason="test missing")
+        assert out["disposition"] == "skeleton_missing"
+        assert out["transitioned"] is True
+        audits = [a for a in database.list_audits(action="sweep_fail")
+                  if a["target_id"] == "ghost_skel"]
+        assert len(audits) == 1
+        assert "skeleton row missing" in audits[0]["decision_reason"]
+
+    def test_r8_split_counters_populated(self, db_env):
+        """Low round-8: sweep result must expose the split counters
+        (not just intent_timeouts)."""
+        import pending_sweep
+        result = asyncio.run(pending_sweep.sweep_stuck_pending())
+        # New keys present
+        for key in ("intent_failed", "intent_reconciled_active",
+                    "intent_reconciled_replaced", "intent_missing",
+                    "intent_needs_review"):
+            assert key in result, f"sweep result missing counter {key}"
+        # Old aggregate no longer used
+        assert "intent_timeouts" not in result, \
+            "intent_timeouts should have been split into sub-counters"
+
+    def test_r8_active_reconciliation_clears_claim(self, db_env):
+        """Low round-8: reconciling an already-active skeleton must also
+        clear the stale finalize_claim so it doesn't linger."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(hours=2)).isoformat()
+        database.insert_pending_memory({
+            "id": "sk_claim_clean", "content": "x", "room": "living_room",
+            "client_request_id": "crq_cc", "status": "pending",
+        })
+        conn = database._get_conn()
+        conn.execute(
+            "UPDATE memories SET status='active', "
+            "finalize_claim_id='ghost_claim', finalize_claim_at=? "
+            "WHERE id=?", (stale, "sk_claim_clean"))
+        conn.execute(
+            "INSERT INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            ("sk_claim_clean", "crq_cc", stale, "gh"),
+        )
+        conn.commit()
+
+        out = database.close_stale_intent_atomic(
+            "sk_claim_clean", "gh", reason="test claim cleanup")
+        assert out["disposition"] == "already_active"
+        row = database.get_memory("sk_claim_clean")
+        assert row["finalize_claim_id"] == ""
+        assert row["finalize_claim_at"] == ""
+
+    def test_r8_semaphore_clear_renamed(self):
+        """Low round-8: production lifecycle should call
+        clear_finalize_semaphores, not the _for_tests alias."""
+        import async_remember
+        # Both names exist (alias for backcompat)
+        assert callable(async_remember.clear_finalize_semaphores)
+        assert callable(async_remember._reset_finalize_semaphore_for_tests)
+        # Alias points to the production function
+        assert (async_remember._reset_finalize_semaphore_for_tests
+                is async_remember.clear_finalize_semaphores)
+        # main.py uses the production name (not the test alias)
+        with open("main.py", encoding="utf-8") as f:
+            src = f.read()
+        assert "clear_finalize_semaphores" in src, \
+            "main.py should call the production-named helper"
+        assert "_reset_finalize_semaphore_for_tests" not in src, \
+            "main.py should not depend on a test-flavored function name"
 
     def test_h_r7_wrong_owner_token_no_op(self, db_env):
         """Round-7 H: close_stale_intent_atomic guards by owner_token. A
