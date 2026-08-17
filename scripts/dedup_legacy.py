@@ -195,13 +195,29 @@ async def _execute_plan(plan_entries: list[dict]) -> dict:
     """H5 execute phase: consume the immutable plan. For each entry, verify
     that both memories are still active AND their updated_at matches the
     snapshot — else skip that entry (someone else touched the row). NEVER
-    calls the LLM classifier; the action was decided at plan time."""
+    calls the LLM classifier; the action was decided at plan time.
+
+    Round-9 (post-first-run): counters split so operators can tell WHY an
+    entry was skipped without guessing:
+      - applied           → maintenance action ran
+      - skipped_drift     → status/updated_at changed since plan
+      - skipped_missing   → memory row deleted since plan
+      - blocked_by_guard  → provenance guard rejected supersede/update
+                            (e.g. ai_summary cannot supersede ai_summary
+                            without user-level authorization)
+      - unexpected_none   → guard passed but action returned None anyway
+                            (indicates a bug or a downstream MaintenanceDrift
+                            we didn't catch)
+      - error             → uncaught exception
+    """
     import memory_ops
     counts = {"applied": 0, "skipped_drift": 0, "skipped_missing": 0,
-              "error": 0}
+              "blocked_by_guard": 0, "unexpected_none": 0, "error": 0}
     for entry in plan_entries:
         action = entry["action"]
         if action not in _DEDUP_ACTIONS:
+            # Plan entries with report-only actions shouldn't reach here
+            # (they're filtered out at plan-write time), but guard anyway.
             counts["skipped_drift"] += 1
             continue
 
@@ -220,6 +236,19 @@ async def _execute_plan(plan_entries: list[dict]) -> dict:
                   f"drift detected since scan")
             continue
 
+        # Round-9: provenance guard pre-check so blocked pairs are reported
+        # accurately instead of being lumped into skipped_drift. This
+        # catches the common case where two ai_summary rows can't
+        # supersede each other without user-level authorization.
+        provenance_for_guard = entry.get("b_provenance", "")
+        if not memory_ops._can_supersede(provenance_for_guard, a):
+            counts["blocked_by_guard"] += 1
+            print(f"  BLOCKED {entry['a_id']} × {entry['b_id']}: "
+                  f"provenance guard rejected ({provenance_for_guard!r} "
+                  f"cannot supersede {a.get('provenance_type')!r}). "
+                  f"Route through user-level review or manual override.")
+            continue
+
         try:
             # H3 round-6: B is load-bearing for the supersede decision even
             # though we only mutate A. Pass B's snapshot to the atomic
@@ -228,7 +257,7 @@ async def _execute_plan(plan_entries: list[dict]) -> dict:
                 action, a, b["content"],
                 reason=f"legacy_dedup_script: {entry['reason']}",
                 source_ai="dedup_script",
-                provenance_type=entry.get("b_provenance", ""),
+                provenance_type=provenance_for_guard,
                 companion_expected_rows=[{
                     "id": entry["b_id"],
                     "status": entry.get("b_status_snapshot", ""),
@@ -238,7 +267,13 @@ async def _execute_plan(plan_entries: list[dict]) -> dict:
             if result:
                 counts["applied"] += 1
             else:
-                counts["skipped_drift"] += 1
+                # Guard already passed our pre-check so a None here means
+                # something else (e.g. MaintenanceDrift swallowed inside
+                # _execute_maintenance_action). Report distinctly for
+                # observability instead of pretending it was drift.
+                counts["unexpected_none"] += 1
+                print(f"  UNEXPECTED_NONE {entry['a_id']} × {entry['b_id']}: "
+                      f"guard passed but action returned None")
         except Exception as e:
             print(f"  ERROR on {entry['a_id']} × {entry['b_id']}: {e}")
             counts["error"] += 1
