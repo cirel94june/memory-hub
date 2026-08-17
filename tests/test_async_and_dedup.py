@@ -1353,3 +1353,93 @@ class TestDedupScriptSmoke:
         ]
         pairs = dedup_legacy._scan_room(mems, sim_threshold=0.85, window_days=3)
         assert pairs == []
+
+    def test_execute_plan_counters_split(self, db_env):
+        """Round-9: skipped_drift used to swallow provenance-guard blocks
+        along with real drift. Now blocked_by_guard is its own counter
+        so operators can tell 'AI-summary can't supersede AI-summary'
+        from 'someone touched the row between plan and execute'."""
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts",
+        ))
+        import dedup_legacy
+        import database as _db
+
+        # Seed A + B, both with ai_summary provenance — guard will reject.
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _db._get_conn()
+        for mid, content in [("guard_A", "AI summary A"),
+                             ("guard_B", "AI summary B")]:
+            conn.execute(
+                "INSERT INTO memories (id, content, room, status, layer, "
+                "  created_at, updated_at, provenance_type) "
+                "VALUES (?, ?, 'living_room', 'active', 'shared', ?, ?, "
+                "        'ai_summary')",
+                (mid, content, now, now),
+            )
+        conn.commit()
+
+        plan = [{
+            "a_id": "guard_A", "b_id": "guard_B",
+            "action": "update",  # would supersede A
+            "a_updated_at_snapshot": now, "b_updated_at_snapshot": now,
+            "a_status_snapshot": "active", "b_status_snapshot": "active",
+            "b_provenance": "ai_summary",
+            "reason": "test", "similarity": 0.9,
+        }]
+        counts = asyncio.run(dedup_legacy._execute_plan(plan))
+        assert counts["blocked_by_guard"] == 1, \
+            f"expected 1 blocked_by_guard, got {counts}"
+        assert counts["applied"] == 0
+        assert counts["skipped_drift"] == 0
+        # Row must NOT be superseded
+        assert database.get_memory("guard_A")["status"] == "active"
+
+    def test_execute_plan_reports_unexpected_none_separately(self, db_env):
+        """Round-9: if guard passes but the action still returns None
+        (bug or downstream unhandled path), report as unexpected_none
+        instead of pretending it was drift."""
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "scripts",
+        ))
+        import dedup_legacy
+        import memory_ops as _mo
+        import database as _db
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _db._get_conn()
+        for mid, content in [("un_A", "content A"),
+                             ("un_B", "content B")]:
+            conn.execute(
+                "INSERT INTO memories (id, content, room, status, layer, "
+                "  created_at, updated_at, provenance_type) "
+                "VALUES (?, ?, 'living_room', 'active', 'shared', ?, ?, "
+                "        'user_statement')",
+                (mid, content, now, now),
+            )
+        conn.commit()
+
+        plan = [{
+            "a_id": "un_A", "b_id": "un_B",
+            "action": "update",
+            "a_updated_at_snapshot": now, "b_updated_at_snapshot": now,
+            "a_status_snapshot": "active", "b_status_snapshot": "active",
+            "b_provenance": "user_correction",  # passes the guard
+            "reason": "test", "similarity": 0.9,
+        }]
+        # Force _execute_maintenance_action to return None
+        async def stub(*a, **kw):
+            return None
+        original = _mo._execute_maintenance_action
+        _mo._execute_maintenance_action = stub
+        try:
+            counts = asyncio.run(dedup_legacy._execute_plan(plan))
+        finally:
+            _mo._execute_maintenance_action = original
+
+        assert counts["unexpected_none"] == 1, \
+            f"expected 1 unexpected_none, got {counts}"
+        assert counts["blocked_by_guard"] == 0
+        assert counts["skipped_drift"] == 0
