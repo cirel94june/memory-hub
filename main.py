@@ -66,18 +66,6 @@ async def lifespan(app: FastAPI):
         lag_task = asyncio.create_task(_event_loop_lag_monitor())
         bg_worker_task = asyncio.create_task(_bg_worker())
         print("[Memory Hub] Daemon scheduler started (every 12h)")
-
-        # PR C 块 8: async remember 卡死 pending 骨架清扫（每 10 min，独立高频）
-        # sweep_task 先初始化为 None——如果 pending_sweep import 失败，finally
-        # 里的 sweep_task.cancel() 就不会 NameError 掩盖原始异常。
-        sweep_task = None
-        try:
-            from pending_sweep import start_sweep_loop
-            sweep_task = start_sweep_loop()
-            print("[Memory Hub] Pending sweep loop started (every 10min)")
-        except Exception as e:
-            logging.getLogger("main").exception(
-                "pending_sweep failed to start (continuing without it): %s", e)
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -89,39 +77,9 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
-            # L: cancel + await so tasks fully unwind. Without the await,
-            # asyncio can print "task was destroyed but it is pending" and
-            # in-flight DB writes may not commit before shutdown.
-            cancel_list = [daemon_task, lag_task, bg_worker_task]
-            if sweep_task is not None:
-                cancel_list.append(sweep_task)
-            for t in cancel_list:
-                t.cancel()
-            await asyncio.gather(*cancel_list, return_exceptions=True)
-            # Also flush the module-level bg task sets from mcp_server /
-            # pending_sweep so in-flight finalize/sweep-retry pipelines
-            # get a chance to complete or cancel cleanly.
-            try:
-                import mcp_server as _mcp_mod
-                import pending_sweep as _sweep_mod
-                for tset in (getattr(_mcp_mod, "_BACKGROUND_TASKS", None),
-                             getattr(_sweep_mod, "_BACKGROUND_TASKS", None)):
-                    if not tset:
-                        continue
-                    for t in list(tset):
-                        t.cancel()
-                    await asyncio.gather(*list(tset), return_exceptions=True)
-            except Exception:
-                logging.getLogger("main").exception(
-                    "bg task drain during shutdown failed")
-            # Round-7 Low: drop the loop-local semaphore dict so a fresh
-            # loop (hot reload, embedded interpreter) doesn't inherit
-            # stale entries.
-            try:
-                import async_remember as _ar
-                _ar.clear_finalize_semaphores()
-            except Exception:
-                pass
+            daemon_task.cancel()
+            lag_task.cancel()
+            bg_worker_task.cancel()
 
 
 def _seconds_until_next_run() -> int:

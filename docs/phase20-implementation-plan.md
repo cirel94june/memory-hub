@@ -59,13 +59,13 @@
 
 **三条真实可行路径**（按落地成本从低到高）：
 
-- **路径 A（推荐）：MCP session token 从环境变量派生 actor**  
+- **路径 A（推荐）：MCP session token 从环境变量派生 actor**
   Bot 启动 MCP 客户端时传 `HUB_ACTOR=lucien` 环境变量。Hub 侧 REST 端点从请求头 `X-Hub-Actor` 取（bot 转发时带上）。相当于把 actor 从 tool 参数下沉到 transport header——**每个 bot process 只服务一个 AI 身份**（现状本来就是）。改动小：REST 端点新增 header 校验 + MCP tool 层废弃 `source_ai` 参数。
-  
-- **路径 B：签名 token**  
+
+- **路径 B：签名 token**
   每个 AI 一个共享 secret，请求带 signed header。安全但工作量大（key management）。
 
-- **路径 C（不推荐）：不改，继续信客户端传 source_ai**  
+- **路径 C（不推荐）：不改，继续信客户端传 source_ai**
   A-5 owner_ai 约束退化成"检查客户端传的 owner_ai 是否 = 客户端传的 source_ai"——防不住恶意客户端伪造，但至少防合规客户端出 bug。**架构方案的安全边界降级**。
 
 **建议**：走**路径 A**（HTTP header 派生 actor）。改动：`main.py` REST 层加 middleware 校验 `X-Hub-Actor`；MCP 层新增 `_get_actor_from_session(ctx)` helper（fallback 到参数值 + 记 warning，为过渡期）。
@@ -91,6 +91,12 @@
 ---
 
 # 二、PR 1：Data Health（细化）
+
+> **⚠️ 本章节已作废**（2026-08-21）
+>
+> PR1 唯一施工依据是 **[phase20-PR1-施工方案.md v2.2](phase20-PR1-施工方案.md)**（含 Step 0 共享写锁真正闭环 / State supersede 原子化 / shared layer key 分层 / context_kind 全链路 / observe→redirect→strict 三阶段上线等 v2.2 收敛）。
+>
+> 本节以下所有内容（4 列 migration / 文本"我"独白判定 / source_context isolation / 15 处 write / 7 天工期）**均已被 v2.2 覆盖**，仅作历史存档保留。施工方看到本节请立刻跳到 v2.2 文档。
 
 ## Q1｜要解决什么问题？
 
@@ -317,7 +323,7 @@ AI 主动 remember 率低。Codex 提出 REST 端点 + auto-approval，Lucien �
 #### A-1：REST 端点
 
 **新增** `main.py`：
-- `POST /api/agent/memory-search`：包装 `memory_ops.recall()` 
+- `POST /api/agent/memory-search`：包装 `memory_ops.recall()`
 - `POST /api/agent/memory-propose`：新流程（走 auto_approval + 可选生成 approval_token）
 
 #### A-2：`auto_approval.py`（5 层 gate）

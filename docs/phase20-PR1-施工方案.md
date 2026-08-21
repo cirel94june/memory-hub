@@ -1,225 +1,157 @@
-# Phase 2.0 PR1 施工方案 v2.1 · Data Health
+# Phase 2.0 PR1 施工方案 v2.2 · Data Health
 
-> 分支：`phase20/pr1-data-health`
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.2 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
 > - v1（作废）：分析假设错误 4 处
 > - v2：Codex 审后收敛 2C+6H+6M
-> - **v2.1**（本文）：user 审后修 2 阻塞点（H3 锁未闭环 + H1 独白判定过宽）
+> - v2.1（作废）：user 一审后修 H3/H1，但 H3 仍未闭环、State supersede 非原子、总方案未同步
+> - **v2.2**（本文）：user 二审后修 5 High + 7 Medium
 
 ---
 
-## v2 → v2.1 变更（2 阻塞项）
+## v2.1 → v2.2 变更总览
 
-### 阻塞 A：H3 `_WRITE_LOCK` 闭环
-
-**问题**（reviewer 确认）：v2 说"复用 `memory_ops._WRITE_LOCK`"但没定明确契约。现状：
-- `memory_ops.py:719` 有 `_WRITE_LOCK = threading.Lock()`
-- 只有 `_touch_recalled_memories`（line 737）+ `_check_auto_resolve`（line 847）持有
-- **`database.commit_maintenance_atomic()` 内部 `BEGIN IMMEDIATE` 但不持锁**（这是 Phase 1.7 遗留 gap）
-- 单让 backfill 拿锁 → 挡不住其他维护路径并发进入同一 conn
-
-**v2.1 方案**（走 reviewer 推荐路径 A：锁下沉到 database.py）：
-
-**Step 0 (PR1 起手第一件事)：`_WRITE_LOCK` 从 `memory_ops.py` 迁到 `database.py`**
-
-```python
-# database.py 顶部新增（PR1 Step 0）
-import threading
-_WRITE_LOCK = threading.Lock()
-"""Module-level lock serializing all BEGIN IMMEDIATE on the shared
-sqlite connection. All commit_* helpers acquire it internally.
-Callers MUST NOT wrap the helpers in this lock (nested acquire deadlocks
-via threading.Lock which is non-reentrant).
-"""
-```
-
-**`memory_ops.py` 保留 backward-compat 引用**：
-```python
-# memory_ops.py:719 改成
-from database import _WRITE_LOCK  # re-export for backcompat
-```
-
-**`commit_maintenance_atomic` v2.1 内部持锁**：
-```python
-def commit_maintenance_atomic(...):
-    with _WRITE_LOCK:  # v2.1 内部持锁，caller 不再包
-        conn = _get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            ...
-            conn.commit()
-        except:
-            conn.execute("ROLLBACK")
-            raise
-```
-
-**同一提交更新其他共享连接 `BEGIN IMMEDIATE` 路径**：
-- `commit_finalize_atomic`（Phase 1.7 PR C）→ 也移到内部持锁（对齐契约）
-- `_check_auto_resolve` → 从外层 with 改为调用内部持锁的 helper
-- `_touch_recalled_memories` → 同上
-- 全部现有和新增的 `commit_*` 函数：**契约变成"caller 绝对不能包锁"**（threading.Lock 非重入，包了会死锁）
-
-**测试证明契约生效**（v2.1 新增，非常关键）：
-1. `test_h3_backfill_and_finalize_concurrent_no_deadlock`：backfill execute + async finalize 并行，无死锁
-2. `test_h3_backfill_and_touch_concurrent_serialized`：backfill + recall touch 并行，观察最终状态一致（都成功，非交错破坏）
-3. `test_h3_nested_acquire_would_deadlock_guard`：模拟 caller 意外包锁 → 用 wait_for 超时兜底断言（防未来 caller 忘 contract）
-
-**Step 0 独立提交**（不与 D-1/D-2 混），Codex 复审 pass 后再往上加 PR1 主体。
-
-### 阻塞 B：H1 独白判定 `OR source_actor_id` 过宽
-
-**问题**（reviewer 反例）：
-```
-source_ai         = 'cloudy'  # 说话的 AI
-source_actor_id   = 'cloudy'  # 谁说
-subject_id        = 'user'    # 关于谁
-content           = 'Ceci 喜欢喝茶'
-```
-这是 Cloudy 陈述 **关于用户** 的信息，不是 Cloudy 独白。v2 的 `subj == source_ai OR actor == source_ai` 会误命中。
-
-**v2.1 方案**：**主判据只用 `subject_id`**，`source_actor_id` 只作辅助验证（不能脱离 subject_id 单独判）。
-
-```python
-def is_ai_soliloquy_structured(mem, source_ai):
-    """AI 独白 = 关于 AI 自己的记忆（by subject_id）。
-    source_actor_id 只表示"谁说的"，不是"关于谁"，不能单独判定独白。"""
-    if not source_ai:
-        return False
-    aliased_ai = _AI_ALIASES.get(source_ai, source_ai)
-    subj = (mem.get('subject_id') or '').strip()
-    if not subj:
-        return False  # 未知 subject → 保守视为非独白
-    aliased_subj = _AI_ALIASES.get(subj, subj)
-    return aliased_subj == aliased_ai
-```
-
-**关键决策**：
-- **完全放弃 `source_actor_id` 主判据**（reviewer 反例证明它单独用会误伤"AI 关于用户"记忆）
-- **subject_id 空 → 保守视为非独白**（不当独白就少改一层，safe default）
-- **subject_id 用别名归一**（`cloudy == claude` 场景）
-
-**必须新增反例测试**（v2.1）：
-- `test_soliloquy_ai_about_user_not_flagged` — reviewer 原反例：`subject_id=user + source_actor_id=cloudy + source_ai=cloudy` → **False**
-- `test_soliloquy_source_actor_id_alone_insufficient` — `subject_id='' + source_actor_id=cloudy + source_ai=cloudy` → **False**
-- `test_soliloquy_subject_ai_via_alias` — `subject_id=cloudy + source_ai=claude` → **True**（别名归一）
-- `test_soliloquy_subject_other_ai_not_flagged` — `subject_id=jasper + source_ai=claude` → **False**
+| 序 | 项 | 类型 |
+|---|---|---|
+| 1 | 共享连接**所有**写路径统一走内部 `_write_transaction()` context manager，锁不导出 | High |
+| 2 | 嵌套锁 fail-fast（threading.local sentinel + RuntimeError），删除 v2.1 的"wait_for 超时兜底"测试 | High |
+| 3 | 新增 `commit_state_supersede_atomic()`：查旧+插新+转 superseded+audit 单事务 | High |
+| 4 | State key 规则按 layer 分：shared 允许 `owner_ai=''`；private/per-AI 必须非空 | High |
+| 5 | `docs/phase20-implementation-plan.md` 同步（PR1 章节标记"以 v2.2 为唯一施工依据"）| High |
+| 6 | Backfill owner_ai 缺 subject_id → **只 report-only**（不再"房间+source_ai 补齐"）| Med |
+| 7 | Daemon CREATE 三点修正行号：`compress_diaries:139 / archive_old_work:235 / distill_psychology:385`；`tidy_living_room:305` 是 UPDATE-in-place**不算 CREATE**（v2/v2.1 全写错）| Med |
+| 8 | 时间注入接入点补 `memory_ops.recall:1698` 主入口 | Med |
+| 9 | Current status prompt 改动落在 `daemon.py:483 refresh_current_status()`（不是 current_status.py 模块）| Med |
+| 10 | Context isolation soft 模式定义收敛：**observe-only（不改 room、不改 tags）** vs **redirect-on / reject-off**，二选一，明确写死不模糊叫 dry-run | Med |
+| 11 | 删除 `--ignore-drift-if-only-touch`，改成"drift 后完整 state_before 比对，只允许 `updated_at / activation_count` 变化才继续" | Med |
+| 12 | 删除 `daemon:{category}` 伪 subject_id；缺 subject 一律 report/skip，未来若需再引入独立 `state_scope_key` | Med |
 
 ---
 
 ## Q1｜要解决什么问题？
 
-摸底后确认 7 类 write 污染：
-
-| 类 | 现象 | 位置 |
-|---|---|---|
-| **越界值** | `importance=9.0` / NaN / inf 能写进 DB | 所有 create 路径无 clamp / 无类型校验 |
-| **`relationships` 复数房间**（v2 澄清）| 有的 AI 写进 `relationship`（AI 私有），有的写进 `relationships`（共享人物），**该分开的时候合并了、该合并的时候分开了** | 提取器和 conversation_capture 混用 |
-| **owner_ai 空** | AI 独白进 `dreams` 但 `owner_ai=''` | `memory_ops.remember()` 未按 subject_id 自动补 |
-| **prefix 错配**（v2 降级）| `[用户] 我梦见...` 明显是 AI 独白 | 存量情况复杂，改**report-only 人工审** |
-| **event 时间感缺失** | 30 天前事件读出来 AI 以为"最近" | recall/corridor/smart_context/gateway/dream_recall 输出层未标注 |
-| **State 无时效** | "最近很烦躁" 三天前的今天当"当前状态" | 无 valid_from/until，daemon 重写不检查 |
-| **Context isolation 缺失**（Lucien 硬约束 1）| game 内容进 living_room、roleplay 进 personality | 无跨房间禁入清单；需要**新加 `context_kind` 字段**承载分类 |
-
-**Fix-completeness 三问**：修生成器（write validation）+ 修存量（backfill 走 plan/execute）+ 修消费路径（4 入口输出层注入）。
+（v2 保留）7 类 write 污染：越界值 / `relationships` 复数房间 / owner_ai 空 / prefix 错配 / event 时间感缺失 / State 无时效 / Context isolation 缺失。修生成器 + 修存量（plan/execute）+ 修消费路径（**5 入口**含 `recall`）。
 
 ---
 
 ## Q2｜现在 Hub 是什么样？
 
-### CREATE 点精确到 6 个（v2 修正保留）
+### CREATE 点（v2.2 修正 daemon 行号）
 
-| # | 位置 | create 场景 |
+| # | 位置 | 场景 |
 |---|---|---|
-| 1 | `memory_ops.remember()` line 484 | create-no-relation 分支（默认路径）|
-| 2 | `memory_ops.remember()` line 424 | create-with-supersede 分支 |
-| 3 | `database.insert_pending_memory()` | MCP async remember 骨架 |
-| 4 | `daemon.py::compress_diaries()` line 219 | weekly 周报合成 |
-| 5 | `daemon.py::distill_psychology()` line 292 | career_mem 合成 |
-| 6 | `daemon.py::tidy_living_room()` line 467 | chapter_mem 合成 |
+| 1 | `memory_ops.remember()` :484 | create-no-relation 默认路径 |
+| 2 | `memory_ops.remember()` :424 | create-with-supersede 分支 |
+| 3 | `database.insert_pending_memory()` :544 | MCP async remember 骨架 |
+| 4 | `daemon.compress_diaries()` :139 | weekly 周报合成（**改**）|
+| 5 | `daemon.archive_old_work()` :235 | 归档旧任务合成（**新增**）|
+| 6 | `daemon.distill_psychology()` :385 | career_mem 合成（**行号改**）|
 
-`_promote_proposal` **不算独立点**——docstring 明写 "via remember(quick=False)"，validation 由 remember 覆盖。
+**不是 CREATE**：`daemon.tidy_living_room:305`（UPDATE-in-place，v2/v2.1 错列，v2.2 移除）；`_promote_proposal`（内部走 `remember(quick=False)`，validation 已覆盖）。
 
-### `relationships` vs `relationship`（v2 澄清保留）
+### 共享 `_conn` 上的**全部**BEGIN IMMEDIATE 写路径（v2.2 完整清单）
 
-`corridor.py:209` `relationship`（AI 私有关系）vs `corridor.py:217` `relationships`（共享人物索引）— 两个不同房间，不能 alias。
+| 函数 | 行 |
+|---|---|
+| `close_stale_intent_atomic` | :735 |
+| `commit_finalize_atomic` | :991 |
+| `commit_maintenance_atomic` | :1091 |
 
-### `source_context` 是原始文本（v2 澄清保留）
+### 共享 `_conn` 上的**其他**写路径（不走 BEGIN IMMEDIATE，直接 execute+commit — v2.2 全部改造）
 
-`memory_ops.py:1158` 里 `evidence_excerpt = source_context[:500]` — free text。必须新增 categorical `context_kind` 字段。
+| 函数 | 行 |
+|---|---|
+| `insert_pending_memory` | :544 |
+| `update_memory_status` | :586 |
+| `mark_replaced` | :626 |
+| `close_stale_intent` | :718 |
+| `write_intent_ledger` | :644 |
+| `set_memory` | :1234 |
+| （proposals / audit / persons / profiles / async_remember_ledger 全部 insert/update 同类）| — |
 
-### `_WRITE_LOCK` 目前 gap（v2.1 阻塞 A 详细）
-
-现在只 `memory_ops:719` 有，`commit_maintenance_atomic` 不持有。**v2.1 Step 0 下沉到 database.py 内部持锁**。
+**dream.py 独立连接**：`dream.py` 自维护单独 `sqlite3.connect()`，不共享 `_conn`，**排除在锁范围外**。v2.2 审计单里明确此豁免（reviewer 要求）。
 
 ### `subject_id / source_actor_id` 已可用
 
-主判据只用 `subject_id`（v2.1 阻塞 B）。
+主判据只用 `subject_id`（v2.1 H1 保留）。
 
 ---
 
 ## Q3｜打算改成什么？
 
-### Step 0（v2.1 新增前置）：`_WRITE_LOCK` 迁移 + `commit_*` 内部持锁
+### **Step 0（v2.2 重写）：共享写锁真正闭环 + 内部 transaction context manager**
 
-- 从 `memory_ops.py:719` 迁到 `database.py` 顶部
-- `commit_maintenance_atomic` / `commit_finalize_atomic` 内部持锁
-- `_check_auto_resolve` / `_touch_recalled_memories` 现有外层 with 改为调用内部持锁的 helper
-- `memory_ops` 保留 `from database import _WRITE_LOCK` re-export（backcompat + 让 test 能直接 import）
-- **契约**：所有 `commit_*` 内部持锁，caller 绝对不能包（threading.Lock 非重入）
-- **3 条测试**证明契约生效（backfill+finalize 并发、backfill+touch 并发、nested guard timeout）
-- **独立提交**，Codex 复审 pass 后再进 D-1/D-2
+**核心契约**：
+1. `_WRITE_LOCK: threading.Lock` **只存在 `database.py` 模块内**，**不 re-export**，`memory_ops.py:719` 的旧定义整体删除；旧 `memory_ops` 里两个持锁位（`_touch_recalled_memories:737`、`_check_auto_resolve:847`）**改为调用 `_write_transaction()`**。
+2. 新增 `_write_transaction()` 内部 context manager：
+   ```python
+   # database.py
+   _WRITE_LOCK = threading.Lock()
+   _in_write_tx = threading.local()  # 嵌套侦测
 
-### D-0：`context_kind` 字段贯穿全链路
+   @contextlib.contextmanager
+   def _write_transaction():
+       """共享 _conn 上任何写操作必须包在本 ctx 内。
+       非重入：同线程嵌套调用立即 RuntimeError（不 deadlock）。
+       退出时 commit；异常 rollback。"""
+       if getattr(_in_write_tx, 'active', False):
+           raise RuntimeError(
+               "nested _write_transaction() forbidden — "
+               "caller inside a write tx must not call another write helper. "
+               "Refactor to do all work inside one _write_transaction() block."
+           )
+       with _WRITE_LOCK:
+           _in_write_tx.active = True
+           conn = _get_conn()
+           conn.execute("BEGIN IMMEDIATE")
+           try:
+               yield conn
+               conn.commit()
+           except BaseException:
+               try:
+                   conn.execute("ROLLBACK")
+               except Exception:
+                   pass
+               raise
+           finally:
+               _in_write_tx.active = False
+   ```
+3. **所有共享 `_conn` 写函数**改造：
+   - 3 个已有 BEGIN IMMEDIATE 函数（`close_stale_intent_atomic` / `commit_finalize_atomic` / `commit_maintenance_atomic`）：移除函数体内的 `conn.execute("BEGIN IMMEDIATE")` / `conn.commit()` / `conn.execute("ROLLBACK")`，改成 `with _write_transaction() as conn:` 包住原有 SQL。
+   - **所有 execute+commit 直写函数**：`insert_pending_memory` / `update_memory_status` / `mark_replaced` / `close_stale_intent` / `write_intent_ledger` / `set_memory` / proposals / audit / persons / profiles / async_remember_ledger 系全部相关函数 — 用 `with _write_transaction() as conn:` 替换现有 execute+commit。
+   - grep 断言：`git grep -n "conn.commit()" database.py` 应**只出现在** `init_db()` 里（schema 初始化用），其余全部走 ctx。
+4. **锁不对外**：删除 v2.1 `memory_ops.py` 的 `from database import _WRITE_LOCK`。外部想批量写 → 只能通过 `database.commit_*()` helper 或未来提供的批量 helper。
+5. **dream.py 独立连接豁免**：在 `database.py` `_write_transaction()` 的 docstring 里明写"本锁只覆盖 `_get_conn()` 返回的共享连接；`dream.py` 自维护独立 sqlite 连接，靠 sqlite 文件锁 + WAL 隔离，不在本契约内。"审计表也记一条 exemption。
 
-**新列**（`memories` + `proposals`）：
+**测试（v2.2 重写）**：删除 v2.1 的"故意 nested deadlock + wait_for 超时"测试（reviewer 说得对：如果同步锁阻死事件循环，`wait_for` 本身也可能 timer 起不来；线程放里放外都不安全）。改为：
+
+1. `test_step0_nested_fail_fast` — 同线程内 `_write_transaction()` 里再调 `commit_maintenance_atomic()` → 立即 `RuntimeError`（不 hang，用 `pytest.raises`）。
+2. `test_step0_finalize_and_maintenance_concurrent_no_deadlock` — 两线程分别调 finalize / maintenance，每个 100 次，总时长有上限（正常不超 5s，超则 fail 提示可能死锁）。
+3. `test_step0_touch_and_maintenance_serialize` — 断言最终状态一致，无交错破坏。
+4. `test_step0_all_write_paths_use_ctx` — 静态断言：`grep 'conn.commit()' database.py` 只出现在 `init_db`。
+5. `test_step0_lock_not_exported` — 断言 `from database import _WRITE_LOCK` 依然可行（不禁 import，但契约上无用），并断言 `memory_ops` 模块里不再引用 `_WRITE_LOCK`。
+
+**Step 0 独立提交** + Codex 复审 pass → 才继续 D-*。
+
+### D-0：`context_kind` 字段贯穿全链路（v2 保留）
+
 ```sql
 ALTER TABLE memories  ADD COLUMN context_kind TEXT NOT NULL DEFAULT '';
 ALTER TABLE proposals ADD COLUMN context_kind TEXT NOT NULL DEFAULT '';
 ```
-值域：`''`（未标）/ `'game'` / `'dream'` / `'roleplay'` / `'joke'` / `'chat'` / `'system'`
+值域：`''` / `game` / `dream` / `roleplay` / `joke` / `chat` / `system`。链路：extractor → proposal → remember → pending → finalize → daemon。
 
-链路：extractor → proposal → remember → pending → finalize → daemon 全串。
+### D-1：`memory_validation.py`（~260 行）
 
-**Validation 依据**：`validate_context_isolation` 用 `mem.get('context_kind')`。
+**导出**：`ROOM_ALIASES`、`PER_AI_ROOMS`、`CONTEXT_PRIMARY_ROOM`、`CONTEXT_ALLOWED_ROOMS`、`validate_memory_write`、`validate_context_isolation`、`is_ai_soliloquy_structured`、`safe_clamp_importance`。
 
-### D-1：`memory_validation.py`（约 260 行）
+**`ROOM_ALIASES`**：只 `preference → preferences`；不 alias `relationships ↔ relationship`（两个不同房间，v2 保留）。
 
-**导出符号**：
-```python
-ROOM_ALIASES: dict[str, str]
-PER_AI_ROOMS: frozenset[str]
-CONTEXT_PRIMARY_ROOM: dict[str, str]      # v2 M2 确定性
-CONTEXT_ALLOWED_ROOMS: dict[str, frozenset[str]]
-
-def validate_memory_write(mem, source_ai) -> dict: ...
-def validate_context_isolation(mem) -> dict: ...  # 可能 raise ValueError
-def is_ai_soliloquy_structured(mem, source_ai) -> bool: ...  # v2.1: 只用 subject_id
-def safe_clamp_importance(val) -> float: ...  # v2 M6: NaN/inf/非数字
-```
-
-**`ROOM_ALIASES` v2 收敛**：
-```python
-ROOM_ALIASES = {
-    'preference': 'preferences',
-    # v2 C1: 删除 'relationships': 'relationship'（两个不同房间）
-}
-```
-
-**`validate_memory_write` 顺序**：
-1. `safe_clamp_importance()` — NaN/inf/非数字/越界都归位
-2. `_normalize_room()` — 仅 canonical typo
-3. `_backfill_owner_ai_by_soliloquy()` — v2.1 用 structured soliloquy 判定
-4. `_normalize_room_by_ownership()` — v2 智能路由 `relationship` vs `relationships`
-5. `validate_context_isolation()` — 用 `context_kind`
-
-**独白判定 v2.1**（阻塞 B 已改）：
+**`is_ai_soliloquy_structured`**（v2.1 保留主判据只用 subject_id）：
 ```python
 def is_ai_soliloquy_structured(mem, source_ai):
-    """主判据：subject_id 是 AI 自己（含别名归一）。
-    source_actor_id 只表示 speaker，不能单独判独白。
-    subject_id 空 → 保守视为非独白。"""
     if not source_ai:
         return False
     aliased_ai = _AI_ALIASES.get(source_ai, source_ai)
@@ -230,103 +162,133 @@ def is_ai_soliloquy_structured(mem, source_ai):
     return aliased_subj == aliased_ai
 ```
 
-**Prefix 修复 v2 降级**：只在 backfill `--check prefix` 输出 report_only，人工审。不动 content。
+**反例测试 v2.1 保留**：`ai_about_user_not_flagged` / `source_actor_id_alone_insufficient` / `subject_ai_via_alias` / `subject_other_ai_not_flagged`。
 
-### D-2 (Event)：`_annotate_event()` v2 M1
+### D-2 Event：`annotate_event()`（v2 保留，30 天前缀 + created_at fallback + `max(0, days)` clamp future）
+
+### D-2 State：`state_ttl.py` + 5 列 migration
+
+Migration 5 列：`valid_from / valid_until / last_confirmed_at / state_ttl_days / context_kind`。`_preserve_on_empty` 加 3；`state_ttl_days` DEFAULT 7；`_prep` 空/None → 7。
+
+#### **State supersede key（v2.2 按 layer 分规则）**
 
 ```python
-EVENT_STALE_DAYS = 30
+STATE_KEY_BASE = ('subject_id', 'category', 'room', 'layer')
 
-def annotate_event(mem, now_utc):
-    if mem.get('info_type') != 'event':
-        return mem
-    ts_str = (mem.get('event_date') or '').strip() or mem.get('created_at', '')
-    ts = _parse_iso_safe(ts_str)
-    if ts is None:
-        return mem
-    days = max(0, (now_utc - ts).days)  # v2 M6 clamp future
-    if days > EVENT_STALE_DAYS:
-        annotated = dict(mem)
-        annotated['content'] = f'[{ts.strftime("%Y-%m-%d")}] {mem["content"]}'
-        return annotated
-    return mem
-```
-
-### D-2 (State)：`state_ttl.py` + 5 列 migration
-
-Migration：
-```sql
-ALTER TABLE memories ADD COLUMN valid_from TEXT NOT NULL DEFAULT '';
-ALTER TABLE memories ADD COLUMN valid_until TEXT NOT NULL DEFAULT '';
-ALTER TABLE memories ADD COLUMN last_confirmed_at TEXT NOT NULL DEFAULT '';
-ALTER TABLE memories ADD COLUMN state_ttl_days INTEGER NOT NULL DEFAULT 7;
-ALTER TABLE memories ADD COLUMN context_kind TEXT NOT NULL DEFAULT '';
-```
-
-`_ALL_COLUMNS` 加 5 项，`_preserve_on_empty` 加 3（`valid_from/valid_until/last_confirmed_at` + `context_kind`）；`state_ttl_days` 不 preserve（DEFAULT 7），`_prep` 空/None → 7。
-
-**State supersede 隔离键 v2 H2**（5 字段全非空才成 key）：
-```python
-STATE_KEY_FIELDS = ('subject_id', 'category', 'room', 'layer', 'owner_ai')
 def state_supersede_key(mem):
-    key = tuple((mem.get(f) or '').strip() for f in STATE_KEY_FIELDS)
-    if any(not part for part in key):
-        return None  # v2 H2 空 key skip
-    return key
+    """按 layer 决定 owner_ai 是否参与 key。
+    - shared: owner_ai='' 是合法的（用户共享 state），key 里 owner_ai 位置固定填 ''
+    - private / per-AI room: owner_ai 必须非空
+    - base 四项任一为空 → return None（不参与 supersede）
+    """
+    base = tuple((mem.get(f) or '').strip() for f in STATE_KEY_BASE)
+    if any(not part for part in base):
+        return None
+    layer = base[3]
+    owner_ai = (mem.get('owner_ai') or '').strip()
+    room = base[2]
+    if layer == 'shared':
+        return base + ('',)  # owner_ai='' 合法
+    # private / per-AI: owner_ai 必须非空
+    if not owner_ai:
+        return None
+    return base + (owner_ai,)
 ```
 
-**`supersede_state_atomic`**：**内部走 `commit_maintenance_atomic`** 而不是自己 `BEGIN IMMEDIATE` — 复用 Step 0 已下沉的锁契约。**不需要**再自己加 `with _WRITE_LOCK`（会 nested deadlock）。
+#### **`commit_state_supersede_atomic()`（v2.2 新增，真正原子）**
+
+单锁单事务内完成：**重新查旧行 → 插新 state → 转全部旧 active state 为 superseded → 写 audit**。任何一步失败全部回滚。
 
 ```python
-def supersede_state_atomic(new_state_mem, source_ai):
-    key = state_supersede_key(new_state_mem)
+# database.py
+def commit_state_supersede_atomic(
+    new_state_mem: dict,       # 完整字段，含 id / valid_from / …
+    key: tuple,                # state_supersede_key(new_state_mem)
+    source_ai: str,
+) -> dict:
+    """返回 {'inserted_id': ..., 'superseded_ids': [...]}"""
     if key is None:
-        return None
-    # 找同 key 老 state（读操作不需锁）
-    conn = database._get_conn()
-    row = conn.execute(
-        "SELECT id, updated_at FROM memories WHERE status='active' "
-        "AND info_type='state' AND subject_id=? AND category=? "
-        "AND room=? AND layer=? AND owner_ai=? AND id != ?",
-        (*key, new_state_mem.get('id', ''))
-    ).fetchone()
-    if not row:
-        return None
-    old_id, old_updated_at = row
-    # 走 Step 0 下沉后的原子 helper
-    try:
-        database.commit_maintenance_atomic(
-            memory_id=old_id,
-            memory_updates={'status': 'superseded',
-                            'valid_until': new_state_mem['valid_from'],
-                            'superseded_by': new_state_mem['id']},
-            audit_row={'action': 'state_supersede', 'target_id': old_id,
-                       'decision_reason': f'new state {new_state_mem["id"]}',
-                       'state_before': json.dumps({'status':'active'}),
-                       'state_after': json.dumps({'status':'superseded'}),
-                       'source_ai': source_ai, 'auto_executed': 1},
-            expected_status='active',
-            expected_updated_at=old_updated_at,  # drift gate
+        raise ValueError("empty state key — cannot supersede")
+
+    with _write_transaction() as conn:
+        # 1) 事务内重新查所有匹配 active
+        subj, cat, room, layer, owner = key
+        if layer == 'shared':
+            old_rows = conn.execute(
+                "SELECT id, updated_at FROM memories WHERE status='active' "
+                "AND info_type='state' AND subject_id=? AND category=? "
+                "AND room=? AND layer='shared' AND owner_ai=''",
+                (subj, cat, room)
+            ).fetchall()
+        else:
+            old_rows = conn.execute(
+                "SELECT id, updated_at FROM memories WHERE status='active' "
+                "AND info_type='state' AND subject_id=? AND category=? "
+                "AND room=? AND layer=? AND owner_ai=?",
+                (subj, cat, room, layer, owner)
+            ).fetchall()
+        old_ids = [r[0] for r in old_rows]
+
+        # 2) 插入新 state（走 helper 里的 raw INSERT，不再嵌套调用外层 helper）
+        _raw_insert_memory(conn, new_state_mem)
+
+        # 3) 全部旧 active → superseded
+        for old_id in old_ids:
+            conn.execute(
+                "UPDATE memories SET status='superseded', "
+                "valid_until=?, superseded_by=?, updated_at=? "
+                "WHERE id=? AND status='active'",
+                (new_state_mem['valid_from'], new_state_mem['id'],
+                 _now_iso(), old_id)
+            )
+
+        # 4) audit
+        conn.execute(
+            "INSERT INTO maintenance_audit (action, target_id, new_content, "
+            "decision_reason, state_before, state_after, source_ai, "
+            "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ('state_supersede', new_state_mem['id'], new_state_mem.get('content',''),
+             f'new state supersedes {len(old_ids)} old',
+             json.dumps({'old_ids': old_ids}),
+             json.dumps({'new_id': new_state_mem['id']}),
+             source_ai, 1, _now_iso())
         )
-        return old_id
-    except database.MaintenanceDrift:
-        return None
+    return {'inserted_id': new_state_mem['id'], 'superseded_ids': old_ids}
 ```
 
-**Daemon archive**：新增 step `archive_stale_states`，扫 `info_type='state' AND last_confirmed_at < now - 3*ttl` → 走 `commit_maintenance_atomic` 标 `status='archived'`。
+**关键**：`_raw_insert_memory(conn, ...)` 是新加的内部 helper，接受已打开的 conn，**不再自持锁 / 不自开事务** — 避免 v2.1 那种"嵌套调 commit_maintenance_atomic 会 nested"的问题。
 
-**State TTL 配置**：
+**并发测试（v2.2 新增）**：
+- `test_state_supersede_concurrent_exactly_one_active` — 5 线程同 key 各调 `commit_state_supersede_atomic` → 最终 `SELECT count(*) WHERE status='active' AND [key]` **恰好等于 1**。
+- `test_state_supersede_multiple_legacy_all_superseded` — 预置 3 条同 key 老 active（历史遗留）→ 一次 supersede 后全部转 superseded。
+- `test_state_supersede_shared_layer_owner_empty_ok` — layer=shared + owner_ai='' → key 有效，supersede 成功。
+- `test_state_supersede_private_layer_owner_empty_returns_none` — layer=private + owner_ai='' → key=None，不参与 supersede。
+
+**Daemon archive**：新增 step `archive_stale_states`，扫 `last_confirmed_at < now - 3*ttl` → 走 `commit_maintenance_atomic` 标 `status='archived'`。
+
+**State TTL**：`{'mood':3, 'health':14, 'work_status':14, 'energy':3, 'default':7}`。
+
+### D-2b：Current status prompt 时间约束（v2.2 修正位置）
+
+**改动落 `daemon.py:483 refresh_current_status()`**（reviewer 修正），不改 `current_status.py`。在拿到 raw memories 后 `apply_temporal_annotation()`；prompt 加"看到日期或 X 天前前缀禁止写'近期/当前/正在'"约束段。
+
+### D-6：Context Isolation（v2.2 soft 模式定义收敛）
+
+**上线模式明确二选一**（不用"dry-run"这个词）：
+
+| 模式 | env 值 | 行为 |
+|---|---|---|
+| **observe-only** | `MEMORY_HUB_CONTEXT_ISOLATION_MODE=observe` | 只 `logger.warning` 记录建议，**不改 room、不改 tags** |
+| **redirect-on / reject-off**（默认）| `''` 或 `redirect` | 立即重定向 room + 打 `_redirected_from_*` tag，但**不 raise** |
+| **strict** | `=strict` | 上述 + 对 `roleplay/joke → 主房间` 直接 `raise ValueError` |
+
+**上线计划**：第 1 周 `observe`；第 2 周切 `redirect`；观察 2 周稳定切 `strict`。
+
 ```python
-STATE_TTL_DAYS = {'mood': 3, 'health': 14, 'work_status': 14, 'energy': 3, 'default': 7}
-```
+def _isolation_mode() -> str:
+    val = os.environ.get('MEMORY_HUB_CONTEXT_ISOLATION_MODE', '').strip().lower()
+    return val if val in ('observe', 'redirect', 'strict') else 'redirect'
 
-### D-2b：Current Status daemon prompt 加时间约束（v1 保留）
-
-`current_status.py`：memory 先走 `apply_temporal_annotation()`；prompt 加"看到日期或 X 天前前缀禁止写'近期/当前/正在'"约束段。
-
-### D-6：Context Isolation（v2 用 context_kind）
-
-```python
 def validate_context_isolation(mem):
     kind = (mem.get('context_kind') or '').strip().lower()
     if not kind or kind not in CONTEXT_ALLOWED_ROOMS:
@@ -335,38 +297,52 @@ def validate_context_isolation(mem):
     room = (mem.get('room') or '').strip()
     if room in allowed:
         return mem
-    if kind in ('roleplay', 'joke') and room in CANONICAL_ROOMS:
-        if _is_strict_mode():
-            raise ValueError(f"context_isolation: {kind} → {room!r} rejected")
-        logger.warning(f"context_isolation SOFT WARN: {kind} → {room}")
+
+    mode = _isolation_mode()
+    if mode == 'observe':
+        logger.warning(f"context_isolation OBSERVE: {kind} would redirect from {room}")
+        return mem  # 不改
+
+    # redirect / strict
+    if mode == 'strict' and kind in ('roleplay', 'joke') and room in CANONICAL_ROOMS:
+        raise ValueError(f"context_isolation strict: {kind} → {room!r} rejected")
+
     original_room = room
-    mem['room'] = CONTEXT_PRIMARY_ROOM[kind]  # v2 M2 确定性
-    tags = _parse_tags(mem.get('tags'))  # v2 M6 dict/坏 JSON 处理
+    mem['room'] = CONTEXT_PRIMARY_ROOM[kind]
+    tags = _parse_tags(mem.get('tags'))
     tags.append(f'_redirected_from_{kind}_{original_room or "empty"}')
     mem['tags'] = json.dumps(tags, ensure_ascii=False)
     return mem
-
-
-def _is_strict_mode() -> bool:
-    """v2 M3: env 值 exact '1' 才 strict；其他 → soft。"""
-    return os.environ.get('MEMORY_HUB_CONTEXT_ISOLATION_STRICT', '').strip() == '1'
 ```
 
-### D-4：`scripts/data_health_backfill.py` v2（plan/execute）
+### D-4：`scripts/data_health_backfill.py`（v2.2 修正）
 
-架构对齐 `dedup_legacy.py`：`--plan` / `--execute --plan-file` / `--db-path` / `--check` / `--max-fixes`。
+架构同 v2：`--plan` / `--execute --plan-file` / `--db-path` / `--check` / `--max-fixes`。
 
-PLAN 阶段快照 `updated_at`；EXECUTE 阶段通过 `commit_maintenance_atomic(expected_updated_at=snapshot)` drift gate。
+**drift gate（v2.2 收严）**：PLAN 快照 `state_before = 完整 dict`；EXECUTE 阶段读取当前状态与 `state_before` 逐字段比对：
+- 允许变化字段：`updated_at`、`activation_count`、`last_activated_at`（recall touch 副作用）
+- 其他任何字段变化 → drift，跳过并 log。
+- **删除 v2.1 的 `--ignore-drift-if-only-touch`**（reviewer 指出 updated_at 变化不能证明只是 touch）。
 
-Prefix 修复归入 `report_only` 段（v2 H1 降级）。
+**owner_ai backfill（v2.2 收严）**：
+- 有 `subject_id` 且能判定独白 → 补 `owner_ai`。
+- **无 subject_id → report-only，人工审**（不再"房间+source_ai 补齐"，reviewer 指出这会把提取者当主体）。
 
-### D-5：接入 6 处 CREATE 点
+**prefix 修复**：`--check prefix` 只 report-only，不动 content（v2 保留）。
 
-见 Q2 表。daemon 3 处加 `try/except ValueError` skip 单条不 crash step。
+### D-5：接入 CREATE 点（v2.2 修正 daemon 三处）
 
-### D-2c：`apply_temporal_annotation()` 接入 4 入口（v2 H6）
+6 处 CREATE 全部包 `try: validate_memory_write(...) except ValueError as e: logger.warning(...); continue`（daemon 里单条不 crash step）。
 
-`smart_context.get_smart_context()` / `corridor.build_corridor()` 每板块 / `gateway.build_context()` / `memory_ops.dream_recall()`。
+### D-2c：`apply_temporal_annotation()` 接入 **5 入口**（v2.2 补 recall）
+
+| 入口 | 位置 |
+|---|---|
+| `memory_ops.recall()` | :1698（**v2.2 新增**）|
+| `smart_context.get_smart_context()` | :73 |
+| `corridor.build_corridor()` | 每板块 items |
+| `gateway.build_context()` | :249 |
+| `memory_ops.dream_recall()` | :1983 |
 
 ---
 
@@ -374,43 +350,33 @@ Prefix 修复归入 `report_only` 段（v2 H1 降级）。
 
 | Step | 工作 | 验收 | 估时 |
 |---|---|---|---|
-| **0（v2.1 新增）** | `_WRITE_LOCK` 迁 database.py + `commit_*` 内部持锁 + 3 条并发测试 | backfill+finalize / backfill+touch / nested guard 都通过 | **1 d** |
-| 1 | `context_kind` migration + extractor/proposal/remember/pending/finalize/daemon 全链路 | context_kind 端到端持续，`test_context_kind_persists_from_extract_to_recall` 通 | 1 d |
-| 2 | `memory_validation.py` D-1 + D-6 + `annotate_event` + `is_ai_soliloquy_structured` v2.1 + 30+ 单元测试 | v2.1 反例测试全过 | 1.5 d |
-| 3 | `state_ttl.py` + 5 列 migration + `supersede_state_atomic`（走 Step 0 helper）+ 15 单元测试 | 隔离键测试全过 + 并发 supersede 测试通 | 1.5 d |
-| 4 | `apply_temporal_annotation()` 接入 4 入口 + 快照测试 4 条 | 4 入口各断言 | 1 d |
-| 5 | `current_status.py` prompt 加时间约束 | mock LLM 收到含约束段 prompt | 0.5 d |
-| 6 | 6 处 CREATE 点接入 validation + daemon archive_stale_states step | grep 确认 6 处 + daemon 集成测试 | 1 d |
-| 7 | `scripts/data_health_backfill.py` v2 plan/execute + 本地冒烟 | 构造脏数据 → plan 报告 + execute drift gate 生效 | 1 d |
+| **0** | `_WRITE_LOCK` + `_write_transaction()` ctx；**全部**共享 _conn 写路径改造；memory_ops 侧删除锁 import；5 条测试 | grep 断言通过 + 并发/嵌套快速拒绝测试通 | **2 d**（比 v2.1 +1d，因涉及 execute+commit 直写全部迁移）|
+| 1 | `context_kind` migration + 全链路 | 端到端持续测试通 | 1 d |
+| 2 | `memory_validation.py` + `annotate_event` + soliloquy v2.1 + 34 单元测试 | 反例测试全过 | 1.5 d |
+| 3 | `state_ttl.py` + 5 列 migration + `commit_state_supersede_atomic` + 隔离键分层 + 18 单元测试（含 4 条并发） | 并发恰好 1 条 active + shared/private layer 测试通 | 2 d |
+| 4 | `apply_temporal_annotation()` 接入 5 入口 + 快照测试 5 条 | 5 入口各断言 | 1 d |
+| 5 | `daemon.py:483 refresh_current_status` prompt 加时间约束 | mock LLM 收到含约束段 prompt | 0.5 d |
+| 6 | 6 处 CREATE 接入 validation + daemon 新 step `archive_stale_states` | grep 6 处 + 集成测试 | 1 d |
+| 7 | `scripts/data_health_backfill.py` plan/execute + 完整 state_before 比对 | 构造脏数据 → plan 报告 + drift 完整比对 pass | 1 d |
 | 8 | VPS backfill plan → Ceci 审 → execute | audit 每条 + rebuild_all_corridors | 0.5 d |
 
-**v2.1 总估时：9 天**（v2 是 8，v2.1 +1 天 Step 0）
+**v2.2 总估时：10 d**（v2.1 是 9，v2.2 +1d for Step 0 全量写路径迁移 + State supersede 原子化）
 
 ---
 
-## v2.1 单元测试清单（60 条）
+## v2.2 单元测试清单（约 65 条）
 
-新增 Step 0 并发测试（3 条）：
-1. `test_step0_backfill_and_finalize_concurrent_no_deadlock`
-2. `test_step0_backfill_and_touch_concurrent_serialized`
-3. `test_step0_nested_acquire_deadlock_guard`
+- Step 0（5 条）：`nested_fail_fast` / `concurrent_no_deadlock` / `touch_and_maintenance_serialize` / `all_write_paths_use_ctx` / `lock_not_referenced_in_memory_ops`
+- 独白判定（4 条 v2.1）：`ai_about_user_not_flagged` / `source_actor_id_alone_insufficient` / `subject_ai_via_alias` / `subject_other_ai_not_flagged`
+- D-1 核心（10 条 v2 保留）
+- 独白 owner_ai 补齐（3 条）
+- D-6 context_kind isolation + 3 mode（10 条：observe/redirect/strict 各含 raise/no-raise）
+- Event annotation（4 条）
+- State ttl（18 条含 4 条并发 supersede + shared/private layer 4 条）
+- 时间注入 5 入口（5 条）
+- Backfill script（6 条含完整 state_before drift 比对）
 
-独白判定 v2.1（阻塞 B 4 条）：
-4. `test_soliloquy_ai_about_user_not_flagged` — **reviewer 原反例**：`subject_id=user + source_actor_id=cloudy + source_ai=cloudy` → **False**
-5. `test_soliloquy_source_actor_id_alone_insufficient`
-6. `test_soliloquy_subject_ai_via_alias` — `subject_id=cloudy + source_ai=claude` → **True**
-7. `test_soliloquy_subject_other_ai_not_flagged` — `subject_id=jasper + source_ai=claude` → **False**
-
-其余（保留 v2 全部）：
-- D-1 核心 10 条（clamp / normalize / soliloquy backfill）
-- 独白 owner_ai 补齐 3 条
-- D-6 context_kind isolation 8 条
-- Event annotation 4 条
-- State ttl 15 条（含隔离键 6 条 + supersede 并发 2 条）
-- 时间注入 4 条
-- Backfill script 6 条
-
-**测试总计约 60 条**。全套目标 410+（Phase 1.7 基础 352 + PR1 v2.1 ~60）。
+全套目标 415+（1.7 基础 352 + PR1 v2.2 ~65）。
 
 ---
 
@@ -418,73 +384,73 @@ Prefix 修复归入 `report_only` 段（v2 H1 降级）。
 
 ### 高
 
-1. **Step 0 迁移影响面**（v2.1 新增）  
-   `_WRITE_LOCK` 迁移 + `commit_*` 契约变更 → 现有 `_touch_recalled_memories` / `_check_auto_resolve` 的外层 with 全部要拆。**如果拆漏一处**，就变成 caller 包锁 + helper 也拿锁 → nested deadlock（`threading.Lock` 非重入）。  
-   **缓解**：（a）Step 0 独立提交 + Codex 复审 pass 后才继续。（b）新增 `test_step0_nested_acquire_deadlock_guard` — 模拟 caller 意外包锁调用 helper → 用 `wait_for(timeout=5)` 兜底断言必然超时（防未来 caller 忘 contract）。（c）codebase-wide grep `with _WRITE_LOCK` 确认全部拆完。
+1. **Step 0 全量写路径迁移影响面**
+   `insert_pending_memory / update_memory_status / set_memory / write_intent_ledger / …` 全部改成 `with _write_transaction()` — 涉及文件多，调用方要么依然通过这些 helper（无感），要么如果外部代码直接 `_get_conn().execute(...)` 会绕过锁。
+   **缓解**：（a）grep 断言 `_get_conn().execute\|_get_conn()\.execute` 只在 `database.py` 出现；（b）Step 0 独立提交后 Codex 复审专门看这个断言；（c）新增测试 `test_step0_no_bare_conn_writes_outside_database`。
 
-2. **独白判定过严导致 owner_ai 补齐率下降**（v2.1）  
-   subject_id 空的记忆 → 保守视为非独白 → 不补 owner_ai。存量数据里很多 subject_id 空，可能补不到多少。  
-   **缓解**：backfill `--check owner_ai` 里用**更完整的规则**（不只 soliloquy 判定，也用房间归属+source_ai）扫存量。存量修在 backfill 侧，生成器只做保守 gate。
+2. **`commit_state_supersede_atomic` 与 `remember()` 的关系**
+   State 记忆走 `remember()` 时不能直接嵌套调此 helper（RuntimeError）。方案：`remember()` 检测 `info_type='state'` 时**不走 helper 内部**，改在 `remember()` 返回前**外层**调 `commit_state_supersede_atomic`（新记忆 ID 已定）。或者更保守：state 走独立入口 `remember_state()`。
+   **缓解**：Step 3 决定二选一并写死；开工时先 spike 30 分钟走通再定。
 
-3. **`context_kind` 全链路串**（v2 高保留）  
-   Extractor 到 daemon 6 层要一致。漏一层就默认空字符串走 pass。  
-   **缓解**：Step 1 加端到端测试；grep `context_kind` 覆盖率检查。
+3. **`context_kind` 全链路串**（v2 保留）
 
 ### 中
 
-4. **State supersede 隔离键太严** — 存量 state 大多缺 subject_id → skip supersede → 老 state 永不 supersede。  
-   **缓解**：daemon 生成 state 侧兜底 subject_id（用 daemon:{category} fallback key）；backfill 生成 subject_id。
-
-5. **backfill drift gate 全 skip** — plan 生成后 activation touch 改 updated_at → execute 全 skip。  
-   **缓解**：Ceci 授权模式加 `--ignore-drift-if-only-touch` 参数（如果 status 未变只是 updated_at 变了，仍执行）。或 Ceci 审时决定重跑 plan。
+4. **State supersede shared 语义**：shared state（用户 mood 等）跨 AI 共用，任一 AI 更新会覆盖所有旧 shared → 是期望行为。文档写清。
+5. **backfill drift gate 严格化**：完整 state_before 比对开销较大，plan-file 会变大（几倍）→ 可接受。
+6. **observe → redirect → strict 上线节奏**：3 周切完，靠 grafana 看 `context_isolation OBSERVE` warning count 曲线判断切换。
 
 ### 低
 
-6. **event_date 与 created_at 都缺** — annotate 返回原 mem。合理行为。加 test。
-
-7. **strict env variable 值** — 明文档 "MUST be exactly '1'"。测试覆盖 'true'/'True' 返回 False。
+7. event_date 与 created_at 都缺 → annotate 返回原 mem。
+8. `MEMORY_HUB_CONTEXT_ISOLATION_MODE` 值大小写不敏感，其他值 → 默认 redirect。
 
 ---
 
-## 附：文件改动预览 v2.1
+## 附：文件改动预览 v2.2
 
 ```
 新增：
   memory_validation.py             (~260 行)
-  state_ttl.py                     (~220 行，走 commit_maintenance_atomic)
-  scripts/data_health_backfill.py  (~400 行)
-  tests/test_memory_validation.py  (~500 行，34 条含 v2.1 独白反例)
-  tests/test_state_ttl.py          (~280 行，15 条)
-  tests/test_temporal_annotation.py (~150 行，4 条)
-  tests/test_backfill_script_v2.py (~180 行，6 条)
-  tests/test_write_lock_step0.py   (~150 行，3 条 v2.1 Step 0)
+  state_ttl.py                     (~240 行含 shared/private key 分层)
+  scripts/data_health_backfill.py  (~400 行含完整 state_before 比对)
+  tests/test_memory_validation.py  (~500 行)
+  tests/test_state_ttl.py          (~350 行含 4 并发)
+  tests/test_temporal_annotation.py (~180 行含 5 入口)
+  tests/test_backfill_script.py    (~200 行)
+  tests/test_write_lock_step0.py   (~200 行 5 条)
 
 改动：
-  database.py       (+_WRITE_LOCK 从 memory_ops 迁入 + commit_* 内部持锁
-                     + 5 列 migration + _ALL_COLUMNS + _preserve_on_empty)
-  memory_ops.py     (removed _WRITE_LOCK 定义改为 re-export 
-                     + 6 处 CREATE 加 validate + supersede_state_atomic 集成)
+  database.py       (+_WRITE_LOCK + _write_transaction ctx + commit_state_supersede_atomic
+                     + 5 列 migration + _ALL_COLUMNS + _preserve_on_empty
+                     + 所有共享 _conn 写路径改造)
+  memory_ops.py     (删除 _WRITE_LOCK 定义 & import；两个持锁位改调 _write_transaction 或 commit_*
+                     + 6 处 CREATE 加 validate
+                     + recall() apply_temporal_annotation
+                     + state 分流到 commit_state_supersede_atomic)
   corridor.py       (板块 items apply_temporal_annotation)
-  smart_context.py  (get_smart_context 输出前 annotation)
+  smart_context.py  (get_smart_context 输出前)
   gateway.py        (build_context 输出前)
   mcp_server.py     (smart_context tool)
-  current_status.py (prompt 加时间约束段)
-  daemon.py         (3 处 CREATE + archive_stale_states step)
+  daemon.py         (:483 refresh_current_status prompt 时间约束
+                     + :139/:235/:385 三处 CREATE 加 validate
+                     + 新增 archive_stale_states step)
   conversation_capture.py (extractor prompt 加 context_kind)
   async_remember.py (finalize 传递 context_kind)
+  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.2 唯一依据)
 ```
 
-约 17 个文件、+2700 行 additive、60 条新测试。
+约 17 个文件、+3000 行 additive、65 条新测试。
 
 ---
 
-## 交付流程 v2.1
+## 交付流程 v2.2
 
-1. **本方案 v2.1 推分支** `phase20/pr1-plan-doc`（本 commit 只推 md，方便 reviewer / Codex 看）
-2. Ceci + Lucien + Codex 都审 v2.1
+1. **本方案 v2.2 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
+2. Ceci + 夜鹭 + Codex 都审 v2.2
 3. 都过 → 开工分支 `phase20/pr1-data-health`
-4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-1/D-2 等
-5. 全套测试 410+ 通过
+4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-*
+5. 全套测试 415+ 通过
 6. 开 PR → Codex 复审 2 轮
 7. 合并 + VPS 部署
 8. VPS backfill plan → Ceci 审 → execute
