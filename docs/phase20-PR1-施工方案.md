@@ -1,17 +1,44 @@
-# Phase 2.0 PR1 施工方案 v2.2 · Data Health
+# Phase 2.0 PR1 施工方案 v2.3 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.2 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.3 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
 > - v1（作废）：分析假设错误 4 处
 > - v2：Codex 审后收敛 2C+6H+6M
 > - v2.1（作废）：user 一审后修 H3/H1，但 H3 仍未闭环、State supersede 非原子、总方案未同步
-> - **v2.2**（本文）：user 二审后修 5 High + 7 Medium
+> - v2.2（作废）：user 二审后修 5 High + 7 Medium；但 `927be84` 意外夹带 5 个生产代码回退（`3494ed0` 已修）；且 v2.2 方案本身仍有 5 High + 5 Medium gap
+> - **v2.3**（本文）：user 三审后修事务原子性 / activity_log 遗漏 / 锁封装契约 / 读连接一致性 / state 落库真路径
 
 ---
 
-## v2.1 → v2.2 变更总览
+## v2.2 → v2.3 变更总览（5 High + 5 Medium）
+
+**Critical 已处理**（不列入本表）：`927be84` 代码回退 → `3494ed0` fixup restore。
+
+### High
+
+| 序 | 项 |
+|---|---|
+| H1 | `_write_transaction()` 修 try/finally 结构：`began` flag + 连接获取/BEGIN 也纳入 try，避免中间抛异常导致 `_in_write_tx.active` 永久污染线程 |
+| H2 | Step 0 补 `activity_log.py`：3 处 `database._get_conn()` + `conn.execute` + `conn.commit` 全部迁移。schema 初始化移入 `database.init_db()`，写/清理走 database 层公开原子 helper |
+| H3 | 锁封装契约收紧：`memory_ops` 不直接调 `_write_transaction()`，改公开 helper `touch_recalled_memories_atomic()` / `check_auto_resolve_atomic()`；测试禁止 `import _WRITE_LOCK`；grep 断言"生产模块（非 database.py）不引用 `_write_transaction` / `_WRITE_LOCK`" |
+| H4 | 读连接一致性：生产读路径统一走独立 `_get_read_conn()`（PRAGMA query_only=ON 只读连接）；grep 断言"读路径不用共享 `_conn`"；同一 connection 事务中间态泄漏问题消失 |
+| H5 | State 落库真路径：不再新造 `_raw_insert_memory()`；抽取 `_set_memory_in_tx(conn, mem)`（含 `memories_vec` + `vec_id_map` 同步 + `client_request_id` / claim / link 保留）。`set_memory()` 变成"包 `_write_transaction()` + 调 `_set_memory_in_tx()`"；`commit_state_supersede_atomic()` 自身事务内也调它。state 分流点明确落 `memory_ops.remember()` 两处 CREATE 分支的 `set_memory()` 之前，不再"return 前处理" |
+
+### Medium
+
+| 序 | 项 |
+|---|---|
+| M1 | Backfill `state_before` JSON 序列化：定义 JSON-safe 字段白名单，`embedding` 只存 `sha256(bytes).hexdigest()` |
+| M2 | 字段名修正：`last_activated_at` → `last_activated`（memory schema 实际字段名）|
+| M3 | Backfill drift gate 语义快照 hash 必须在**同一 `BEGIN IMMEDIATE`** 内校验，不能事务外快照 → 事务内更新（TOCTOU）|
+| M4 | Context isolation 默认值：`observe`（未配置或非法值走 observe，而非 v2.2 的 redirect），与"第一周 observe"一致 |
+| M5 | CREATE 校验失败处理分路径：daemon 循环内 `log + continue`；MCP / `remember()` 直路径必须**结构化拒绝** or `raise ValidationError`（wrapper 转 4xx），不能 continue |
+
+---
+
+## v2.1 → v2.2 变更总览（存档）
 
 | 序 | 项 | 类型 |
 |---|---|---|
@@ -59,19 +86,22 @@
 | `commit_finalize_atomic` | :991 |
 | `commit_maintenance_atomic` | :1091 |
 
-### 共享 `_conn` 上的**其他**写路径（不走 BEGIN IMMEDIATE，直接 execute+commit — v2.2 全部改造）
+### 共享 `_conn` 上的**其他**写路径（不走 BEGIN IMMEDIATE，直接 execute+commit — v2.3 全部改造）
 
-| 函数 | 行 |
+| 函数 / 位置 | 行 |
 |---|---|
-| `insert_pending_memory` | :544 |
-| `update_memory_status` | :586 |
-| `mark_replaced` | :626 |
-| `close_stale_intent` | :718 |
-| `write_intent_ledger` | :644 |
-| `set_memory` | :1234 |
-| （proposals / audit / persons / profiles / async_remember_ledger 全部 insert/update 同类）| — |
+| `database.insert_pending_memory` | :544 |
+| `database.update_memory_status` | :586 |
+| `database.mark_replaced` | :626 |
+| `database.close_stale_intent` | :718 |
+| `database.write_intent_ledger` | :644 |
+| `database.set_memory` | :1234 |
+| （database 内 proposals / maintenance_audit / persons / profiles / async_remember_ledger insert/update 同类） | — |
+| **`activity_log.py:123` schema 建表（v2.3 补）** | 迁入 `database.init_db()` |
+| **`activity_log.py:181` INSERT activity_log（v2.3 补）** | 走新 `database.append_activity_log_atomic()` |
+| **`activity_log.py:197` DELETE 清理（v2.3 补）** | 走新 `database.trim_activity_log_atomic()` |
 
-**dream.py 独立连接**：`dream.py` 自维护单独 `sqlite3.connect()`，不共享 `_conn`，**排除在锁范围外**。v2.2 审计单里明确此豁免（reviewer 要求）。
+**dream.py 独立连接**：`dream.py` 自维护单独 `sqlite3.connect()`，不共享 `_conn`，**排除在锁范围外**（sqlite 文件锁 + WAL 隔离）。v2.3 审计单明确此豁免。
 
 ### `subject_id / source_actor_id` 已可用
 
@@ -81,57 +111,90 @@
 
 ## Q3｜打算改成什么？
 
-### **Step 0（v2.2 重写）：共享写锁真正闭环 + 内部 transaction context manager**
+### **Step 0（v2.3 重写）：共享写锁真闭环 + 内部 tx ctx + 读连接一致 + activity_log 归位**
 
 **核心契约**：
-1. `_WRITE_LOCK: threading.Lock` **只存在 `database.py` 模块内**，**不 re-export**，`memory_ops.py:719` 的旧定义整体删除；旧 `memory_ops` 里两个持锁位（`_touch_recalled_memories:737`、`_check_auto_resolve:847`）**改为调用 `_write_transaction()`**。
-2. 新增 `_write_transaction()` 内部 context manager：
+
+1. **锁与 ctx 只属于 database.py**：`_WRITE_LOCK: threading.Lock` 和 `_write_transaction()` context manager **仅在 `database.py` 内部使用**；生产模块（`memory_ops` / `activity_log` / `daemon` / …）**禁止**直接引用它们。删除 `memory_ops.py:719` 旧 `_WRITE_LOCK` 定义。
+
+2. **`_write_transaction()` 修正版**（H1，`began` flag + 完整 try/finally 保护）：
    ```python
    # database.py
+   import contextlib, threading
    _WRITE_LOCK = threading.Lock()
-   _in_write_tx = threading.local()  # 嵌套侦测
+   _in_write_tx = threading.local()
 
    @contextlib.contextmanager
    def _write_transaction():
        """共享 _conn 上任何写操作必须包在本 ctx 内。
        非重入：同线程嵌套调用立即 RuntimeError（不 deadlock）。
-       退出时 commit；异常 rollback。"""
+       H1 修正：连接获取 + BEGIN 也在 try/finally 内；began flag 控制 ROLLBACK；
+       active 标志无论中间抛什么都会恢复。"""
        if getattr(_in_write_tx, 'active', False):
            raise RuntimeError(
                "nested _write_transaction() forbidden — "
                "caller inside a write tx must not call another write helper. "
                "Refactor to do all work inside one _write_transaction() block."
            )
-       with _WRITE_LOCK:
+       lock_acquired = False
+       began = False
+       try:
+           _WRITE_LOCK.acquire()
+           lock_acquired = True
            _in_write_tx.active = True
            conn = _get_conn()
            conn.execute("BEGIN IMMEDIATE")
-           try:
-               yield conn
-               conn.commit()
-           except BaseException:
+           began = True
+           yield conn
+           conn.commit()
+           began = False
+       except BaseException:
+           if began:
                try:
                    conn.execute("ROLLBACK")
                except Exception:
                    pass
-               raise
-           finally:
-               _in_write_tx.active = False
+           raise
+       finally:
+           _in_write_tx.active = False
+           if lock_acquired:
+               _WRITE_LOCK.release()
    ```
-3. **所有共享 `_conn` 写函数**改造：
-   - 3 个已有 BEGIN IMMEDIATE 函数（`close_stale_intent_atomic` / `commit_finalize_atomic` / `commit_maintenance_atomic`）：移除函数体内的 `conn.execute("BEGIN IMMEDIATE")` / `conn.commit()` / `conn.execute("ROLLBACK")`，改成 `with _write_transaction() as conn:` 包住原有 SQL。
-   - **所有 execute+commit 直写函数**：`insert_pending_memory` / `update_memory_status` / `mark_replaced` / `close_stale_intent` / `write_intent_ledger` / `set_memory` / proposals / audit / persons / profiles / async_remember_ledger 系全部相关函数 — 用 `with _write_transaction() as conn:` 替换现有 execute+commit。
-   - grep 断言：`git grep -n "conn.commit()" database.py` 应**只出现在** `init_db()` 里（schema 初始化用），其余全部走 ctx。
-4. **锁不对外**：删除 v2.1 `memory_ops.py` 的 `from database import _WRITE_LOCK`。外部想批量写 → 只能通过 `database.commit_*()` helper 或未来提供的批量 helper。
-5. **dream.py 独立连接豁免**：在 `database.py` `_write_transaction()` 的 docstring 里明写"本锁只覆盖 `_get_conn()` 返回的共享连接；`dream.py` 自维护独立 sqlite 连接，靠 sqlite 文件锁 + WAL 隔离，不在本契约内。"审计表也记一条 exemption。
 
-**测试（v2.2 重写）**：删除 v2.1 的"故意 nested deadlock + wait_for 超时"测试（reviewer 说得对：如果同步锁阻死事件循环，`wait_for` 本身也可能 timer 起不来；线程放里放外都不安全）。改为：
+3. **公开的 database.py atomic helpers**（H3 + H2）— `memory_ops` 只调这些，从不接触 ctx：
+   - 现有：`commit_maintenance_atomic` / `commit_finalize_atomic` / `close_stale_intent_atomic` / `set_memory` / `insert_pending_memory` / `update_memory_status` / `mark_replaced` / `close_stale_intent` / `write_intent_ledger` 全部改造为**内部包 `with _write_transaction()`**。
+   - **v2.3 新增**（H3 支撑）：
+     - `touch_recalled_memories_atomic(mem_ids: list[str], now_iso: str) -> None` — 原 `memory_ops._touch_recalled_memories:737` 的写部分迁入
+     - `check_auto_resolve_atomic(...)` — 原 `memory_ops._check_auto_resolve:847` 的写部分迁入
+   - **v2.3 新增**（H2 activity_log 归位）：
+     - `init_db()` 里加 `CREATE TABLE IF NOT EXISTS activity_log ...`（从 `activity_log.py:123` 迁入）
+     - `append_activity_log_atomic(row: dict) -> None` — INSERT
+     - `trim_activity_log_atomic(keep_last_n: int) -> None` — 清理
 
-1. `test_step0_nested_fail_fast` — 同线程内 `_write_transaction()` 里再调 `commit_maintenance_atomic()` → 立即 `RuntimeError`（不 hang，用 `pytest.raises`）。
-2. `test_step0_finalize_and_maintenance_concurrent_no_deadlock` — 两线程分别调 finalize / maintenance，每个 100 次，总时长有上限（正常不超 5s，超则 fail 提示可能死锁）。
-3. `test_step0_touch_and_maintenance_serialize` — 断言最终状态一致，无交错破坏。
-4. `test_step0_all_write_paths_use_ctx` — 静态断言：`grep 'conn.commit()' database.py` 只出现在 `init_db`。
-5. `test_step0_lock_not_exported` — 断言 `from database import _WRITE_LOCK` 依然可行（不禁 import，但契约上无用），并断言 `memory_ops` 模块里不再引用 `_WRITE_LOCK`。
+4. **`activity_log.py` v2.3 改造**（H2）：删掉自己的 `_get_conn()` + 建表 + INSERT + DELETE + `conn.commit()`；改为 `from database import append_activity_log_atomic, trim_activity_log_atomic`。
+
+5. **读连接一致性**（H4）：**生产读路径全部走 `_get_read_conn()`**（PRAGMA query_only=ON 独立只读连接，无 tx 参与，看不到其他线程未提交状态）。grep 断言：非 database.py 的生产模块中不允许出现 `database._get_conn()` 或 `_get_conn()` 用于读。已有的 `_get_read_conn` 在 `database.py:35` — 只需把 `memory_ops` / `corridor` / `smart_context` / `gateway` / `mcp_server` / `main` 里所有读路径迁过去。
+
+6. **grep 断言全套**（H3 + H4 支撑）：
+   - `git grep -n "_write_transaction\|_WRITE_LOCK" -- '*.py'` → 只在 `database.py` 和 `tests/test_write_lock_step0.py` 出现
+   - `git grep -nE "database\._get_conn|\bfrom database import _get_conn" -- '*.py'` → 只在 `database.py` 内部出现（生产模块禁用）
+   - `git grep -n "conn.commit()" database.py` → 只在 `init_db()` 出现
+   - `git grep -n "database\._get_conn" activity_log.py` → 0 命中
+
+7. **dream.py 独立连接豁免**：docstring 明写，审计表记 exemption。
+
+**测试（v2.3 收敛）**：
+
+1. `test_step0_nested_fail_fast` — 同线程内 tx 里再调 `commit_maintenance_atomic` → 立即 `RuntimeError`，用 `pytest.raises` 断言（不 hang）。
+2. `test_step0_active_flag_recovered_on_begin_failure` — mock `conn.execute("BEGIN IMMEDIATE")` 抛异常 → 断言 `_in_write_tx.active` 事后仍为 False，后续 tx 正常。**H1 直测**。
+3. `test_step0_active_flag_recovered_on_yield_failure` — tx body 抛异常 → 断言 active 恢复 + lock 释放（连续 3 次都 OK）。
+4. `test_step0_finalize_and_maintenance_concurrent_no_deadlock` — 两线程各 100 次，总时长上限（正常 <5s）。
+5. `test_step0_touch_and_maintenance_serialize` — 最终状态一致断言。
+6. `test_step0_all_write_paths_use_ctx` — 静态 grep 断言 `conn.commit()` 只在 `init_db`。
+7. `test_step0_lock_not_exported_outside_database` — 静态 grep 断言：非 database.py / 非 `tests/test_write_lock_step0.py` 的所有 `.py` 文件不含 `_write_transaction` 或 `_WRITE_LOCK`。
+8. `test_step0_no_shared_conn_writes_outside_database` — 静态 grep 断言：非 database.py 生产文件不用 `database._get_conn()`（读也不用）。
+9. `test_step0_activity_log_uses_public_helpers` — 单元测试 activity_log 写入正确落 DB + 观察不到共享 conn 直用。
+10. `test_step0_read_paths_use_read_conn` — 静态 grep 断言：生产模块读操作走 `_get_read_conn`。
 
 **Step 0 独立提交** + Codex 复审 pass → 才继续 D-*。
 
@@ -229,8 +292,9 @@ def commit_state_supersede_atomic(
             ).fetchall()
         old_ids = [r[0] for r in old_rows]
 
-        # 2) 插入新 state（走 helper 里的 raw INSERT，不再嵌套调用外层 helper）
-        _raw_insert_memory(conn, new_state_mem)
+        # 2) 插入新 state（v2.3：走 _set_memory_in_tx，含 vec_id_map + memories_vec 同步 + preserve 保护，
+        #    不再造缩水版 _raw_insert_memory）
+        _set_memory_in_tx(conn, new_state_mem)
 
         # 3) 全部旧 active → superseded
         for old_id in old_ids:
@@ -256,7 +320,35 @@ def commit_state_supersede_atomic(
     return {'inserted_id': new_state_mem['id'], 'superseded_ids': old_ids}
 ```
 
-**关键**：`_raw_insert_memory(conn, ...)` 是新加的内部 helper，接受已打开的 conn，**不再自持锁 / 不自开事务** — 避免 v2.1 那种"嵌套调 commit_maintenance_atomic 会 nested"的问题。
+**关键 v2.3（H5）**：**不新造缩水版 INSERT**。改从现有 `set_memory()` 抽取核心逻辑到 `_set_memory_in_tx(conn, mem)` 内部 helper：
+- 完整 UPSERT `memories` 表（含 `_preserve_on_empty` / `_preserve_always` 处理，保护 `client_request_id` / `finalize_claim_id` / `link_to_real_id` / `created_at` 等字段不被空值覆盖）
+- 同步维护 `memories_vec` 表（embedding 更新）
+- 同步维护 `vec_id_map`（新 mem 分配 rowid）
+- **不自持锁 / 不自开事务**（接受已打开的 conn）
+
+改造后：
+- `database.set_memory()` = `with _write_transaction() as conn: _set_memory_in_tx(conn, mem)`
+- `commit_state_supersede_atomic()` 自身 tx 内调 `_set_memory_in_tx(conn, new_state_mem)`
+- 所有 CREATE 点（`memory_ops.remember()` 两处、daemon 三处、`insert_pending_memory` 路径）**继续走 `set_memory()`**，无感
+
+**state 分流点明确**（H5 二审要求）：在 `memory_ops.remember()` 的两处 CREATE 分支（`:484` create-no-relation + `:424` create-with-supersede）里，**调 `set_memory()` 之前**分流：
+```python
+# memory_ops.remember() 两处伪代码
+if info_type == 'state':
+    key = state_supersede_key(mem_dict)
+    if key is not None:
+        # 走原子 supersede（内含 _set_memory_in_tx 插新 + 老 → superseded + audit）
+        result = database.commit_state_supersede_atomic(mem_dict, key, source_ai)
+        return result['inserted_id']
+    # key is None（缺 subject_id 等）→ 落 report-only backfill 单，不写入
+    logger.warning(f"state without valid key: {mem_dict.get('id')} → not persisted")
+    return None
+# 非 state → 正常 set_memory
+database.set_memory(mem_dict)
+```
+
+- `insert_pending_memory` 路径也同分流（在 finalize 阶段升级 state 时判断）。
+- daemon 三处若合成 state 记忆亦走 `commit_state_supersede_atomic`。
 
 **并发测试（v2.2 新增）**：
 - `test_state_supersede_concurrent_exactly_one_active` — 5 线程同 key 各调 `commit_state_supersede_atomic` → 最终 `SELECT count(*) WHERE status='active' AND [key]` **恰好等于 1**。
@@ -274,20 +366,21 @@ def commit_state_supersede_atomic(
 
 ### D-6：Context Isolation（v2.2 soft 模式定义收敛）
 
-**上线模式明确二选一**（不用"dry-run"这个词）：
+**上线模式明确三选一**（v2.3 M4：默认改回 `observe`，与上线第一周一致）：
 
 | 模式 | env 值 | 行为 |
 |---|---|---|
-| **observe-only** | `MEMORY_HUB_CONTEXT_ISOLATION_MODE=observe` | 只 `logger.warning` 记录建议，**不改 room、不改 tags** |
-| **redirect-on / reject-off**（默认）| `''` 或 `redirect` | 立即重定向 room + 打 `_redirected_from_*` tag，但**不 raise** |
+| **observe-only（v2.3 默认）** | `''` / `observe` / 非法值 | 只 `logger.warning` 记录建议，**不改 room、不改 tags** |
+| **redirect-on / reject-off** | `MEMORY_HUB_CONTEXT_ISOLATION_MODE=redirect` | 立即重定向 room + 打 `_redirected_from_*` tag，但**不 raise** |
 | **strict** | `=strict` | 上述 + 对 `roleplay/joke → 主房间` 直接 `raise ValueError` |
 
-**上线计划**：第 1 周 `observe`；第 2 周切 `redirect`；观察 2 周稳定切 `strict`。
+**上线计划**：第 1 周 `observe`（默认）；第 2 周显式切 `redirect`；观察 2 周稳定后切 `strict`。**未配置 → observe**，避免"忘 set env 就立即改数据"的意外。
 
 ```python
 def _isolation_mode() -> str:
     val = os.environ.get('MEMORY_HUB_CONTEXT_ISOLATION_MODE', '').strip().lower()
-    return val if val in ('observe', 'redirect', 'strict') else 'redirect'
+    # v2.3 M4: 未配置 / 非法值 默认 observe（不改数据），只有显式配置才 redirect/strict
+    return val if val in ('observe', 'redirect', 'strict') else 'observe'
 
 def validate_context_isolation(mem):
     kind = (mem.get('context_kind') or '').strip().lower()
@@ -315,24 +408,53 @@ def validate_context_isolation(mem):
     return mem
 ```
 
-### D-4：`scripts/data_health_backfill.py`（v2.2 修正）
+### D-4：`scripts/data_health_backfill.py`（v2.3 修正 M1/M2/M3）
 
 架构同 v2：`--plan` / `--execute --plan-file` / `--db-path` / `--check` / `--max-fixes`。
 
-**drift gate（v2.2 收严）**：PLAN 快照 `state_before = 完整 dict`；EXECUTE 阶段读取当前状态与 `state_before` 逐字段比对：
-- 允许变化字段：`updated_at`、`activation_count`、`last_activated_at`（recall touch 副作用）
-- 其他任何字段变化 → drift，跳过并 log。
-- **删除 v2.1 的 `--ignore-drift-if-only-touch`**（reviewer 指出 updated_at 变化不能证明只是 touch）。
+**drift gate（v2.3 M3 修正 TOCTOU）**：
+- PLAN 阶段：从每条 memory 抽取 **JSON-safe 字段白名单**（v2.3 M1）计算 `snapshot_hash = sha256(json.dumps(snapshot, sort_keys=True))`；`state_before = {'snapshot_hash': ..., 'sample_fields': {id, status, updated_at, ...}}`。
+- EXECUTE 阶段：**在 `commit_maintenance_atomic` 的同一 `BEGIN IMMEDIATE` 事务内**（v2.3 M3：不能事务外查后再进 tx 更新，那样有 TOCTOU）：
+  1. 读取当前 memory 完整字段
+  2. 计算当前 `snapshot_hash`
+  3. 允许字段变化后重算：如果只有 `updated_at` / `activation_count` / `last_activated`（v2.3 M2 修正字段名）变化，用**"忽略这三字段"版本的白名单**重算 hash 对比
+  4. hash 一致 → 执行；不一致 → drift，事务内 ROLLBACK 并 log skip
+- 为了让上面 4 步在 tx 内跑，`commit_maintenance_atomic` 增加可选参数 `pre_execute_check: Callable[[conn, current_row], bool] | None`，backfill 传入此 callback；callback 返回 False 抛 `MaintenanceDrift`（事务回滚）。
+- **删除 v2.1 的 `--ignore-drift-if-only-touch`**（reviewer 早前指出）；改为白名单排除。
 
-**owner_ai backfill（v2.2 收严）**：
-- 有 `subject_id` 且能判定独白 → 补 `owner_ai`。
-- **无 subject_id → report-only，人工审**（不再"房间+source_ai 补齐"，reviewer 指出这会把提取者当主体）。
+**JSON-safe state_before 字段白名单（v2.3 M1）**：
+```python
+STATE_BEFORE_FIELDS = (
+    'id', 'status', 'info_type', 'content', 'room', 'category', 'layer',
+    'importance', 'subject_id', 'source_actor_id', 'owner_ai',
+    'created_at', 'updated_at', 'activation_count', 'last_activated',  # M2 字段名
+    'valid_from', 'valid_until', 'last_confirmed_at', 'state_ttl_days',
+    'context_kind', 'provenance_type', 'fact_confidence',
+    'client_request_id', 'link_to_real_id', 'superseded_by',
+)
+# embedding 单独处理：只存 sha256(bytes).hexdigest()，不进 JSON dict
+def _snapshot_for_hash(mem_row: dict) -> dict:
+    snap = {k: mem_row.get(k) for k in STATE_BEFORE_FIELDS}
+    emb = mem_row.get('embedding')
+    snap['embedding_sha256'] = hashlib.sha256(emb).hexdigest() if emb else ''
+    return snap
+```
 
-**prefix 修复**：`--check prefix` 只 report-only，不动 content（v2 保留）。
+**owner_ai backfill**（v2.2 保留）：有 `subject_id` 且能判定独白 → 补；无 → report-only。
 
-### D-5：接入 CREATE 点（v2.2 修正 daemon 三处）
+**prefix 修复**：`--check prefix` 只 report-only（v2 保留）。
 
-6 处 CREATE 全部包 `try: validate_memory_write(...) except ValueError as e: logger.warning(...); continue`（daemon 里单条不 crash step）。
+### D-5：接入 CREATE 点（v2.3 M5：分路径处理）
+
+**分两类**：
+
+| 路径 | 校验失败处理 |
+|---|---|
+| **MCP / REST `remember()` 直路径**（`memory_ops.remember` 两处 CREATE）| **`raise ValidationError`**（新自定义异常），FastAPI wrapper 转 400；MCP tool 层捕获转结构化错误 `{"ok": False, "error": "validation_failed", "detail": ...}`。**不 continue**。 |
+| **daemon 循环**（`compress_diaries:139` / `archive_old_work:235` / `distill_psychology:385`）| `try: validate_memory_write(...) except ValidationError as e: logger.warning(...); continue`（单条不 crash step）|
+| `insert_pending_memory` finalize 阶段 | 结构化拒绝 → ledger 记 `finalize_failed`，wrapper 转客户端错误 |
+
+**新自定义异常**：`memory_validation.ValidationError(Exception)`，`validate_memory_write` / `validate_context_isolation`（strict 模式）改为 raise 此类型，而非 `ValueError`（区分度更好，避免误捕获）。
 
 ### D-2c：`apply_temporal_annotation()` 接入 **5 入口**（v2.2 补 recall）
 
@@ -350,7 +472,7 @@ def validate_context_isolation(mem):
 
 | Step | 工作 | 验收 | 估时 |
 |---|---|---|---|
-| **0** | `_WRITE_LOCK` + `_write_transaction()` ctx；**全部**共享 _conn 写路径改造；memory_ops 侧删除锁 import；5 条测试 | grep 断言通过 + 并发/嵌套快速拒绝测试通 | **2 d**（比 v2.1 +1d，因涉及 execute+commit 直写全部迁移）|
+| **0** | `_WRITE_LOCK` + `_write_transaction()` ctx（H1 try/finally 修正）；**全部**共享 `_conn` 写路径改造（含 `activity_log.py` 3 处，H2）；`memory_ops` 走公开 helper 不接触锁/ctx（H3）；生产读路径迁 `_get_read_conn()`（H4）；抽取 `_set_memory_in_tx(conn, mem)`（H5）；10 条测试（含 grep 静态断言 4 条 + active-flag 恢复 2 条 + 并发 2 条 + activity_log 1 条 + 读连接 1 条）| grep 断言 4 类全过；并发/嵌套快速拒绝通；activity_log 走公开 helper | **3 d**（v2.2 是 2，v2.3 +1d 处理 activity_log 迁移 + 读连接迁移 + `_set_memory_in_tx` 抽取）|
 | 1 | `context_kind` migration + 全链路 | 端到端持续测试通 | 1 d |
 | 2 | `memory_validation.py` + `annotate_event` + soliloquy v2.1 + 34 单元测试 | 反例测试全过 | 1.5 d |
 | 3 | `state_ttl.py` + 5 列 migration + `commit_state_supersede_atomic` + 隔离键分层 + 18 单元测试（含 4 条并发） | 并发恰好 1 条 active + shared/private layer 测试通 | 2 d |
@@ -376,7 +498,7 @@ def validate_context_isolation(mem):
 - 时间注入 5 入口（5 条）
 - Backfill script（6 条含完整 state_before drift 比对）
 
-全套目标 415+（1.7 基础 352 + PR1 v2.2 ~65）。
+全套目标 420+（1.7 基础 352 + PR1 v2.3 ~70：Step 0 10 条含 activity_log/读连接/active-flag 恢复；+ 分模式 CREATE 校验 5 条）。
 
 ---
 
@@ -384,26 +506,29 @@ def validate_context_isolation(mem):
 
 ### 高
 
-1. **Step 0 全量写路径迁移影响面**
-   `insert_pending_memory / update_memory_status / set_memory / write_intent_ledger / …` 全部改成 `with _write_transaction()` — 涉及文件多，调用方要么依然通过这些 helper（无感），要么如果外部代码直接 `_get_conn().execute(...)` 会绕过锁。
-   **缓解**：（a）grep 断言 `_get_conn().execute\|_get_conn()\.execute` 只在 `database.py` 出现；（b）Step 0 独立提交后 Codex 复审专门看这个断言；（c）新增测试 `test_step0_no_bare_conn_writes_outside_database`。
+1. **Step 0 全量写 + 读路径迁移影响面**（v2.3 收敛）
+   写：`insert_pending_memory / update_memory_status / set_memory / write_intent_ledger / activity_log` 全部改 ctx。读：`memory_ops / corridor / smart_context / gateway / mcp_server` 里所有共享 `_conn` 读迁到 `_get_read_conn()`。
+   **缓解**：4 类 grep 断言（写只走 ctx / 锁只在 database / 生产不引用 ctx / 读走 read_conn）+ 独立提交 + Codex 复审。**若某处漏迁，grep 立即红**。
 
-2. **`commit_state_supersede_atomic` 与 `remember()` 的关系**
-   State 记忆走 `remember()` 时不能直接嵌套调此 helper（RuntimeError）。方案：`remember()` 检测 `info_type='state'` 时**不走 helper 内部**，改在 `remember()` 返回前**外层**调 `commit_state_supersede_atomic`（新记忆 ID 已定）。或者更保守：state 走独立入口 `remember_state()`。
-   **缓解**：Step 3 决定二选一并写死；开工时先 spike 30 分钟走通再定。
+2. **`_set_memory_in_tx` 抽取的正确性**（H5 直接对应）
+   `set_memory()` 现有约 100 行含 UPSERT + `memories_vec` + `vec_id_map` + preserve 保护。抽取时如果漏一段（比如 vec_id_map 分配），state 落库后 vector recall 找不到。
+   **缓解**：（a）抽取前先跑一遍现有 `test_set_memory` 全套确认基线；（b）抽完后新增 `test_state_supersede_new_state_appears_in_vector_recall` 断言 supersede 后新 state 立即能被 `vector_search` 找到；（c）Codex 复审专门看这个 diff。
 
-3. **`context_kind` 全链路串**（v2 保留）
+3. **`commit_state_supersede_atomic` 与 `remember()` 的分流点**（v2.3 H5 定死）
+   已明确：`remember()` 两处 CREATE 分支的 `set_memory()` 之前分流；缺 key 时 skip 落 report-only。开工先跑通 spike 30 分钟。
+
+4. **`context_kind` 全链路串**（v2 保留）
 
 ### 中
 
-4. **State supersede shared 语义**：shared state（用户 mood 等）跨 AI 共用，任一 AI 更新会覆盖所有旧 shared → 是期望行为。文档写清。
-5. **backfill drift gate 严格化**：完整 state_before 比对开销较大，plan-file 会变大（几倍）→ 可接受。
-6. **observe → redirect → strict 上线节奏**：3 周切完，靠 grafana 看 `context_isolation OBSERVE` warning count 曲线判断切换。
+5. **State supersede shared 语义**：文档写清。
+6. **Backfill snapshot_hash 覆盖率**：白名单未列的字段变化不会触发 drift，但也不会误伤。若发现漏字段（如未来加新列），白名单要同步更新——加个 pytest 从 `_ALL_COLUMNS` 反查白名单完备性。
+7. **observe → redirect → strict 上线节奏**：3 周切完，靠 grafana 看 warning count 曲线。
 
 ### 低
 
-7. event_date 与 created_at 都缺 → annotate 返回原 mem。
-8. `MEMORY_HUB_CONTEXT_ISOLATION_MODE` 值大小写不敏感，其他值 → 默认 redirect。
+8. event_date 与 created_at 都缺 → annotate 返回原 mem。
+9. `MEMORY_HUB_CONTEXT_ISOLATION_MODE` 值大小写不敏感；v2.3 默认 `observe`（安全默认）。
 
 ---
 
