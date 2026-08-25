@@ -1,20 +1,30 @@
-# Phase 2.0 PR1 施工方案 v2.5 · Data Health
+# Phase 2.0 PR1 施工方案 v2.6 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.5 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.6 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
-> - v1（作废）：分析假设错误 4 处
-> - v2：Codex 审后收敛 2C+6H+6M
-> - v2.1（作废）：user 一审后修 H3/H1，但 H3 仍未闭环、State supersede 非原子、总方案未同步
-> - v2.2（作废）：user 二审后修 5 High + 7 Medium；但 `927be84` 意外夹带 5 个生产代码回退（`3494ed0` 已修）；且 v2.2 方案本身仍有 5 High + 5 Medium gap
-> - v2.3（作废）：user 三审后修事务原子性 / activity_log / 锁封装契约 / 读连接一致性 / state 落库真路径
-> - v2.4（作废）：Claude 自审后收 3 High + 3 Medium；Codex 复审又抓 4 High + 3 Medium + 1 Low（v2.4 的 H-A/H-B 与生产代码 signature 不匹配、H-C 时间戳 gate 未闭环、state supersede self-link、database.py 内部读入口漏迁、read_conn 缺 DB_PATH 失效、state_before 格式前后不一致）
-> - **v2.5**（本文）：Codex 复审后按现有生产 signature 收敛
+> - v1 → v2.4（作废，见既往）
+> - v2.5（作废）：Codex 三审后按现有生产 signature 收敛 4H+3M+1L；但仍有 3 High（auto-resolve 循环依赖 / read helpers 清单漏 11 个 + 写错 1 个 / state self-supersede 修法只写在测试没进主伪代码）+ 2 Medium（24h audit 去重不是真幂等 / v2.4 残留 callsite 冲突）+ 2 Low
+> - **v2.6**（本文）：Codex 四审后修 3 High + 2 Medium + 2 Low
 
 ---
 
-## v2.4 → v2.5 变更总览（4 High + 3 Medium + 1 Low，Codex 复审）
+## v2.5 → v2.6 变更总览（3 High + 2 Medium + 2 Low，Codex 四审）
+
+| 序 | 项 |
+|---|---|
+| H1 | auto-resolve **循环依赖修**：抽出 `resolve_patterns.py` 独立模块，含 `_matches_resolve_pattern` + 所有 resolve constants / regex；`database.py`（用于 `check_auto_resolve_atomic`）和 `memory_ops.py` 都从它 import；补真实 import 测试 `test_h1_no_circular_import` |
+| H2 | database.py **纯读函数完整清单**（26 个，v2.5 漏 11 个 + 写错 1 个）：`get_memory / get_memory_by_client_request_id / list_stale_intent_ledgers / get_ledger / list_memories_by_status / query_memories / count_memories / get_proposal / list_proposals / count_proposals / list_audits / count_audits / get_profile / list_profiles / vector_search / fts_search / cjk_like_search / get_all_memory_ids / get_memories_batch / iter_memories / get_person / list_persons / get_memories_by_subject / count_memories_by_subject / resolve_alias / get_all_aliases`（v2.5 的 `get_person_by_alias` 不存在，实际是 `resolve_alias`）。新增 AST 测试 `test_h2_all_pure_reads_use_read_conn`：解析 database.py AST，白名单外的 public 函数其函数体不允许出现 `_get_conn()`（含 `_get_read_conn` 的除外）|
+| H3 | state supersede **主伪代码写死 5 条规则**（v2.5 只在测试说明里写，主 code 没跟）：`_state_supersede_in_tx()` 起点先按 ID 查 existing；existing active + 同 key + payload fingerprint 相同 → idempotent no-op return；同 ID 但 payload 不同 → 抛 `IdempotencyConflict`；查旧 SELECT 加 `AND id <> ?`；audit 走**永久幂等**（M1）|
+| M1 | audit **永久幂等**（不再 24h）：`maintenance_audit` 加 `UNIQUE(action, target_id, operation_id)` 索引；`operation_id` 由 caller 传（同 op 重放显式复用同 id）；同 target_id 的 state_supersede **永久唯一**（默认 operation_id = target_id + new_mem_id 组合）|
+| M2 | 删除 v2.4 残留：`_state_supersede_in_tx()` 章节里"finalize/daemon 直接调 in_tx helper"的说法（第 341–343 行）与 v2.5 "全走 public wrapper、不改 finalize" 冲突 → 直接删掉这段，避免施工时选错 |
+| L1 | 交付流程末尾"v2.2 推分支 / 都审 v2.2" → v2.6 |
+| L2 | callsite 计数"3 类 4 处" → "5 分流点 4 函数"（`remember` 2 + daemon 3；函数计数 `memory_ops.remember` + 3 daemon = 4 函数）|
+
+---
+
+## v2.4 → v2.5 变更总览（4 High + 3 Medium + 1 Low，Codex 三审，存档）
 
 | 序 | 项 |
 |---|---|
@@ -195,7 +205,12 @@
    - 现有：`commit_maintenance_atomic` / `commit_finalize_atomic` / `close_stale_intent_atomic` / `set_memory` / `insert_pending_memory` / `update_memory_status` / `mark_replaced` / `close_stale_intent` / `write_intent_ledger` 全部改造为**内部包 `with _write_transaction()`**。
    - **v2.3 新增**（H3 支撑）：
      - `touch_recalled_memories_atomic(mem_ids: list[str], now_iso: str) -> None` — 原 `memory_ops._touch_recalled_memories:737` 的写部分迁入
-     - `check_auto_resolve_atomic(candidate_ids: list[str], new_content: str, source_ai: str) -> list[str]` — **v2.5 H1 按现有生产收敛**。对齐 `memory_ops._check_auto_resolve(content, related_mems, source_ai) -> list[str]` 的语义：多候选、复用 `_matches_resolve_pattern()`（含中英/否定/疑问/分句检测）、audit 带 `source_ai`、返回 resolved IDs 列表。所有步骤（`_matches_resolve_pattern(new_content)` 短路 + 事务内 SELECT 全部候选完整内容 + 逐条条件 UPDATE + 逐条写 audit）**全在同一 `_write_transaction()` 内**，避免 TOCTOU（`_matches_resolve_pattern` 是纯 CPU，多候选累计持锁 <5ms 可接受）。原 `memory_ops._check_auto_resolve:821` 整段迁入。
+     - `check_auto_resolve_atomic(candidate_ids: list[str], new_content: str, source_ai: str) -> list[str]` — **v2.6 修循环依赖**。语义对齐 `memory_ops._check_auto_resolve(content, related_mems, source_ai) -> list[str]`。**新增 `resolve_patterns.py` 独立模块**（避免 database.py 反向 import memory_ops 循环）：
+       - `resolve_patterns.py` 承载：`_matches_resolve_pattern(text) -> bool` + 所有 resolve constants / regex（中英词表 / 否定 / 疑问 / 分句检测），全部从 `memory_ops.py:630` 迁入
+       - `memory_ops.py` 改为 `from resolve_patterns import _matches_resolve_pattern`（保留原调用点）
+       - `database.check_auto_resolve_atomic` 也 `from resolve_patterns import _matches_resolve_pattern`
+       - 步骤（`_matches_resolve_pattern(new_content)` 短路 + 事务内 SELECT 全部候选内容 + 逐条条件 UPDATE + 逐条写 audit）**全在同一 `_write_transaction()` 内**（`_matches_resolve_pattern` 纯 CPU，多候选累计持锁 <5ms 可接受）
+       - **v2.6 H1 测试**：`test_h1_no_circular_import` — 真实 `import database; import memory_ops; import resolve_patterns` 三个都成功，不用 mock；`test_h1_resolve_pattern_shared_across_modules` 断言两侧引用是同一函数对象
    - **v2.3 新增**（H2 activity_log 归位）：
      - `init_db()` 里加 `CREATE TABLE IF NOT EXISTS activity_log ...`（从 `activity_log.py:123` 迁入）
      - `append_activity_log_atomic(row: dict) -> None` — INSERT
@@ -210,10 +225,34 @@
 
 5. **读连接一致性**（H4）：**生产读路径全部走 `_get_read_conn()`**（PRAGMA query_only=ON 独立只读连接，无 tx 参与，看不到其他线程未提交状态）。
 
-   **v2.5 M1 修正——不只迁上层模块，database.py 内部所有 public read helpers 也要迁**（Codex 复审指出，v2.4 只禁其他模块用共享 `_conn`，但普通 caller 实际走 `database.get_memory()` 等，仍回到共享 `_conn`）：
-   - **必迁清单**（database.py 内）：`get_memory` / `get_memory_by_client_request_id` / `query_memories` / `vector_search` / `fts_search` / `get_memories_batch` / `list_proposals` / `get_proposal` / `list_persons` / `get_person_by_alias` / `list_profiles` / `get_profile` / `list_audits` / `count_audits` / `list_stale_intent_ledgers` / `get_ledger` — 全部改用 `_get_read_conn()`。
-   - **规则**：内部逻辑若确实需要读**未提交**数据（如原子事务里先 SELECT 再 UPDATE），必须显式接受 `conn` 参数（属于 in_tx helper 系列，如 `_state_supersede_in_tx` 里的查旧）。
-   - 上层 `memory_ops` / `corridor` / `smart_context` / `gateway` / `mcp_server` / `main` 通过调 database public helpers 间接迁移，无需自己动 `_get_conn()`。
+   **v2.6 H2 修正——完整清单（26 个真实 pure read helpers）**：Codex 四审指出 v2.5 清单漏 11 个 + 错写 1 个（`get_person_by_alias` 不存在，实际是 `resolve_alias`）。以下按现有 database.py 的行号扫过一遍确认：
+
+   | 函数 | 行 | 函数 | 行 |
+   |---|---|---|---|
+   | `get_memory` | 521 | `count_proposals` | 1572 |
+   | `get_memory_by_client_request_id` | 532 | `list_audits` | 1601 |
+   | `list_stale_intent_ledgers` | 694 | `count_audits` | 1616 |
+   | `get_ledger` | 932 | `get_profile` | 1671 |
+   | `list_memories_by_status` | 1209 | `list_profiles` | 1681 |
+   | `query_memories` | 1405 | `vector_search` | 1743 |
+   | `count_memories` | 1504 | `fts_search` | 1869 |
+   | `get_proposal` | 1540 | `cjk_like_search` | 2010 |
+   | `list_proposals` | 1546 | `get_all_memory_ids` | 2047 |
+   | `get_memories_batch` | 2056 | `iter_memories` | 2076 |
+   | `get_person` | 2254 | `list_persons` | 2262 |
+   | `get_memories_by_subject` | 2276 | `count_memories_by_subject` | 2286 |
+   | `resolve_alias` | 2302 | `get_all_aliases` | 2397 |
+
+   全 26 个 body 里的 `_get_conn()` 替换为 `_get_read_conn()`。
+
+   **`ro_*` 变体已在 read_conn 上，不动**（`ro_iter_memories:2118 / ro_vector_search:2144 / ro_fts_search:2166 / ro_cjk_like_search:2183 / ro_get_memory:2200`）。
+
+   **规则**：内部逻辑若确实需要读**未提交**数据（如原子事务里先 SELECT 再 UPDATE），必须显式接受 `conn` 参数（属于 in_tx helper 系列，如 `_state_supersede_in_tx` 里的查旧）。上层 `memory_ops` / `corridor` / `smart_context` / `gateway` / `mcp_server` / `main` 通过调 database public helpers 间接迁移，无需自己动 `_get_conn()`。
+
+   **v2.6 H2 测试**：`test_h2_all_pure_reads_use_read_conn`：AST 解析 `database.py`，对上表 26 个函数每个函数体：
+   - 允许出现 `_get_read_conn()` 调用（≥1）
+   - 禁止出现 `_get_conn()` 调用
+   - 未来若新增 pure read helper 忘迁 → 立即红（比 grep 更严格，因 grep 可能被"路径不匹配"绕过）
 
    **v2.5 M2 修正——`_get_read_conn()` 加 DB_PATH 失效机制**（Codex 复审确认现状是 `threading.local` 缓存，缺失效）：
    ```python
@@ -336,35 +375,65 @@ def state_supersede_key(mem):
     return base + (owner_ai,)
 ```
 
-#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.2 引入，v2.4 H-A 分离）**
+#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.6 最终版）**
 
-**v2.4 分层**：
-- **public**：`commit_state_supersede_atomic()` = 包 `_write_transaction()` + 调 in_tx helper。给 `memory_ops.remember()` 分流点用（起点无 tx）。
-- **internal**：`_state_supersede_in_tx(conn, new_mem, key, source_ai)` — 不自持锁 / 不自开事务，接受已开 tx 的 conn。给 `commit_finalize_atomic` 已在 tx 内 + daemon 已在 tx 内的调用者用。**避免嵌套 `_write_transaction()` 撞 RuntimeError**。
+**分层**：
+- **public**：`commit_state_supersede_atomic()` = 包 `_write_transaction()` + 调 in_tx helper。**PR1 唯一生产入口**——`memory_ops.remember()` 分流点 + daemon 三处 CREATE 都调此。
+- **internal**：`_state_supersede_in_tx(conn, new_mem, key, source_ai)` — 不自持锁 / 不自开事务，接受已开 tx 的 conn。**PR1 无生产 caller 直接调**——只作为 public wrapper 的实现细节，以及未来若出现真正持 tx 的 database 内部 caller 时的复用点。
+- **不改** `commit_finalize_atomic`（只做 ledger + skeleton 终态，`memory_ops.remember()` 已经落库；async pipeline 重构远超 PR1 范围）。
 
 ```python
 # database.py
 
 def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
-    """内部 helper — 已在 tx 内的 conn 上调用，不自持锁。"""
+    """内部 helper — 已在 tx 内的 conn 上调用，不自持锁。
+    v2.6 H3: 5 条规则全部写死在主 code。"""
     if key is None:
         raise ValueError("empty state key — cannot supersede")
 
     subj, cat, room, layer, owner = key
-    # 1) 事务内重新查所有匹配 active
+    new_id = new_state_mem['id']
+
+    # v2.6 H3 规则 1-3: idempotent 保护
+    existing = conn.execute(
+        "SELECT id, status, content, subject_id, category, room, layer, owner_ai "
+        "FROM memories WHERE id = ?", (new_id,)
+    ).fetchone()
+    if existing is not None:
+        existing_dict = dict(existing)
+        existing_key = state_supersede_key(existing_dict)
+        # 计算 payload fingerprint（内容 + 关键字段）
+        new_fp = _payload_fingerprint(new_state_mem)
+        existing_fp = _payload_fingerprint(existing_dict)
+        if existing_dict['status'] == 'active' and existing_key == key and existing_fp == new_fp:
+            # 规则 2: 完全相同的 idempotent 重放 → no-op
+            return {'inserted_id': new_id, 'superseded_ids': [], 'idempotent': True}
+        if existing_fp != new_fp:
+            # 规则 3: 同 ID 但 payload 不同 → 禁止覆盖
+            raise IdempotencyConflict(
+                f"memory id {new_id} already exists with different payload; "
+                f"caller must use fresh id or explicit update path"
+            )
+        # 同 ID 同 payload 但已 superseded → 也当 no-op（避免复活死记忆）
+        return {'inserted_id': new_id, 'superseded_ids': [], 'idempotent': True}
+
+    # v2.6 H3 规则 4: 查旧加 AND id <> ?
+    # 1) 事务内重新查所有匹配 active（排除新 id 自身）
     if layer == 'shared':
         old_rows = conn.execute(
             "SELECT id, updated_at FROM memories WHERE status='active' "
             "AND info_type='state' AND subject_id=? AND category=? "
-            "AND room=? AND layer='shared' AND owner_ai=''",
-            (subj, cat, room)
+            "AND room=? AND layer='shared' AND owner_ai='' "
+            "AND id <> ?",  # v2.6 H3 规则 4
+            (subj, cat, room, new_id)
         ).fetchall()
     else:
         old_rows = conn.execute(
             "SELECT id, updated_at FROM memories WHERE status='active' "
             "AND info_type='state' AND subject_id=? AND category=? "
-            "AND room=? AND layer=? AND owner_ai=?",
-            (subj, cat, room, layer, owner)
+            "AND room=? AND layer=? AND owner_ai=? "
+            "AND id <> ?",  # v2.6 H3 规则 4
+            (subj, cat, room, layer, owner, new_id)
         ).fetchall()
     old_ids = [r[0] for r in old_rows]
 
@@ -381,18 +450,22 @@ def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
              _now_iso(), old_id)
         )
 
-    # 4) audit
+    # 4) audit — v2.6 M1: 永久幂等，靠 (action, target_id, operation_id) UNIQUE 索引
+    #    默认 operation_id = state_supersede:{new_id} —— 同 target_id 只允许一条 state_supersede audit
+    operation_id = f"state_supersede:{new_id}"
     conn.execute(
-        "INSERT INTO maintenance_audit (action, target_id, new_content, "
+        "INSERT OR IGNORE INTO maintenance_audit "
+        "(action, target_id, operation_id, new_content, "
         "decision_reason, state_before, state_after, source_ai, "
-        "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        ('state_supersede', new_state_mem['id'], new_state_mem.get('content',''),
+        "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ('state_supersede', new_id, operation_id,
+         new_state_mem.get('content', ''),
          f'new state supersedes {len(old_ids)} old',
          json.dumps({'old_ids': old_ids}),
-         json.dumps({'new_id': new_state_mem['id']}),
+         json.dumps({'new_id': new_id}),
          source_ai, 1, _now_iso())
     )
-    return {'inserted_id': new_state_mem['id'], 'superseded_ids': old_ids}
+    return {'inserted_id': new_id, 'superseded_ids': old_ids, 'idempotent': False}
 
 
 def commit_state_supersede_atomic(new_state_mem, key, source_ai):
@@ -404,15 +477,37 @@ def commit_state_supersede_atomic(new_state_mem, key, source_ai):
         return _state_supersede_in_tx(conn, new_state_mem, key, source_ai)
 ```
 
-**v2.5 生产 callsite 定死**（3 类 4 处，全走 public wrapper）：
-1. `memory_ops.remember()` 两处 CREATE 分支（`:484` + `:424`）的 `set_memory()` 之前分流点 → 调 `commit_state_supersede_atomic(...)`
-2. `daemon.compress_diaries:139` / `daemon.archive_old_work:235` / `daemon.distill_psychology:385` iteration 内合成 state 时 → 调 `commit_state_supersede_atomic(...)`
+**v2.6 生产 callsite 定死**（**5 分流点、4 函数**，全走 public wrapper）：
+1. `memory_ops.remember()` **两处** CREATE 分支（`:484` + `:424`）的 `set_memory()` 之前分流点 → 调 `commit_state_supersede_atomic(...)`
+2. `daemon.compress_diaries:139` / `daemon.archive_old_work:235` / `daemon.distill_psychology:385` **三处** iteration 内合成 state 时 → 调 `commit_state_supersede_atomic(...)`
 3. **不改** `commit_finalize_atomic`（现签名只做 ledger + skeleton 终态；`memory_ops.remember()` 已经落库 state；async pipeline "LLM 只生成 write intent、最终统一事务落库"的重构远超 PR1 范围）
 
-**v2.5 H3 反例测试**（避免 self-supersede）：
-- SELECT 加 `AND id <> ?`（新 state 的 id 不参与旧 active 查询）
-- `test_state_supersede_idempotent_same_id_retry` — 同 mem_dict 连调两次 `commit_state_supersede_atomic` → 第二次 no-op（idempotent upsert），最终恰好 1 条 active，`superseded_by` 不指向自己
-- audit 24h 内对 `action='state_supersede' AND target_id=X` 去重
+**v2.6 H3 + M1 schema 支撑**：
+```sql
+-- database.init_db() migration 段新增
+ALTER TABLE maintenance_audit ADD COLUMN operation_id TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_op_unique
+  ON maintenance_audit(action, target_id, operation_id)
+  WHERE operation_id != '';  -- 部分索引，空值不参与唯一约束（兼容存量）
+```
+
+`_payload_fingerprint(mem)` helper：
+```python
+_FINGERPRINT_FIELDS = ('content', 'importance', 'subject_id', 'source_actor_id',
+                       'owner_ai', 'room', 'category', 'layer', 'context_kind',
+                       'valid_from', 'valid_until', 'state_ttl_days')
+def _payload_fingerprint(mem: dict) -> str:
+    snap = {k: mem.get(k) for k in _FINGERPRINT_FIELDS}
+    return hashlib.sha256(json.dumps(snap, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+```
+
+`IdempotencyConflict(Exception)` — 新自定义异常，`memory_ops.remember()` 分流点 catch 后包装为 `ValidationError` 返回给 client。
+
+**v2.6 H3 + M1 反例测试**：
+- `test_h3_same_id_same_payload_replay_is_noop` — 连调两次 → 第二次返回 `{'idempotent': True}`；DB 恰好 1 条 active；audit 恰好 1 条（`INSERT OR IGNORE` 触发）
+- `test_h3_same_id_diff_payload_raises_conflict` — 同 ID 改 content → 抛 `IdempotencyConflict`；DB 里 existing row 不变
+- `test_h3_supersede_excludes_self` — 断言 `superseded_by` 永不指向自己
+- `test_m1_audit_permanent_idempotent_across_days` — 手动改 audit `created_at` 为 30 天前，再重放 → audit 仍恰好 1 条（M1 永久幂等，非 24h 窗口）
 
 **关键 v2.3（H5）**：**不新造缩水版 INSERT**。改从现有 `set_memory()` 抽取核心逻辑到 `_set_memory_in_tx(conn, mem)` 内部 helper：
 - 完整 UPSERT `memories` 表（含 `_preserve_on_empty` / `_preserve_always` 处理，保护 `client_request_id` / `finalize_claim_id` / `link_to_real_id` / `created_at` 等字段不被空值覆盖）
@@ -702,8 +797,8 @@ def state_before_snapshot(mem_row: dict) -> dict:
 
 ## 交付流程 v2.5
 
-1. **本方案 v2.2 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
-2. Ceci + 夜鹭 + Codex 都审 v2.2
+1. **本方案 v2.6 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
+2. Ceci + Codex 都审 v2.6
 3. 都过 → 开工分支 `phase20/pr1-data-health`
 4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-*
 5. 全套测试 415+ 通过
