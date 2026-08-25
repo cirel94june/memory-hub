@@ -1231,6 +1231,38 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _prepare_memory_value(key: str, value):
+    """Memory-field value preparation for INSERT/UPSERT.
+
+    Phase 2.0 Step 0-A: 从 set_memory._prep 原样抽出，供
+    _set_memory_in_tx / _payload_fingerprint (Step 0-B) 共用同一份规范化
+    规则，避免"写入时补 ''、fingerprint 时保 None"造成的漂移。
+
+    5 条既有语义严格保留（v2.9 H1 收敛）：
+      - resolved/anchored → _resolved_to_int
+      - comments/history → JSON dumps；None → "[]"
+      - embedding 原样（bytes/None）
+      - fact_confidence 原样（保留 None 表"未知置信度"，不改成 0.0）
+      - 其他 None → ""
+    state_ttl_days 的默认 7 分支等 Step 0-B（列还没进 _ALL_COLUMNS）。
+    """
+    if key in ("resolved", "anchored"):
+        return _resolved_to_int(value)
+    if key in ("comments", "history"):
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return "[]"
+        return value
+    if key == "embedding":
+        return value  # bytes or None
+    if key == "fact_confidence":
+        return value  # REAL or None
+    if value is None:
+        return ""
+    return value
+
+
 def set_memory(mem: dict) -> None:
     """Insert or replace a memory (upsert).
 
@@ -1239,26 +1271,7 @@ def set_memory(mem: dict) -> None:
     """
     conn = _get_conn()
 
-    # Prepare values — serialise list/dict fields to JSON strings
-    def _prep(key):
-        val = mem.get(key)
-        if key in ("resolved", "anchored"):
-            return _resolved_to_int(val)
-        if key in ("comments", "history"):
-            if isinstance(val, (list, dict)):
-                return json.dumps(val, ensure_ascii=False)
-            if val is None:
-                return "[]"
-            return val
-        if key == "embedding":
-            return val  # bytes or None
-        if key == "fact_confidence":
-            return val  # REAL or None
-        if val is None:
-            return ""
-        return val
-
-    values = [_prep(col) for col in _ALL_COLUMNS]
+    values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
     cols = ", ".join(_ALL_COLUMNS)
     # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
