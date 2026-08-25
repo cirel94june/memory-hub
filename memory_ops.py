@@ -3,13 +3,11 @@
 基于 SQLite 持久化，通过 database.py 做搜索/查询，通过 github_store 做 CRUD
 """
 import json
-import re
 import time
 import math
 import asyncio
 import logging
 import threading
-import unicodedata
 from datetime import datetime, timezone, timedelta
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
@@ -635,7 +633,13 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
 # BEGIN IMMEDIATE only coordinates between distinct connections. Every
 # `BEGIN IMMEDIATE` on `database._get_conn()` in this module (touch, auto-
 # resolve, and any future writer) MUST hold this lock.
-_WRITE_LOCK = threading.Lock()
+#
+# Phase 2.0 Step 0-A #2a 过渡：临时指向 database._WRITE_LOCK 让 memory_ops
+# 里剩下的两处 inline `with _WRITE_LOCK: BEGIN IMMEDIATE` 和 database.py 的
+# _write_transaction() ctx 共享同一个锁对象，消除跨模块 conn 竞态。批次 #5
+# 抽取 touch_recalled_memories_atomic / check_auto_resolve_atomic 到
+# database.py 后彻底删除本行，恢复 v2.9 契约（memory_ops 不接触 _WRITE_LOCK）。
+_WRITE_LOCK = database._WRITE_LOCK
 
 
 def _touch_recalled_memories(ids: list[str]) -> None:

@@ -5,6 +5,7 @@ SQLite 数据库引擎（替代内存 dict + GitHub 存储）
 - WAL 模式并发读
 - 同步 sqlite3，hot-path 读操作通过 to_thread 离开事件循环
 """
+import contextlib
 import json
 import re
 import struct
@@ -30,6 +31,54 @@ _conn: sqlite3.Connection | None = None
 
 # ── 线程局部只读连接池（to_thread 里的读操作用） ──
 _local = threading.local()
+
+
+# ── 写锁 + 事务 context manager（Phase 2.0 Step 0-A #2a）──
+# 所有共享 _conn 上的写操作必须包在 _write_transaction() 内。threading.Lock
+# 非重入：同线程嵌套调用立即 RuntimeError（防死锁）。v2.9 H1 修正版：try/finally
+# 保证 _in_write_tx.active 与锁在中间抛异常时也恢复；began flag 控制 ROLLBACK
+# 只对已开事务生效。
+_WRITE_LOCK = threading.Lock()
+_in_write_tx = threading.local()
+
+
+@contextlib.contextmanager
+def _write_transaction():
+    """共享 _conn 上任何写操作必须包在本 ctx 内。
+
+    非重入：同线程嵌套调用立即 RuntimeError（不 deadlock）。正常退出 commit；
+    异常 ROLLBACK 并 re-raise。空 tx（仅读或 no-op）commit 是安全的。
+    """
+    if getattr(_in_write_tx, 'active', False):
+        raise RuntimeError(
+            "nested _write_transaction() forbidden — caller inside a write tx "
+            "must not call another write helper. Refactor to do all work "
+            "inside one _write_transaction() block."
+        )
+    lock_acquired = False
+    began = False
+    conn = None
+    try:
+        _WRITE_LOCK.acquire()
+        lock_acquired = True
+        _in_write_tx.active = True
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        yield conn
+        conn.commit()
+        began = False
+    except BaseException:
+        if began and conn is not None:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        _in_write_tx.active = False
+        if lock_acquired:
+            _WRITE_LOCK.release()
 
 
 def _get_read_conn() -> sqlite3.Connection:
@@ -757,10 +806,8 @@ def close_stale_intent_atomic(
 
     Returns: {"disposition": ..., "transitioned": bool, "skeleton_status": ...}
     """
-    conn = _get_conn()
     now = _now_iso()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction() as conn:
 
         # 1. Re-verify ledger is still our stale in_flight (defense against
         #    race where the ledger raced between our list_stale_* snapshot
@@ -771,7 +818,7 @@ def close_stale_intent_atomic(
         ).fetchone()
         if not ledger_row or ledger_row[0] != "in_flight" \
                 or ledger_row[1] != owner_token:
-            conn.execute("ROLLBACK")
+            # Read-only bail-out — ctx commits an empty tx (no-op).
             return {"disposition": "already_terminaled",
                     "transitioned": False, "skeleton_status": None}
 
@@ -806,7 +853,7 @@ def close_stale_intent_atomic(
                 f"INSERT INTO maintenance_audit "
                 f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_sm_ph})",
                 _sm_vals)
-            conn.commit()
+            # ctx auto-commits on normal exit
             return {"disposition": "skeleton_missing",
                     "transitioned": True, "skeleton_status": None}
         skel_status = skel_row[0]
@@ -847,7 +894,7 @@ def close_stale_intent_atomic(
                 f"({', '.join(_AUDIT_COLUMNS)}) "
                 f"VALUES ({audit_ph})",
                 audit_vals)
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "failed", "transitioned": True,
                     "skeleton_status": "pending"}
 
@@ -862,7 +909,7 @@ def close_stale_intent_atomic(
             conn.execute(
                 "UPDATE memories SET finalize_claim_id='', "
                 "finalize_claim_at='' WHERE id=?", (skeleton_id,))
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "already_active", "transitioned": True,
                     "skeleton_status": "active"}
 
@@ -876,7 +923,7 @@ def close_stale_intent_atomic(
             conn.execute(
                 "UPDATE memories SET finalize_claim_id='', "
                 "finalize_claim_at='' WHERE id=?", (skeleton_id,))
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "already_replaced", "transitioned": True,
                     "skeleton_status": "replaced"}
 
@@ -915,18 +962,10 @@ def close_stale_intent_atomic(
                 f"INSERT INTO maintenance_audit "
                 f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_nr_ph})",
                 _nr_vals)
-            conn.commit()
-        else:
-            # Already audited this skeleton — nothing new to record.
-            conn.execute("ROLLBACK")
+        # else: already audited this skeleton — nothing new to insert; ctx
+        # commits an empty (SELECT-only) tx which is a no-op.
         return {"disposition": "needs_review", "transitioned": False,
                 "skeleton_status": skel_status}
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 def get_ledger(skeleton_id: str) -> dict | None:
@@ -1013,10 +1052,8 @@ def commit_finalize_atomic(
     if terminal_state not in ("active", "replaced", "failed"):
         raise ValueError(f"invalid terminal_state: {terminal_state}")
 
-    conn = _get_conn()
     now = _now_iso()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction() as conn:
         # H2 + H1 round-6: race-losing terminal writer cannot clobber
         # winner. Two constraints on the UPDATE branch:
         #   - terminal_state must still be 'in_flight' (nobody terminaled yet)
@@ -1039,9 +1076,8 @@ def commit_finalize_atomic(
         )
         # H1 round-6: if the ledger UPDATE did not affect our row (someone
         # else already terminaled or owns a different token), do NOT touch
-        # the skeleton. Rollback and return False; caller must reconcile.
+        # the skeleton. Return False; ctx commits (no-op — no rows changed).
         if cur.rowcount != 1:
-            conn.execute("ROLLBACK")
             return False
 
         if skeleton_update:
@@ -1072,14 +1108,8 @@ def commit_finalize_atomic(
                 f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
                 params,
             )
-        conn.commit()
+        # ctx auto-commits
         return True
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 class MaintenanceDrift(RuntimeError):
@@ -1109,7 +1139,6 @@ def commit_maintenance_atomic(
     `history` are serialized to JSON if list/dict.
     audit_row: dict with keys matching _AUDIT_COLUMNS.
     """
-    conn = _get_conn()
     now = _now_iso()
 
     # Build memory UPDATE
@@ -1139,9 +1168,7 @@ def commit_maintenance_atomic(
     audit_placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
     audit_cols_str = ", ".join(_AUDIT_COLUMNS)
 
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-
+    with _write_transaction() as conn:
         # H3 round-6: validate ALL rows the decision depends on — not just
         # the target A being mutated. dedup plans use A+B: if B drifted
         # between plan generation and execute, the mutation of A based on
@@ -1150,7 +1177,6 @@ def commit_maintenance_atomic(
             for expect in extra_expected_rows:
                 exp_id = expect.get("id")
                 if not exp_id:
-                    conn.execute("ROLLBACK")
                     raise ValueError(
                         "extra_expected_rows entry missing 'id'")
                 sel = conn.execute(
@@ -1158,19 +1184,16 @@ def commit_maintenance_atomic(
                     (exp_id,),
                 ).fetchone()
                 if not sel:
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion row {exp_id} not found")
                 cur_status, cur_updated = sel[0], sel[1]
                 if ("status" in expect
                         and expect["status"] != cur_status):
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion {exp_id} drifted: expected "
                         f"status={expect['status']!r}, got {cur_status!r}")
                 if ("updated_at" in expect
                         and expect["updated_at"] != cur_updated):
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion {exp_id} drifted: expected "
                         f"updated_at={expect['updated_at']!r}, "
@@ -1183,8 +1206,8 @@ def commit_maintenance_atomic(
         )
         if cur.rowcount != 1:
             # Drift detected — someone modified the row between snapshot
-            # and now. Rollback both memory UPDATE (no-op) and skip audit.
-            conn.execute("ROLLBACK")
+            # and now. Raise → ctx ROLLBACKs the UPDATE (no-op if nothing
+            # matched) and skips the audit INSERT.
             raise MaintenanceDrift(
                 f"target {memory_id} drifted "
                 f"(expected status={expected_status!r}, "
@@ -1195,15 +1218,7 @@ def commit_maintenance_atomic(
             f"VALUES ({audit_placeholders})",
             audit_values,
         )
-        conn.commit()
-    except MaintenanceDrift:
-        raise
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+        # ctx auto-commits
 
 
 def list_memories_by_status(status: str, older_than_minutes: int = 0,
