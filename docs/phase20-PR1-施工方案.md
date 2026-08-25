@@ -1,16 +1,26 @@
-# Phase 2.0 PR1 施工方案 v2.7 · Data Health
+# Phase 2.0 PR1 施工方案 v2.8 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.7 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.8 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
-> - v1 → v2.5（作废，见既往）
-> - v2.6（作废）：Codex 四审后修 3H+2M+2L；但仍有 3 High（pending skeleton 会被误判 IdempotencyConflict / fingerprint SELECT 字段不全 / INSERT OR IGNORE 吞掉非幂等错误）+ 2 Medium（operation_id migration 契约不完整 / AST 测试描述夸大）+ 1 Low（v2.5 残留）
-> - **v2.7**（本文）：Codex 五审后修 3H+2M+1L
+> - v1 → v2.6（作废，见既往）
+> - v2.7（作废）：Codex 五审后修 3H+2M+1L；但仍有 2 High（fingerprint 默认字段规范化不一致 → 相同 payload 首次写入后重放会误判冲突 / pending skeleton CRQ 校验 fail-open）+ 1 Low
+> - **v2.8**（本文）：Codex 六审后修 2H+1L
 
 ---
 
-## v2.6 → v2.7 变更总览（3 High + 2 Medium + 1 Low，Codex 五审）
+## v2.7 → v2.8 变更总览（2 High + 1 Low，Codex 六审）
+
+| 序 | 项 |
+|---|---|
+| H1 | **canonical fingerprint 消除默认字段漂移**：v2.7 fingerprint 直接 `mem.get(k)`，同一 payload 首次写入后 `_set_memory._prep()` 会把缺失字符串补成 `''`；重放同一原始 dict 时缺失字段仍是 `None`，导致完全相同请求 fingerprint 不同、误报冲突。修：抽出 `_canonical_memory_value(field, value)` helper，`_set_memory_in_tx` 的 `_prep` 与 `_payload_fingerprint` 共用同一规范化规则（字符串 None→'' / importance→float / state_ttl_days→int/7 / resolved/anchored→canonical int|None / JSON 字段 sort_keys）。避免两套默认规则漂移 |
+| H2 | **pending skeleton CRQ 校验 fail-closed**：v2.7 只在双方 CRQ 都非空且不同时才拒绝，skeleton 已绑定 CRQ 但 incoming 忘传时会绕过校验。修：`existing_crq` 非空时**任何** `new_crq != existing_crq`（含 `new_crq` 为空）均拒绝；`existing_crq` 空 + `new_crq` 非空 → 允许 legacy skeleton 首次绑定但打 `WARN legacy_skeleton_bind` log；双方均空 → 允许升级但打 `WARN legacy_skeleton_no_crq` log |
+| L1 | line 402 章节标题"v2.6 最终版" → "v2.8 最终版" |
+
+---
+
+## v2.6 → v2.7 变更总览（3 High + 2 Medium + 1 Low，Codex 五审，存档）
 
 | 序 | 项 |
 |---|---|
@@ -399,7 +409,7 @@ def state_supersede_key(mem):
     return base + (owner_ai,)
 ```
 
-#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.6 最终版）**
+#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.8 最终版）**
 
 **分层**：
 - **public**：`commit_state_supersede_atomic()` = 包 `_write_transaction()` + 调 in_tx helper。**PR1 唯一生产入口**——`memory_ops.remember()` 分流点 + daemon 三处 CREATE 都调此。
@@ -427,20 +437,38 @@ def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
         existing_dict = dict(existing)
         existing_status = existing_dict.get('status', '')
 
-        # v2.7 H1: 按 status 分支处理
+        # v2.8 H2: 按 status 分支处理，CRQ 校验 fail-closed
         if existing_status == 'pending':
-            # async remember skeleton 升级路径：校验 CRQ 一致
+            # async remember skeleton 升级路径
             new_crq = (new_state_mem.get('client_request_id') or '').strip()
             existing_crq = (existing_dict.get('client_request_id') or '').strip()
-            if new_crq and existing_crq and new_crq != existing_crq:
-                raise IdempotencyConflict(
-                    f"pending skeleton {new_id} bound to CRQ {existing_crq!r}, "
-                    f"cannot upgrade with different CRQ {new_crq!r}"
+
+            if existing_crq:
+                # skeleton 已绑定 CRQ → incoming 必须精确匹配
+                # （包括 new_crq 为空的情况：不允许"忘传 CRQ"绕过校验）
+                if new_crq != existing_crq:
+                    raise IdempotencyConflict(
+                        f"pending skeleton {new_id} bound to CRQ {existing_crq!r}, "
+                        f"cannot upgrade with CRQ {new_crq!r}"
+                    )
+            elif new_crq:
+                # legacy skeleton 无 CRQ、incoming 带 CRQ → 允许首次绑定（走 _preserve_on_empty）
+                logger.warning(
+                    f"legacy_skeleton_bind: skeleton {new_id} had empty CRQ, "
+                    f"binding to {new_crq!r} on upgrade"
                 )
-            # 允许升级：走下面正常流程（_set_memory_in_tx 里的 _preserve_on_empty
-            # 保护 CRQ/finalize_claim_id/link_to_real_id/created_at 等 skeleton 字段）
-            # 不走 replay fingerprint（skeleton 本来就缺字段，比对无意义）
-            pass  # fall through to normal supersede path
+            else:
+                # 双方 CRQ 均空 → legacy 路径升级，打警告以便追踪
+                logger.warning(
+                    f"legacy_skeleton_no_crq: skeleton {new_id} upgrading without CRQ; "
+                    f"identity guarantee weaker than async ledger contract"
+                )
+
+            # CRQ 校验通过 → fall through 到正常 supersede path
+            # （_set_memory_in_tx 里的 _preserve_on_empty 保护 CRQ/finalize_claim_id/
+            # link_to_real_id/created_at 等 skeleton 字段；不走 replay fingerprint，
+            # 因 skeleton 本来就缺字段，比对无意义）
+            pass
 
         elif existing_status in ('active', 'superseded', 'archived', 'resolved'):
             # v2.7 H3 规则 1-3: 已终态的记忆做 idempotent 保护
@@ -545,27 +573,80 @@ conn.execute(
 ```
 `_AUDIT_COLUMNS` 加 `'operation_id'`；`insert_audit(row)` 允许 `row.get('operation_id', '')`。
 
-**v2.7 H2 `_payload_fingerprint` 扩展字段集**：
+**v2.8 H1 `_payload_fingerprint` + canonical 规范化**（消除 None/'' 漂移）：
 ```python
-# v2.7 H2: fingerprint 加入创建语义字段（info_type/source_ai/provenance_type/event_date），
-# 避免同 ID 不同来源被静默 no-op
+# v2.8 H1: canonical 规则由 _canonical_memory_value 统一，
+# _set_memory_in_tx 的 _prep 与 _payload_fingerprint 共用，避免默认值两套漂移
+
+_STRING_FIELDS = frozenset({
+    'content', 'room', 'category', 'layer', 'owner_ai', 'source_ai',
+    'source_actor_id', 'subject_id', 'context_kind', 'provenance_type',
+    'info_type', 'event_date', 'valid_from', 'valid_until',
+    'last_confirmed_at', 'client_request_id', 'link_to_real_id',
+    'source_context', 'source_platform', 'domain',  # 视 schema 补齐
+})
+_FLOAT_FIELDS = frozenset({'importance', 'fact_confidence', 'valence',
+                           'emotion_arousal', 'decay_score'})
+_INT_FIELDS = frozenset({'state_ttl_days', 'activation_count'})
+_INT_OR_NONE_FIELDS = frozenset({'resolved', 'anchored'})
+_JSON_FIELDS = frozenset({'tags', 'linked_memories', 'supersedes', 'history', 'comments'})
+_INT_DEFAULTS = {'state_ttl_days': 7}
+
+def _canonical_memory_value(field: str, value):
+    """v2.8 H1: 与 _set_memory_in_tx._prep 严格一致的字段规范化。
+    None → default（string→'', int/float→typed default, int_or_none→None, JSON→[]）
+    避免"首次写入时 _prep 补 ''、重放时 None"造成的 fingerprint 漂移。
+    """
+    if field in _STRING_FIELDS:
+        return '' if value is None else str(value)
+    if field in _FLOAT_FIELDS:
+        return 0.0 if value is None else float(value)
+    if field in _INT_FIELDS:
+        default = _INT_DEFAULTS.get(field, 0)
+        return default if (value is None or value == '') else int(value)
+    if field in _INT_OR_NONE_FIELDS:
+        return None if value in (None, '') else int(value)
+    if field in _JSON_FIELDS:
+        # 允许 list/dict/JSON str；统一序列化为 canonical JSON string
+        if value is None or value == '':
+            return '[]'
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                parsed = value
+            return json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    # 未列出的字段（timestamp / id 等）原样返回
+    return value
+
 _FINGERPRINT_FIELDS = (
     'content', 'importance', 'subject_id', 'source_actor_id',
     'owner_ai', 'room', 'category', 'layer', 'context_kind',
     'valid_from', 'valid_until', 'state_ttl_days',
-    'info_type', 'source_ai', 'provenance_type', 'event_date',  # v2.7 新增
+    'info_type', 'source_ai', 'provenance_type', 'event_date',
 )
+
 def _payload_fingerprint(mem: dict) -> str:
-    snap = {k: mem.get(k) for k in _FINGERPRINT_FIELDS}
+    snap = {k: _canonical_memory_value(k, mem.get(k)) for k in _FINGERPRINT_FIELDS}
     return hashlib.sha256(json.dumps(snap, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 ```
-主伪代码里 `SELECT *` 已确保所有字段可读到（v2.7 H2）。
+
+**关键契约**：`_set_memory_in_tx._prep(mem)` 内部也调 `_canonical_memory_value(field, value)`——写入 DB 前先规范化，与 fingerprint 用**同一函数**。任何未来加新字段只需更新 `_canonical_memory_value` 一处，两侧同步。
+
+**v2.8 H1 反例测试**：
+- `test_h1_fingerprint_stable_across_default_omission` — 首次 `commit_state_supersede_atomic(mem_dict)` 缺 `event_date / context_kind / provenance_type / valid_until`；DB 里被 `_prep` 补成 ''。同 mem_dict（依然缺这些字段）再调一次 → 第二次必须 `idempotent=True`（不再误报 conflict）
+- `test_h1_canonical_shared_between_prep_and_fingerprint` — 静态断言 `_set_memory_in_tx._prep` 内出现 `_canonical_memory_value(` 调用（AST 或直接源码检查），保证不会分裂成两套规则
 
 `IdempotencyConflict(Exception)` — 新自定义异常，`memory_ops.remember()` 分流点 catch 后包装为 `ValidationError` 返回给 client。
 
 **v2.7 H1/H2/H3 + M1 反例测试**：
 - `test_h1_pending_skeleton_upgrade_succeeds` — `insert_pending_memory(id=X)` → `remember(existing_id=X, info_type='state', ...)` → 走 pending 分支升级；CRQ/claim/link/created_at 字段被 `_preserve_on_empty` 保留
 - `test_h1_pending_skeleton_crq_mismatch_raises` — pending skeleton CRQ='req_A'，remember 传 CRQ='req_B' → `IdempotencyConflict`
+- **v2.8 H2 fail-closed 补测**：
+  - `test_v28_h2_pending_bound_crq_incoming_empty_raises` — skeleton CRQ='req_A'，incoming CRQ='' → `IdempotencyConflict`（不再 fail-open 通过）
+  - `test_v28_h2_pending_empty_crq_incoming_binds_with_warning` — skeleton CRQ=''，incoming CRQ='req_A' → 升级成功；断言 log 出现 `legacy_skeleton_bind`
+  - `test_v28_h2_pending_both_empty_upgrades_with_warning` — 双方 CRQ 空 → 升级成功；断言 log 出现 `legacy_skeleton_no_crq`
 - `test_h2_fingerprint_covers_context_kind_and_ttl` — 同 ID 只改 `context_kind` 或 `state_ttl_days` → 触发 `IdempotencyConflict`（不再静默 no-op）
 - `test_h2_fingerprint_covers_source_ai` — 同 ID 换 source_ai → `IdempotencyConflict`
 - `test_h3_same_id_same_payload_replay_is_noop` — 连调两次 → 第二次返回 `{'idempotent': True}`；DB 恰好 1 条 active；audit 恰好 1 条（定向 conflict 触发）
@@ -774,11 +855,11 @@ def state_before_snapshot(mem_row: dict) -> dict:
 | 7 | `scripts/data_health_backfill.py` plan/execute + 完整 state_before 比对 | 构造脏数据 → plan 报告 + drift 完整比对 pass | 1 d |
 | 8 | VPS backfill plan → Ceci 审 → execute | audit 每条 + rebuild_all_corridors | 0.5 d |
 
-**v2.7 总估时：11 d**（v2.1=9 → v2.2=10 → v2.3=11；v2.4/v2.5/v2.6/v2.7 不加 d，只是把契约写死 + 收敛 signature + 修 pending skeleton 分支）
+**v2.8 总估时：11 d**（v2.1=9 → v2.2=10 → v2.3=11；v2.4/v2.5/v2.6/v2.7 不加 d，只是把契约写死 + 收敛 signature + 修 pending skeleton 分支）
 
 ---
 
-## v2.7 单元测试清单（约 85 条）
+## v2.8 单元测试清单（约 85 条）
 
 - Step 0（5 条）：`nested_fail_fast` / `concurrent_no_deadlock` / `touch_and_maintenance_serialize` / `all_write_paths_use_ctx` / `lock_not_referenced_in_memory_ops`
 - 独白判定（4 条 v2.1）：`ai_about_user_not_flagged` / `source_actor_id_alone_insufficient` / `subject_ai_via_alias` / `subject_other_ai_not_flagged`
@@ -824,7 +905,7 @@ def state_before_snapshot(mem_row: dict) -> dict:
 
 ---
 
-## 附：文件改动预览 v2.7
+## 附：文件改动预览 v2.8
 
 ```
 新增：
@@ -854,17 +935,17 @@ def state_before_snapshot(mem_row: dict) -> dict:
                      + 新增 archive_stale_states step)
   conversation_capture.py (extractor prompt 加 context_kind)
   async_remember.py (finalize 传递 context_kind)
-  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.7 唯一依据)
+  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.8 唯一依据)
 ```
 
 约 17 个文件、+3000 行 additive、65 条新测试。
 
 ---
 
-## 交付流程 v2.7
+## 交付流程 v2.8
 
-1. **本方案 v2.7 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
-2. Ceci + Codex 都审 v2.7
+1. **本方案 v2.8 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
+2. Ceci + Codex 都审 v2.8
 3. 都过 → 开工分支 `phase20/pr1-data-health`
 4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-*
 5. 全套测试 415+ 通过
