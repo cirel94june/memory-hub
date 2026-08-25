@@ -1,22 +1,30 @@
-# Phase 2.0 PR1 施工方案 v2.8 · Data Health
+# Phase 2.0 PR1 施工方案 v2.9 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.8 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.9 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
-> - v1 → v2.6（作废，见既往）
-> - v2.7（作废）：Codex 五审后修 3H+2M+1L；但仍有 2 High（fingerprint 默认字段规范化不一致 → 相同 payload 首次写入后重放会误判冲突 / pending skeleton CRQ 校验 fail-open）+ 1 Low
-> - **v2.8**（本文）：Codex 六审后修 2H+1L
+> - v1 → v2.7（作废，见既往）
+> - v2.8（作废）：Codex 六审后修 2H+1L；但 `_canonical_memory_value` 重新发明类型系统，漏了 `id/status/created_at/updated_at/last_activated/superseded_by/finalize_claim_id/finalize_claim_at` 8 个字段（会写 None 进 NOT NULL 列）+ 改变 `fact_confidence` 语义（None→0.0 抹掉"未知置信度"含义）
+> - **v2.9**（本文）：Codex 七审后修 1 High——不重造类型系统，忠实抽取现有 `_prep` 为 `_prepare_memory_value`
 
 ---
 
-## v2.7 → v2.8 变更总览（2 High + 1 Low，Codex 六审）
+## v2.8 → v2.9 变更总览（1 High，Codex 七审）
+
+| 序 | 项 |
+|---|---|
+| H1 | **忠实抽取 `_prepare_memory_value`，不重造类型系统**：v2.8 引入的 `_canonical_memory_value` + `_STRING_FIELDS / _FLOAT_FIELDS / _INT_FIELDS` 遗漏 `id/status/created_at/updated_at/last_activated/superseded_by/finalize_claim_id/finalize_claim_at` 8 字段（fallback 返回 None，若 `_set_memory_in_tx._prep` 全量调用会往 NOT NULL 列写 None）；同时把 `fact_confidence=None → 0.0` 改变了"未知置信度"语义。修：把现有 `database.set_memory._prep(key)` **原样**抽成模块级 `_prepare_memory_value(key, value)`，保留 5 条既有语义（resolved/anchored → `_resolved_to_int`；comments/history → JSON；embedding 原样；fact_confidence 原样；其他 None→''）+ **新增** state_ttl_days 明确默认 7；`_set_memory_in_tx` 直接调此 helper；fingerprint 侧在这层之上再对 fingerprint 副本做 sort_keys canonical（不动持久化格式） |
+
+---
+
+## v2.7 → v2.8 变更总览（2 High + 1 Low，Codex 六审，存档）
 
 | 序 | 项 |
 |---|---|
 | H1 | **canonical fingerprint 消除默认字段漂移**：v2.7 fingerprint 直接 `mem.get(k)`，同一 payload 首次写入后 `_set_memory._prep()` 会把缺失字符串补成 `''`；重放同一原始 dict 时缺失字段仍是 `None`，导致完全相同请求 fingerprint 不同、误报冲突。修：抽出 `_canonical_memory_value(field, value)` helper，`_set_memory_in_tx` 的 `_prep` 与 `_payload_fingerprint` 共用同一规范化规则（字符串 None→'' / importance→float / state_ttl_days→int/7 / resolved/anchored→canonical int|None / JSON 字段 sort_keys）。避免两套默认规则漂移 |
 | H2 | **pending skeleton CRQ 校验 fail-closed**：v2.7 只在双方 CRQ 都非空且不同时才拒绝，skeleton 已绑定 CRQ 但 incoming 忘传时会绕过校验。修：`existing_crq` 非空时**任何** `new_crq != existing_crq`（含 `new_crq` 为空）均拒绝；`existing_crq` 空 + `new_crq` 非空 → 允许 legacy skeleton 首次绑定但打 `WARN legacy_skeleton_bind` log；双方均空 → 允许升级但打 `WARN legacy_skeleton_no_crq` log |
-| L1 | line 402 章节标题"v2.6 最终版" → "v2.8 最终版" |
+| L1 | line 402 章节标题"v2.6 最终版" → "v2.9 最终版" |
 
 ---
 
@@ -409,7 +417,7 @@ def state_supersede_key(mem):
     return base + (owner_ai,)
 ```
 
-#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.8 最终版）**
+#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.9 最终版）**
 
 **分层**：
 - **public**：`commit_state_supersede_atomic()` = 包 `_write_transaction()` + 调 in_tx helper。**PR1 唯一生产入口**——`memory_ops.remember()` 分流点 + daemon 三处 CREATE 都调此。
@@ -573,53 +581,44 @@ conn.execute(
 ```
 `_AUDIT_COLUMNS` 加 `'operation_id'`；`insert_audit(row)` 允许 `row.get('operation_id', '')`。
 
-**v2.8 H1 `_payload_fingerprint` + canonical 规范化**（消除 None/'' 漂移）：
+**v2.9 H1 `_prepare_memory_value` 忠实抽取现有 `_prep`**（不重造类型系统）：
+
+Codex 七审确认：v2.8 引入的花哨类型系统会漏 8 字段 + 改 `fact_confidence` 语义。改为直接把 `database.set_memory._prep(key)`（现在 line 1244 起）抽为模块级 helper，两侧共用，不加不减规则。
+
 ```python
-# v2.8 H1: canonical 规则由 _canonical_memory_value 统一，
-# _set_memory_in_tx 的 _prep 与 _payload_fingerprint 共用，避免默认值两套漂移
-
-_STRING_FIELDS = frozenset({
-    'content', 'room', 'category', 'layer', 'owner_ai', 'source_ai',
-    'source_actor_id', 'subject_id', 'context_kind', 'provenance_type',
-    'info_type', 'event_date', 'valid_from', 'valid_until',
-    'last_confirmed_at', 'client_request_id', 'link_to_real_id',
-    'source_context', 'source_platform', 'domain',  # 视 schema 补齐
-})
-_FLOAT_FIELDS = frozenset({'importance', 'fact_confidence', 'valence',
-                           'emotion_arousal', 'decay_score'})
-_INT_FIELDS = frozenset({'state_ttl_days', 'activation_count'})
-_INT_OR_NONE_FIELDS = frozenset({'resolved', 'anchored'})
-_JSON_FIELDS = frozenset({'tags', 'linked_memories', 'supersedes', 'history', 'comments'})
-_INT_DEFAULTS = {'state_ttl_days': 7}
-
-def _canonical_memory_value(field: str, value):
-    """v2.8 H1: 与 _set_memory_in_tx._prep 严格一致的字段规范化。
-    None → default（string→'', int/float→typed default, int_or_none→None, JSON→[]）
-    避免"首次写入时 _prep 补 ''、重放时 None"造成的 fingerprint 漂移。
-    """
-    if field in _STRING_FIELDS:
-        return '' if value is None else str(value)
-    if field in _FLOAT_FIELDS:
-        return 0.0 if value is None else float(value)
-    if field in _INT_FIELDS:
-        default = _INT_DEFAULTS.get(field, 0)
-        return default if (value is None or value == '') else int(value)
-    if field in _INT_OR_NONE_FIELDS:
-        return None if value in (None, '') else int(value)
-    if field in _JSON_FIELDS:
-        # 允许 list/dict/JSON str；统一序列化为 canonical JSON string
-        if value is None or value == '':
-            return '[]'
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except Exception:
-                parsed = value
-            return json.dumps(parsed, sort_keys=True, ensure_ascii=False)
-        return json.dumps(value, sort_keys=True, ensure_ascii=False)
-    # 未列出的字段（timestamp / id 等）原样返回
+# database.py 顶部（v2.9 H1）
+def _prepare_memory_value(key: str, value):
+    """把现有 set_memory._prep 逻辑原样抽出，供 _set_memory_in_tx / _payload_fingerprint 共用。
+    严格保留现有语义，不重造类型系统。"""
+    # 5 条既有规则（原 _prep 逐字迁入）
+    if key in ("resolved", "anchored"):
+        return _resolved_to_int(value)
+    if key in ("comments", "history"):
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return "[]"
+        return value
+    if key == "embedding":
+        return value  # bytes or None
+    if key == "fact_confidence":
+        return value  # REAL or None —— 保留 None 表"未知置信度"，不改成 0.0
+    # v2.9 新增：state_ttl_days 明确默认 7（Phase 2.0 PR1 新列，业务约定）
+    if key == "state_ttl_days":
+        return 7 if (value is None or value == "") else int(value)
+    # 其他所有字段：None → ''（与现有 _prep 一致）
+    if value is None:
+        return ""
     return value
+```
 
+**改造**：
+- `database.set_memory._prep` 内联块删除，改为调 `_prepare_memory_value(key, mem.get(key))`
+- `_set_memory_in_tx(conn, mem)` 也调 `_prepare_memory_value` 逐字段准备值
+- 生产 `set_memory()` 行为完全不变（本次抽取无副作用），只是代码位置变了
+
+**fingerprint 侧**（不改动持久化格式）：
+```python
 _FINGERPRINT_FIELDS = (
     'content', 'importance', 'subject_id', 'source_actor_id',
     'owner_ai', 'room', 'category', 'layer', 'context_kind',
@@ -628,15 +627,21 @@ _FINGERPRINT_FIELDS = (
 )
 
 def _payload_fingerprint(mem: dict) -> str:
-    snap = {k: _canonical_memory_value(k, mem.get(k)) for k in _FINGERPRINT_FIELDS}
-    return hashlib.sha256(json.dumps(snap, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    # 先按 _prepare_memory_value 规范化（拉齐 None/'' 漂移）
+    prepared = {k: _prepare_memory_value(k, mem.get(k)) for k in _FINGERPRINT_FIELDS}
+    # 再对 fingerprint **副本** 做 sort_keys canonical（仅影响哈希输入，不落库）
+    return hashlib.sha256(
+        json.dumps(prepared, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
 ```
 
-**关键契约**：`_set_memory_in_tx._prep(mem)` 内部也调 `_canonical_memory_value(field, value)`——写入 DB 前先规范化，与 fingerprint 用**同一函数**。任何未来加新字段只需更新 `_canonical_memory_value` 一处，两侧同步。
-
-**v2.8 H1 反例测试**：
-- `test_h1_fingerprint_stable_across_default_omission` — 首次 `commit_state_supersede_atomic(mem_dict)` 缺 `event_date / context_kind / provenance_type / valid_until`；DB 里被 `_prep` 补成 ''。同 mem_dict（依然缺这些字段）再调一次 → 第二次必须 `idempotent=True`（不再误报 conflict）
-- `test_h1_canonical_shared_between_prep_and_fingerprint` — 静态断言 `_set_memory_in_tx._prep` 内出现 `_canonical_memory_value(` 调用（AST 或直接源码检查），保证不会分裂成两套规则
+**v2.9 H1 覆盖测试**：
+- `test_h1_prepare_helper_covers_all_columns` — 遍历 `_ALL_COLUMNS`，每列调 `_prepare_memory_value(col, None)` 断言不 raise 且返回值符合列 SQL 类型的合法值（NOT NULL 列返回非 None）
+- `test_h1_prepare_helper_fact_confidence_none_stays_none` — `_prepare_memory_value('fact_confidence', None) is None`（保留 SQL NULL 语义）
+- `test_h1_prepare_helper_state_ttl_default_7` — `_prepare_memory_value('state_ttl_days', None) == 7` / `('state_ttl_days', '') == 7`
+- `test_h1_set_memory_behavior_unchanged` — 保留一份 v2.8 前 `set_memory` 输入/输出 golden 数据；抽取后跑同一份数据断言 DB row 逐字段完全一致
+- `test_h1_fingerprint_stable_across_default_omission` — 首次 `commit_state_supersede_atomic(mem_dict)` 缺 `event_date / context_kind / provenance_type / valid_until`；DB 里被 `_prepare_memory_value` 补成 ''。同 mem_dict 再调一次 → 第二次 `idempotent=True`
+- `test_h1_prep_and_fingerprint_share_helper` — 静态断言（源码 grep 或 AST）`_set_memory_in_tx` + `_payload_fingerprint` 都调用 `_prepare_memory_value`，且 `database.py` 中 `_prep` 内联块已删除（避免两套规则）
 
 `IdempotencyConflict(Exception)` — 新自定义异常，`memory_ops.remember()` 分流点 catch 后包装为 `ValidationError` 返回给 client。
 
@@ -855,11 +860,11 @@ def state_before_snapshot(mem_row: dict) -> dict:
 | 7 | `scripts/data_health_backfill.py` plan/execute + 完整 state_before 比对 | 构造脏数据 → plan 报告 + drift 完整比对 pass | 1 d |
 | 8 | VPS backfill plan → Ceci 审 → execute | audit 每条 + rebuild_all_corridors | 0.5 d |
 
-**v2.8 总估时：11 d**（v2.1=9 → v2.2=10 → v2.3=11；v2.4/v2.5/v2.6/v2.7 不加 d，只是把契约写死 + 收敛 signature + 修 pending skeleton 分支）
+**v2.9 总估时：11 d**（v2.1=9 → v2.2=10 → v2.3=11；v2.4/v2.5/v2.6/v2.7 不加 d，只是把契约写死 + 收敛 signature + 修 pending skeleton 分支）
 
 ---
 
-## v2.8 单元测试清单（约 85 条）
+## v2.9 单元测试清单（约 85 条）
 
 - Step 0（5 条）：`nested_fail_fast` / `concurrent_no_deadlock` / `touch_and_maintenance_serialize` / `all_write_paths_use_ctx` / `lock_not_referenced_in_memory_ops`
 - 独白判定（4 条 v2.1）：`ai_about_user_not_flagged` / `source_actor_id_alone_insufficient` / `subject_ai_via_alias` / `subject_other_ai_not_flagged`
@@ -905,7 +910,7 @@ def state_before_snapshot(mem_row: dict) -> dict:
 
 ---
 
-## 附：文件改动预览 v2.8
+## 附：文件改动预览 v2.9
 
 ```
 新增：
@@ -935,17 +940,17 @@ def state_before_snapshot(mem_row: dict) -> dict:
                      + 新增 archive_stale_states step)
   conversation_capture.py (extractor prompt 加 context_kind)
   async_remember.py (finalize 传递 context_kind)
-  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.8 唯一依据)
+  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.9 唯一依据)
 ```
 
 约 17 个文件、+3000 行 additive、65 条新测试。
 
 ---
 
-## 交付流程 v2.8
+## 交付流程 v2.9
 
-1. **本方案 v2.8 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
-2. Ceci + Codex 都审 v2.8
+1. **本方案 v2.9 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
+2. Ceci + Codex 都审 v2.9
 3. 都过 → 开工分支 `phase20/pr1-data-health`
 4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-*
 5. 全套测试 415+ 通过
