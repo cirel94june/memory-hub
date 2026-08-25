@@ -1,16 +1,29 @@
-# Phase 2.0 PR1 施工方案 v2.6 · Data Health
+# Phase 2.0 PR1 施工方案 v2.7 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.6 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.7 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
-> - v1 → v2.4（作废，见既往）
-> - v2.5（作废）：Codex 三审后按现有生产 signature 收敛 4H+3M+1L；但仍有 3 High（auto-resolve 循环依赖 / read helpers 清单漏 11 个 + 写错 1 个 / state self-supersede 修法只写在测试没进主伪代码）+ 2 Medium（24h audit 去重不是真幂等 / v2.4 残留 callsite 冲突）+ 2 Low
-> - **v2.6**（本文）：Codex 四审后修 3 High + 2 Medium + 2 Low
+> - v1 → v2.5（作废，见既往）
+> - v2.6（作废）：Codex 四审后修 3H+2M+2L；但仍有 3 High（pending skeleton 会被误判 IdempotencyConflict / fingerprint SELECT 字段不全 / INSERT OR IGNORE 吞掉非幂等错误）+ 2 Medium（operation_id migration 契约不完整 / AST 测试描述夸大）+ 1 Low（v2.5 残留）
+> - **v2.7**（本文）：Codex 五审后修 3H+2M+1L
 
 ---
 
-## v2.5 → v2.6 变更总览（3 High + 2 Medium + 2 Low，Codex 四审）
+## v2.6 → v2.7 变更总览（3 High + 2 Medium + 1 Low，Codex 五审）
+
+| 序 | 项 |
+|---|---|
+| H1 | **pending skeleton 分支处理**：v2.6 主伪代码对任何已存在 ID 都做 fingerprint 比较，会把 async remember 的 pending 骨架（缺 `subject_id/context_kind/state_ttl_days` 等字段）判成 `IdempotencyConflict`，所有 async state 系统性失败。修：按 `existing.status` 分支——`pending` → 校验 `client_request_id` 一致后允许升级（走 `_set_memory_in_tx` 复用现有 `_preserve_on_empty` 保护 CRQ/claim/link）；`active/superseded/archived` → 才走 replay fingerprint 逻辑 |
+| H2 | **fingerprint 查询字段完整**：v2.6 SELECT 只取 8 字段但 `_payload_fingerprint` 用了 12 字段，剩下 4 个在 existing_dict 里是 None，同 payload 也判不同。改 `SELECT *` 读全字段；fingerprint 字段集扩展加 `info_type/source_ai/provenance_type/event_date`，避免同 ID 不同来源被静默 no-op |
+| H3 | **audit 用定向 conflict 而非宽泛 IGNORE**：v2.6 `INSERT OR IGNORE` 会吞其他约束错误（NOT NULL 违反、FK 等），导致 state 已 supersede 但 audit 缺失。改为 `INSERT ... ON CONFLICT(action, target_id, operation_id) WHERE operation_id != '' DO NOTHING`——只静默幂等重放，其他错误抛出让整个 tx 回滚 |
+| M1 | **operation_id migration 契约完整**：`ALTER TABLE` 前用 `PRAGMA table_info` 检查列是否已存在（幂等 migration）；`_AUDIT_COLUMNS` 加 `operation_id`；补 `test_m1_init_db_rerun_after_migration` 断言老 DB 重跑 `init_db()` 不 fail |
+| M2 | **AST 测试描述改准确**：v2.6 声称"未来新增 pure read 自动报错"不成立（新函数没加入名单不会检查）。改：维护显式 `_PURE_READ_HELPERS: frozenset[str]` 清单在 database.py 顶部，AST 测试断言"名单内每个函数体不含 `_get_conn()` + 名单穷举 database.py 所有 public 非下划线纯 SELECT 函数"，双向对齐 |
+| L1 | v2.5 残留（总实施方案 + 本文 4 处）统一改 v2.7 |
+
+---
+
+## v2.5 → v2.6 变更总览（3 High + 2 Medium + 2 Low，Codex 四审，存档）
 
 | 序 | 项 |
 |---|---|
@@ -249,10 +262,21 @@
 
    **规则**：内部逻辑若确实需要读**未提交**数据（如原子事务里先 SELECT 再 UPDATE），必须显式接受 `conn` 参数（属于 in_tx helper 系列，如 `_state_supersede_in_tx` 里的查旧）。上层 `memory_ops` / `corridor` / `smart_context` / `gateway` / `mcp_server` / `main` 通过调 database public helpers 间接迁移，无需自己动 `_get_conn()`。
 
-   **v2.6 H2 测试**：`test_h2_all_pure_reads_use_read_conn`：AST 解析 `database.py`，对上表 26 个函数每个函数体：
-   - 允许出现 `_get_read_conn()` 调用（≥1）
-   - 禁止出现 `_get_conn()` 调用
-   - 未来若新增 pure read helper 忘迁 → 立即红（比 grep 更严格，因 grep 可能被"路径不匹配"绕过）
+   **v2.7 H2 + M2 测试**：显式维护清单双向对齐：
+   ```python
+   # database.py 顶部
+   _PURE_READ_HELPERS: frozenset[str] = frozenset({
+       'get_memory', 'get_memory_by_client_request_id', 'list_stale_intent_ledgers',
+       'get_ledger', 'list_memories_by_status', 'query_memories', 'count_memories',
+       'get_proposal', 'list_proposals', 'count_proposals', 'list_audits', 'count_audits',
+       'get_profile', 'list_profiles', 'vector_search', 'fts_search', 'cjk_like_search',
+       'get_all_memory_ids', 'get_memories_batch', 'iter_memories', 'get_person',
+       'list_persons', 'get_memories_by_subject', 'count_memories_by_subject',
+       'resolve_alias', 'get_all_aliases',
+   })
+   ```
+   - `test_h2_pure_reads_use_read_conn` — AST 遍历 `_PURE_READ_HELPERS` 每个函数体：允许 `_get_read_conn()` 调用；**禁止** `_get_conn()` 调用
+   - `test_m2_pure_reads_inventory_synced` — AST 扫 database.py 所有 public 非下划线函数，如果函数体是纯 SELECT（无 INSERT/UPDATE/DELETE/CREATE，无 `commit_*`/`ALTER`）且**不在** `_PURE_READ_HELPERS`、也不在写函数白名单 → fail 提示"疑似新加 pure read，请加入清单或加 skip 注释"。双向对齐避免"新函数漏加名单也不报错"。
 
    **v2.5 M2 修正——`_get_read_conn()` 加 DB_PATH 失效机制**（Codex 复审确认现状是 `threading.local` 缓存，缺失效）：
    ```python
@@ -394,28 +418,52 @@ def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
     subj, cat, room, layer, owner = key
     new_id = new_state_mem['id']
 
-    # v2.6 H3 规则 1-3: idempotent 保护
+    # v2.7 H2: SELECT * 读全字段，保证 fingerprint 所有字段可对比
     existing = conn.execute(
-        "SELECT id, status, content, subject_id, category, room, layer, owner_ai "
-        "FROM memories WHERE id = ?", (new_id,)
+        "SELECT * FROM memories WHERE id = ?", (new_id,)
     ).fetchone()
+
     if existing is not None:
         existing_dict = dict(existing)
-        existing_key = state_supersede_key(existing_dict)
-        # 计算 payload fingerprint（内容 + 关键字段）
-        new_fp = _payload_fingerprint(new_state_mem)
-        existing_fp = _payload_fingerprint(existing_dict)
-        if existing_dict['status'] == 'active' and existing_key == key and existing_fp == new_fp:
-            # 规则 2: 完全相同的 idempotent 重放 → no-op
+        existing_status = existing_dict.get('status', '')
+
+        # v2.7 H1: 按 status 分支处理
+        if existing_status == 'pending':
+            # async remember skeleton 升级路径：校验 CRQ 一致
+            new_crq = (new_state_mem.get('client_request_id') or '').strip()
+            existing_crq = (existing_dict.get('client_request_id') or '').strip()
+            if new_crq and existing_crq and new_crq != existing_crq:
+                raise IdempotencyConflict(
+                    f"pending skeleton {new_id} bound to CRQ {existing_crq!r}, "
+                    f"cannot upgrade with different CRQ {new_crq!r}"
+                )
+            # 允许升级：走下面正常流程（_set_memory_in_tx 里的 _preserve_on_empty
+            # 保护 CRQ/finalize_claim_id/link_to_real_id/created_at 等 skeleton 字段）
+            # 不走 replay fingerprint（skeleton 本来就缺字段，比对无意义）
+            pass  # fall through to normal supersede path
+
+        elif existing_status in ('active', 'superseded', 'archived', 'resolved'):
+            # v2.7 H3 规则 1-3: 已终态的记忆做 idempotent 保护
+            existing_key = state_supersede_key(existing_dict)
+            new_fp = _payload_fingerprint(new_state_mem)
+            existing_fp = _payload_fingerprint(existing_dict)
+            if existing_status == 'active' and existing_key == key and existing_fp == new_fp:
+                # 规则 2: 完全相同的 idempotent 重放 → no-op
+                return {'inserted_id': new_id, 'superseded_ids': [], 'idempotent': True}
+            if existing_fp != new_fp:
+                # 规则 3: 同 ID 但 payload 不同 → 禁止覆盖
+                raise IdempotencyConflict(
+                    f"memory id {new_id} already exists (status={existing_status}) "
+                    f"with different payload; caller must use fresh id or explicit update path"
+                )
+            # 同 ID 同 payload 但已 superseded/archived/resolved → no-op（避免复活死记忆）
             return {'inserted_id': new_id, 'superseded_ids': [], 'idempotent': True}
-        if existing_fp != new_fp:
-            # 规则 3: 同 ID 但 payload 不同 → 禁止覆盖
+
+        else:
+            # 未知 status → 保守视为冲突
             raise IdempotencyConflict(
-                f"memory id {new_id} already exists with different payload; "
-                f"caller must use fresh id or explicit update path"
+                f"memory id {new_id} exists with unknown status {existing_status!r}"
             )
-        # 同 ID 同 payload 但已 superseded → 也当 no-op（避免复活死记忆）
-        return {'inserted_id': new_id, 'superseded_ids': [], 'idempotent': True}
 
     # v2.6 H3 规则 4: 查旧加 AND id <> ?
     # 1) 事务内重新查所有匹配 active（排除新 id 自身）
@@ -450,14 +498,15 @@ def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
              _now_iso(), old_id)
         )
 
-    # 4) audit — v2.6 M1: 永久幂等，靠 (action, target_id, operation_id) UNIQUE 索引
-    #    默认 operation_id = state_supersede:{new_id} —— 同 target_id 只允许一条 state_supersede audit
+    # 4) audit — v2.7 H3: 定向 conflict（只静默幂等重放，不吞其他约束错误）
     operation_id = f"state_supersede:{new_id}"
     conn.execute(
-        "INSERT OR IGNORE INTO maintenance_audit "
+        "INSERT INTO maintenance_audit "
         "(action, target_id, operation_id, new_content, "
         "decision_reason, state_before, state_after, source_ai, "
-        "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(action, target_id, operation_id) "
+        "WHERE operation_id != '' DO NOTHING",
         ('state_supersede', new_id, operation_id,
          new_state_mem.get('content', ''),
          f'new state supersedes {len(old_ids)} old',
@@ -482,32 +531,49 @@ def commit_state_supersede_atomic(new_state_mem, key, source_ai):
 2. `daemon.compress_diaries:139` / `daemon.archive_old_work:235` / `daemon.distill_psychology:385` **三处** iteration 内合成 state 时 → 调 `commit_state_supersede_atomic(...)`
 3. **不改** `commit_finalize_atomic`（现签名只做 ledger + skeleton 终态；`memory_ops.remember()` 已经落库 state；async pipeline "LLM 只生成 write intent、最终统一事务落库"的重构远超 PR1 范围）
 
-**v2.6 H3 + M1 schema 支撑**：
-```sql
--- database.init_db() migration 段新增
-ALTER TABLE maintenance_audit ADD COLUMN operation_id TEXT NOT NULL DEFAULT '';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_op_unique
-  ON maintenance_audit(action, target_id, operation_id)
-  WHERE operation_id != '';  -- 部分索引，空值不参与唯一约束（兼容存量）
-```
-
-`_payload_fingerprint(mem)` helper：
+**v2.7 H3 + M1 schema 支撑（幂等 migration）**：
 ```python
-_FINGERPRINT_FIELDS = ('content', 'importance', 'subject_id', 'source_actor_id',
-                       'owner_ai', 'room', 'category', 'layer', 'context_kind',
-                       'valid_from', 'valid_until', 'state_ttl_days')
+# database.init_db() migration 段
+audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
+if 'operation_id' not in audit_cols:  # v2.7 M1: 幂等 migration
+    conn.execute("ALTER TABLE maintenance_audit ADD COLUMN operation_id TEXT NOT NULL DEFAULT ''")
+conn.execute(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_op_unique "
+    "ON maintenance_audit(action, target_id, operation_id) "
+    "WHERE operation_id != ''"  # 部分索引：空值不参与唯一约束（兼容存量）
+)
+```
+`_AUDIT_COLUMNS` 加 `'operation_id'`；`insert_audit(row)` 允许 `row.get('operation_id', '')`。
+
+**v2.7 H2 `_payload_fingerprint` 扩展字段集**：
+```python
+# v2.7 H2: fingerprint 加入创建语义字段（info_type/source_ai/provenance_type/event_date），
+# 避免同 ID 不同来源被静默 no-op
+_FINGERPRINT_FIELDS = (
+    'content', 'importance', 'subject_id', 'source_actor_id',
+    'owner_ai', 'room', 'category', 'layer', 'context_kind',
+    'valid_from', 'valid_until', 'state_ttl_days',
+    'info_type', 'source_ai', 'provenance_type', 'event_date',  # v2.7 新增
+)
 def _payload_fingerprint(mem: dict) -> str:
     snap = {k: mem.get(k) for k in _FINGERPRINT_FIELDS}
     return hashlib.sha256(json.dumps(snap, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 ```
+主伪代码里 `SELECT *` 已确保所有字段可读到（v2.7 H2）。
 
 `IdempotencyConflict(Exception)` — 新自定义异常，`memory_ops.remember()` 分流点 catch 后包装为 `ValidationError` 返回给 client。
 
-**v2.6 H3 + M1 反例测试**：
-- `test_h3_same_id_same_payload_replay_is_noop` — 连调两次 → 第二次返回 `{'idempotent': True}`；DB 恰好 1 条 active；audit 恰好 1 条（`INSERT OR IGNORE` 触发）
-- `test_h3_same_id_diff_payload_raises_conflict` — 同 ID 改 content → 抛 `IdempotencyConflict`；DB 里 existing row 不变
+**v2.7 H1/H2/H3 + M1 反例测试**：
+- `test_h1_pending_skeleton_upgrade_succeeds` — `insert_pending_memory(id=X)` → `remember(existing_id=X, info_type='state', ...)` → 走 pending 分支升级；CRQ/claim/link/created_at 字段被 `_preserve_on_empty` 保留
+- `test_h1_pending_skeleton_crq_mismatch_raises` — pending skeleton CRQ='req_A'，remember 传 CRQ='req_B' → `IdempotencyConflict`
+- `test_h2_fingerprint_covers_context_kind_and_ttl` — 同 ID 只改 `context_kind` 或 `state_ttl_days` → 触发 `IdempotencyConflict`（不再静默 no-op）
+- `test_h2_fingerprint_covers_source_ai` — 同 ID 换 source_ai → `IdempotencyConflict`
+- `test_h3_same_id_same_payload_replay_is_noop` — 连调两次 → 第二次返回 `{'idempotent': True}`；DB 恰好 1 条 active；audit 恰好 1 条（定向 conflict 触发）
+- `test_h3_same_id_diff_payload_raises_conflict` — 同 ID 改 content → 抛 `IdempotencyConflict`
 - `test_h3_supersede_excludes_self` — 断言 `superseded_by` 永不指向自己
-- `test_m1_audit_permanent_idempotent_across_days` — 手动改 audit `created_at` 为 30 天前，再重放 → audit 仍恰好 1 条（M1 永久幂等，非 24h 窗口）
+- `test_h3_audit_other_constraint_error_propagates` — mock audit 的 `NOT NULL source_ai` 违反 → 断言事务回滚（不被 `ON CONFLICT DO NOTHING` 吞掉）
+- `test_m1_init_db_rerun_after_migration_is_noop` — 老 DB 已有 `operation_id` 列 → 再次 `init_db()` 不 fail、不重复 ALTER
+- `test_m1_audit_permanent_idempotent_across_days` — 手动改 audit `created_at` 为 30 天前，再重放 → audit 仍恰好 1 条（永久幂等）
 
 **关键 v2.3（H5）**：**不新造缩水版 INSERT**。改从现有 `set_memory()` 抽取核心逻辑到 `_set_memory_in_tx(conn, mem)` 内部 helper：
 - 完整 UPSERT `memories` 表（含 `_preserve_on_empty` / `_preserve_always` 处理，保护 `client_request_id` / `finalize_claim_id` / `link_to_real_id` / `created_at` 等字段不被空值覆盖）
@@ -708,11 +774,11 @@ def state_before_snapshot(mem_row: dict) -> dict:
 | 7 | `scripts/data_health_backfill.py` plan/execute + 完整 state_before 比对 | 构造脏数据 → plan 报告 + drift 完整比对 pass | 1 d |
 | 8 | VPS backfill plan → Ceci 审 → execute | audit 每条 + rebuild_all_corridors | 0.5 d |
 
-**v2.5 总估时：11 d**（v2.1=9 → v2.2=10 +1d for Step 0 全量迁移 + State supersede 原子化；v2.3=11 +1d for activity_log 迁移 + 读连接迁移 + `_set_memory_in_tx` 抽取；v2.4/v2.5 不加 d，只是把契约写死 + 收敛 signature）
+**v2.7 总估时：11 d**（v2.1=9 → v2.2=10 → v2.3=11；v2.4/v2.5/v2.6/v2.7 不加 d，只是把契约写死 + 收敛 signature + 修 pending skeleton 分支）
 
 ---
 
-## v2.5 单元测试清单（约 75 条）
+## v2.7 单元测试清单（约 85 条）
 
 - Step 0（5 条）：`nested_fail_fast` / `concurrent_no_deadlock` / `touch_and_maintenance_serialize` / `all_write_paths_use_ctx` / `lock_not_referenced_in_memory_ops`
 - 独白判定（4 条 v2.1）：`ai_about_user_not_flagged` / `source_actor_id_alone_insufficient` / `subject_ai_via_alias` / `subject_other_ai_not_flagged`
@@ -758,7 +824,7 @@ def state_before_snapshot(mem_row: dict) -> dict:
 
 ---
 
-## 附：文件改动预览 v2.5
+## 附：文件改动预览 v2.7
 
 ```
 新增：
@@ -788,17 +854,17 @@ def state_before_snapshot(mem_row: dict) -> dict:
                      + 新增 archive_stale_states step)
   conversation_capture.py (extractor prompt 加 context_kind)
   async_remember.py (finalize 传递 context_kind)
-  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.5 唯一依据)
+  docs/phase20-implementation-plan.md (PR1 章节同步 → v2.7 唯一依据)
 ```
 
 约 17 个文件、+3000 行 additive、65 条新测试。
 
 ---
 
-## 交付流程 v2.5
+## 交付流程 v2.7
 
-1. **本方案 v2.6 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
-2. Ceci + Codex 都审 v2.6
+1. **本方案 v2.7 推分支** `phase20/pr1-plan-v3`（含 implementation-plan.md 同步）
+2. Ceci + Codex 都审 v2.7
 3. 都过 → 开工分支 `phase20/pr1-data-health`
 4. **Step 0 独立提交 + Codex 复审 pass 后**才继续 D-*
 5. 全套测试 415+ 通过

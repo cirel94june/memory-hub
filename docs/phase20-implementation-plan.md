@@ -94,9 +94,9 @@
 
 > **⚠️ 本章节已作废**（2026-08-21）
 >
-> PR1 唯一施工依据是 **[phase20-PR1-施工方案.md v2.5](phase20-PR1-施工方案.md)**（含 Step 0 共享写锁真正闭环 / State supersede 原子化 / shared layer key 分层 / context_kind 全链路 / observe→redirect→strict 三阶段上线等 v2.5 收敛）。
+> PR1 唯一施工依据是 **[phase20-PR1-施工方案.md v2.7](phase20-PR1-施工方案.md)**（含 Step 0 共享写锁真正闭环 / State supersede 原子化 / shared layer key 分层 / context_kind 全链路 / observe→redirect→strict 三阶段上线等 v2.7 收敛）。
 >
-> 本节以下所有内容（4 列 migration / 文本"我"独白判定 / source_context isolation / 15 处 write / 7 天工期）**均已被 v2.5 覆盖**，仅作历史存档保留。施工方看到本节请立刻跳到 v2.5 文档。
+> 本节以下所有内容（4 列 migration / 文本"我"独白判定 / source_context isolation / 15 处 write / 7 天工期）**均已被 v2.7 覆盖**，仅作历史存档保留。施工方看到本节请立刻跳到 v2.7 文档。
 
 ## Q1｜要解决什么问题？
 
