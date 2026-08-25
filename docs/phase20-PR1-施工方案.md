@@ -1,6 +1,6 @@
-# Phase 2.0 PR1 施工方案 v2.3 · Data Health
+# Phase 2.0 PR1 施工方案 v2.4 · Data Health
 
-> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.3 pass 后开）
+> 分支：本文推送分支 `phase20/pr1-plan-v3`（doc-only）；开工分支 `phase20/pr1-data-health`（v2.4 pass 后开）
 > 依赖：Phase 1.7 全部合并（main 至 `604bc72`）
 >
 > **版本历史**：
@@ -8,11 +8,25 @@
 > - v2：Codex 审后收敛 2C+6H+6M
 > - v2.1（作废）：user 一审后修 H3/H1，但 H3 仍未闭环、State supersede 非原子、总方案未同步
 > - v2.2（作废）：user 二审后修 5 High + 7 Medium；但 `927be84` 意外夹带 5 个生产代码回退（`3494ed0` 已修）；且 v2.2 方案本身仍有 5 High + 5 Medium gap
-> - **v2.3**（本文）：user 三审后修事务原子性 / activity_log 遗漏 / 锁封装契约 / 读连接一致性 / state 落库真路径
+> - v2.3（作废）：user 三审后修事务原子性 / activity_log / 锁封装契约 / 读连接一致性 / state 落库真路径
+> - **v2.4**（本文）：Claude 戴夜鹭帽子自审后收 3 High + 3 Medium（finalize/daemon 遇 state 无路径 / auto_resolve TOCTOU / drift check 签名 / daemon 校验层级 / grep 范围 / read_conn 线程模型）
 
 ---
 
-## v2.2 → v2.3 变更总览（5 High + 5 Medium）
+## v2.3 → v2.4 变更总览（3 High + 3 Medium，Claude 自审）
+
+| 序 | 项 |
+|---|---|
+| H-A | 抽 `_state_supersede_in_tx(conn, ...)` 内部 helper；`commit_state_supersede_atomic` 只作 public wrapper；finalize / daemon 已在 tx 内的调用者直接调 in_tx helper，避免嵌套 `_write_transaction()` 撞 RuntimeError |
+| H-B | `check_auto_resolve_atomic(mem_id, new_content, trigger_pattern) -> {'resolved': bool, 'audit_id': int\|None}` signature 定死；读 + regex + 写全在同一 `_write_transaction()` 内（regex 纯 CPU <1ms/条），避免 TOCTOU |
+| H-C | Backfill `pre_execute_check` 补 3 参数：`(conn, current_row, plan_state_before)`；hash 对比在事务内完成 |
+| M-A | daemon `try/except ValidationError` **wrap 位置落到每个 step 内 for 循环单次 iteration 最外层**（不塞 helper） |
+| M-B | 所有 `git grep` 静态断言加 `':!tests/'` 排除测试目录，避免 fixture 用共享 conn 触发假红 |
+| M-C | 开工前 spike 10 分钟确认 `_get_read_conn()` 是模块级单例还是 `threading.local()` 每线程一个；结论写进 Step 0 commit message |
+
+---
+
+## v2.2 → v2.3 变更总览（5 High + 5 Medium，存档）
 
 **Critical 已处理**（不列入本表）：`927be84` 代码回退 → `3494ed0` fixup restore。
 
@@ -161,25 +175,36 @@
                _WRITE_LOCK.release()
    ```
 
-3. **公开的 database.py atomic helpers**（H3 + H2）— `memory_ops` 只调这些，从不接触 ctx：
+3. **公开的 database.py atomic helpers** — `memory_ops` 只调这些，从不接触 ctx：
    - 现有：`commit_maintenance_atomic` / `commit_finalize_atomic` / `close_stale_intent_atomic` / `set_memory` / `insert_pending_memory` / `update_memory_status` / `mark_replaced` / `close_stale_intent` / `write_intent_ledger` 全部改造为**内部包 `with _write_transaction()`**。
    - **v2.3 新增**（H3 支撑）：
      - `touch_recalled_memories_atomic(mem_ids: list[str], now_iso: str) -> None` — 原 `memory_ops._touch_recalled_memories:737` 的写部分迁入
-     - `check_auto_resolve_atomic(...)` — 原 `memory_ops._check_auto_resolve:847` 的写部分迁入
+     - `check_auto_resolve_atomic(mem_id: str, new_content: str, trigger_pattern: re.Pattern) -> dict` — **v2.4 H-B 定死 signature**。读候选内容 + regex 匹配 + 写 resolved 三步**全在同一 `_write_transaction()` 内**，避免 TOCTOU（regex 是纯 CPU，持锁 <1ms/条，可接受）。返回 `{'resolved': bool, 'audit_id': int|None}`。原 `memory_ops._check_auto_resolve:847` 整段迁入。
    - **v2.3 新增**（H2 activity_log 归位）：
      - `init_db()` 里加 `CREATE TABLE IF NOT EXISTS activity_log ...`（从 `activity_log.py:123` 迁入）
      - `append_activity_log_atomic(row: dict) -> None` — INSERT
      - `trim_activity_log_atomic(keep_last_n: int) -> None` — 清理
+   - **v2.4 新增**（H-A finalize/daemon 遇 state 无路径）：
+     - `_state_supersede_in_tx(conn, new_mem, key, source_ai) -> dict` — 内部 helper（不自持锁，需在已开 tx 的 conn 上调用）。含"事务内重新查旧 → `_set_memory_in_tx` 插新 → 全部旧 → superseded → 写 audit"。与 `_set_memory_in_tx` 平行。
+     - `commit_state_supersede_atomic(new_mem, key, source_ai)` = `with _write_transaction() as conn: return _state_supersede_in_tx(conn, ...)` — 供 `memory_ops.remember()` 分流点调用。
+     - `commit_finalize_atomic` 内部升级 state 时**直接调 `_state_supersede_in_tx(conn, ...)`**（已在 tx 内，不能调 public helper）。
+     - daemon 三处 CREATE 若合成 state，同样直接调 `_state_supersede_in_tx`（若走 daemon 已有的 `commit_maintenance_atomic` tx 内），或走 public `commit_state_supersede_atomic`（若在自己独立 tx 里）。
 
 4. **`activity_log.py` v2.3 改造**（H2）：删掉自己的 `_get_conn()` + 建表 + INSERT + DELETE + `conn.commit()`；改为 `from database import append_activity_log_atomic, trim_activity_log_atomic`。
 
 5. **读连接一致性**（H4）：**生产读路径全部走 `_get_read_conn()`**（PRAGMA query_only=ON 独立只读连接，无 tx 参与，看不到其他线程未提交状态）。grep 断言：非 database.py 的生产模块中不允许出现 `database._get_conn()` 或 `_get_conn()` 用于读。已有的 `_get_read_conn` 在 `database.py:35` — 只需把 `memory_ops` / `corridor` / `smart_context` / `gateway` / `mcp_server` / `main` 里所有读路径迁过去。
 
-6. **grep 断言全套**（H3 + H4 支撑）：
-   - `git grep -n "_write_transaction\|_WRITE_LOCK" -- '*.py'` → 只在 `database.py` 和 `tests/test_write_lock_step0.py` 出现
-   - `git grep -nE "database\._get_conn|\bfrom database import _get_conn" -- '*.py'` → 只在 `database.py` 内部出现（生产模块禁用）
+   **v2.4 M-C：开工前 spike 10 分钟**确认 `_get_read_conn()` 的线程模型：
+   - 若是模块级单例 → 多线程并发读会串到同一 sqlite conn（Python `check_same_thread` default），性能不行 → 改成 `threading.local()` 缓存每线程一个 read_conn。
+   - 若是每次 new 一个新连接 → 有 close pattern 才不泄漏 → 检查是否有 context manager / `weakref`。
+   - spike 结论写进 Step 0 提交的 commit message，Codex 复审时对照现状看。
+
+6. **grep 断言全套**（H3 + H4 支撑；**v2.4 M-B**：全部加 `':!tests/'` 排除测试目录，避免 fixture 用共享 conn 触发假红）：
+   - `git grep -nE "_write_transaction|_WRITE_LOCK" -- '*.py' ':!tests/'` → **只在 `database.py` 出现**（生产模块 + scripts/ 均禁用）
+   - `git grep -nE "database\._get_conn|\bfrom database import _get_conn" -- '*.py' ':!tests/'` → 只在 `database.py` 内部出现
    - `git grep -n "conn.commit()" database.py` → 只在 `init_db()` 出现
    - `git grep -n "database\._get_conn" activity_log.py` → 0 命中
+   - `git grep -nE "database\._get_conn" -- 'memory_ops.py' 'corridor.py' 'smart_context.py' 'gateway.py' 'mcp_server.py' 'main.py'` → 0 命中（读全走 `_get_read_conn`）
 
 7. **dream.py 独立连接豁免**：docstring 明写，审计表记 exemption。
 
@@ -258,66 +283,71 @@ def state_supersede_key(mem):
     return base + (owner_ai,)
 ```
 
-#### **`commit_state_supersede_atomic()`（v2.2 新增，真正原子）**
+#### **`commit_state_supersede_atomic()` + `_state_supersede_in_tx()`（v2.2 引入，v2.4 H-A 分离）**
 
-单锁单事务内完成：**重新查旧行 → 插新 state → 转全部旧 active state 为 superseded → 写 audit**。任何一步失败全部回滚。
+**v2.4 分层**：
+- **public**：`commit_state_supersede_atomic()` = 包 `_write_transaction()` + 调 in_tx helper。给 `memory_ops.remember()` 分流点用（起点无 tx）。
+- **internal**：`_state_supersede_in_tx(conn, new_mem, key, source_ai)` — 不自持锁 / 不自开事务，接受已开 tx 的 conn。给 `commit_finalize_atomic` 已在 tx 内 + daemon 已在 tx 内的调用者用。**避免嵌套 `_write_transaction()` 撞 RuntimeError**。
 
 ```python
 # database.py
-def commit_state_supersede_atomic(
-    new_state_mem: dict,       # 完整字段，含 id / valid_from / …
-    key: tuple,                # state_supersede_key(new_state_mem)
-    source_ai: str,
-) -> dict:
-    """返回 {'inserted_id': ..., 'superseded_ids': [...]}"""
+
+def _state_supersede_in_tx(conn, new_state_mem, key, source_ai):
+    """内部 helper — 已在 tx 内的 conn 上调用，不自持锁。"""
     if key is None:
         raise ValueError("empty state key — cannot supersede")
 
-    with _write_transaction() as conn:
-        # 1) 事务内重新查所有匹配 active
-        subj, cat, room, layer, owner = key
-        if layer == 'shared':
-            old_rows = conn.execute(
-                "SELECT id, updated_at FROM memories WHERE status='active' "
-                "AND info_type='state' AND subject_id=? AND category=? "
-                "AND room=? AND layer='shared' AND owner_ai=''",
-                (subj, cat, room)
-            ).fetchall()
-        else:
-            old_rows = conn.execute(
-                "SELECT id, updated_at FROM memories WHERE status='active' "
-                "AND info_type='state' AND subject_id=? AND category=? "
-                "AND room=? AND layer=? AND owner_ai=?",
-                (subj, cat, room, layer, owner)
-            ).fetchall()
-        old_ids = [r[0] for r in old_rows]
+    subj, cat, room, layer, owner = key
+    # 1) 事务内重新查所有匹配 active
+    if layer == 'shared':
+        old_rows = conn.execute(
+            "SELECT id, updated_at FROM memories WHERE status='active' "
+            "AND info_type='state' AND subject_id=? AND category=? "
+            "AND room=? AND layer='shared' AND owner_ai=''",
+            (subj, cat, room)
+        ).fetchall()
+    else:
+        old_rows = conn.execute(
+            "SELECT id, updated_at FROM memories WHERE status='active' "
+            "AND info_type='state' AND subject_id=? AND category=? "
+            "AND room=? AND layer=? AND owner_ai=?",
+            (subj, cat, room, layer, owner)
+        ).fetchall()
+    old_ids = [r[0] for r in old_rows]
 
-        # 2) 插入新 state（v2.3：走 _set_memory_in_tx，含 vec_id_map + memories_vec 同步 + preserve 保护，
-        #    不再造缩水版 _raw_insert_memory）
-        _set_memory_in_tx(conn, new_state_mem)
+    # 2) 插入新 state（走 _set_memory_in_tx，含 vec_id_map + memories_vec 同步 + preserve 保护）
+    _set_memory_in_tx(conn, new_state_mem)
 
-        # 3) 全部旧 active → superseded
-        for old_id in old_ids:
-            conn.execute(
-                "UPDATE memories SET status='superseded', "
-                "valid_until=?, superseded_by=?, updated_at=? "
-                "WHERE id=? AND status='active'",
-                (new_state_mem['valid_from'], new_state_mem['id'],
-                 _now_iso(), old_id)
-            )
-
-        # 4) audit
+    # 3) 全部旧 active → superseded
+    for old_id in old_ids:
         conn.execute(
-            "INSERT INTO maintenance_audit (action, target_id, new_content, "
-            "decision_reason, state_before, state_after, source_ai, "
-            "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            ('state_supersede', new_state_mem['id'], new_state_mem.get('content',''),
-             f'new state supersedes {len(old_ids)} old',
-             json.dumps({'old_ids': old_ids}),
-             json.dumps({'new_id': new_state_mem['id']}),
-             source_ai, 1, _now_iso())
+            "UPDATE memories SET status='superseded', "
+            "valid_until=?, superseded_by=?, updated_at=? "
+            "WHERE id=? AND status='active'",
+            (new_state_mem['valid_from'], new_state_mem['id'],
+             _now_iso(), old_id)
         )
+
+    # 4) audit
+    conn.execute(
+        "INSERT INTO maintenance_audit (action, target_id, new_content, "
+        "decision_reason, state_before, state_after, source_ai, "
+        "auto_executed, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        ('state_supersede', new_state_mem['id'], new_state_mem.get('content',''),
+         f'new state supersedes {len(old_ids)} old',
+         json.dumps({'old_ids': old_ids}),
+         json.dumps({'new_id': new_state_mem['id']}),
+         source_ai, 1, _now_iso())
+    )
     return {'inserted_id': new_state_mem['id'], 'superseded_ids': old_ids}
+
+
+def commit_state_supersede_atomic(new_state_mem, key, source_ai):
+    """public wrapper — 起点无 tx 的 caller 用（如 memory_ops.remember 分流点）。
+    已在 tx 内的调用者（finalize / daemon commit_maintenance_atomic 内部）
+    直接调 _state_supersede_in_tx(conn, ...)，不走本 wrapper（避免嵌套 RuntimeError）。"""
+    with _write_transaction() as conn:
+        return _state_supersede_in_tx(conn, new_state_mem, key, source_ai)
 ```
 
 **关键 v2.3（H5）**：**不新造缩水版 INSERT**。改从现有 `set_memory()` 抽取核心逻辑到 `_set_memory_in_tx(conn, mem)` 内部 helper：
@@ -419,7 +449,11 @@ def validate_context_isolation(mem):
   2. 计算当前 `snapshot_hash`
   3. 允许字段变化后重算：如果只有 `updated_at` / `activation_count` / `last_activated`（v2.3 M2 修正字段名）变化，用**"忽略这三字段"版本的白名单**重算 hash 对比
   4. hash 一致 → 执行；不一致 → drift，事务内 ROLLBACK 并 log skip
-- 为了让上面 4 步在 tx 内跑，`commit_maintenance_atomic` 增加可选参数 `pre_execute_check: Callable[[conn, current_row], bool] | None`，backfill 传入此 callback；callback 返回 False 抛 `MaintenanceDrift`（事务回滚）。
+- 为了让上面 4 步在 tx 内跑，`commit_maintenance_atomic` 增加可选参数 **v2.4 H-C**：
+  ```python
+  pre_execute_check: Callable[[conn, current_row: dict, plan_state_before: dict], bool] | None
+  ```
+  三参数：已开事务的 conn、事务内读到的当前完整 row、PLAN 阶段快照的 `state_before`（含白名单字段 + `embedding_sha256`）。callback 返回 False → `commit_maintenance_atomic` 抛 `MaintenanceDrift`（事务回滚 + backfill 侧 skip + log）。
 - **删除 v2.1 的 `--ignore-drift-if-only-touch`**（reviewer 早前指出）；改为白名单排除。
 
 **JSON-safe state_before 字段白名单（v2.3 M1）**：
@@ -451,7 +485,7 @@ def _snapshot_for_hash(mem_row: dict) -> dict:
 | 路径 | 校验失败处理 |
 |---|---|
 | **MCP / REST `remember()` 直路径**（`memory_ops.remember` 两处 CREATE）| **`raise ValidationError`**（新自定义异常），FastAPI wrapper 转 400；MCP tool 层捕获转结构化错误 `{"ok": False, "error": "validation_failed", "detail": ...}`。**不 continue**。 |
-| **daemon 循环**（`compress_diaries:139` / `archive_old_work:235` / `distill_psychology:385`）| `try: validate_memory_write(...) except ValidationError as e: logger.warning(...); continue`（单条不 crash step）|
+| **daemon 循环**（`compress_diaries:139` / `archive_old_work:235` / `distill_psychology:385`）| **v2.4 M-A：wrap 必须落在每个 daemon step 内 for 循环的单次 iteration 最外层**，不能塞进内部 helper。伪代码：<br>`for batch in batches:`<br>`    try:`<br>`        await _synthesize_and_remember(batch)  # remember() 可能 raise ValidationError`<br>`    except ValidationError as e:`<br>`        logger.warning(f"skip {batch.id}: {e}")`<br>`        continue`<br>三处 daemon 各自的 batch 变量名（`week` / `task_group` / `session`）在开工时按现有代码定名。|
 | `insert_pending_memory` finalize 阶段 | 结构化拒绝 → ledger 记 `finalize_failed`，wrapper 转客户端错误 |
 
 **新自定义异常**：`memory_validation.ValidationError(Exception)`，`validate_memory_write` / `validate_context_isolation`（strict 模式）改为 raise 此类型，而非 `ValueError`（区分度更好，避免误捕获）。
