@@ -120,33 +120,38 @@ def init_activity_table():
     global _db_ready
     try:
         import database
-        conn = database._get_conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                epoch REAL NOT NULL,
-                action TEXT NOT NULL,
-                detail TEXT,
-                memory_id TEXT,
-                ai_id TEXT,
-                model TEXT,
-                tokens_used INTEGER DEFAULT 0,
-                duration_ms INTEGER DEFAULT 0,
-                success INTEGER DEFAULT 1,
-                extra TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_activity_epoch ON activity_log(epoch DESC)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action)
-        """)
-        conn.commit()
+        # DDL 走共享写锁事务（Phase 2.0 Step 0-A #2b 临时过渡：activity_log 直
+        # 接引用 database._write_transaction 违反 v2.9 契约「生产模块不接触
+        # ctx」，但目前 activity_log CRUD 未抽到 database.py。批次 #5 会新增
+        # database.append_activity_log_atomic / trim_activity_log_atomic 公开
+        # helper + 把建表迁到 init_db()，届时删除本处直接引用）。
+        with database._write_transaction() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS activity_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    epoch REAL NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT,
+                    memory_id TEXT,
+                    ai_id TEXT,
+                    model TEXT,
+                    tokens_used INTEGER DEFAULT 0,
+                    duration_ms INTEGER DEFAULT 0,
+                    success INTEGER DEFAULT 1,
+                    extra TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activity_epoch ON activity_log(epoch DESC)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action)
+            """)
         _db_ready = True
 
-        # 加载最近的日志到内存缓冲
+        # 加载最近的日志到内存缓冲（read after DDL commit）
+        conn = database._get_conn()
         rows = conn.execute(
             "SELECT ts, epoch, action, detail, memory_id, ai_id, model, "
             "tokens_used, duration_ms, success, extra "
@@ -173,31 +178,37 @@ def init_activity_table():
 
 
 def _persist(entry: dict):
-    """写入一条日志到 SQLite"""
+    """写入一条日志到 SQLite。
+
+    Phase 2.0 Step 0-A #2b: INSERT 与清理拆成两个独立事务，保留原语义
+    「INSERT 成功而 DELETE 失败时 INSERT 仍持久化」。若 _persist 恰好在
+    另一个共享 conn 的写事务内被调用（不应发生），_write_transaction 的
+    非重入守卫会抛 RuntimeError，被外层 except Exception: pass 静默吞掉
+    → 该条 activity log 丢失。这是安全降级（不 crash 主逻辑）。
+    """
     if not _db_ready:
         return
     try:
         import database
-        conn = database._get_conn()
         extra_json = json.dumps(entry.get("extra")) if entry.get("extra") else None
-        conn.execute(
-            "INSERT INTO activity_log (ts, epoch, action, detail, memory_id, ai_id, "
-            "model, tokens_used, duration_ms, success, extra) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                entry["ts"], entry["epoch"], entry["action"], entry["detail"],
-                entry["memory_id"], entry["ai_id"], entry["model"],
-                entry["tokens_used"], entry["duration_ms"],
-                1 if entry["success"] else 0, extra_json,
-            ),
-        )
-        conn.commit()
+        with database._write_transaction() as conn:
+            conn.execute(
+                "INSERT INTO activity_log (ts, epoch, action, detail, memory_id, ai_id, "
+                "model, tokens_used, duration_ms, success, extra) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entry["ts"], entry["epoch"], entry["action"], entry["detail"],
+                    entry["memory_id"], entry["ai_id"], entry["model"],
+                    entry["tokens_used"], entry["duration_ms"],
+                    1 if entry["success"] else 0, extra_json,
+                ),
+            )
 
-        # 清理超过 500 条的旧记录
-        conn.execute(
-            "DELETE FROM activity_log WHERE id NOT IN "
-            "(SELECT id FROM activity_log ORDER BY epoch DESC LIMIT 500)"
-        )
-        conn.commit()
+        # 清理超过 500 条的旧记录 —— 独立事务，失败不回退 INSERT
+        with database._write_transaction() as conn:
+            conn.execute(
+                "DELETE FROM activity_log WHERE id NOT IN "
+                "(SELECT id FROM activity_log ORDER BY epoch DESC LIMIT 500)"
+            )
     except Exception:
         pass

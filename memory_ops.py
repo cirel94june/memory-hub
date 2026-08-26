@@ -7,7 +7,6 @@ import time
 import math
 import asyncio
 import logging
-import threading
 from datetime import datetime, timezone, timedelta
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,

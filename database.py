@@ -600,7 +600,6 @@ def insert_pending_memory(mem: dict) -> None:
     Historically this method hard-coded '[]' which silently dropped any
     caller-provided values.
     """
-    conn = _get_conn()
     now = mem.get("created_at") or _now_iso()
 
     def _as_json_list(val):
@@ -611,25 +610,25 @@ def insert_pending_memory(mem: dict) -> None:
         # Already-serialized string
         return val
 
-    conn.execute(
-        "INSERT INTO memories ("
-        "  id, content, layer, room, category, owner_ai, importance,"
-        "  source_ai, source_platform, event_date, source_context,"
-        "  status, client_request_id, created_at, updated_at, tags, domain"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
-            mem.get("room", "living_room"), mem.get("category", ""),
-            mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
-            mem.get("source_ai", ""), mem.get("source_platform", ""),
-            mem.get("event_date", ""), mem.get("source_context", ""),
-            mem.get("status", "pending"), mem.get("client_request_id", ""),
-            now, now,
-            _as_json_list(mem.get("tags")),
-            _as_json_list(mem.get("domain")),
-        ),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO memories ("
+            "  id, content, layer, room, category, owner_ai, importance,"
+            "  source_ai, source_platform, event_date, source_context,"
+            "  status, client_request_id, created_at, updated_at, tags, domain"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
+                mem.get("room", "living_room"), mem.get("category", ""),
+                mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
+                mem.get("source_ai", ""), mem.get("source_platform", ""),
+                mem.get("event_date", ""), mem.get("source_context", ""),
+                mem.get("status", "pending"), mem.get("client_request_id", ""),
+                now, now,
+                _as_json_list(mem.get("tags")),
+                _as_json_list(mem.get("domain")),
+            ),
+        )
 
 
 def update_memory_status(mem_id: str, status: str,
@@ -646,7 +645,6 @@ def update_memory_status(mem_id: str, status: str,
     so downstream can tell WHY the row is in this state
     (e.g. ':pipeline_error' vs ':sweep_timeout'). Idempotent.
     """
-    conn = _get_conn()
     now = _now_iso()
     if source_platform_suffix:
         suffix = source_platform_suffix if source_platform_suffix.startswith(":") \
@@ -667,9 +665,10 @@ def update_memory_status(mem_id: str, status: str,
         sql += " AND status = ?"
         params.append(require_status)
 
-    cur = conn.execute(sql, params)
-    conn.commit()
-    return cur.rowcount
+    with _write_transaction() as conn:
+        cur = conn.execute(sql, params)
+        rowcount = cur.rowcount
+    return rowcount
 
 
 def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
@@ -680,14 +679,13 @@ def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
     """
     if not skeleton_id or not link_to_real_id:
         raise ValueError("mark_replaced requires both skeleton_id and link_to_real_id")
-    conn = _get_conn()
     now = _now_iso()
-    conn.execute(
-        "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
-        "updated_at = ? WHERE id = ?",
-        (link_to_real_id, now, skeleton_id),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
+            "updated_at = ? WHERE id = ?",
+            (link_to_real_id, now, skeleton_id),
+        )
 
 
 def write_intent_ledger(skeleton_id: str, client_request_id: str,
@@ -714,30 +712,29 @@ def write_intent_ledger(skeleton_id: str, client_request_id: str,
         return "created"  # no idempotency requested for this call
     if not owner_token:
         raise ValueError("write_intent_ledger requires a non-empty owner_token")
-    conn = _get_conn()
     now = _now_iso()
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO async_remember_ledger "
-        "(skeleton_id, client_request_id, terminal_state, "
-        " result_memory_id, committed_at, owner_token) "
-        "VALUES (?, ?, 'in_flight', '', ?, ?)",
-        (skeleton_id, client_request_id, now, owner_token),
-    )
-    conn.commit()
-    if cur.rowcount == 1:
-        # We inserted the row — we own the intent.
-        return "created"
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            (skeleton_id, client_request_id, now, owner_token),
+        )
+        if cur.rowcount == 1:
+            # We inserted the row — we own the intent.
+            return "created"
 
-    # INSERT ignored — a row already exists. Read the winner's state.
-    row = conn.execute(
-        "SELECT terminal_state FROM async_remember_ledger "
-        "WHERE skeleton_id = ?", (skeleton_id,),
-    ).fetchone()
-    if not row:
-        # Extremely unlikely: no row despite INSERT OR IGNORE not inserting.
-        # Fail-closed: treat as unknown; caller should NOT proceed.
-        return "in_flight"
-    return row[0] if row[0] else "in_flight"
+        # INSERT ignored — a row already exists. Read the winner's state.
+        row = conn.execute(
+            "SELECT terminal_state FROM async_remember_ledger "
+            "WHERE skeleton_id = ?", (skeleton_id,),
+        ).fetchone()
+        if not row:
+            # Extremely unlikely: no row despite INSERT OR IGNORE not inserting.
+            # Fail-closed: treat as unknown; caller should NOT proceed.
+            return "in_flight"
+        return row[0] if row[0] else "in_flight"
 
 
 def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
@@ -768,17 +765,17 @@ def close_stale_intent(skeleton_id: str, owner_token: str) -> bool:
     """DEPRECATED: kept for backwards compat. Prefer
     close_stale_intent_atomic which reconciles ledger + skeleton + audit
     in one transaction."""
-    conn = _get_conn()
     now = _now_iso()
-    cur = conn.execute(
-        "UPDATE async_remember_ledger "
-        "SET terminal_state = 'failed', committed_at = ? "
-        "WHERE skeleton_id = ? AND terminal_state = 'in_flight' "
-        "  AND owner_token = ?",
-        (now, skeleton_id, owner_token),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE async_remember_ledger "
+            "SET terminal_state = 'failed', committed_at = ? "
+            "WHERE skeleton_id = ? AND terminal_state = 'in_flight' "
+            "  AND owner_token = ?",
+            (now, skeleton_id, owner_token),
+        )
+        rowcount = cur.rowcount
+    return rowcount == 1
 
 
 def close_stale_intent_atomic(
@@ -1002,29 +999,28 @@ def try_claim_finalize(skeleton_id: str, claim_token: str,
     """
     if not skeleton_id or not claim_token:
         return False
-    conn = _get_conn()
     now = _now_iso()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(minutes=stale_after_minutes)).isoformat()
-    cur = conn.execute(
-        "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
-        "WHERE id = ? AND status = 'pending' "
-        "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
-        (claim_token, now, skeleton_id, cutoff),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
+            "WHERE id = ? AND status = 'pending' "
+            "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
+            (claim_token, now, skeleton_id, cutoff),
+        )
+        rowcount = cur.rowcount
+    return rowcount == 1
 
 
 def release_finalize_claim(skeleton_id: str) -> None:
     """H1: release a claim after finalize completes (successful or terminal
     failure). Called from commit_finalize_atomic in the same transaction.
     Standalone helper for the rare non-terminal cleanup paths."""
-    conn = _get_conn()
-    conn.execute(
-        "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
-        "WHERE id = ?", (skeleton_id,))
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
+            "WHERE id = ?", (skeleton_id,))
 
 
 def commit_finalize_atomic(
@@ -1284,103 +1280,123 @@ def set_memory(mem: dict) -> None:
     Also maintains the vec_id_map and memories_vec tables for vector search.
     FTS is handled automatically by triggers.
     """
-    conn = _get_conn()
-
-    values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
-    placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
-    cols = ", ".join(_ALL_COLUMNS)
-    # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
-    # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
-    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
-    # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
-    # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
-    # 已存在的 crq/link，否则骨架幂等追踪失效。
-    # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
-    # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
-    # "刚刚创建"，破 recency boost、破 sweep 判 age）。
-    # M1 round-6: finalize_claim_id/at are runtime coordination columns —
-    # generic UPSERT (activation touch, comment append) must NEVER clobber
-    # them. Callers write these ONLY via try_claim_finalize /
-    # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
-    # dict lacks the field, keep the DB's current value.
-    _preserve_on_empty = {"client_request_id", "link_to_real_id",
-                          "finalize_claim_id", "finalize_claim_at"}
-    _preserve_always = {"created_at"}
-    update_set_parts = []
-    for c in _ALL_COLUMNS:
-        if c == "id":
-            continue
-        if c == "embedding":
-            update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
-        elif c in _preserve_always:
-            # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
-            update_set_parts.append(
-                f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
-                f"ELSE excluded.{c} END"
-            )
-        elif c in _preserve_on_empty:
-            # 只在 excluded 值非空时覆盖，为空则保留已有值
-            update_set_parts.append(
-                f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
-                f"ELSE memories.{c} END"
-            )
-        else:
-            update_set_parts.append(f"{c} = excluded.{c}")
-    update_set = ", ".join(update_set_parts)
-
-    sql = (
-        f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "
-        f"ON CONFLICT(id) DO UPDATE SET {update_set}"
-    )
-
-    try:
-        conn.execute(sql, values)
-    except sqlite3.Error:
-        logger.exception(f"Failed to upsert memory {mem.get('id', '?')}")
-        raise
-
-    # ── Update vector index ──
-    mem_id = mem["id"]
-    embedding = mem.get("embedding")
-
-    if embedding is not None and len(embedding) == EMBEDDING_DIM * 4:
-        # Ensure a vec_id_map entry exists
-        row = conn.execute(
-            "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
-        ).fetchone()
-
-        if row is not None:
-            vec_rowid = row[0]
-            # Update existing vec entry
-            try:
-                conn.execute(
-                    "UPDATE memories_vec SET embedding = ? WHERE rowid = ?",
-                    (embedding, vec_rowid),
+    with _write_transaction() as conn:
+        values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
+        placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
+        cols = ", ".join(_ALL_COLUMNS)
+        # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
+        # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
+        # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
+        # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
+        # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
+        # 已存在的 crq/link，否则骨架幂等追踪失效。
+        # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
+        # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
+        # "刚刚创建"，破 recency boost、破 sweep 判 age）。
+        # M1 round-6: finalize_claim_id/at are runtime coordination columns —
+        # generic UPSERT (activation touch, comment append) must NEVER clobber
+        # them. Callers write these ONLY via try_claim_finalize /
+        # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
+        # dict lacks the field, keep the DB's current value.
+        _preserve_on_empty = {"client_request_id", "link_to_real_id",
+                              "finalize_claim_id", "finalize_claim_at"}
+        _preserve_always = {"created_at"}
+        update_set_parts = []
+        for c in _ALL_COLUMNS:
+            if c == "id":
+                continue
+            if c == "embedding":
+                update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
+            elif c in _preserve_always:
+                # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
+                update_set_parts.append(
+                    f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
+                    f"ELSE excluded.{c} END"
                 )
-            except sqlite3.Error:
-                # Row might not exist in vec table (e.g. after rebuild); insert instead
+            elif c in _preserve_on_empty:
+                # 只在 excluded 值非空时覆盖，为空则保留已有值
+                update_set_parts.append(
+                    f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
+                    f"ELSE memories.{c} END"
+                )
+            else:
+                update_set_parts.append(f"{c} = excluded.{c}")
+        update_set = ", ".join(update_set_parts)
+
+        sql = (
+            f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO UPDATE SET {update_set}"
+        )
+
+        try:
+            conn.execute(sql, values)
+        except sqlite3.Error:
+            logger.exception(f"Failed to upsert memory {mem.get('id', '?')}")
+            raise
+
+        # ── Update vector index ──
+        mem_id = mem["id"]
+        embedding = mem.get("embedding")
+
+        if embedding is not None and len(embedding) == EMBEDDING_DIM * 4:
+            # Ensure a vec_id_map entry exists
+            row = conn.execute(
+                "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
+            ).fetchone()
+
+            if row is not None:
+                vec_rowid = row[0]
+                # Update existing vec entry
+                try:
+                    conn.execute(
+                        "UPDATE memories_vec SET embedding = ? WHERE rowid = ?",
+                        (embedding, vec_rowid),
+                    )
+                except sqlite3.Error:
+                    # Row might not exist in vec table (e.g. after rebuild); insert instead
+                    try:
+                        conn.execute(
+                            "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
+                            (vec_rowid, embedding),
+                        )
+                    except sqlite3.Error:
+                        logger.warning(f"Failed to update/insert vec for {mem_id}")
+            else:
+                # New entry — insert into map, then into vec table
+                cur = conn.execute(
+                    "INSERT INTO vec_id_map (memory_id) VALUES (?)", (mem_id,)
+                )
+                vec_rowid = cur.lastrowid
                 try:
                     conn.execute(
                         "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
                         (vec_rowid, embedding),
                     )
                 except sqlite3.Error:
-                    logger.warning(f"Failed to update/insert vec for {mem_id}")
+                    logger.warning(f"Failed to insert vec for {mem_id}")
         else:
-            # New entry — insert into map, then into vec table
-            cur = conn.execute(
-                "INSERT INTO vec_id_map (memory_id) VALUES (?)", (mem_id,)
-            )
-            vec_rowid = cur.lastrowid
-            try:
-                conn.execute(
-                    "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
-                    (vec_rowid, embedding),
-                )
-            except sqlite3.Error:
-                logger.warning(f"Failed to insert vec for {mem_id}")
-    else:
-        # No valid embedding — remove from vec if it existed
+            # No valid embedding — remove from vec if it existed
+            row = conn.execute(
+                "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
+            ).fetchone()
+            if row is not None:
+                vec_rowid = row[0]
+                try:
+                    conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+                except sqlite3.Error:
+                    pass
+                conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
+
+        # ctx auto-commits
+
+
+def remove_memory(mem_id: str) -> None:
+    """Delete a memory and its FTS/vec entries.
+
+    FTS cleanup is handled by the DELETE trigger. Vec cleanup is explicit.
+    """
+    with _write_transaction() as conn:
+        # Clean up vec index
         row = conn.execute(
             "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
         ).fetchone()
@@ -1392,31 +1408,8 @@ def set_memory(mem: dict) -> None:
                 pass
             conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
 
-    conn.commit()
-
-
-def remove_memory(mem_id: str) -> None:
-    """Delete a memory and its FTS/vec entries.
-
-    FTS cleanup is handled by the DELETE trigger. Vec cleanup is explicit.
-    """
-    conn = _get_conn()
-
-    # Clean up vec index
-    row = conn.execute(
-        "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
-    ).fetchone()
-    if row is not None:
-        vec_rowid = row[0]
-        try:
-            conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
-        except sqlite3.Error:
-            pass
-        conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
-
-    # Delete from main table (triggers handle FTS)
-    conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
-    conn.commit()
+        # Delete from main table (triggers handle FTS)
+        conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
 
 
 # ════════════════════════════════════════════
@@ -1557,12 +1550,11 @@ _PROPOSAL_COLUMNS = [
 
 
 def insert_proposal(row: dict) -> None:
-    conn = _get_conn()
     values = [row.get(c, "") for c in _PROPOSAL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_PROPOSAL_COLUMNS))
     cols = ", ".join(_PROPOSAL_COLUMNS)
-    conn.execute(f"INSERT INTO proposals ({cols}) VALUES ({placeholders})", values)
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(f"INSERT INTO proposals ({cols}) VALUES ({placeholders})", values)
 
 
 def get_proposal(pid: str) -> dict | None:
@@ -1586,15 +1578,14 @@ def update_proposal_status(
     pid: str, status: str, reviewed_by: str = "", reject_reason: str = "",
     applied_memory_id: str = "", failure_reason: str = "",
 ) -> None:
-    conn = _get_conn()
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE proposals SET status = ?, reviewed_at = ?, reviewed_by = ?, "
-        "reject_reason = ?, applied_memory_id = ?, failure_reason = ? WHERE id = ?",
-        (status, now, reviewed_by, reject_reason, applied_memory_id, failure_reason, pid),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE proposals SET status = ?, reviewed_at = ?, reviewed_by = ?, "
+            "reject_reason = ?, applied_memory_id = ?, failure_reason = ? WHERE id = ?",
+            (status, now, reviewed_by, reject_reason, applied_memory_id, failure_reason, pid),
+        )
 
 
 def count_proposals(status: str = "pending") -> int:
@@ -1617,13 +1608,13 @@ _AUDIT_COLUMNS = [
 
 
 def insert_audit(row: dict) -> int:
-    conn = _get_conn()
     values = [row.get(c, "") for c in _AUDIT_COLUMNS]
     placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
     cols = ", ".join(_AUDIT_COLUMNS)
-    cur = conn.execute(f"INSERT INTO maintenance_audit ({cols}) VALUES ({placeholders})", values)
-    conn.commit()
-    return cur.lastrowid
+    with _write_transaction() as conn:
+        cur = conn.execute(f"INSERT INTO maintenance_audit ({cols}) VALUES ({placeholders})", values)
+        lastrowid = cur.lastrowid
+    return lastrowid
 
 
 def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
@@ -1655,45 +1646,44 @@ def count_audits(action: str = None) -> int:
 # ════════════════════════════════════════════
 
 def upsert_profile(profile: dict) -> None:
-    conn = _get_conn()
     pid = profile["id"]
     status = profile.get("status", "pending_review")
-    existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
-    if existing:
-        new_version = existing[0] + 1
-        conn.execute("""
-            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
-            version = ?, status = ?
-            WHERE id = ?
-        """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
-              new_version, status, pid))
-    else:
-        conn.execute("""
-            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
-            source_memory_ids, version, status)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-        """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
-              profile["content"], profile["generated_at"],
-              profile.get("source_memory_ids", "[]"), status))
-    conn.commit()
+    with _write_transaction() as conn:
+        existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
+        if existing:
+            new_version = existing[0] + 1
+            conn.execute("""
+                UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
+                version = ?, status = ?
+                WHERE id = ?
+            """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
+                  new_version, status, pid))
+        else:
+            conn.execute("""
+                INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
+                source_memory_ids, version, status)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
+                  profile["content"], profile["generated_at"],
+                  profile.get("source_memory_ids", "[]"), status))
 
 
 def approve_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute(
-        "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
-        (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
+            (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def supersede_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute(
-        "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
-        (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
+            (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def get_profile(profile_id: str, status: str = None) -> dict | None:
@@ -1724,10 +1714,10 @@ def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
 
 
 def delete_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 # ════════════════════════════════════════════
@@ -2251,32 +2241,31 @@ def _person_row_to_dict(row: sqlite3.Row) -> dict:
 
 
 def upsert_person(person: dict) -> None:
-    conn = _get_conn()
     aliases = person.get("aliases", [])
     if isinstance(aliases, list):
         aliases = json.dumps(aliases, ensure_ascii=False)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO persons (person_id, entity_type, canonical_name, aliases, "
-        "linked_agent_id, note, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(person_id) DO UPDATE SET "
-        "entity_type=excluded.entity_type, canonical_name=excluded.canonical_name, "
-        "aliases=excluded.aliases, linked_agent_id=excluded.linked_agent_id, "
-        "note=excluded.note, updated_at=excluded.updated_at",
-        (
-            person["person_id"],
-            person.get("entity_type", "other"),
-            person["canonical_name"],
-            aliases,
-            person.get("linked_agent_id", ""),
-            person.get("note", ""),
-            person.get("created_at", now),
-            now,
-        ),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO persons (person_id, entity_type, canonical_name, aliases, "
+            "linked_agent_id, note, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(person_id) DO UPDATE SET "
+            "entity_type=excluded.entity_type, canonical_name=excluded.canonical_name, "
+            "aliases=excluded.aliases, linked_agent_id=excluded.linked_agent_id, "
+            "note=excluded.note, updated_at=excluded.updated_at",
+            (
+                person["person_id"],
+                person.get("entity_type", "other"),
+                person["canonical_name"],
+                aliases,
+                person.get("linked_agent_id", ""),
+                person.get("note", ""),
+                person.get("created_at", now),
+                now,
+            ),
+        )
 
 
 def get_person(person_id: str) -> dict | None:
@@ -2321,10 +2310,10 @@ def count_memories_by_subject(person_id: str) -> int:
 
 
 def delete_person(person_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def resolve_alias(name: str, scope: str = "household") -> str | None:
@@ -2352,6 +2341,7 @@ def resolve_alias(name: str, scope: str = "household") -> str | None:
 
 def seed_baseline_persons() -> int:
     """启动时种入基线人物（如果 persons 表为空）。返回种入数量。"""
+    # 读检查用 _get_conn()（read 场景）；写走 _write_transaction()
     conn = _get_conn()
     count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
     if count > 0:
@@ -2410,15 +2400,15 @@ def seed_baseline_persons() -> int:
         },
     ]
 
-    for p in baseline:
-        conn.execute(
-            "INSERT OR IGNORE INTO persons "
-            "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (p["person_id"], p["entity_type"], p["canonical_name"],
-             p["aliases"], p["linked_agent_id"], p["note"], now, now),
-        )
-    conn.commit()
+    with _write_transaction() as conn:
+        for p in baseline:
+            conn.execute(
+                "INSERT OR IGNORE INTO persons "
+                "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (p["person_id"], p["entity_type"], p["canonical_name"],
+                 p["aliases"], p["linked_agent_id"], p["note"], now, now),
+            )
     return len(baseline)
 
 
