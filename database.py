@@ -2340,13 +2340,12 @@ def resolve_alias(name: str, scope: str = "household") -> str | None:
 
 
 def seed_baseline_persons() -> int:
-    """启动时种入基线人物（如果 persons 表为空）。返回种入数量。"""
-    # 读检查用 _get_conn()（read 场景）；写走 _write_transaction()
-    conn = _get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-    if count > 0:
-        return 0
+    """启动时种入基线人物（如果 persons 表为空）。返回真实新增行数。
 
+    Codex #2b M1: COUNT 与 INSERT 必须同一事务，否则两线程同时读到 0 会
+    双重返 len(baseline)（数据靠 INSERT OR IGNORE 不重复，但返回值不真实，
+    且 seed 是写决策不能走独立只读连接——WAL 快照可能是旧的）。
+    """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
 
@@ -2400,16 +2399,22 @@ def seed_baseline_persons() -> int:
         },
     ]
 
+    inserted = 0
     with _write_transaction() as conn:
+        # v2b M1: COUNT 在事务内查（BEGIN IMMEDIATE 已锁）→ 决策原子
+        count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+        if count > 0:
+            return 0
         for p in baseline:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO persons "
                 "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (p["person_id"], p["entity_type"], p["canonical_name"],
                  p["aliases"], p["linked_agent_id"], p["note"], now, now),
             )
-    return len(baseline)
+            inserted += cur.rowcount
+    return inserted
 
 
 def get_all_aliases(scope: str = "household") -> dict[str, str]:
