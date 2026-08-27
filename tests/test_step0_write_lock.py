@@ -379,12 +379,14 @@ def _find_violations(source: str, allowed_func_names=('_write_transaction', 'ini
                 violations.append((node.lineno, fn.attr, "any-receiver commit/rollback"))
             continue
 
-        # 2) executescript — Codex round-4 M2：多语句脚本无法用首词判断
-        #    ("SELECT 1; DELETE ...") → 事务外/allowed-func 外一律违规。
+        # 2) executescript — Codex round-5 M：executescript 会**隐式提交**
+        #    当前事务，导致 _write_transaction() 的 rollback 无法撤销之前的写。
+        #    只允许 init_db 内使用（那里没有嵌套事务需要保护）。
         if fn.attr == "executescript":
-            if not (in_write_tx or in_allowed_func):
+            if enc_func != "init_db":
                 violations.append((node.lineno, fn.attr,
-                                   "executescript() outside write ctx / allowed func"))
+                                   "executescript() only allowed in init_db "
+                                   "(implicit commit breaks _write_transaction atomicity)"))
             continue
 
         # 3) execute/executemany — decide via SQL literal & enclosing context
@@ -531,7 +533,7 @@ def bad(flag):
 
 def test_ast_gate_catches_executescript_with_dml():
     """executescript("SELECT 1; DELETE ...") 首词是 SELECT 但脚本内含 DELETE。
-    executescript 在事务外一律违规，不做首词分析。
+    executescript 只允许 init_db 内使用，其它一律违规不做首词分析。
     """
     src = '''
 def bad():
@@ -542,6 +544,35 @@ def bad():
                for _, kind, d in v), (
         f"failed to catch executescript with DML: {v}"
     )
+
+
+def test_ast_gate_catches_executescript_inside_write_transaction():
+    """Codex round-5 M: executescript 会隐式提交当前事务，即使被
+    with _write_transaction(): 包裹也不安全——事务里之前的写会被提前
+    commit，ctx 的 rollback 无法撤销。只有 init_db 内允许（那里没有
+    需要保护的嵌套事务）。
+    """
+    src = '''
+def bad():
+    with _write_transaction() as conn:
+        conn.execute("INSERT INTO memories VALUES (?)", ("x",))
+        conn.executescript("SELECT 1;")  # 隐式提交上面 INSERT，rollback 无用
+'''
+    v = _find_violations(src, allowed_func_names=('_write_transaction',))
+    assert any('executescript' in kind or 'executescript' in d
+               for _, kind, d in v), (
+        f"failed to catch executescript inside _write_transaction: {v}"
+    )
+
+
+def test_ast_gate_allows_executescript_only_in_init_db():
+    """init_db 内的 executescript 允许（schema 初始化专用位置）。"""
+    src = '''
+def init_db():
+    conn.executescript(_SCHEMA_MAIN)
+'''
+    v = _find_violations(src, allowed_func_names=('init_db',))
+    assert not v, f"init_db's executescript should pass: {v}"
 
 
 def test_ast_gate_allows_safe_read_verbs():
