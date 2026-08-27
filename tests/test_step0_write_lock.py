@@ -410,18 +410,61 @@ def _find_violations(source: str, allowed_func_names=('_write_transaction', 'ini
 # 批次 #4 全部切到 query_only=ON 读连接后再考虑是否重新引入。
 
 
+# Explicit in-tx helper list（Step 0-A #3 起的命名约定）—— 显式维护而非自动
+# 收集，避免"命名恰好带 _in_tx 就被无条件放行"的越权。每新增一个 in-tx
+# helper 必须同时更新本清单 + 保证所有调用点都在 with _write_transaction()
+# 内（由 test_ast_gate_in_tx_helpers_only_called_inside_write_ctx 兜底）。
+_IN_TX_HELPERS = frozenset({
+    '_set_memory_in_tx',
+})
+
+
 def test_ast_gate_database_writes_only_in_ctx_and_init_db():
-    """database.py fail-closed 闸门：
-    - .commit()/.rollback() 任何 receiver 必须在 _write_transaction() / init_db()
-      / lexically 在 with database._write_transaction() 块内
-    - execute/executemany/executescript 若 SQL literal 非 SELECT/EXPLAIN/白名单
-      PRAGMA 开头 → 视为写
-    - 动态 SQL 在合规位置外一律 fail-closed（不再有 pure_read 豁免）
-    - ancestry 遇嵌套函数边界立即停止
+    """database.py fail-closed 闸门。允许函数：
+      - _write_transaction    ctx 本身
+      - init_db               schema 初始化
+      - _IN_TX_HELPERS 里的每个 in-tx 内部 helper（契约上 caller 已开 tx）
     """
     src = Path(database.__file__).read_text(encoding='utf-8')
-    violations = _find_violations(src, allowed_func_names=('_write_transaction', 'init_db'))
+    allowed = ('_write_transaction', 'init_db') + tuple(_IN_TX_HELPERS)
+    violations = _find_violations(src, allowed_func_names=allowed)
     assert not violations, f"database.py AST gate violations: {violations}"
+
+
+def test_ast_gate_in_tx_helpers_only_called_inside_write_ctx():
+    """Companion 闸门：_IN_TX_HELPERS 里的 helper 只允许在这些位置被调用：
+      - lexically 在 with _write_transaction(): 块内
+      - lexically 在另一个 _IN_TX_HELPERS 函数体内（in-tx 之间可级联）
+
+    防止有人误在事务外直接调 _set_memory_in_tx —— 那会绕过写锁，语义崩溃。
+    """
+    src = Path(database.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    pmap = _build_parent_map(tree)
+    violations = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = None
+        if isinstance(fn, ast.Name):
+            name = fn.id
+        elif isinstance(fn, ast.Attribute):
+            name = fn.attr
+        if name not in _IN_TX_HELPERS:
+            continue
+        # is caller in with _write_transaction() ctx?
+        in_ctx = _inside_write_tx_via_ancestry(node, pmap)
+        # is caller inside another in-tx helper function?
+        enc_name = _enclosing_func_name(node, pmap)
+        in_another_in_tx = enc_name in _IN_TX_HELPERS
+        if not (in_ctx or in_another_in_tx):
+            violations.append((node.lineno, name,
+                               f"called outside _write_transaction() ctx / other in-tx helper "
+                               f"(enclosing func: {enc_name!r})"))
+    assert not violations, (
+        f"in-tx helpers called from unsafe location: {violations}"
+    )
 
 
 def test_ast_gate_activity_log_no_bare_writes():
@@ -592,6 +635,85 @@ def test_memory_ops_shares_database_write_lock():
     """memory_ops._WRITE_LOCK 与 database._WRITE_LOCK 必须是同一对象。"""
     import memory_ops
     assert memory_ops._WRITE_LOCK is database._WRITE_LOCK
+
+
+def test_set_memory_in_tx_extracted_helper(initdb):
+    """Step 0-A #3: _set_memory_in_tx accepts an already-open conn, does
+    NOT self-acquire the lock or commit. Full set_memory() semantics preserved.
+
+    Golden checks:
+      - _set_memory_in_tx works inside an outer _write_transaction()
+      - set_memory public wrapper still upserts identically
+      - upsert twice with same id → row count == 1 (idempotent identity)
+      - _preserve_on_empty semantics still enforced (empty crq keeps existing)
+    """
+    # 1) _set_memory_in_tx directly, inside caller's tx
+    with database._write_transaction() as conn:
+        database._set_memory_in_tx(conn, {
+            "id": "mem_step3_a",
+            "content": "hello step3",
+            "layer": "shared",
+            "room": "living_room",
+            "importance": 0.5,
+        })
+        # inside same tx we can read what we just wrote
+        row = conn.execute("SELECT id, content FROM memories WHERE id = ?",
+                           ("mem_step3_a",)).fetchone()
+        assert row is not None and row[1] == "hello step3"
+
+    # 2) set_memory public wrapper works
+    database.set_memory({
+        "id": "mem_step3_b",
+        "content": "via public wrapper",
+        "importance": 0.7,
+    })
+    got = database.get_memory("mem_step3_b")
+    assert got is not None and got["content"] == "via public wrapper"
+
+    # 3) idempotent upsert
+    database.set_memory({"id": "mem_step3_b", "content": "updated", "importance": 0.9})
+    with database._write_transaction() as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM memories WHERE id = ?",
+                           ("mem_step3_b",)).fetchone()[0]
+    assert cnt == 1, f"expected 1 row after upsert, got {cnt}"
+
+    # 4) _preserve_on_empty: existing crq not clobbered by empty
+    database.set_memory({
+        "id": "mem_step3_c",
+        "content": "first",
+        "client_request_id": "crq_kept",
+    })
+    database.set_memory({
+        "id": "mem_step3_c",
+        "content": "second",
+        "client_request_id": "",  # empty must not clobber
+    })
+    kept = database.get_memory("mem_step3_c")
+    assert kept["client_request_id"] == "crq_kept", (
+        f"client_request_id should be preserved: got {kept['client_request_id']!r}"
+    )
+    assert kept["content"] == "second"
+
+
+def test_set_memory_public_wrapper_uses_in_tx_helper(initdb):
+    """Static check: set_memory body must contain a call to _set_memory_in_tx
+    (i.e. the wrapper never duplicates upsert logic). Guards against future
+    regression where someone re-inlines upsert into set_memory and forgets
+    to update _set_memory_in_tx alongside.
+    """
+    src = Path(database.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'set_memory':
+            calls = [n for n in ast.walk(node) if isinstance(n, ast.Call)]
+            names = [(n.func.id if isinstance(n.func, ast.Name) else
+                      n.func.attr if isinstance(n.func, ast.Attribute) else None)
+                     for n in calls]
+            assert '_set_memory_in_tx' in names, (
+                f"set_memory wrapper must call _set_memory_in_tx; call names: {names}"
+            )
+            return
+    pytest.fail("set_memory function not found in database.py")
 
 
 def test_seed_baseline_persons_concurrent_returns_actual_inserts(initdb, monkeypatch):

@@ -1274,120 +1274,153 @@ def _prepare_memory_value(key: str, value):
     return value
 
 
-def set_memory(mem: dict) -> None:
-    """Insert or replace a memory (upsert).
+def _set_memory_in_tx(conn: sqlite3.Connection, mem: dict) -> None:
+    """UPSERT `mem` into memories + maintain vec_id_map + memories_vec, on an
+    already-open tx (does NOT acquire _WRITE_LOCK, does NOT commit).
 
-    Also maintains the vec_id_map and memories_vec tables for vector search.
-    FTS is handled automatically by triggers.
+    Phase 2.0 Step 0-A #3: extracted from set_memory() with **zero behavioural
+    changes** so future callers already inside `_write_transaction()` (e.g.
+    the state supersede helper coming in Step 0-B) can reuse the full upsert
+    logic without nesting `_write_transaction()` (which would RuntimeError
+    on non-reentrant lock).
+
+    Preserved semantics from set_memory:
+      - `_prepare_memory_value` for column value coercion
+      - `_preserve_on_empty` = {client_request_id, link_to_real_id,
+        finalize_claim_id, finalize_claim_at} — CASE-guarded UPSERT so empty
+        excluded values never clobber a valid stored value
+      - `_preserve_always` = {created_at} — kept unless memories.created_at is
+        currently empty (first insert only)
+      - embedding via COALESCE — never overwrite a non-null stored embedding
+        with NULL from a caller that didn't compute vectors
+      - vec_id_map + memories_vec kept in sync (insert/update/delete based on
+        whether a valid EMBEDDING_DIM*4-sized bytes is present)
+
+    Failure handling: on sqlite3.Error from the main UPSERT, logs + re-raises
+    (caller's tx will roll back). Vec-index writes swallow errors after
+    logging.warning to preserve the original best-effort semantics.
     """
-    with _write_transaction() as conn:
-        values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
-        placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
-        cols = ", ".join(_ALL_COLUMNS)
-        # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
-        # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
-        # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
-        # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
-        # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
-        # 已存在的 crq/link，否则骨架幂等追踪失效。
-        # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
-        # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
-        # "刚刚创建"，破 recency boost、破 sweep 判 age）。
-        # M1 round-6: finalize_claim_id/at are runtime coordination columns —
-        # generic UPSERT (activation touch, comment append) must NEVER clobber
-        # them. Callers write these ONLY via try_claim_finalize /
-        # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
-        # dict lacks the field, keep the DB's current value.
-        _preserve_on_empty = {"client_request_id", "link_to_real_id",
-                              "finalize_claim_id", "finalize_claim_at"}
-        _preserve_always = {"created_at"}
-        update_set_parts = []
-        for c in _ALL_COLUMNS:
-            if c == "id":
-                continue
-            if c == "embedding":
-                update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
-            elif c in _preserve_always:
-                # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
-                update_set_parts.append(
-                    f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
-                    f"ELSE excluded.{c} END"
+    values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
+    placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
+    cols = ", ".join(_ALL_COLUMNS)
+    # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
+    # 不能让 None 覆盖掉库里已有的 embedding——否则任何 activation 更新
+    # 都会把离线补好的向量冲掉（2026-07-18：382 条向量被这样冲没过）。
+    # PR C 块 8: client_request_id / link_to_real_id 同理——非 MCP 路径的
+    # set_memory 调用（activation touch、comment 追加等）不能把 '' 覆盖到
+    # 已存在的 crq/link，否则骨架幂等追踪失效。
+    # created_at 永远保留 DB 中已有值——pipeline 完成时 UPSERT 会传入新
+    # created_at，会破坏骨架的 recency（一条 10 分钟前入 pending 的记忆变成
+    # "刚刚创建"，破 recency boost、破 sweep 判 age）。
+    # M1 round-6: finalize_claim_id/at are runtime coordination columns —
+    # generic UPSERT (activation touch, comment append) must NEVER clobber
+    # them. Callers write these ONLY via try_claim_finalize /
+    # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
+    # dict lacks the field, keep the DB's current value.
+    _preserve_on_empty = {"client_request_id", "link_to_real_id",
+                          "finalize_claim_id", "finalize_claim_at"}
+    _preserve_always = {"created_at"}
+    update_set_parts = []
+    for c in _ALL_COLUMNS:
+        if c == "id":
+            continue
+        if c == "embedding":
+            update_set_parts.append(f"{c} = COALESCE(excluded.{c}, memories.{c})")
+        elif c in _preserve_always:
+            # 只在 memories.{c} 为空时才用 excluded.{c}（首次插入）
+            update_set_parts.append(
+                f"{c} = CASE WHEN memories.{c} != '' THEN memories.{c} "
+                f"ELSE excluded.{c} END"
+            )
+        elif c in _preserve_on_empty:
+            # 只在 excluded 值非空时覆盖，为空则保留已有值
+            update_set_parts.append(
+                f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
+                f"ELSE memories.{c} END"
+            )
+        else:
+            update_set_parts.append(f"{c} = excluded.{c}")
+    update_set = ", ".join(update_set_parts)
+
+    sql = (
+        f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "
+        f"ON CONFLICT(id) DO UPDATE SET {update_set}"
+    )
+
+    try:
+        conn.execute(sql, values)
+    except sqlite3.Error:
+        logger.exception(f"Failed to upsert memory {mem.get('id', '?')}")
+        raise
+
+    # ── Update vector index ──
+    mem_id = mem["id"]
+    embedding = mem.get("embedding")
+
+    if embedding is not None and len(embedding) == EMBEDDING_DIM * 4:
+        # Ensure a vec_id_map entry exists
+        row = conn.execute(
+            "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
+        ).fetchone()
+
+        if row is not None:
+            vec_rowid = row[0]
+            # Update existing vec entry
+            try:
+                conn.execute(
+                    "UPDATE memories_vec SET embedding = ? WHERE rowid = ?",
+                    (embedding, vec_rowid),
                 )
-            elif c in _preserve_on_empty:
-                # 只在 excluded 值非空时覆盖，为空则保留已有值
-                update_set_parts.append(
-                    f"{c} = CASE WHEN excluded.{c} != '' THEN excluded.{c} "
-                    f"ELSE memories.{c} END"
-                )
-            else:
-                update_set_parts.append(f"{c} = excluded.{c}")
-        update_set = ", ".join(update_set_parts)
-
-        sql = (
-            f"INSERT INTO memories ({cols}) VALUES ({placeholders}) "
-            f"ON CONFLICT(id) DO UPDATE SET {update_set}"
-        )
-
-        try:
-            conn.execute(sql, values)
-        except sqlite3.Error:
-            logger.exception(f"Failed to upsert memory {mem.get('id', '?')}")
-            raise
-
-        # ── Update vector index ──
-        mem_id = mem["id"]
-        embedding = mem.get("embedding")
-
-        if embedding is not None and len(embedding) == EMBEDDING_DIM * 4:
-            # Ensure a vec_id_map entry exists
-            row = conn.execute(
-                "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
-            ).fetchone()
-
-            if row is not None:
-                vec_rowid = row[0]
-                # Update existing vec entry
-                try:
-                    conn.execute(
-                        "UPDATE memories_vec SET embedding = ? WHERE rowid = ?",
-                        (embedding, vec_rowid),
-                    )
-                except sqlite3.Error:
-                    # Row might not exist in vec table (e.g. after rebuild); insert instead
-                    try:
-                        conn.execute(
-                            "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
-                            (vec_rowid, embedding),
-                        )
-                    except sqlite3.Error:
-                        logger.warning(f"Failed to update/insert vec for {mem_id}")
-            else:
-                # New entry — insert into map, then into vec table
-                cur = conn.execute(
-                    "INSERT INTO vec_id_map (memory_id) VALUES (?)", (mem_id,)
-                )
-                vec_rowid = cur.lastrowid
+            except sqlite3.Error:
+                # Row might not exist in vec table (e.g. after rebuild); insert instead
                 try:
                     conn.execute(
                         "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
                         (vec_rowid, embedding),
                     )
                 except sqlite3.Error:
-                    logger.warning(f"Failed to insert vec for {mem_id}")
+                    logger.warning(f"Failed to update/insert vec for {mem_id}")
         else:
-            # No valid embedding — remove from vec if it existed
-            row = conn.execute(
-                "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
-            ).fetchone()
-            if row is not None:
-                vec_rowid = row[0]
-                try:
-                    conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
-                except sqlite3.Error:
-                    pass
-                conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
+            # New entry — insert into map, then into vec table
+            cur = conn.execute(
+                "INSERT INTO vec_id_map (memory_id) VALUES (?)", (mem_id,)
+            )
+            vec_rowid = cur.lastrowid
+            try:
+                conn.execute(
+                    "INSERT INTO memories_vec (rowid, embedding) VALUES (?, ?)",
+                    (vec_rowid, embedding),
+                )
+            except sqlite3.Error:
+                logger.warning(f"Failed to insert vec for {mem_id}")
+    else:
+        # No valid embedding — remove from vec if it existed
+        row = conn.execute(
+            "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
+        ).fetchone()
+        if row is not None:
+            vec_rowid = row[0]
+            try:
+                conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+            except sqlite3.Error:
+                pass
+            conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
 
-        # ctx auto-commits
+
+def set_memory(mem: dict) -> None:
+    """Insert or replace a memory (upsert).
+
+    Also maintains the vec_id_map and memories_vec tables for vector search.
+    FTS is handled automatically by triggers.
+
+    Public wrapper: opens a `_write_transaction()` and delegates to the
+    in-tx helper `_set_memory_in_tx`. Callers already inside a write tx
+    (e.g. state supersede in Step 0-B) MUST call `_set_memory_in_tx`
+    directly — invoking `set_memory` would hit the non-reentrant lock's
+    RuntimeError guard.
+    """
+    with _write_transaction() as conn:
+        _set_memory_in_tx(conn, mem)
 
 
 def remove_memory(mem_id: str) -> None:
