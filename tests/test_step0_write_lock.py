@@ -212,7 +212,8 @@ def _leading_text_of(node, pmap, seen: set | None = None) -> str | None:
         return _leading_text_of(node.left, pmap, seen)
 
     if isinstance(node, ast.Name):
-        # look up last assignment to this name in enclosing function
+        # look up ALL assignments to this name in enclosing function
+        # (Codex round-4 M: 保守处理——如果任一分支赋 write SQL，整条 fail-closed)
         enc = pmap.get(node)
         while enc is not None:
             if isinstance(enc, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -220,13 +221,10 @@ def _leading_text_of(node, pmap, seen: set | None = None) -> str | None:
             enc = pmap.get(enc)
         if enc is None:
             return None
-        # collect assignments (walking function body statements only, not nested defs)
         target_name = node.id
-        best_rhs = None
-        best_lineno = -1
+        candidate_rhss = []
         for stmt in ast.walk(enc):
-            # 只看纯 Assign (`x = ...`)；AugAssign (`x += ...`) 是叠加不是覆盖，
-            # 用它做 leading text 会错读成 " LIMIT ?..." 之类续接片段。
+            # 只看纯 Assign (`x = ...`)；AugAssign (`x += ...`) 是叠加不是覆盖
             if not isinstance(stmt, ast.Assign):
                 continue
             if stmt.lineno >= node.lineno:
@@ -243,11 +241,23 @@ def _leading_text_of(node, pmap, seen: set | None = None) -> str | None:
                 continue
             for tgt in stmt.targets:
                 if isinstance(tgt, ast.Name) and tgt.id == target_name:
-                    if stmt.lineno > best_lineno:
-                        best_lineno = stmt.lineno
-                        best_rhs = stmt.value
-        if best_rhs is not None:
-            return _leading_text_of(best_rhs, pmap, seen)
+                    candidate_rhss.append(stmt.value)
+        if not candidate_rhss:
+            return None
+        # Resolve leading text for every candidate. If any is None → unresolvable
+        # → return None (caller treats as dynamic/fail-closed). If all resolve to
+        # safe read prefix, return the FIRST candidate's leading text (they're
+        # all read; caller just needs to see a read verb).
+        resolved = [_leading_text_of(rhs, pmap, seen.copy()) for rhs in candidate_rhss]
+        if any(r is None for r in resolved):
+            return None
+        # All resolved. If ANY is non-read, caller must fail-closed → return
+        # the first non-read one so caller sees it as write.
+        for r in resolved:
+            if not _is_read_only_sql(r):
+                return r
+        # All safe reads → return any (first works)
+        return resolved[0]
 
     return None
 
@@ -369,8 +379,16 @@ def _find_violations(source: str, allowed_func_names=('_write_transaction', 'ini
                 violations.append((node.lineno, fn.attr, "any-receiver commit/rollback"))
             continue
 
-        # 2) execute* — decide via SQL literal & enclosing context
-        if fn.attr in ("execute", "executemany", "executescript"):
+        # 2) executescript — Codex round-4 M2：多语句脚本无法用首词判断
+        #    ("SELECT 1; DELETE ...") → 事务外/allowed-func 外一律违规。
+        if fn.attr == "executescript":
+            if not (in_write_tx or in_allowed_func):
+                violations.append((node.lineno, fn.attr,
+                                   "executescript() outside write ctx / allowed func"))
+            continue
+
+        # 3) execute/executemany — decide via SQL literal & enclosing context
+        if fn.attr in ("execute", "executemany"):
             if in_write_tx or in_allowed_func:
                 continue
             sql = _first_str_arg(node, pmap)
@@ -475,6 +493,54 @@ def outer():
     v = _find_violations(src, allowed_func_names=())
     assert any('DELETE' in d for _, _, d in v), (
         f"failed to catch nested-function DELETE outside real ctx: {v}"
+    )
+
+
+def test_ast_gate_catches_branch_reassignment_dml():
+    """sql = "DELETE"; if flag: sql = "SELECT"; conn.execute(sql)
+    当 flag=False 时执行 DELETE。保守分析必须视全部分支：任一分支非 read → fail-closed。
+    """
+    src = '''
+def bad(flag):
+    sql = "DELETE FROM memories"
+    if flag:
+        sql = "SELECT 1"
+    conn.execute(sql)
+'''
+    v = _find_violations(src, allowed_func_names=())
+    assert any('DELETE' in d or 'dynamic' in d for _, _, d in v), (
+        f"failed to catch branch-reassignment DELETE: {v}"
+    )
+
+
+def test_ast_gate_catches_if_else_write_branch():
+    """if/else 分别赋 DELETE / SELECT，任一分支非 read → 违规。"""
+    src = '''
+def bad(flag):
+    if flag:
+        sql = "DELETE FROM memories"
+    else:
+        sql = "SELECT 1"
+    conn.execute(sql)
+'''
+    v = _find_violations(src, allowed_func_names=())
+    assert any('DELETE' in d or 'dynamic' in d for _, _, d in v), (
+        f"failed to catch if/else write branch: {v}"
+    )
+
+
+def test_ast_gate_catches_executescript_with_dml():
+    """executescript("SELECT 1; DELETE ...") 首词是 SELECT 但脚本内含 DELETE。
+    executescript 在事务外一律违规，不做首词分析。
+    """
+    src = '''
+def bad():
+    conn.executescript("SELECT 1; DELETE FROM memories;")
+'''
+    v = _find_violations(src, allowed_func_names=())
+    assert any('executescript' in kind or 'executescript' in d
+               for _, kind, d in v), (
+        f"failed to catch executescript with DML: {v}"
     )
 
 
