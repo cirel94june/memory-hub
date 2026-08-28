@@ -431,12 +431,10 @@ def test_ast_gate_database_writes_only_in_ctx_and_init_db():
     assert not violations, f"database.py AST gate violations: {violations}"
 
 
-def test_ast_gate_in_tx_helpers_only_called_inside_write_ctx():
-    """Companion 闸门：_IN_TX_HELPERS 里的 helper 只允许在这些位置被调用：
-      - lexically 在 with _write_transaction(): 块内
-      - lexically 在另一个 _IN_TX_HELPERS 函数体内（in-tx 之间可级联）
-
-    防止有人误在事务外直接调 _set_memory_in_tx —— 那会绕过写锁，语义崩溃。
+def test_ast_gate_in_tx_helpers_only_called_inside_write_ctx_in_database():
+    """database.py 内部：_IN_TX_HELPERS 只允许在
+      - with _write_transaction(): 块内
+      - 另一个 _IN_TX_HELPERS 函数体内（in-tx 可级联）
     """
     src = Path(database.__file__).read_text(encoding='utf-8')
     tree = ast.parse(src)
@@ -446,25 +444,101 @@ def test_ast_gate_in_tx_helpers_only_called_inside_write_ctx():
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        name = None
-        if isinstance(fn, ast.Name):
-            name = fn.id
-        elif isinstance(fn, ast.Attribute):
-            name = fn.attr
+        name = fn.id if isinstance(fn, ast.Name) else (
+            fn.attr if isinstance(fn, ast.Attribute) else None
+        )
         if name not in _IN_TX_HELPERS:
             continue
-        # is caller in with _write_transaction() ctx?
         in_ctx = _inside_write_tx_via_ancestry(node, pmap)
-        # is caller inside another in-tx helper function?
         enc_name = _enclosing_func_name(node, pmap)
         in_another_in_tx = enc_name in _IN_TX_HELPERS
         if not (in_ctx or in_another_in_tx):
             violations.append((node.lineno, name,
                                f"called outside _write_transaction() ctx / other in-tx helper "
                                f"(enclosing func: {enc_name!r})"))
+    assert not violations, f"database.py in-tx helper misuse: {violations}"
+
+
+# Codex round-2 M: 跨文件闸门 — _IN_TX_HELPERS 只允许 database.py 内部使用
+# 其他生产模块出现 `database._set_memory_in_tx(...)` 或
+# `from database import _set_memory_in_tx` 一律违规（会绕过写锁）
+_PRODUCTION_MODULES_TO_SCAN_FOR_IN_TX_MISUSE = None  # 运行时扫描 project root
+
+
+def _enumerate_production_py_files():
+    """列出项目根目录下所有生产 .py 文件（排除 tests/、scripts/、__pycache__、
+    database.py 自身、docs/、frontend/ 等静态资源目录）。"""
+    project_root = Path(__file__).parent.parent
+    # 只扫模块根一层的 .py（当前项目结构：所有生产 py 都在根目录）
+    py_files = []
+    for p in project_root.iterdir():
+        if not p.is_file() or p.suffix != '.py':
+            continue
+        if p.name == 'database.py':
+            continue
+        py_files.append(p)
+    return py_files
+
+
+def test_ast_gate_in_tx_helpers_forbidden_outside_database():
+    """Codex round-2 M: 跨文件契约 — _IN_TX_HELPERS 不允许被 database.py 之外的
+    任何生产模块调用（会绕过写锁 + 事务保证）。
+
+    违规形式：
+      - `database._set_memory_in_tx(...)` 或 `db._set_memory_in_tx(...)` Attribute 调用
+      - `from database import _set_memory_in_tx` 导入语句
+      - `import database as X` 后 `X._set_memory_in_tx(...)`
+
+    简化检测：AST 扫每个非 database.py 生产文件，禁止：
+      1. 任何名字与 _IN_TX_HELPERS 元素相同的 attr 引用（Attribute 或 Name）
+      2. 任何 from ... import 里出现 _IN_TX_HELPERS 元素
+    """
+    violations = []
+    for path in _enumerate_production_py_files():
+        try:
+            src = path.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            continue
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            # import statements
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in _IN_TX_HELPERS:
+                        violations.append((path.name, node.lineno,
+                                           f"imports {alias.name!r} from {node.module!r}"))
+            # attribute access (database._set_memory_in_tx, db._set_memory_in_tx, etc.)
+            elif isinstance(node, ast.Attribute):
+                if node.attr in _IN_TX_HELPERS:
+                    violations.append((path.name, node.lineno,
+                                       f"attribute reference to {node.attr!r}"))
+            # bare Name reference (only meaningful if imported — caught by ImportFrom above,
+            # but also check direct Name usage for imports like `from database import *`)
+            elif isinstance(node, ast.Name):
+                if node.id in _IN_TX_HELPERS:
+                    violations.append((path.name, node.lineno,
+                                       f"bare name reference to {node.id!r} (possibly star-import)"))
     assert not violations, (
-        f"in-tx helpers called from unsafe location: {violations}"
+        f"in-tx helpers referenced outside database.py: {violations}"
     )
+
+
+def test_ast_gate_in_tx_helpers_forbidden_outside_database_reversal():
+    """反例 sanity check：把一个假 memory_ops.py 内容传给同一 AST 逻辑，必须抓住。"""
+    fake_src = '''
+import database
+def bad():
+    conn = database._get_conn()
+    database._set_memory_in_tx(conn, {"id": "x"})
+'''
+    # inline 复用与上面 test 一致的检测逻辑
+    tree = ast.parse(fake_src)
+    found = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _IN_TX_HELPERS:
+            found = True
+            break
+    assert found, "reversal case not caught — cross-file gate is toothless"
 
 
 def test_ast_gate_activity_log_no_bare_writes():
