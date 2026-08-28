@@ -323,271 +323,297 @@ async def init_db(db_path: str = None) -> None:
     path on its next call and rebuild its cached connection. Otherwise the
     read helpers would keep pointing at the old DB (write B, read A — real
     bug scripts/supersede_old_profiles.py would hit).
+
+    Phase 2.0 Step 0-A #4 fixup round-2 (Codex Medium): two-phase swap —
+    all setup (connect / pragmas / vec load / migrations) runs on a local
+    `new_conn`. Only after success do we swap in the new DB_PATH + close
+    old read connections + close old _conn. If any setup step raises, the
+    old state (DB_PATH / _conn / cached read connections) is untouched and
+    the failed `new_conn` is closed to prevent fd leak. Prevents "init B
+    failed → DB_PATH already changed to B → write goes to leftover old
+    _conn (A) → public read helpers hit missing B" split state.
     """
     global _conn, DB_PATH
 
-    if db_path is not None:
-        DB_PATH = Path(db_path)
-        # Belt-and-suspenders: also close current thread's cached read
-        # connection so a stale FD doesn't linger before the next
-        # _get_read_conn() call rebuilds against the new path.
-        close_thread_read_conn()
-
-    path = str(DB_PATH)
+    new_db_path = Path(db_path) if db_path is not None else DB_PATH
+    path = str(new_db_path)
     logger.info(f"Initialising SQLite database at {path}")
 
     conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-
-    # Pragmas
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    # Load sqlite-vec extension
     try:
-        import sqlite_vec
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
-        logger.info("sqlite-vec extension loaded")
-    except Exception as e:
-        logger.error(f"Failed to load sqlite-vec extension: {e}")
+        conn.row_factory = sqlite3.Row
+
+        # Pragmas
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        # Load sqlite-vec extension
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            logger.info("sqlite-vec extension loaded")
+        except Exception as e:
+            logger.error(f"Failed to load sqlite-vec extension: {e}")
+            raise
+
+        # Create main table + indexes
+        conn.executescript(_SCHEMA_MAIN)
+
+        # Create FTS5 virtual table + sync triggers
+        conn.executescript(_SCHEMA_FTS)
+        conn.executescript(_SCHEMA_FTS_TRIGGERS)
+
+        # Create vec id mapping table
+        conn.executescript(_SCHEMA_VEC_ID_MAP)
+
+        # Create sqlite-vec virtual table
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
+            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
+        )
+
+        # ── Migrations for existing databases ──
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "anchored" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
+            logger.info("Migrated: added 'anchored' column")
+        if "provenance_type" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'provenance_type' column")
+        if "fact_confidence" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
+            logger.info("Migrated: added 'fact_confidence' column")
+
+        if "subject_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'subject_id' column")
+        if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'source_actor_id' column")
+        if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
+            logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
+        if "info_type" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
+            logger.info("Migrated: added 'info_type' column")
+
+        # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
+        if "client_request_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'client_request_id' column")
+        if "link_to_real_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'link_to_real_id' column")
+        # PR C round-4 H1: real atomic claim for sweep retries. Without this,
+        # two concurrent sweeps can both spawn a finalize for the same skeleton.
+        if "finalize_claim_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'finalize_claim_id' column")
+        if "finalize_claim_at" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'finalize_claim_at' column")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
+        # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
+            "ON memories(client_request_id) WHERE client_request_id != ''"
+        )
+
+        # ── Proposals table (MemoryProposal 候选区) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS proposals (
+                id                  TEXT PRIMARY KEY,
+                content             TEXT NOT NULL,
+                claim_type          TEXT NOT NULL DEFAULT 'observation',
+                speech_mode         TEXT NOT NULL DEFAULT 'uncertain',
+                conversation_kind   TEXT NOT NULL DEFAULT 'house_chat',
+                proposed_room       TEXT NOT NULL DEFAULT 'living_room',
+                source_message_ids  TEXT NOT NULL DEFAULT '[]',
+                evidence_excerpt    TEXT NOT NULL DEFAULT '',
+                proposer_ai_id      TEXT NOT NULL DEFAULT '',
+                confidence          REAL NOT NULL DEFAULT 0.5,
+                conflicts_with      TEXT NOT NULL DEFAULT '[]',
+                status              TEXT NOT NULL DEFAULT 'pending',
+                layer               TEXT NOT NULL DEFAULT 'shared',
+                owner_ai            TEXT NOT NULL DEFAULT '',
+                importance          REAL NOT NULL DEFAULT 0.5,
+                emotion_arousal     REAL NOT NULL DEFAULT 0.3,
+                category            TEXT NOT NULL DEFAULT '',
+                tags                TEXT NOT NULL DEFAULT '[]',
+                event_date          TEXT NOT NULL DEFAULT '',
+                source_context      TEXT NOT NULL DEFAULT '',
+                source_platform     TEXT NOT NULL DEFAULT '',
+                provenance_type     TEXT NOT NULL DEFAULT '',
+                created_at          TEXT NOT NULL,
+                reviewed_at         TEXT NOT NULL DEFAULT '',
+                reviewed_by         TEXT NOT NULL DEFAULT '',
+                reject_reason       TEXT NOT NULL DEFAULT '',
+                triage_reason       TEXT NOT NULL DEFAULT '',
+                applied_memory_id   TEXT NOT NULL DEFAULT '',
+                failure_reason      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
+        """)
+
+        # ── Proposals table migrations ──
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
+        for col, typedef in [
+            ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
+            ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_actor_id", "TEXT NOT NULL DEFAULT ''"),
+            ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
+            ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
+            ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
+                logger.info(f"Migrated proposals: added '{col}' column")
+        if "source_speaker_id" in existing and "source_actor_id" not in existing:
+            conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
+            logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
+
+        # ── Maintenance Audit table ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS maintenance_audit (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                action              TEXT NOT NULL,
+                target_id           TEXT NOT NULL DEFAULT '',
+                new_content         TEXT NOT NULL DEFAULT '',
+                source_message_ids  TEXT NOT NULL DEFAULT '[]',
+                decision_reason     TEXT NOT NULL DEFAULT '',
+                state_before        TEXT NOT NULL DEFAULT '{}',
+                state_after         TEXT NOT NULL DEFAULT '{}',
+                model_id            TEXT NOT NULL DEFAULT '',
+                source_ai           TEXT NOT NULL DEFAULT '',
+                auto_executed       INTEGER NOT NULL DEFAULT 1,
+                prompt_version      TEXT NOT NULL DEFAULT '',
+                created_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
+            CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
+        """)
+
+        audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
+        if "prompt_version" not in audit_cols:
+            conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated maintenance_audit: added 'prompt_version' column")
+
+        # ── PR C H2: async_remember_ledger ──
+        # Records the terminal outcome of each async remember pipeline. Written
+        # in the SAME transaction as the memory changes (via _commit_ledger),
+        # so a mid-flight crash cannot leave the ledger and memory tables out
+        # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
+        # state exists, sweep applies it without re-running the pipeline.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS async_remember_ledger (
+                skeleton_id       TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL DEFAULT '',
+                terminal_state    TEXT NOT NULL,   -- 'in_flight' | 'active' | 'replaced' | 'failed'
+                result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
+                committed_at      TEXT NOT NULL,
+                owner_token       TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_crq
+                ON async_remember_ledger(client_request_id);
+        """)
+
+        # H1 round-6: owner_token migration for pre-existing ledger tables.
+        ledger_cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(async_remember_ledger)").fetchall()}
+        if "owner_token" not in ledger_cols:
+            conn.execute(
+                "ALTER TABLE async_remember_ledger "
+                "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated async_remember_ledger: added 'owner_token'")
+
+        # ── Profiles table migration ──
+        try:
+            profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+            if profile_cols and "status" not in profile_cols:
+                conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                logger.info("Migrated profiles: added 'status' column")
+        except sqlite3.OperationalError:
+            pass
+
+        # ── Dream dedup table (one dream per AI per local day) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS dream_log (
+                ai_id       TEXT NOT NULL,
+                local_day   TEXT NOT NULL,
+                memory_id   TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (ai_id, local_day)
+            );
+        """)
+
+        # ── Persons table (人物名片) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS persons (
+                person_id       TEXT PRIMARY KEY,
+                entity_type     TEXT NOT NULL DEFAULT 'other',
+                canonical_name  TEXT NOT NULL,
+                aliases         TEXT NOT NULL DEFAULT '[]',
+                linked_agent_id TEXT NOT NULL DEFAULT '',
+                note            TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT '',
+                updated_at      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
+            CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
+        """)
+
+        # ── Profiles table (User/Agent/Relationship Profile) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                id              TEXT PRIMARY KEY,
+                profile_type    TEXT NOT NULL,
+                owner_ai        TEXT NOT NULL DEFAULT '',
+                content         TEXT NOT NULL DEFAULT '{}',
+                generated_at    TEXT NOT NULL DEFAULT '',
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                version         INTEGER NOT NULL DEFAULT 1,
+                status          TEXT NOT NULL DEFAULT 'pending_review'
+            );
+            CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
+            CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
+            CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
+        """)
+
+        conn.commit()
+    except BaseException:
+        # Setup failed — close the half-initialised conn and re-raise
+        # WITHOUT touching module globals. DB_PATH / _conn / read_conn
+        # remain pointing at whatever was in place before init_db was called.
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise
 
-    # Create main table + indexes
-    conn.executescript(_SCHEMA_MAIN)
-
-    # Create FTS5 virtual table + sync triggers
-    conn.executescript(_SCHEMA_FTS)
-    conn.executescript(_SCHEMA_FTS_TRIGGERS)
-
-    # Create vec id mapping table
-    conn.executescript(_SCHEMA_VEC_ID_MAP)
-
-    # Create sqlite-vec virtual table
-    conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
-        f"USING vec0(embedding float[{EMBEDDING_DIM}])"
-    )
-
-    # ── Migrations for existing databases ──
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
-    if "anchored" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
-        logger.info("Migrated: added 'anchored' column")
-    if "provenance_type" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'provenance_type' column")
-    if "fact_confidence" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
-        logger.info("Migrated: added 'fact_confidence' column")
-
-    if "subject_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'subject_id' column")
-    if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'source_actor_id' column")
-    if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
-        logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
-    if "info_type" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
-        logger.info("Migrated: added 'info_type' column")
-
-    # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
-    if "client_request_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'client_request_id' column")
-    if "link_to_real_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'link_to_real_id' column")
-    # PR C round-4 H1: real atomic claim for sweep retries. Without this,
-    # two concurrent sweeps can both spawn a finalize for the same skeleton.
-    if "finalize_claim_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'finalize_claim_id' column")
-    if "finalize_claim_at" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'finalize_claim_at' column")
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
-    # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
-        "ON memories(client_request_id) WHERE client_request_id != ''"
-    )
-
-    # ── Proposals table (MemoryProposal 候选区) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS proposals (
-            id                  TEXT PRIMARY KEY,
-            content             TEXT NOT NULL,
-            claim_type          TEXT NOT NULL DEFAULT 'observation',
-            speech_mode         TEXT NOT NULL DEFAULT 'uncertain',
-            conversation_kind   TEXT NOT NULL DEFAULT 'house_chat',
-            proposed_room       TEXT NOT NULL DEFAULT 'living_room',
-            source_message_ids  TEXT NOT NULL DEFAULT '[]',
-            evidence_excerpt    TEXT NOT NULL DEFAULT '',
-            proposer_ai_id      TEXT NOT NULL DEFAULT '',
-            confidence          REAL NOT NULL DEFAULT 0.5,
-            conflicts_with      TEXT NOT NULL DEFAULT '[]',
-            status              TEXT NOT NULL DEFAULT 'pending',
-            layer               TEXT NOT NULL DEFAULT 'shared',
-            owner_ai            TEXT NOT NULL DEFAULT '',
-            importance          REAL NOT NULL DEFAULT 0.5,
-            emotion_arousal     REAL NOT NULL DEFAULT 0.3,
-            category            TEXT NOT NULL DEFAULT '',
-            tags                TEXT NOT NULL DEFAULT '[]',
-            event_date          TEXT NOT NULL DEFAULT '',
-            source_context      TEXT NOT NULL DEFAULT '',
-            source_platform     TEXT NOT NULL DEFAULT '',
-            provenance_type     TEXT NOT NULL DEFAULT '',
-            created_at          TEXT NOT NULL,
-            reviewed_at         TEXT NOT NULL DEFAULT '',
-            reviewed_by         TEXT NOT NULL DEFAULT '',
-            reject_reason       TEXT NOT NULL DEFAULT '',
-            triage_reason       TEXT NOT NULL DEFAULT '',
-            applied_memory_id   TEXT NOT NULL DEFAULT '',
-            failure_reason      TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
-        CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
-    """)
-
-    # ── Proposals table migrations ──
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
-    for col, typedef in [
-        ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
-        ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
-        ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
-        ("subject_id", "TEXT NOT NULL DEFAULT ''"),
-        ("source_actor_id", "TEXT NOT NULL DEFAULT ''"),
-        ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
-        ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
-        ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
-    ]:
-        if col not in existing:
-            conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
-            logger.info(f"Migrated proposals: added '{col}' column")
-    if "source_speaker_id" in existing and "source_actor_id" not in existing:
-        conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
-        logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
-
-    # ── Maintenance Audit table ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS maintenance_audit (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            action              TEXT NOT NULL,
-            target_id           TEXT NOT NULL DEFAULT '',
-            new_content         TEXT NOT NULL DEFAULT '',
-            source_message_ids  TEXT NOT NULL DEFAULT '[]',
-            decision_reason     TEXT NOT NULL DEFAULT '',
-            state_before        TEXT NOT NULL DEFAULT '{}',
-            state_after         TEXT NOT NULL DEFAULT '{}',
-            model_id            TEXT NOT NULL DEFAULT '',
-            source_ai           TEXT NOT NULL DEFAULT '',
-            auto_executed       INTEGER NOT NULL DEFAULT 1,
-            prompt_version      TEXT NOT NULL DEFAULT '',
-            created_at          TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
-        CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
-        CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
-    """)
-
-    audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
-    if "prompt_version" not in audit_cols:
-        conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated maintenance_audit: added 'prompt_version' column")
-
-    # ── PR C H2: async_remember_ledger ──
-    # Records the terminal outcome of each async remember pipeline. Written
-    # in the SAME transaction as the memory changes (via _commit_ledger),
-    # so a mid-flight crash cannot leave the ledger and memory tables out
-    # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
-    # state exists, sweep applies it without re-running the pipeline.
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS async_remember_ledger (
-            skeleton_id       TEXT PRIMARY KEY,
-            client_request_id TEXT NOT NULL DEFAULT '',
-            terminal_state    TEXT NOT NULL,   -- 'in_flight' | 'active' | 'replaced' | 'failed'
-            result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
-            committed_at      TEXT NOT NULL,
-            owner_token       TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_ledger_crq
-            ON async_remember_ledger(client_request_id);
-    """)
-
-    # H1 round-6: owner_token migration for pre-existing ledger tables.
-    ledger_cols = {row[1] for row in conn.execute(
-        "PRAGMA table_info(async_remember_ledger)").fetchall()}
-    if "owner_token" not in ledger_cols:
-        conn.execute(
-            "ALTER TABLE async_remember_ledger "
-            "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated async_remember_ledger: added 'owner_token'")
-
-    # ── Profiles table migration ──
-    try:
-        profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
-        if profile_cols and "status" not in profile_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-            logger.info("Migrated profiles: added 'status' column")
-    except sqlite3.OperationalError:
-        pass
-
-    # ── Dream dedup table (one dream per AI per local day) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS dream_log (
-            ai_id       TEXT NOT NULL,
-            local_day   TEXT NOT NULL,
-            memory_id   TEXT NOT NULL DEFAULT '',
-            created_at  TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (ai_id, local_day)
-        );
-    """)
-
-    # ── Persons table (人物名片) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS persons (
-            person_id       TEXT PRIMARY KEY,
-            entity_type     TEXT NOT NULL DEFAULT 'other',
-            canonical_name  TEXT NOT NULL,
-            aliases         TEXT NOT NULL DEFAULT '[]',
-            linked_agent_id TEXT NOT NULL DEFAULT '',
-            note            TEXT NOT NULL DEFAULT '',
-            created_at      TEXT NOT NULL DEFAULT '',
-            updated_at      TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
-        CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
-    """)
-
-    # ── Profiles table (User/Agent/Relationship Profile) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            id              TEXT PRIMARY KEY,
-            profile_type    TEXT NOT NULL,
-            owner_ai        TEXT NOT NULL DEFAULT '',
-            content         TEXT NOT NULL DEFAULT '{}',
-            generated_at    TEXT NOT NULL DEFAULT '',
-            source_memory_ids TEXT NOT NULL DEFAULT '[]',
-            version         INTEGER NOT NULL DEFAULT 1,
-            status          TEXT NOT NULL DEFAULT 'pending_review'
-        );
-        CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
-        CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
-        CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
-    """)
-
-    conn.commit()
+    # Two-phase swap: only after all setup succeeded do we mutate globals.
+    # Close the previously-installed write conn (if any) to avoid fd leak on
+    # re-init; close the current thread's cached read conn so the next
+    # _get_read_conn() rebuilds against the new DB_PATH.
+    old_conn = _conn
+    DB_PATH = new_db_path
     _conn = conn
+    close_thread_read_conn()
+    if old_conn is not None and old_conn is not conn:
+        try:
+            old_conn.close()
+        except Exception:
+            pass
     logger.info("Database initialised successfully")
 
 

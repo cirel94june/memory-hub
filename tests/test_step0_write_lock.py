@@ -573,6 +573,44 @@ def test_ast_gate_pure_read_helpers_all_present():
     assert not missing, f"pure-read helpers missing from database.py: {missing}"
 
 
+def test_init_db_failed_swap_leaves_old_state_intact(tmp_path):
+    """Codex #4 round-2 Medium regression: if init_db(new_path) fails partway
+    through setup, DB_PATH / _conn / read helpers must all still point at the
+    original DB. Prior implementation eagerly assigned DB_PATH before the new
+    conn was fully initialised → failure state left DB_PATH pointing at bad
+    path while _conn still held old conn (write A, read fails on B).
+    """
+    import asyncio as _asyncio
+
+    db_a = tmp_path / "a.db"
+    _asyncio.run(database.init_db(str(db_a)))
+    database.set_memory({"id": "row_a", "content": "in DB A"})
+    assert database.get_memory("row_a") is not None
+
+    old_db_path = database.DB_PATH
+    old_conn = database._conn
+
+    # Point at a bad path (parent dir doesn't exist → connect will fail on
+    # first PRAGMA or actual disk touch)
+    bad_path = tmp_path / "does_not_exist_dir" / "b.db"
+
+    with pytest.raises(Exception):
+        _asyncio.run(database.init_db(str(bad_path)))
+
+    # Post-condition: DB_PATH untouched, _conn untouched, A still accessible
+    assert database.DB_PATH == old_db_path, (
+        f"DB_PATH changed on failed init: {database.DB_PATH} vs {old_db_path}"
+    )
+    assert database._conn is old_conn, "_conn replaced despite failed init"
+
+    # Both write and read on A still function correctly
+    database.set_memory({"id": "row_a_after", "content": "still writable"})
+    got = database.get_memory("row_a")
+    assert got is not None and got["content"] == "in DB A"
+    got2 = database.get_memory("row_a_after")
+    assert got2 is not None and got2["content"] == "still writable"
+
+
 def test_init_db_syncs_global_db_path(tmp_path):
     """Codex #4 High regression: `init_db(path_b)` must update the module-level
     DB_PATH so `_get_read_conn()` sees the new path. Without this fix, write
