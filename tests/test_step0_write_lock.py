@@ -573,6 +573,40 @@ def test_ast_gate_pure_read_helpers_all_present():
     assert not missing, f"pure-read helpers missing from database.py: {missing}"
 
 
+def test_init_db_syncs_global_db_path(tmp_path):
+    """Codex #4 High regression: `init_db(path_b)` must update the module-level
+    DB_PATH so `_get_read_conn()` sees the new path. Without this fix, write
+    would go to B but read helpers keep hitting A ——scripts/supersede_old_profiles.py
+    passes db_path via env var and immediately calls read helpers, hitting the bug.
+    """
+    import asyncio as _asyncio
+
+    db_a = tmp_path / "a.db"
+    db_b = tmp_path / "b.db"
+
+    # setup A explicitly
+    database.DB_PATH = db_a
+    _asyncio.run(database.init_db(str(db_a)))
+    database.set_memory({"id": "row_a", "content": "in DB A"})
+    assert database.get_memory("row_a") is not None
+
+    # switch to B via init_db(path_b) ONLY (no manual DB_PATH mutation)
+    database._conn = None
+    _asyncio.run(database.init_db(str(db_b)))
+
+    # Post-condition 1: DB_PATH module global must now be db_b
+    assert str(database.DB_PATH) == str(db_b), (
+        f"init_db(db_b) did not sync DB_PATH: got {database.DB_PATH}"
+    )
+
+    # Post-condition 2: read helpers must operate against B
+    database.set_memory({"id": "row_b", "content": "in DB B"})
+    got_a = database.get_memory("row_a")
+    got_b = database.get_memory("row_b")
+    assert got_a is None, "read helper still hitting DB A — DB_PATH not synced"
+    assert got_b is not None and got_b["content"] == "in DB B"
+
+
 def test_read_conn_invalidates_on_db_path_switch(tmp_path):
     """M2: 同线程先读 DB A → 切 DB_PATH → 再读应看到 DB B 的数据。"""
     import asyncio as _asyncio

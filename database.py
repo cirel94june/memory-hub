@@ -317,10 +317,23 @@ async def init_db(db_path: str = None) -> None:
     Creates tables, loads the sqlite-vec extension, and sets pragmas.
     The ``async`` signature is for startup-flow compatibility only;
     all work is synchronous.
-    """
-    global _conn
 
-    path = db_path or str(DB_PATH)
+    Phase 2.0 Step 0-A #4 fixup (Codex High): if `db_path` is provided,
+    update the module-level DB_PATH so `_get_read_conn()` will see the new
+    path on its next call and rebuild its cached connection. Otherwise the
+    read helpers would keep pointing at the old DB (write B, read A — real
+    bug scripts/supersede_old_profiles.py would hit).
+    """
+    global _conn, DB_PATH
+
+    if db_path is not None:
+        DB_PATH = Path(db_path)
+        # Belt-and-suspenders: also close current thread's cached read
+        # connection so a stale FD doesn't linger before the next
+        # _get_read_conn() call rebuilds against the new path.
+        close_thread_read_conn()
+
+    path = str(DB_PATH)
     logger.info(f"Initialising SQLite database at {path}")
 
     conn = sqlite3.connect(path, check_same_thread=False)
