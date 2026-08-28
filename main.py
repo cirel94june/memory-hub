@@ -122,6 +122,13 @@ async def lifespan(app: FastAPI):
                 _ar.clear_finalize_semaphores()
             except Exception:
                 pass
+            # Phase 2.0 Step 0-A #4: close current thread's read connection
+            # to avoid fd leaks on hot reload / embedded interpreter shutdown.
+            try:
+                from database import close_thread_read_conn
+                close_thread_read_conn()
+            except Exception:
+                pass
 
 
 def _seconds_until_next_run() -> int:

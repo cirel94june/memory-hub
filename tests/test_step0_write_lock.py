@@ -523,6 +523,106 @@ def test_ast_gate_in_tx_helpers_forbidden_outside_database():
     )
 
 
+# ── Batch #4: 26 pure-read helpers 迁 _get_read_conn + DB_PATH 失效 ──
+
+_PURE_READ_HELPERS_LIST = (
+    'get_memory', 'get_memory_by_client_request_id', 'list_stale_intent_ledgers',
+    'get_ledger', 'list_memories_by_status', 'query_memories', 'count_memories',
+    'get_proposal', 'list_proposals', 'count_proposals', 'list_audits', 'count_audits',
+    'get_profile', 'list_profiles', 'vector_search', 'fts_search', 'cjk_like_search',
+    'get_all_memory_ids', 'get_memories_batch', 'iter_memories', 'get_person',
+    'list_persons', 'get_memories_by_subject', 'count_memories_by_subject',
+    'resolve_alias', 'get_all_aliases',
+)
+
+
+def test_ast_gate_pure_read_helpers_use_read_conn():
+    """Batch #4: 26 个 pure-read helpers 必须使用 _get_read_conn()（不再 _get_conn()）。
+
+    AST 扫每个函数体，禁止 _get_conn() 调用，允许 _get_read_conn() 调用。
+    """
+    src = Path(database.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    pmap = _build_parent_map(tree)
+
+    violations = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        # 只关心 _get_conn()（不含属性访问）
+        if isinstance(fn, ast.Name) and fn.id == '_get_conn':
+            enc = _enclosing_func_name(node, pmap)
+            if enc in _PURE_READ_HELPERS_LIST:
+                violations.append((node.lineno, enc, "pure-read helper uses _get_conn()"))
+
+    assert not violations, (
+        f"pure-read helpers must use _get_read_conn(), not _get_conn(): {violations}"
+    )
+
+
+def test_ast_gate_pure_read_helpers_all_present():
+    """确保 26 个 pure-read helpers 确实定义在 database.py（防止清单漂移）。"""
+    src = Path(database.__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    defined = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing = [n for n in _PURE_READ_HELPERS_LIST if n not in defined]
+    assert not missing, f"pure-read helpers missing from database.py: {missing}"
+
+
+def test_read_conn_invalidates_on_db_path_switch(tmp_path):
+    """M2: 同线程先读 DB A → 切 DB_PATH → 再读应看到 DB B 的数据。"""
+    import asyncio as _asyncio
+
+    db_a = tmp_path / "a.db"
+    db_b = tmp_path / "b.db"
+
+    # init A + 用 set_memory 插入 marker A
+    database.DB_PATH = db_a
+    _asyncio.run(database.init_db(str(db_a)))
+    database.set_memory({"id": "marker_a", "content": "in DB A"})
+
+    # 首次读：应该看到 A
+    got_a = database.get_memory("marker_a")
+    assert got_a is not None and got_a["content"] == "in DB A"
+
+    # 切到 B（需要重置 _conn 因为它是全局单例）
+    database._conn = None
+    database.DB_PATH = db_b
+    _asyncio.run(database.init_db(str(db_b)))
+    database.set_memory({"id": "marker_b", "content": "in DB B"})
+
+    # 同线程再读 —— read_conn 应已失效重建，看到 B 的数据
+    got_a_after = database.get_memory("marker_a")
+    got_b = database.get_memory("marker_b")
+    assert got_a_after is None, "should NOT see DB A rows after switch"
+    assert got_b is not None and got_b["content"] == "in DB B"
+
+
+def test_close_thread_read_conn_releases_fd(initdb):
+    """M2: close_thread_read_conn 关闭当前线程 read_conn；再次调 _get_read_conn 会重建。"""
+    conn1 = database._get_read_conn()
+    assert conn1 is not None
+    # verify it's actually usable
+    row = conn1.execute("SELECT 1").fetchone()
+    assert row[0] == 1
+
+    database.close_thread_read_conn()
+    assert getattr(database._local, 'read_conn', None) is None
+    assert getattr(database._local, 'read_db_path', None) is None
+
+    # subsequent get should rebuild — different object
+    conn2 = database._get_read_conn()
+    assert conn2 is not None
+    assert conn2 is not conn1, "expected a fresh connection after close"
+
+    # cleanup for other tests
+    database.close_thread_read_conn()
+
+
 def test_ast_gate_in_tx_helpers_forbidden_outside_database_reversal():
     """反例 sanity check：把一个假 memory_ops.py 内容传给同一 AST 逻辑，必须抓住。"""
     fake_src = '''

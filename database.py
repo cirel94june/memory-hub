@@ -82,12 +82,24 @@ def _write_transaction():
 
 
 def _get_read_conn() -> sqlite3.Connection:
-    """每个线程独立的只读连接，WAL 模式下不会被写锁阻塞。"""
+    """每个线程独立的只读连接，WAL 模式下不会被写锁阻塞。
+
+    Phase 2.0 Step 0-A #4 (v2.9 M2): 缓存 read_conn + read_db_path；DB_PATH 变化
+    时关旧建新（--db-path backfill / test 切库 / init_db(path_B) 后同一线程仍
+    能读到正确的 DB）。
+    """
+    cur_path = str(DB_PATH)
     conn = getattr(_local, "read_conn", None)
-    if conn is not None:
+    cached_path = getattr(_local, "read_db_path", None)
+    if conn is not None and cached_path == cur_path:
         return conn
-    path = str(DB_PATH)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+    # 路径变了或首次调用 → 关旧（若有）建新
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    conn = sqlite3.connect(f"file:{cur_path}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=200")  # 读连接只等 200ms，不要等 5s
     conn.execute("PRAGMA query_only=ON")
@@ -99,7 +111,24 @@ def _get_read_conn() -> sqlite3.Connection:
     except Exception:
         pass
     _local.read_conn = conn
+    _local.read_db_path = cur_path
     return conn
+
+
+def close_thread_read_conn() -> None:
+    """关闭当前线程的只读连接（进程 shutdown / --db-path 切库前调用）。
+
+    Phase 2.0 Step 0-A #4: 避免 fd 泄漏；主进程 shutdown hook 调用；backfill
+    脚本切库前调用；测试之间隔离亦可复用。
+    """
+    conn = getattr(_local, "read_conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.read_conn = None
+        _local.read_db_path = None
 
 
 async def read_in_thread(fn: Callable[..., T], *args, **kwargs) -> T:
@@ -569,7 +598,7 @@ _ALL_COLUMNS = [
 
 def get_memory(mem_id: str) -> dict | None:
     """Get a single memory by ID. Returns full dict including embedding."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
     if row is None:
         return None
@@ -583,7 +612,7 @@ def get_memory_by_client_request_id(crq: str) -> dict | None:
     regardless of status (pending/active/replaced/failed)."""
     if not crq:
         return None
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT * FROM memories WHERE client_request_id = ? LIMIT 1", (crq,)
     ).fetchone()
@@ -745,7 +774,7 @@ def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
 
     Sweep should mark each returned skeleton failed + close out the ledger.
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(minutes=older_than_minutes)).isoformat()
     rows = conn.execute(
@@ -970,7 +999,7 @@ def get_ledger(skeleton_id: str) -> dict | None:
     pipeline hasn't committed a terminal state yet."""
     if not skeleton_id:
         return None
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT skeleton_id, client_request_id, terminal_state, "
         "       result_memory_id, committed_at "
@@ -1221,7 +1250,7 @@ def list_memories_by_status(status: str, older_than_minutes: int = 0,
                              limit: int = 500) -> list[dict]:
     """Return memories in a specific status, optionally older than N minutes.
     Used by the pending sweep to find stuck skeletons."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     if older_than_minutes > 0:
         cutoff = (datetime.now(timezone.utc)
                   - timedelta(minutes=older_than_minutes)).isoformat()
@@ -1472,7 +1501,7 @@ def query_memories(
     include_rooms: list[str] = None,
 ) -> list[dict]:
     """Query memories with filters. Returns dicts without embedding."""
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     clauses: list[str] = []
     params: list = []
@@ -1557,7 +1586,7 @@ def _sanitise_order_by(order_by: str) -> str:
 
 def count_memories(status: str = "active") -> int:
     """Count memories by status."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE status = ?", (status,)
     ).fetchone()
@@ -1591,7 +1620,7 @@ def insert_proposal(row: dict) -> None:
 
 
 def get_proposal(pid: str) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute("SELECT * FROM proposals WHERE id = ?", (pid,)).fetchone()
     return dict(row) if row else None
 
@@ -1599,7 +1628,7 @@ def get_proposal(pid: str) -> dict | None:
 def list_proposals(
     status: str = "pending", limit: int = 50, offset: int = 0,
 ) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (status, limit, offset),
@@ -1622,7 +1651,7 @@ def update_proposal_status(
 
 
 def count_proposals(status: str = "pending") -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM proposals WHERE status = ?", (status,)
     ).fetchone()
@@ -1651,7 +1680,7 @@ def insert_audit(row: dict) -> int:
 
 
 def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if action:
         rows = conn.execute(
             "SELECT * FROM maintenance_audit WHERE action = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -1666,7 +1695,7 @@ def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[di
 
 
 def count_audits(action: str = None) -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if action:
         row = conn.execute("SELECT COUNT(*) FROM maintenance_audit WHERE action = ?", (action,)).fetchone()
     else:
@@ -1720,7 +1749,7 @@ def supersede_profile(profile_id: str) -> bool:
 
 
 def get_profile(profile_id: str, status: str = None) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if status:
         row = conn.execute("SELECT * FROM profiles WHERE id = ? AND status = ?",
                            (profile_id, status)).fetchone()
@@ -1730,7 +1759,7 @@ def get_profile(profile_id: str, status: str = None) -> dict | None:
 
 
 def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     conditions = []
     params = []
     if profile_type:
@@ -1810,7 +1839,7 @@ def vector_search(
     by the requested criteria at the SQL layer, returning up to ``top_k``
     results with a ``distance`` field (lower is more similar).
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     return _vector_search_impl(
         conn, query_vec, top_k, status, room, include_rooms, exclude_rooms,
         layer, owner_ai, exclude_provenance, exclude_resolved, exclude_superseded,
@@ -1928,7 +1957,7 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     Returns memories matching the query with a ``rank`` field
     (more negative = better match in FTS5 bm25 scoring).
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     return _fts_search_impl(conn, query, top_k, status, exclude_provenance,
                             exclude_resolved, exclude_superseded,
                             include_rooms, exclude_rooms)
@@ -2066,7 +2095,7 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
                     exclude_rooms: list[str] = None) -> list[dict]:
     """中文子串搜索（LIKE 路）。委托到共享 impl。"""
     return _cjk_like_search_impl(
-        _get_conn(), query, top_k, status, exclude_provenance,
+        _get_read_conn(), query, top_k, status, exclude_provenance,
         exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
     )
 
@@ -2097,7 +2126,7 @@ def _fts_escape_token(token: str) -> str:
 
 def get_all_memory_ids() -> list[str]:
     """Get all active memory IDs."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT id FROM memories WHERE status = 'active'"
     ).fetchall()
@@ -2108,7 +2137,7 @@ def get_memories_batch(ids: list[str]) -> list[dict]:
     """Get multiple memories by ID. Returns dicts without embedding."""
     if not ids:
         return []
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     results = []
     # Process in batches of 500 for SQLite variable limit
@@ -2134,7 +2163,7 @@ def iter_memories(
 
     Yields dicts without embedding, fetching ``batch_size`` rows at a time.
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     clauses: list[str] = []
     params: list = []
@@ -2302,7 +2331,7 @@ def upsert_person(person: dict) -> None:
 
 
 def get_person(person_id: str) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT * FROM persons WHERE person_id = ?", (person_id,)
     ).fetchone()
@@ -2310,7 +2339,7 @@ def get_person(person_id: str) -> dict | None:
 
 
 def list_persons(entity_type: str = None) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if entity_type:
         rows = conn.execute(
             "SELECT * FROM persons WHERE entity_type = ? ORDER BY canonical_name",
@@ -2324,7 +2353,7 @@ def list_persons(entity_type: str = None) -> list[dict]:
 
 
 def get_memories_by_subject(person_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT * FROM memories WHERE subject_id = ? AND status = 'active' "
         "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
@@ -2334,7 +2363,7 @@ def get_memories_by_subject(person_id: str, limit: int = 50, offset: int = 0) ->
 
 
 def count_memories_by_subject(person_id: str) -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE subject_id = ? AND status = 'active'",
         (person_id,),
@@ -2351,7 +2380,7 @@ def delete_person(person_id: str) -> bool:
 
 def resolve_alias(name: str, scope: str = "household") -> str | None:
     """根据别名找到 person_id。先精确匹配 canonical_name，再搜 aliases JSON。"""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT person_id FROM persons WHERE canonical_name = ?", (name,)
     ).fetchone()
@@ -2452,7 +2481,7 @@ def seed_baseline_persons() -> int:
 
 def get_all_aliases(scope: str = "household") -> dict[str, str]:
     """返回 {别名: person_id} 映射表，用于批量归一。"""
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute("SELECT person_id, canonical_name, aliases FROM persons").fetchall()
     result: dict[str, str] = {}
     for r in rows:
