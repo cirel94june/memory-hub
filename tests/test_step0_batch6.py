@@ -104,6 +104,40 @@ def test_prepare_memory_value_parametrized(key, inp, expected, desc):
     assert got == expected, f"{desc}: expected {expected!r}, got {got!r}"
 
 
+# Codex batch #6 L1: _ALL_COLUMNS 全字段回归 —— 保证未来加新列时测试自动纳入。
+# 遍历完整 schema，None 输入不能 raise；对无覆盖字段给出合理默认。
+@pytest.mark.parametrize("key", database._ALL_COLUMNS)
+def test_prepare_accepts_every_memory_column(key):
+    """_ALL_COLUMNS 每一列都必须能通过 _prepare_memory_value(key, None) 不抛。
+
+    这条测试对"新增列必须走 _prepare_memory_value"形成 forcing 约束——添加新
+    列后如果忘更新 helper，本测试会立即红。
+    """
+    # 不断言具体返回值（走 default 各分支路径不同）；只断言不 raise
+    result = _prepare_memory_value(key, None)
+    # 对 SQL NULL-friendly 字段（resolved/anchored/embedding/fact_confidence）
+    # 允许返回 None；其他字段返回值不能是 None（会撞 memories 表的 NOT NULL）
+    if key in ("resolved", "anchored", "embedding", "fact_confidence"):
+        assert result is None or isinstance(result, (int, float, bytes, str)), (
+            f"{key!r} nullable field: unexpected type {type(result).__name__}"
+        )
+    else:
+        assert result is not None, (
+            f"{key!r} non-nullable field: _prepare_memory_value returned None "
+            f"— this will violate NOT NULL constraint at INSERT"
+        )
+
+
+def test_all_columns_count_matches_expected():
+    """schema 字段数在 Step 0-A 完结时应稳定；未来加列必须显式 revisit
+    _prepare_memory_value + set_memory 保护 (_preserve_on_empty / _preserve_always)。
+    本断言不是硬约束——只是让加列时提醒 reviewer 检查一下相关配套。"""
+    # 当前 (Step 0-A 完结) 应为 38 列（含 finalize_claim_id/at）
+    assert len(database._ALL_COLUMNS) >= 30, (
+        f"unexpected _ALL_COLUMNS drop: {len(database._ALL_COLUMNS)}"
+    )
+
+
 def test_prepare_memory_value_fact_confidence_none_stays_none():
     """v2.9 H1 契约核心断言：fact_confidence 的 None 必须保留（不改成 0.0）。"""
     assert _prepare_memory_value("fact_confidence", None) is None
@@ -244,7 +278,8 @@ def test_set_memory_vec_index_new_entry(initdb):
 
 
 def test_set_memory_vec_index_update_existing(initdb):
-    """vec 已存在：第二次 UPSERT 用新 embedding 更新 memories_vec 同 rowid。"""
+    """vec 已存在：第二次 UPSERT 用新 embedding 必须真正替换 memories_vec 内容
+    (Codex batch #6 L2)。断言 rowid 稳定 + 向量内容确实变了。"""
     emb1 = b"\x03" * (EMBEDDING_DIM * 4)
     emb2 = b"\x04" * (EMBEDDING_DIM * 4)
     database.set_memory({
@@ -255,6 +290,11 @@ def test_set_memory_vec_index_update_existing(initdb):
     rowid1 = conn.execute(
         "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", ("gold_vec_upd",)
     ).fetchone()[0]
+    # 读回 memories_vec 内容验证 emb1 已入向量表
+    vec_bytes1 = conn.execute(
+        "SELECT embedding FROM memories_vec WHERE rowid = ?", (rowid1,)
+    ).fetchone()[0]
+    assert vec_bytes1 == emb1, "initial embedding must be stored in memories_vec"
 
     database.set_memory({
         "id": "gold_vec_upd", "content": "v2", "status": "active",
@@ -265,6 +305,15 @@ def test_set_memory_vec_index_update_existing(initdb):
         "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", ("gold_vec_upd",)
     ).fetchone()[0]
     assert rowid1 == rowid2, "vec_rowid must remain stable across UPSERT"
+    # Codex L2: 断言向量内容真的换成 emb2（而非仍是 emb1）
+    vec_bytes2 = conn.execute(
+        "SELECT embedding FROM memories_vec WHERE rowid = ?", (rowid2,)
+    ).fetchone()[0]
+    assert vec_bytes2 == emb2, (
+        "memories_vec must contain emb2 after UPSERT, "
+        f"got {vec_bytes2[:16]!r}... (expected {emb2[:16]!r}...)"
+    )
+    assert vec_bytes2 != emb1, "embedding content must actually change, not just rowid"
 
 
 def test_set_memory_vec_cleanup_on_no_embedding(initdb):
@@ -272,6 +321,9 @@ def test_set_memory_vec_cleanup_on_no_embedding(initdb):
     真正的清理场景：mem dict 显式带 embedding=<invalid size or None> 且旧 mem 有映射.
     实际当前实现: dict 无 embedding 键 → COALESCE 保留旧；dict 有 embedding=None 且旧存在 → 也 COALESCE 保留。
     唯一走清理路径：dict 有 embedding=<size 不对的 bytes>（视为 invalid），触发 else 分支。
+
+    Codex batch #6 L2: 同时断言 memories_vec 表实际 row 也被删除，不只是
+    vec_id_map 里的映射消失。
     """
     emb = b"\x05" * (EMBEDDING_DIM * 4)
     database.set_memory({
@@ -279,10 +331,16 @@ def test_set_memory_vec_cleanup_on_no_embedding(initdb):
         "embedding": emb,
     })
     conn = database._get_read_conn()
-    assert conn.execute(
+    map_row = conn.execute(
         "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?",
         ("gold_vec_clean",)
-    ).fetchone() is not None
+    ).fetchone()
+    assert map_row is not None
+    old_rowid = map_row[0]
+    # verify memories_vec row exists
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memories_vec WHERE rowid = ?", (old_rowid,)
+    ).fetchone()[0] == 1
 
     # 用无效 embedding (size 不对)：走 else 清理分支
     database.set_memory({
@@ -290,11 +348,16 @@ def test_set_memory_vec_cleanup_on_no_embedding(initdb):
         "embedding": b"\x00\x00\x00",  # wrong size
     })
     conn = database._get_read_conn()
-    map_row = conn.execute(
+    assert conn.execute(
         "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?",
         ("gold_vec_clean",)
-    ).fetchone()
-    assert map_row is None, "vec_id_map entry should be cleaned when embedding invalid"
+    ).fetchone() is None, "vec_id_map entry should be cleaned when embedding invalid"
+    # Codex L2: memories_vec 里对应 rowid 也应被删除
+    assert conn.execute(
+        "SELECT COUNT(*) FROM memories_vec WHERE rowid = ?", (old_rowid,)
+    ).fetchone()[0] == 0, (
+        f"memories_vec row {old_rowid} should be deleted, not just its map entry"
+    )
 
 
 def test_set_memory_vec_write_failure_swallowed(initdb, monkeypatch):
@@ -346,11 +409,16 @@ _EXCLUDED_DIRS = {'tests', 'scripts', '__pycache__', '.venv', 'venv',
                   '.git', 'frontend', 'static-app', 'static', 'data', 'docs'}
 
 
-def _enumerate_production_py_files_recursive():
+def _enumerate_production_py_files_recursive(project_root: Path = None):
     """升级版：rglob 递归找所有生产 .py，显式排除测试/脚本/缓存/前端/文档等。
     覆盖了未来任何嵌套生产子包的情况（原 iterdir 只扫单层）。
+
+    Codex batch #6 L3: 参数化 project_root 让测试能用 tmp_path 构造嵌套
+    反例，真正验证 rglob 递归能力（旧 iterdir 版本在这种反例下会漏扫嵌套
+    文件，从而暴露 gate 空覆盖）。
     """
-    project_root = Path(__file__).parent.parent
+    if project_root is None:
+        project_root = Path(__file__).parent.parent
     py_files = []
     for p in project_root.rglob("*.py"):
         # 跳过排除目录（任一父路径匹配即跳过）
@@ -402,6 +470,39 @@ def test_batch6_rglob_gate_catches_in_tx_helper_bare_name_reversal():
         for n in ast.walk(tree)
     )
     assert found_name, "bare-name reversal not caught"
+
+
+def test_batch6_rglob_finds_nested_production_module(tmp_path):
+    """Codex batch #6 L3: 真正构造嵌套 tmp_path/pkg/sub/module.py 验证
+    rglob 递归能力（旧 iterdir 版本会漏 → gate 无覆盖）。
+    """
+    # 构造反例目录结构
+    (tmp_path / "root_mod.py").write_text("# root-level prod module\n")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "nested_mod.py").write_text("# nested prod module\n")
+    (tmp_path / "pkg" / "sub").mkdir()
+    (tmp_path / "pkg" / "sub" / "deep_mod.py").write_text("# deep prod module\n")
+    # 排除目录里的文件不该出现
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_fake.py").write_text("# should be excluded\n")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "run.py").write_text("# should be excluded\n")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "cached.py").write_text("# should be excluded\n")
+
+    files = _enumerate_production_py_files_recursive(project_root=tmp_path)
+    names = {p.name for p in files}
+
+    # 生产文件（root + 嵌套两层）全部命中
+    assert 'root_mod.py' in names, "root-level prod module missed"
+    assert 'nested_mod.py' in names, "1-level nested prod module missed (proves rglob recursion)"
+    assert 'deep_mod.py' in names, "2-level nested prod module missed"
+
+    # 排除目录里的文件均不出现
+    assert 'test_fake.py' not in names, "tests/ subdir file leaked past excludes"
+    assert 'run.py' not in names, "scripts/ subdir file leaked past excludes"
+    assert 'cached.py' not in names, "__pycache__/ subdir file leaked past excludes"
 
 
 def test_batch6_rglob_gate_current_codebase_clean():
