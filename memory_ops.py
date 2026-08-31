@@ -626,99 +626,22 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
         item["score"] = round(item.get("score", 0) * boost, 6)
 
 
-# Serializes ALL write transactions on the shared module-level sqlite
-# connection. Two threads cannot safely share one sqlite3.Connection for
-# concurrent transactions (`cannot start a transaction within a transaction`);
-# BEGIN IMMEDIATE only coordinates between distinct connections. Every
-# `BEGIN IMMEDIATE` on `database._get_conn()` in this module (touch, auto-
-# resolve, and any future writer) MUST hold this lock.
-#
-# Phase 2.0 Step 0-A #2a 过渡：临时指向 database._WRITE_LOCK 让 memory_ops
-# 里剩下的两处 inline `with _WRITE_LOCK: BEGIN IMMEDIATE` 和 database.py 的
-# _write_transaction() ctx 共享同一个锁对象，消除跨模块 conn 竞态。批次 #5
-# 抽取 touch_recalled_memories_atomic / check_auto_resolve_atomic 到
-# database.py 后彻底删除本行，恢复 v2.9 契约（memory_ops 不接触 _WRITE_LOCK）。
-_WRITE_LOCK = database._WRITE_LOCK
+# Phase 2.0 Step 0-A #5: _WRITE_LOCK re-export removed. v2.9 contract
+# restored — memory_ops does not touch database's lock or context manager.
+# All write side effects flow through `database.*_atomic()` public helpers.
 
 
 def _touch_recalled_memories(ids: list[str]) -> None:
     """Atomic activation_count increment for recalled memories, plus ±48h ripple.
 
-    Serialized via `_WRITE_LOCK` because the module shares one sqlite connection
-    across threads. Ripple candidates are collected across all reference
-    timestamps (each query bounded by the remaining budget via SQL LIMIT),
-    deduplicated, globally capped at 5*N, then updated in one UPDATE. Any
-    exception is logged but never propagates — touch is best-effort.
+    Thin wrapper around `database.touch_recalled_memories_atomic` — best-effort
+    semantics preserved: any exception is logged but never propagates so recall
+    results are still returned to the caller.
     """
     if not ids:
         return
     try:
-        now = _now()
-        conn = database._get_conn()
-        placeholders = ",".join("?" * len(ids))
-        with _WRITE_LOCK:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    f"UPDATE memories SET "
-                    f"activation_count = COALESCE(activation_count, 0) + 1, "
-                    f"last_activated = ? "
-                    f"WHERE id IN ({placeholders})",
-                    (now, *ids),
-                )
-                ripple_cap = 5 * len(ids)
-                ref_rows = conn.execute(
-                    f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
-                    f"FROM memories WHERE id IN ({placeholders})",
-                    ids,
-                ).fetchall()
-                recalled_set = set(ids)
-                candidates: dict[str, None] = {}
-                for (ref_ts,) in ref_rows:
-                    remaining = ripple_cap - len(candidates)
-                    if remaining <= 0:
-                        break
-                    if not ref_ts:
-                        continue
-                    try:
-                        base = datetime.fromisoformat(ref_ts)
-                        if base.tzinfo is None:
-                            base = base.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
-                    lo = (base - timedelta(hours=48)).isoformat()
-                    hi = (base + timedelta(hours=48)).isoformat()
-                    # SQL-side LIMIT bounds the scan while the write tx holds
-                    # the lock. Over-fetch a bit (remaining + len(ids)) so
-                    # recalled ids filtered in Python don't shrink the budget.
-                    rows = conn.execute(
-                        "SELECT id FROM memories "
-                        "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
-                        "LIMIT ?",
-                        (lo, hi, remaining + len(ids)),
-                    ).fetchall()
-                    for (mid,) in rows:
-                        if mid in recalled_set or mid in candidates:
-                            continue
-                        candidates[mid] = None
-                        if len(candidates) >= ripple_cap:
-                            break
-                if candidates:
-                    ripple_ids = list(candidates.keys())
-                    rph = ",".join("?" * len(ripple_ids))
-                    conn.execute(
-                        f"UPDATE memories SET activation_count = "
-                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
-                        f"WHERE id IN ({rph})",
-                        ripple_ids,
-                    )
-                conn.execute("COMMIT")
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
+        database.touch_recalled_memories_atomic(ids, _now())
     except Exception as e:
         logger.warning(f"recall touch failed (results still returned): {e}")
 
@@ -743,12 +666,17 @@ def _apply_activation_penalty(items: list[dict]) -> None:
 def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) -> list[str]:
     """Find related memories that should be resolved, and resolve them atomically.
 
-    Returns list of resolved memory IDs.
+    Thin wrapper around `database.check_auto_resolve_atomic`. This module still
+    owns the "which related_mems are still unresolved" pre-filter because
+    `related_mems` is caller-provided context (recall output); the database
+    helper re-verifies status inside the tx as an additional TOCTOU guard.
+
+    Returns list of resolved memory IDs. Any exception is caught → return [].
     """
-    if not related_mems or not _matches_resolve_pattern(content):
+    if not related_mems:
         return []
 
-    to_resolve = []
+    to_resolve_ids = []
     for mem in related_mems:
         is_unresolved = (
             mem.get("resolved") == 0
@@ -757,62 +685,16 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
                 and not mem.get("resolved"))
         )
         if is_unresolved:
-            to_resolve.append(mem)
+            to_resolve_ids.append(mem["id"])
 
-    if not to_resolve:
+    if not to_resolve_ids:
         return []
 
-    now = _now()
-    resolved_ids: list[str] = []
-    conn = database._get_conn()
     try:
-        with _WRITE_LOCK:
-            conn.execute("BEGIN IMMEDIATE")
-            _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now,
-                                 resolved_ids)
+        return database.check_auto_resolve_atomic(to_resolve_ids, content, source_ai)
     except Exception as e:
         logger.warning(f"Atomic auto-resolve failed: {e}")
         return []
-    return resolved_ids
-
-
-def _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now, resolved_ids):
-    """Body of the auto-resolve transaction. Assumes caller holds _WRITE_LOCK
-    and has already issued BEGIN IMMEDIATE. Commits on success, rolls back on
-    any exception."""
-    try:
-        for mem in to_resolve:
-            # Conditional UPDATE: only touch rows still resolved=0/NULL.
-            # Prevents double-resolve under concurrent writers.
-            cur = conn.execute(
-                "UPDATE memories SET resolved = 1, updated_at = ? "
-                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
-                (now, mem["id"]),
-            )
-            if cur.rowcount != 1:
-                continue
-            conn.execute(
-                "INSERT INTO maintenance_audit "
-                "(action, target_id, new_content, source_message_ids, "
-                "decision_reason, state_before, state_after, "
-                "model_id, source_ai, auto_executed, prompt_version, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "resolve_thread", mem["id"], content, "[]",
-                    "auto-resolve: 内容匹配完成模式",
-                    json.dumps({"resolved": mem.get("resolved")}, ensure_ascii=False),
-                    json.dumps({"resolved": 1}, ensure_ascii=False),
-                    "", source_ai or "", 1, "", now,
-                ),
-            )
-            resolved_ids.append(mem["id"])
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 _REOPEN_PATTERNS = ("又出问题了", "没搞定", "还没完", "又复发", "重新开", "再来一次", "还是有问题", "又坏了")

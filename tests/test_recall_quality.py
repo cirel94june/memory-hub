@@ -652,16 +652,26 @@ class TestM2AtomicTouch:
         assert row[0] == 6
 
     def test_touch_helper_uses_atomic_sql(self):
-        """_touch_recalled_memories source uses UPDATE … COALESCE(... , 0) + 1,
-        not a read-modify-write pattern. Guards against silent regressions
-        that would reintroduce lost updates under concurrency."""
+        """touch must use atomic SQL increment (`COALESCE + 1`), not a read-
+        modify-write pattern. Phase 2.0 Step 0-A #5: source moved from
+        memory_ops._touch_recalled_memories to database.touch_recalled_memories_atomic;
+        assert on the new location + the thin wrapper delegates to it.
+        """
         import inspect
         from memory_ops import _touch_recalled_memories
-        src = inspect.getsource(_touch_recalled_memories)
-        assert "COALESCE(activation_count, 0) + 1" in src, \
-            "touch must use atomic SQL increment"
-        assert "get_memory(" not in src and "set_memory(" not in src, \
-            "touch must not read-modify-write memory objects"
+        from database import touch_recalled_memories_atomic
+
+        # 1) 生产 atomic helper 里保留了 SQL 层原子递增
+        db_src = inspect.getsource(touch_recalled_memories_atomic)
+        assert "COALESCE(activation_count, 0) + 1" in db_src, \
+            "database helper must use atomic SQL increment"
+        assert "get_memory(" not in db_src and "set_memory(" not in db_src, \
+            "database helper must not read-modify-write memory objects"
+
+        # 2) memory_ops 的 wrapper 现在只 delegate（v2.9 契约）
+        wrapper_src = inspect.getsource(_touch_recalled_memories)
+        assert "touch_recalled_memories_atomic" in wrapper_src, \
+            "memory_ops wrapper must delegate to database.touch_recalled_memories_atomic"
 
     def test_concurrent_touch_via_production_helper(self, db_env):
         """Two threads call the production _touch_recalled_memories directly on

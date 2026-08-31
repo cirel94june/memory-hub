@@ -590,6 +590,28 @@ async def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
         """)
 
+        # ── Activity log table (Phase 2.0 Step 0-A #5: migrated from
+        #    activity_log.init_activity_table so activity_log no longer
+        #    references database._write_transaction directly) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                epoch REAL NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT,
+                memory_id TEXT,
+                ai_id TEXT,
+                model TEXT,
+                tokens_used INTEGER DEFAULT 0,
+                duration_ms INTEGER DEFAULT 0,
+                success INTEGER DEFAULT 1,
+                extra TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_epoch ON activity_log(epoch DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action);
+        """)
+
         conn.commit()
     except BaseException:
         # Setup failed — close the half-initialised conn and re-raise
@@ -1489,6 +1511,175 @@ def set_memory(mem: dict) -> None:
     """
     with _write_transaction() as conn:
         _set_memory_in_tx(conn, mem)
+
+
+# ════════════════════════════════════════════
+#  Phase 2.0 Step 0-A #5: public atomic helpers migrated from memory_ops
+#  and activity_log so those modules never touch _WRITE_LOCK or
+#  _write_transaction directly (v2.9 contract).
+# ════════════════════════════════════════════
+
+def touch_recalled_memories_atomic(mem_ids: list[str], now_iso: str) -> None:
+    """Atomic activation_count increment for recalled memories + ±48h ripple.
+
+    Migrated from memory_ops._touch_recalled_memories with **zero behaviour
+    change**. Caller (memory_ops) MUST wrap in its own try/except for
+    best-effort semantics — this helper does raise on internal SQL errors so
+    the ctx rolls back cleanly.
+
+    - +1 exact activation_count on each id in `mem_ids`
+    - collect ±48h event_date/created_at ripple candidates (globally capped
+      at 5 * len(mem_ids)), then +0.3 on each in one UPDATE
+    """
+    if not mem_ids:
+        return
+    placeholders = ",".join("?" * len(mem_ids))
+    with _write_transaction() as conn:
+        conn.execute(
+            f"UPDATE memories SET "
+            f"activation_count = COALESCE(activation_count, 0) + 1, "
+            f"last_activated = ? "
+            f"WHERE id IN ({placeholders})",
+            (now_iso, *mem_ids),
+        )
+        ripple_cap = 5 * len(mem_ids)
+        ref_rows = conn.execute(
+            f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+            f"FROM memories WHERE id IN ({placeholders})",
+            mem_ids,
+        ).fetchall()
+        recalled_set = set(mem_ids)
+        candidates: dict[str, None] = {}
+        for (ref_ts,) in ref_rows:
+            remaining = ripple_cap - len(candidates)
+            if remaining <= 0:
+                break
+            if not ref_ts:
+                continue
+            try:
+                base = datetime.fromisoformat(ref_ts)
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            lo = (base - timedelta(hours=48)).isoformat()
+            hi = (base + timedelta(hours=48)).isoformat()
+            # SQL-side LIMIT bounds the scan while the write tx holds
+            # the lock. Over-fetch a bit (remaining + len(ids)) so
+            # recalled ids filtered in Python don't shrink the budget.
+            rows = conn.execute(
+                "SELECT id FROM memories "
+                "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
+                "LIMIT ?",
+                (lo, hi, remaining + len(mem_ids)),
+            ).fetchall()
+            for (mid,) in rows:
+                if mid in recalled_set or mid in candidates:
+                    continue
+                candidates[mid] = None
+                if len(candidates) >= ripple_cap:
+                    break
+        if candidates:
+            ripple_ids = list(candidates.keys())
+            rph = ",".join("?" * len(ripple_ids))
+            conn.execute(
+                f"UPDATE memories SET activation_count = "
+                f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                f"WHERE id IN ({rph})",
+                ripple_ids,
+            )
+
+
+def check_auto_resolve_atomic(candidate_ids: list[str], new_content: str,
+                              source_ai: str) -> list[str]:
+    """v2.9 H1 contract: read candidates + regex match + write resolved +
+    write audit — all inside one `_write_transaction()` to avoid TOCTOU.
+
+    Migrated from memory_ops._check_auto_resolve + _run_auto_resolve_tx.
+    Signature aligned with the v2.9 spec: caller passes IDs it identified as
+    unresolved candidates; this helper re-verifies inside the tx (conditional
+    UPDATE with `WHERE resolved IS NULL OR resolved = 0`) so a concurrent
+    writer can't cause double-resolve.
+
+    Uses `resolve_patterns._matches_resolve_pattern` as the short-circuit
+    gate (empty candidates OR non-matching content → return []).
+    Returns the memory ids that were actually resolved this call.
+    """
+    from resolve_patterns import _matches_resolve_pattern
+
+    if not candidate_ids or not _matches_resolve_pattern(new_content):
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    resolved_ids: list[str] = []
+
+    with _write_transaction() as conn:
+        placeholders = ",".join("?" * len(candidate_ids))
+        # re-verify status inside tx so a stale caller list can't misfire
+        rows = conn.execute(
+            f"SELECT id, resolved FROM memories WHERE id IN ({placeholders})",
+            candidate_ids,
+        ).fetchall()
+        for row in rows:
+            mem_id, resolved = row[0], row[1]
+            # Conditional UPDATE: only touch rows still resolved=0/NULL.
+            cur = conn.execute(
+                "UPDATE memories SET resolved = 1, updated_at = ? "
+                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
+                (now, mem_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO maintenance_audit "
+                "(action, target_id, new_content, source_message_ids, "
+                "decision_reason, state_before, state_after, "
+                "model_id, source_ai, auto_executed, prompt_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "resolve_thread", mem_id, new_content, "[]",
+                    "auto-resolve: 内容匹配完成模式",
+                    json.dumps({"resolved": resolved}, ensure_ascii=False),
+                    json.dumps({"resolved": 1}, ensure_ascii=False),
+                    "", source_ai or "", 1, "", now,
+                ),
+            )
+            resolved_ids.append(mem_id)
+    return resolved_ids
+
+
+def append_activity_log_atomic(entry: dict) -> None:
+    """Insert one activity_log row. Migrated from activity_log._persist so
+    that module no longer references database._write_transaction directly
+    (v2.9 contract). `entry` is the same dict format activity_log builds.
+    Caller (activity_log._persist) still swallows exceptions for best-effort
+    logging semantics.
+    """
+    extra_json = json.dumps(entry.get("extra")) if entry.get("extra") else None
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO activity_log (ts, epoch, action, detail, memory_id, ai_id, "
+            "model, tokens_used, duration_ms, success, extra) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry["ts"], entry["epoch"], entry["action"], entry["detail"],
+                entry["memory_id"], entry["ai_id"], entry["model"],
+                entry["tokens_used"], entry["duration_ms"],
+                1 if entry["success"] else 0, extra_json,
+            ),
+        )
+
+
+def trim_activity_log_atomic(keep_last_n: int = 500) -> None:
+    """Delete activity_log rows beyond the most-recent `keep_last_n`.
+    Separate tx from append so INSERT persists even if DELETE fails.
+    """
+    with _write_transaction() as conn:
+        conn.execute(
+            "DELETE FROM activity_log WHERE id NOT IN "
+            "(SELECT id FROM activity_log ORDER BY epoch DESC LIMIT ?)",
+            (keep_last_n,),
+        )
 
 
 def remove_memory(mem_id: str) -> None:

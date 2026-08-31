@@ -573,6 +573,100 @@ def test_ast_gate_pure_read_helpers_all_present():
     assert not missing, f"pure-read helpers missing from database.py: {missing}"
 
 
+def test_step0_5_atomic_helpers_all_present():
+    """Batch #5: 4 new public atomic helpers must exist on database module."""
+    for name in ('touch_recalled_memories_atomic', 'check_auto_resolve_atomic',
+                 'append_activity_log_atomic', 'trim_activity_log_atomic'):
+        assert hasattr(database, name), f"database.{name} missing"
+
+
+def test_step0_5_touch_recalled_functional(initdb):
+    """touch_recalled_memories_atomic 端到端：+1 activation_count on named ids."""
+    database.set_memory({"id": "t5_touch_a", "content": "a"})
+    database.set_memory({"id": "t5_touch_b", "content": "b"})
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    database.touch_recalled_memories_atomic(["t5_touch_a", "t5_touch_b"], now_iso)
+    row_a = database.get_memory("t5_touch_a")
+    row_b = database.get_memory("t5_touch_b")
+    assert row_a["activation_count"] == 1
+    assert row_b["activation_count"] == 1
+
+
+def test_step0_5_check_auto_resolve_functional(initdb):
+    """check_auto_resolve_atomic 端到端：'搞定了' 触发 pattern，unresolved 变 resolved。"""
+    # 插一条 unresolved 的 task 记忆
+    database.set_memory({
+        "id": "t5_task", "content": "打疫苗", "info_type": "task",
+        "resolved": 0,
+    })
+    # 触发 auto-resolve
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_task"], "已经搞定了", source_ai="claude"
+    )
+    assert resolved == ["t5_task"]
+    row = database.get_memory("t5_task")
+    assert row["resolved"] == 1
+    # audit 记录
+    audits = database.list_audits(action="resolve_thread", limit=10)
+    assert any(a["target_id"] == "t5_task" for a in audits)
+
+
+def test_step0_5_check_auto_resolve_pattern_gates_return_empty(initdb):
+    """No matching pattern → return [] without touching DB."""
+    database.set_memory({"id": "t5_task2", "content": "task", "resolved": 0})
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_task2"], "还在做", source_ai="claude"
+    )
+    assert resolved == []
+    row = database.get_memory("t5_task2")
+    assert row["resolved"] == 0
+
+
+def test_step0_5_activity_log_atomic_helpers(initdb):
+    """append + trim helpers 端到端。"""
+    entry = {
+        "ts": "2026-08-28T10:00:00", "epoch": 1234567890.0,
+        "action": "test_action", "detail": "detail",
+        "memory_id": "", "ai_id": "claude", "model": "test",
+        "tokens_used": 100, "duration_ms": 50, "success": True,
+        "extra": {"key": "value"},
+    }
+    database.append_activity_log_atomic(entry)
+    # 用只读连接读回
+    conn = database._get_read_conn()
+    rows = conn.execute("SELECT COUNT(*) FROM activity_log").fetchall()
+    assert rows[0][0] >= 1
+    # trim to 0 should clear all
+    database.trim_activity_log_atomic(0)
+    conn = database._get_read_conn()
+    rows = conn.execute("SELECT COUNT(*) FROM activity_log").fetchall()
+    assert rows[0][0] == 0
+
+
+def test_step0_5_ast_gate_activity_log_no_write_ctx_reference():
+    """activity_log.py 恢复 v2.9 契约：不再直接引用 database._write_transaction。
+    AST 层面检查 Attribute / Name / ImportFrom（跳过 docstring / 行注释中的
+    历史提及）。
+    """
+    src = Path(__file__).parent.parent.joinpath("activity_log.py").read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == '_write_transaction':
+            violations.append((node.lineno, 'attribute'))
+        elif isinstance(node, ast.Name) and node.id == '_write_transaction':
+            violations.append((node.lineno, 'name'))
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == '_write_transaction':
+                    violations.append((node.lineno, 'import'))
+    assert not violations, (
+        f"activity_log.py must not reference database._write_transaction in code: "
+        f"{violations} — should call public append/trim_activity_log_atomic helpers"
+    )
+
+
 def test_init_db_failed_swap_leaves_old_state_intact(tmp_path):
     """Codex #4 round-2 Medium regression: if init_db(new_path) fails partway
     through setup, DB_PATH / _conn / read helpers must all still point at the
@@ -877,10 +971,26 @@ def read_only():
     assert not v, f"unexpectedly flagged safe reads: {v}"
 
 
-def test_memory_ops_shares_database_write_lock():
-    """memory_ops._WRITE_LOCK 与 database._WRITE_LOCK 必须是同一对象。"""
+def test_memory_ops_no_longer_touches_write_lock():
+    """Phase 2.0 Step 0-A #5: v2.9 contract restored — memory_ops must NOT
+    define or re-export _WRITE_LOCK. All write side effects flow through
+    database.*_atomic() public helpers. Prior batches (#2a/#2b) had a
+    temporary `_WRITE_LOCK = database._WRITE_LOCK` re-export that #5
+    deletes now that touch/auto_resolve are migrated.
+    """
     import memory_ops
-    assert memory_ops._WRITE_LOCK is database._WRITE_LOCK
+    assert not hasattr(memory_ops, '_WRITE_LOCK'), (
+        "memory_ops._WRITE_LOCK re-export must be removed (v2.9 contract)"
+    )
+    # AST 层面同步断言：源代码不再引用 database._WRITE_LOCK
+    src = Path(memory_ops.__file__).read_text(encoding='utf-8')
+    assert 'database._WRITE_LOCK' not in src, (
+        "memory_ops.py must not reference database._WRITE_LOCK"
+    )
+    assert '_WRITE_LOCK' not in src or src.count('_WRITE_LOCK') <= 3, (
+        # docstrings/comments referencing history are OK; guard against real usage
+        "unexpected _WRITE_LOCK references in memory_ops.py"
+    )
 
 
 def test_set_memory_in_tx_extracted_helper(initdb):
