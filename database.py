@@ -1615,17 +1615,25 @@ def check_auto_resolve_atomic(candidate_ids: list[str], new_content: str,
 
     with _write_transaction() as conn:
         placeholders = ",".join("?" * len(candidate_ids))
-        # re-verify status inside tx so a stale caller list can't misfire
+        # re-verify inside tx: candidates must still be status='active' AND
+        # unresolved. A concurrent writer that archived/superseded/replaced
+        # them between recall and now must not be silently resolved.
+        # (Codex #5 round-2 M: SELECT was missing status='active' filter →
+        # archived candidates could still receive resolve+audit.)
         rows = conn.execute(
-            f"SELECT id, resolved FROM memories WHERE id IN ({placeholders})",
+            f"SELECT id, resolved FROM memories "
+            f"WHERE id IN ({placeholders}) AND status = 'active'",
             candidate_ids,
         ).fetchall()
         for row in rows:
             mem_id, resolved = row[0], row[1]
-            # Conditional UPDATE: only touch rows still resolved=0/NULL.
+            # Conditional UPDATE: only touch rows still status='active' AND
+            # resolved=0/NULL. Prevents double-resolve AND late-status-drift
+            # (recall → archive → auto-resolve TOCTOU).
             cur = conn.execute(
                 "UPDATE memories SET resolved = 1, updated_at = ? "
-                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
+                "WHERE id = ? AND status = 'active' "
+                "AND (resolved IS NULL OR resolved = 0)",
                 (now, mem_id),
             )
             if cur.rowcount != 1:

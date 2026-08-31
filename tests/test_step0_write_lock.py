@@ -595,10 +595,10 @@ def test_step0_5_touch_recalled_functional(initdb):
 
 def test_step0_5_check_auto_resolve_functional(initdb):
     """check_auto_resolve_atomic 端到端：'搞定了' 触发 pattern，unresolved 变 resolved。"""
-    # 插一条 unresolved 的 task 记忆
+    # 插一条 unresolved 的 active task 记忆
     database.set_memory({
         "id": "t5_task", "content": "打疫苗", "info_type": "task",
-        "resolved": 0,
+        "status": "active", "resolved": 0,
     })
     # 触发 auto-resolve
     resolved = database.check_auto_resolve_atomic(
@@ -621,6 +621,84 @@ def test_step0_5_check_auto_resolve_pattern_gates_return_empty(initdb):
     assert resolved == []
     row = database.get_memory("t5_task2")
     assert row["resolved"] == 0
+
+
+def _audit_count_for(target_id: str) -> int:
+    """Count resolve_thread audits for a target — via read_conn to avoid tx clash."""
+    conn = database._get_read_conn()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM maintenance_audit "
+        "WHERE action = 'resolve_thread' AND target_id = ?",
+        (target_id,),
+    ).fetchone()
+    return row[0]
+
+
+def test_step0_5_check_auto_resolve_skips_archived_candidate(initdb):
+    """Codex #5 round-2 M: recall → archive → auto-resolve TOCTOU.
+    Candidate was active at recall time; between recall and helper call
+    another writer archived it. Helper must skip: no resolve, no audit.
+    """
+    database.set_memory({"id": "t5_stale_arch", "content": "task",
+                         "status": "active", "resolved": 0})
+    # simulate: another writer archives it before helper runs
+    database.update_memory_status("t5_stale_arch", "archived")
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_stale_arch"], "已经搞定了", source_ai="claude"
+    )
+    assert resolved == [], "archived candidate must not be auto-resolved"
+    row = database.get_memory("t5_stale_arch")
+    assert row["status"] == "archived"
+    assert row["resolved"] == 0, "resolved flag must remain 0 on archived row"
+    assert _audit_count_for("t5_stale_arch") == 0, "no audit for skipped candidate"
+
+
+def test_step0_5_check_auto_resolve_skips_superseded_candidate(initdb):
+    """Same TOCTOU pattern, status='superseded'."""
+    database.set_memory({"id": "t5_stale_sup", "content": "task",
+                         "status": "active", "resolved": 0})
+    database.update_memory_status("t5_stale_sup", "superseded")
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_stale_sup"], "已经搞定了", source_ai="claude"
+    )
+    assert resolved == []
+    row = database.get_memory("t5_stale_sup")
+    assert row["resolved"] == 0
+    assert _audit_count_for("t5_stale_sup") == 0
+
+
+def test_step0_5_check_auto_resolve_skips_replaced_candidate(initdb):
+    """Same TOCTOU pattern, status='replaced'."""
+    database.set_memory({"id": "t5_stale_rep", "content": "task",
+                         "status": "active", "resolved": 0})
+    database.update_memory_status("t5_stale_rep", "replaced")
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_stale_rep"], "已经搞定了", source_ai="claude"
+    )
+    assert resolved == []
+    row = database.get_memory("t5_stale_rep")
+    assert row["resolved"] == 0
+    assert _audit_count_for("t5_stale_rep") == 0
+
+
+def test_step0_5_check_auto_resolve_mixed_active_and_stale(initdb):
+    """Mix of active + stale candidates: only active gets resolved."""
+    database.set_memory({"id": "t5_mix_ok", "content": "task ok",
+                         "status": "active", "resolved": 0})
+    database.set_memory({"id": "t5_mix_stale", "content": "task stale",
+                         "status": "active", "resolved": 0})
+    database.update_memory_status("t5_mix_stale", "archived")
+
+    resolved = database.check_auto_resolve_atomic(
+        ["t5_mix_ok", "t5_mix_stale"], "都搞定了", source_ai="claude"
+    )
+    assert set(resolved) == {"t5_mix_ok"}, (
+        f"only active candidate should resolve, got {resolved}"
+    )
+    assert database.get_memory("t5_mix_ok")["resolved"] == 1
+    assert database.get_memory("t5_mix_stale")["resolved"] == 0
+    assert _audit_count_for("t5_mix_ok") == 1
+    assert _audit_count_for("t5_mix_stale") == 0
 
 
 def test_step0_5_activity_log_atomic_helpers(initdb):
