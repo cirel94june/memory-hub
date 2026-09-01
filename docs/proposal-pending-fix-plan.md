@@ -1,516 +1,505 @@
-# Proposal Pending Bug 修复方案 v3
+# Proposal Pending Bug 修复方案 v4
 
-> 分支：`phase20/proposal-pending-fix-plan-v2` (等 v3 pass 后 open `phase20/proposal-pending-fix`)
+> 分支：`phase20/proposal-pending-fix-plan-v2` (v4 pass 后 open `phase20/proposal-pending-fix`)
 > 硬前置：Step 0-A 已合并 main `da88279`
-> 独立于 UX 层：对话式 Proposal 审批 UX 排后续 PR
+> 对话式 Proposal 审批 UX 排后续 PR
 >
 > **版本历史**：
-> - v1（作废）：`remember(existing_id=...)` 假装原子、只清 claim 不重跑、无 fencing、旧数据自动 reconcile
-> - v2（作废）：拆两阶段但**只覆盖 1 个入口**、Migration 会让旧 40 条被 orphan 分支自动扫走（Critical）、`commit_promotion_atomic` 硬写 auto_approved 无法服务人工审、PromotionPayload schema 不全
-> - **v3**（本文）：Codex 1C + 3H + 3M + 2L 全部收敛；5 项最小闭环全部写死
+> - v1（作废）：`remember(existing_id=...)` 假装原子；只清 claim 不重跑；无 fencing
+> - v2（作废）：拆两阶段但只覆盖 1 入口；旧 40 条会被 orphan 自动扫走
+> - v3（作废）：protocol_version 隔离通过，但**把人工审批旧数据的路封死**；maintenance recovery 3 漏洞；reject 无 CAS；golden 路径不可行
+> - **v4**（本文）：Codex 4H+3M+3L 全部收敛；6 项最小闭环写死
 
 ---
 
-## v3 五项最小闭环（Codex 底线）
+## v4 六项最小闭环（Codex 底线）
 
-1. **`promotion_protocol_version` 列** — 旧行永远 `0`，SQL 层禁止 recovery 命中
-2. **列全 4 个 promotion 入口** — 逐个改造，绝无遗漏
-3. **统一 fenced atomic commit kernel** — 所有入口走同一 helper；terminal_state / reviewed_by 参数化
-4. **完整 PromotionPayload schema** — 逐字段列出 + 与现有 create 路径 golden 对比
-5. **4 组关键反例** — legacy exclusion / maintenance 崩溃 / 人工并发 / audit rollback
+1. **人工 adopt legacy 原子路径** — `adopt_legacy_proposal_atomic()`（v0→v2 hash 校验单事务）
+2. **Maintenance target snapshot 持久化** — proposal 新列 `target_snapshot_json`；drift 后**必进 promotion_failed，禁止降级 create**
+3. **Reject CAS** — `reject_proposal_atomic()` `WHERE status='pending'` + rowcount==1
+4. **共享 payload builder + in-tx kernel** — `_build_new_memory_payload` 正常 create 和 promotion 共用；`_commit_promotion_in_tx` 进入 `_IN_TX_HELPERS`
+5. **State_before 由 kernel 事务内构造** — caller 不再伪造
+6. **7 组反例** — legacy adopt / recovery legacy exclude / maintenance restart recovery / maintenance drift no-downgrade / reject vs auto race / audit rollback / needs_review 硬拒
 
 ---
 
 ## Q1｜要解决什么问题
 
-- **存量**：40 条 auto_approve pending 卡池（原报 15 → 2 周涨到 40；oldest `2026-07-24`）
-- **结构**：async 中断 / 崩溃 / 重启后自动恢复；两 worker 不重复晋升；同一 proposal 重放不多创建；`needs_review` 严格排除；**旧数据永不自动 reconcile**（新老 ID 派生不同 → 会创建 duplicate）
+- **存量**：40 条 auto_approve pending 卡池
+- **结构**：async 中断 / 崩溃 / 重启后自动恢复；两 worker 不重复晋升；同一 proposal 重放不多创建；`needs_review` 严格排除；**旧数据 recovery 不动，但人工审可 adopt**
 
-## Q2｜现状（4 个 promotion 入口全列）
+## Q2｜现状（4 promotion 入口）
 
-| 入口 | 位置 | 现状 | v3 处理 |
+| 入口 | 位置 | 现状 | v4 处理 |
 |---|---|---|---|
-| **A. 普通 auto** | `memory_ops.py:1301-1327` (`_create_proposal` auto_approve 分支) | 3 步非原子 | 改造：claim → build payload → `commit_promotion_atomic` |
-| **B. maintenance auto** | `memory_ops.py:1063-1078` (`_execute_maintenance_action` update/supersede 分支) | **旧 memory 先 supersede + 独立 tx 再 promote**（比 A 更糟：崩溃后旧 memory 消失、新 memory 未创建）| **重构为单事务**：drift check + supersede + set_memory + finalize proposal + audit 全在一个 tx |
-| **C. 人工 approve** | `memory_ops.py:1194-1222` (`review_proposal(action="approve")`) | 走 `_promote_proposal` (老)，崩溃后重复 promotion 风险 | 走同一 fenced kernel，terminal_state=`approved` + `reviewed_by=<真实调用者>` |
-| **D. bulk retriage** | `memory_ops.py:1225-1262` + `main.py:776-780` endpoint | 遍历 pending 直接调 `_promote_proposal` 写库；**可能批量处理旧 40 条**绕过 protocol version | **暂停自动写入**：改为 report-only 生成审核清单；若保留写库，必须走 claim + protocol gate + atomic commit |
-
-### 现有 `_promote_proposal` 走完整 `remember(quick=False)` 隐患
-- `remember(quick=False)` 内部 dedup/relation 分类，返回的 mem_id 可能 ≠ deterministic ID
-- Recovery 用 deterministic ID 查不到 → 判"没写" → 重复创建 duplicate
-
-### 已确认可复用契约（Step 0-A 后）
-- `_write_transaction()` / `_set_memory_in_tx(conn, mem)` / `_IN_TX_HELPERS`
-- `_get_read_conn()` DB_PATH 失效
-- AST 闸门 fail-closed
+| **A. 普通 auto** | `memory_ops.py:1105-1139` (`_create_proposal` auto_approve 分支) | 3 步非原子 | 走 `commit_promotion_atomic` (auto) |
+| **B. maintenance auto** | `memory_ops.py:1063-1078` (`_execute_maintenance_action` update/supersede) | 旧 memory 先 supersede + 独立 tx 再 promote | **重构**：triage=`auto_approve_maintenance`；proposal 存 `target_snapshot`；走 `commit_maintenance_promotion_atomic` 单事务 |
+| **C. 人工 approve v=2** | `memory_ops.py:1194-1222` (`review_proposal(action='approve')`) | 走老 `_promote_proposal` | 走 `commit_promotion_atomic` (manual) |
+| **C'. 人工 adopt v=0** | 同上 | v3 直接返 legacy error 拒绝 | **新路径**：`adopt_legacy_proposal_atomic(prop_id, expected_content_hash, reviewed_by)` |
+| **D. bulk retriage** | `memory_ops.py:1225-1262` + `main.py:776-780` | 遍历 pending 直接 `_promote_proposal` 写库 | **改 report-only**（不写库）|
 
 ---
 
-## Q3｜设计（按 Codex 1C + 3H + 3M + 2L 逐条对应）
+## Q3｜设计（按 Codex 4H + 3M + 3L 逐条对应）
 
-### C1【Critical 修】`promotion_protocol_version` 列 — 旧 40 条 SQL 层永久排除
+### C1【H1 修】人工 adopt legacy 安全路径
 
-**Migration** (`database.init_db()` 内幂等)：
+**问题**：v3 把 v=0 数据在三层全拒绝（kernel / review_proposal / audit script），S9 又要求 Ceci 人工 approve A 类 → 死循环。
+
+**新 helper** `database.adopt_legacy_proposal_atomic(prop_id, expected_content_hash, reviewed_by, review_plan_id="")`：
 ```python
-prop_cols = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
-if 'promotion_claim_id' not in prop_cols:
-    conn.execute("ALTER TABLE proposals ADD COLUMN promotion_claim_id TEXT NOT NULL DEFAULT ''")
-if 'promotion_claim_at' not in prop_cols:
-    conn.execute("ALTER TABLE proposals ADD COLUMN promotion_claim_at TEXT NOT NULL DEFAULT ''")
-if 'promotion_protocol_version' not in prop_cols:
-    # 关键：DEFAULT 0 → 存量所有 pending 都是 v0（永不入 recovery 视野）
-    conn.execute(
-        "ALTER TABLE proposals ADD COLUMN promotion_protocol_version INTEGER NOT NULL DEFAULT 0"
-    )
-```
-
-**新流程 `_create_proposal` 强制写 `= 2`**：
-- `insert_proposal(proposal)` 前，`proposal['promotion_protocol_version'] = 2` 硬编码
-- `_PROPOSAL_COLUMNS` 加入 `promotion_protocol_version` / `promotion_claim_id` / `promotion_claim_at`
-
-**Recovery SQL 强制 `= 2`**：
-```sql
-SELECT * FROM proposals
-WHERE status='pending'
-  AND promotion_protocol_version = 2                   -- **legacy exclusion**
-  AND triage_reason IN ('auto_approve', 'auto_approve_silent')
-  AND (
-    (promotion_claim_id != '' AND promotion_claim_at < ?)     -- stale takeover
-    OR (promotion_claim_id = '' AND created_at < ?)           -- orphan
-  )
-ORDER BY created_at ASC
-LIMIT ?
-```
-
-**为什么用 protocol_version 而不是 date cutoff**：
-- date cutoff 有 race — 部署上线瞬间之前几秒创建的新 proposal 会被误判 legacy
-- protocol_version 是**显式契约**，新代码创建的 proposal 必然写 2；旧数据必然是 DEFAULT 0
-
-**反例测试**（4 组之一）：
-- `test_v3_c1_legacy_orphan_never_recovered` — 造一条 `status='pending' + triage_reason='auto_approve' + promotion_claim_id='' + promotion_protocol_version=0 + created_at=30 天前`；跑 recovery sweep；断言：**candidates 空、memory 未创建、proposal 状态未变**
-
-### C2【H1 修】重构 maintenance auto 入口（Entry B）— 全在一个 tx
-
-**现状**：
-```python
-# _execute_maintenance_action(update/supersede)
-result = await database.commit_maintenance_atomic(...)  # ← tx 1: 旧 memory → superseded
-# ↓ ↓ ↓ 崩溃点：旧 memory 已 superseded，新 memory 未创建
-if result and result.get('superseded_id'):
-    proposal['status'] = 'pending'
-    database.insert_proposal(proposal)                   # ← tx 2
-    result = await _promote_proposal(proposal)           # ← tx 3+ (走 remember)
-    database.update_proposal_status(prop_id, 'auto_approved', ...)  # ← tx 4
-```
-
-**v3 改造**：抽 `commit_maintenance_promotion_atomic(prop_id, claim_token, mem_payload, target_id, expected_target_status, expected_target_updated_at, audit_row, terminal_state, reviewed_by)`：
-```python
-def commit_maintenance_promotion_atomic(
-    prop_id, claim_token, mem_payload,
-    target_id, expected_target_status, expected_target_updated_at,
-    audit_row, terminal_state, reviewed_by,
-):
-    """全部在一个 _write_transaction() 内：
-      1. Fencing gate: proposal 状态复查 + claim_token 复查
-      2. drift gate: 旧 target memory status/updated_at 未变
-      3. supersede old memory (via _set_memory_in_tx with status='superseded' + superseded_by)
-      4. insert new memory (via _set_memory_in_tx with deterministic id + status='active')
-      5. finalize proposal (status → auto_approved/approved, applied_memory_id, claim 释放)
-      6. audit row insert
-    任何一步失败全回滚。"""
-```
-
-**maintenance 入口调用**：
-```python
-# Entry B 新版
-if action in ("update", "supersede"):
-    # 1. claim proposal
-    token = uuid.uuid4().hex
-    proposal["promotion_protocol_version"] = 2
-    database.insert_proposal(proposal)
-    if not database.try_claim_promotion(prop_id, token, expected_current_claim=""):
-        return {"error": "claim_lost_at_entry"}
-    # 2. build payload (out-of-tx, no side effect)
-    mem_payload = _build_promotion_payload(proposal, target_mem)
-    # 3. atomic
-    try:
-        database.commit_maintenance_promotion_atomic(
-            prop_id, token, mem_payload,
-            target_id=target_id,
-            expected_target_status=target_mem["status"],
-            expected_target_updated_at=target_mem["updated_at"],
-            audit_row=..., terminal_state="auto_approved",
-            reviewed_by="system",
-        )
-    except PromotionClaimLost:
-        return {...}
-    except MaintenanceDrift:
-        database.mark_promotion_failed(prop_id, token, "drift on target")
-        return {...}
-```
-
-**关键**：drift 触发时**新 memory 不 insert**，旧 memory **不 supersede**，proposal 保持 pending（下轮 recovery 会重试或 fail）。
-
-### C3【H2 修】4 个入口共用 fenced kernel
-
-**统一 kernel**（database.py 唯一入口）：
-```python
-def commit_promotion_atomic(
+def adopt_legacy_proposal_atomic(
     prop_id: str,
-    claim_token: str,
-    mem_payload: dict,
-    audit_row: dict,
-    terminal_state: str,               # 'auto_approved' / 'approved' / 'retriaged_approved'
-    reviewed_by: str,                  # 'system' / '<user_id>' / 'retriage'
+    expected_content_hash: str,       # sha256(proposal.content) at report time
+    reviewed_by: str,                  # 必填，人工审用户名
+    review_plan_id: str = "",          # 可选：audit script 生成的 report ID
 ) -> dict:
-    """Unified fenced kernel for ALL promotion entrypoints:
-      - Entry A (normal auto):        terminal_state='auto_approved', reviewed_by='system'
-      - Entry B (maintenance auto):   use commit_maintenance_promotion_atomic instead
-      - Entry C (manual approve):     terminal_state='approved', reviewed_by=<caller>
-      - Entry D (retriage):           v3 doesn't call this — retriage is report-only
+    """人工审批专用路径。单事务内：
+      1. 校验 status='pending' AND promotion_protocol_version = 0
+      2. 校验 content hash 未漂移（防 report 生成到 approve 之间 proposal 被改）
+      3. v0 → v2（升级 protocol）
+      4. 人工 claim（一步到位 fencing）
+      5. 走同一 _commit_promotion_in_tx（同 in-tx kernel）
+    Recovery/retriage 严格禁止调用此函数（AST 闸门 + runtime assertion）。
     """
-    if terminal_state not in ('auto_approved', 'approved', 'retriaged_approved'):
-        raise ValueError(f"invalid terminal_state: {terminal_state!r}")
+    caller_frame = inspect.stack()[1].function
+    if caller_frame in {"proposal_recovery_loop", "_process_one_batch",
+                        "retriage_pending_proposals_report_only",
+                        "commit_promotion_atomic"}:
+        raise RuntimeError(
+            f"adopt_legacy_proposal_atomic must not be called from {caller_frame!r}"
+        )
+    if not reviewed_by or not reviewed_by.strip():
+        raise ValueError("reviewed_by required for legacy adoption")
+    now = _now_iso()
     with _write_transaction() as conn:
-        now = _now_iso()
-        # 1. legacy exclusion: 二次防御，即使 recovery SQL 忘 filter 也不放行
         row = conn.execute(
-            "SELECT triage_reason, promotion_protocol_version "
+            "SELECT content, status, promotion_protocol_version "
             "FROM proposals WHERE id=?", (prop_id,)
         ).fetchone()
         if not row:
-            raise PromotionClaimLost(f"proposal {prop_id} not found")
-        if row[1] != 2:
+            raise ValueError(f"proposal {prop_id} not found")
+        if row[1] != 'pending':
+            raise ValueError(f"proposal {prop_id} status={row[1]!r}, not pending")
+        if row[2] != 0:
             raise ValueError(
-                f"refuse to promote legacy proposal (protocol_version={row[1]})"
+                f"proposal {prop_id} already v={row[2]}, use review_proposal instead"
             )
-        # 2. needs_review 防御（对 auto_approved 分支硬约束）
-        if terminal_state == 'auto_approved' and row[0] not in ('auto_approve', 'auto_approve_silent'):
-            raise ValueError(
-                f"auto_approved requires triage_reason in {{auto_approve, auto_approve_silent}}, "
-                f"got {row[0]!r}"
+        current_hash = hashlib.sha256(row[0].encode('utf-8')).hexdigest()
+        if current_hash != expected_content_hash:
+            raise LegacyContentDrift(
+                f"proposal {prop_id} content changed since report "
+                f"(expected {expected_content_hash[:12]}..., got {current_hash[:12]}...)"
             )
-        # 3. fencing gate
+        # 升级 protocol + 分配人工 claim（一步 CAS）
+        token = uuid.uuid4().hex
         cur = conn.execute(
-            "UPDATE proposals SET status=?, applied_memory_id=?, reviewed_at=?, "
-            "reviewed_by=?, promotion_claim_id='', promotion_claim_at='' "
-            "WHERE id=? AND status='pending' AND promotion_claim_id=?",
-            (terminal_state, mem_payload['id'], now, reviewed_by, prop_id, claim_token)
+            "UPDATE proposals SET promotion_protocol_version=2, "
+            "promotion_claim_id=?, promotion_claim_at=? "
+            "WHERE id=? AND status='pending' AND promotion_protocol_version=0",
+            (token, now, prop_id)
         )
         if cur.rowcount != 1:
-            raise PromotionClaimLost(
-                f"proposal {prop_id} claim {claim_token!r} no longer valid"
-            )
-        # 4. memory (via _set_memory_in_tx — vec index + preserve 保护齐全)
-        _set_memory_in_tx(conn, mem_payload)
-        # 5. audit
-        conn.execute(
-            "INSERT INTO maintenance_audit "
-            "(action, target_id, new_content, source_message_ids, "
-            " decision_reason, state_before, state_after, model_id, "
-            " source_ai, auto_executed, prompt_version, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                audit_row.get("action", "promotion_committed"),
-                mem_payload['id'],
-                mem_payload.get("content", ""),
-                audit_row.get("source_message_ids", "[]"),
-                audit_row.get("decision_reason", ""),
-                audit_row.get("state_before", "{}"),
-                audit_row.get("state_after", "{}"),
-                audit_row.get("model_id", ""),
-                audit_row.get("source_ai", ""),
-                1 if terminal_state != 'approved' else 0,
-                audit_row.get("prompt_version", ""),
-                now,
-            )
+            raise PromotionClaimLost(f"legacy adoption race on {prop_id}")
+        # 重新读一致的 proposal + 走共享 in-tx kernel
+        proposal = _row_to_proposal_dict(
+            conn.execute("SELECT * FROM proposals WHERE id=?", (prop_id,)).fetchone()
         )
-    return {"memory_id": mem_payload['id'], "proposal_id": prop_id,
-            "terminal_state": terminal_state, "reviewed_by": reviewed_by}
+        mem_payload = _promotion_payload_from_proposal(
+            proposal, origin='legacy_adoption',
+        )
+        return _commit_promotion_in_tx(
+            conn=conn, prop_id=prop_id, claim_token=token,
+            mem_payload=mem_payload, terminal_state='approved',
+            reviewed_by=reviewed_by,
+            audit_extra={
+                "action": "legacy_adopt",
+                "review_plan_id": review_plan_id,
+            },
+        )
 ```
 
-**各入口对应**：
+**新异常** `LegacyContentDrift` — 人工看到后应重新出 audit report 再决定。
 
-| 入口 | terminal_state | reviewed_by | audit action |
-|---|---|---|---|
-| A normal auto | `auto_approved` | `"system"` | `promotion_committed` |
-| B maintenance auto | `auto_approved` | `"system"` | `promotion_committed_with_supersede`（走 `commit_maintenance_promotion_atomic`）|
-| C manual approve | `approved` | 参数传入 | `manual_approve` |
-| D retriage | **不走 kernel** — 只生成 `retriage_report.md`；不自动写 | — | — |
+**caller frame 断言** 是 belt-and-suspenders；主约束是 AST 闸门：
+- `test_v4_ast_gate_adopt_only_from_review_proposal` — AST 扫全生产代码，`adopt_legacy_proposal_atomic` 的调用者必须在 `memory_ops.review_proposal` 或未来的 `mcp_server.review_proposal_tool` 内
 
-**retriage endpoint** (`main.py:776`)：**保留 endpoint 但改行为为 report-only**（返回 JSON 描述"多少条会通过 retriage"，不实际写库）；等 v3 稳定后再评估是否恢复自动写入（届时必走 kernel）。
-
-**旧 `_promote_proposal` 函数**：改为 wrapper，仅供 backward-compat 的测试用（生产 4 个入口全部迁走）；加 `warnings.warn(DeprecationWarning)`。
-
-**AST/callsite 闸门**（新增 test）：生产代码非 tests/ 目录不允许直接调 `_promote_proposal`（AST 扫函数调用）。
-
-### C4【H3 修】完整 `PromotionPayload` schema
-
-**`_build_promotion_payload(proposal: dict, target_mem: dict | None = None) -> dict`**：
-- **纯数据变换**，不查 DB，不写 DB，不走 dedup（Codex 强调）
-- 显式列出每个 `_ALL_COLUMNS` 字段的值来源
-- AI alias canonicalization（`owner_ai` / `source_ai` 走 `AI_ALIASES.get(x, x)`）
-- 与现有 create 路径 `remember(quick=True)` 生成的字段做 **golden 对比**（S3 单元测试）
-
-**Schema 逐字段表**（对齐 `_ALL_COLUMNS`）：
+**`review_proposal(action='approve')` 分流**：
 ```python
-def _build_promotion_payload(proposal: dict, target_mem: dict | None = None) -> dict:
-    """把 proposal 转成 memory dict，可直接喂 _set_memory_in_tx。
-    无副作用；无 embedding 时留 None 由 _set_memory_in_tx.COALESCE 保留旧值或空。
+if action == "approve":
+    if proposal.get("promotion_protocol_version", 0) == 0:
+        return {"error": "legacy_needs_adopt",
+                "hint": "call review_proposal(action='adopt_legacy', expected_content_hash=...)"}
+    # v=2 走 commit_promotion_atomic（既有 manual 分支）
+elif action == "adopt_legacy":  # v4 新增 action
+    return await _adopt_legacy_via_review(
+        proposal_id, expected_content_hash, reviewed_by,
+    )
+elif action == "reject":
+    return database.reject_proposal_atomic(proposal_id, reviewed_by, reject_reason)
+```
+
+**反例测试**（7 组之一）:
+- `test_v4_h1_adopt_legacy_hash_drift_rejected` — content 被改后 adopt 失败，DB 无变化
+- `test_v4_h1_adopt_legacy_from_recovery_raises` — 从 `proposal_recovery_loop` 调 → RuntimeError
+
+### C2【H2 修】Maintenance recovery 三漏洞
+
+**漏洞 1：Entry B 没 triage_reason='auto_approve'** → recovery SQL 捡不到
+- v4 引入新 triage 值 `auto_approve_maintenance`
+- Recovery SQL 白名单：`triage_reason IN ('auto_approve', 'auto_approve_silent', 'auto_approve_maintenance')`
+- `_commit_promotion_in_tx` 的 needs_review 防御白名单同步
+
+**漏洞 2：target snapshot 未持久化，重启后无法重建 drift gate**
+- Proposals 表新增列（migration 幂等）：`target_snapshot_json TEXT NOT NULL DEFAULT ''`
+- Entry B 创建 proposal 时写入：
+```json
+{
+  "target_id": "mem_xxx",
+  "expected_status": "active",
+  "expected_updated_at": "2026-08-27T10:00:00+00:00",
+  "relation": "supersede",
+  "reason": "contradicts existing"
+}
+```
+- Recovery 拿到 v=2 + auto_approve_maintenance proposal → 从 `target_snapshot_json` 重建 drift gate
+
+**漏洞 3：drift 时降级 create 会静默改决策 → 2 条 active 冲突**
+- v4 硬约束：drift → `mark_promotion_failed(reason='target_drifted')`，proposal 状态变 `promotion_failed`
+- **绝不降级为 insert-only**
+- Ceci/AI 后续可以看到 `promotion_failed` proposal，重新出决策
+
+**修正**：v3 说"drift 保 pending，下轮 recovery 重试"矛盾于 `mark_promotion_failed` 的语义 —— v4 明确 drift = `promotion_failed` 终态，需要人工重新出 proposal。
+
+**`commit_maintenance_promotion_atomic` v4**：
+```python
+def commit_maintenance_promotion_atomic(
+    prop_id, claim_token, mem_payload,
+    target_snapshot,     # {'target_id', 'expected_status', 'expected_updated_at', 'relation'}
+    reviewed_by,
+) -> dict:
+    """单事务：drift 校验 + supersede + insert new + finalize proposal + audit。
+    drift 触发 → MaintenanceDrift 抛出（caller mark_promotion_failed）。绝不降级。"""
+    with _write_transaction() as conn:
+        # 1. drift gate
+        tgt = target_snapshot
+        cur_row = conn.execute(
+            "SELECT status, updated_at FROM memories WHERE id=?", (tgt['target_id'],)
+        ).fetchone()
+        if not cur_row:
+            raise MaintenanceDrift(f"target {tgt['target_id']} not found")
+        if cur_row[0] != tgt['expected_status'] or cur_row[1] != tgt['expected_updated_at']:
+            raise MaintenanceDrift(
+                f"target {tgt['target_id']} drifted: expected "
+                f"({tgt['expected_status']}, {tgt['expected_updated_at']}), "
+                f"got ({cur_row[0]}, {cur_row[1]})"
+            )
+        # 2. supersede old（in-tx，UPSERT via _set_memory_in_tx 保留 preserve）
+        old_mem = _fetch_full_mem(conn, tgt['target_id'])
+        old_mem['status'] = 'superseded'
+        old_mem['superseded_by'] = mem_payload['id']
+        old_mem['updated_at'] = _now_iso()
+        _set_memory_in_tx(conn, old_mem)
+        # 3. insert new + finalize proposal + audit —— 共享 in-tx kernel
+        return _commit_promotion_in_tx(
+            conn=conn, prop_id=prop_id, claim_token=claim_token,
+            mem_payload=mem_payload, terminal_state='auto_approved',
+            reviewed_by=reviewed_by,
+            audit_extra={
+                "action": "promotion_with_supersede",
+                "superseded_target": tgt['target_id'],
+                "relation": tgt.get('relation', ''),
+            },
+        )
+```
+
+**反例测试**（7 组之一）:
+- `test_v4_h2_maintenance_restart_recovery_from_snapshot` — 造一条 v=2+auto_approve_maintenance proposal 带 snapshot；重启进程；recovery 拿到 → 走完整 supersede+insert
+- `test_v4_h2_maintenance_drift_marks_failed_no_downgrade` — target 在 recovery 前被改；断言 proposal 变 promotion_failed，新 memory **未** insert，旧 memory **未** supersede
+
+### C3【H3 修】Reject CAS
+
+**新 helper** `database.reject_proposal_atomic(prop_id, reviewed_by, reject_reason)`：
+```python
+def reject_proposal_atomic(prop_id: str, reviewed_by: str, reject_reason: str) -> dict:
+    """条件 UPDATE：只在 status='pending' 且 claim 未持有时 reject。
+    若已 auto_approved（auto worker 抢先了）→ 返回 already_finalized 不覆盖。
+    若被 auto worker 持有 claim → 返回 in_flight（人工可稍后再试）。
     """
-    from config import AI_ALIASES
     now = _now_iso()
-    prop_id = proposal["id"]
-    mem_id = f"mem_from_prop_{prop_id}"
-    canonical_owner = AI_ALIASES.get(proposal.get("owner_ai", ""), proposal.get("owner_ai", ""))
-    canonical_source = AI_ALIASES.get(proposal.get("proposer_ai_id", ""), proposal.get("proposer_ai_id", ""))
+    with _write_transaction() as conn:
+        # 先看当前状态（read）
+        row = conn.execute(
+            "SELECT status, promotion_claim_id, applied_memory_id "
+            "FROM proposals WHERE id=?", (prop_id,)
+        ).fetchone()
+        if not row:
+            return {"error": "not_found"}
+        if row[0] != 'pending':
+            return {"status": row[0], "note": "already_finalized",
+                    "applied_memory_id": row[2] or ""}
+        if row[1]:  # claim held by auto worker
+            return {"status": "in_flight", "note": "auto worker holds claim, retry later"}
+        # CAS reject
+        cur = conn.execute(
+            "UPDATE proposals SET status='rejected', reviewed_by=?, "
+            "reviewed_at=?, reject_reason=?, "
+            "promotion_claim_id='', promotion_claim_at='' "
+            "WHERE id=? AND status='pending' AND promotion_claim_id=''",
+            (reviewed_by, now, reject_reason, prop_id)
+        )
+        if cur.rowcount != 1:
+            return {"status": "in_flight", "note": "claim taken between read and update"}
+        return {"status": "rejected", "reviewed_by": reviewed_by}
+```
 
-    # tags / linked_memories / supersedes / history / comments 归一为 canonical JSON string
-    tags = proposal.get("tags") or "[]"
-    if isinstance(tags, (list, dict)):
-        tags = json.dumps(tags, ensure_ascii=False)
+**`review_proposal(action='reject')` 走此新 helper**（memory_ops 侧只 wrap）。
 
-    supersedes = json.dumps([target_mem["id"]]) if (target_mem and target_mem.get("id")) else "[]"
+**反例测试**（7 组之一）:
+- `test_v4_h3_reject_vs_auto_race` — 双线程：thread_A auto worker 拿 claim + 提交；thread_B 人工 reject。断言最终恰好一种终态（`auto_approved+1 memory` 或 `rejected+0 memory`），不出现 `rejected+1 memory` 矛盾
 
+### C4【H4 修】共享 payload builder + in-tx kernel
+
+**问题**：v3 的 `_build_promotion_payload` 生成字段跟正常 create 路径不等价（decay_score / domain / history schema），golden 测试无对照标准。
+
+**v4 新架构**：抽取共享**纯函数** `memory_ops._build_new_memory_payload`（不查 DB、不写 DB、不 mutate 输入）：
+
+```python
+def _build_new_memory_payload(
+    *,
+    content: str,
+    layer: str = "shared",
+    room: str = "living_room",
+    category: str = "",
+    owner_ai: str = "",
+    source_ai: str = "",
+    source_platform: str = "",
+    importance: float = 0.5,
+    emotion_arousal: float = 0.3,
+    valence: float = 0.5,
+    domain: str = "[]",
+    tags: list[str] | str = None,
+    subject_id: str = "",
+    source_actor_id: str = "",
+    info_type: str = "fact",
+    event_date: str = "",
+    source_context: str = "",
+    provenance_type: str = "",
+    fact_confidence: float | None = None,
+    embedding: bytes | None = None,
+    # promotion-specific:
+    override_id: str | None = None,           # deterministic mem_from_prop_{id}
+    override_created_at: str | None = None,   # 保留 proposal 时间
+    origin: str = "normal_create",            # 'normal_create' / 'promotion' / 'legacy_adoption'
+    supersedes: list[str] | None = None,      # maintenance path 才有
+    proposal_id: str = "",                    # audit trail
+) -> dict:
+    """纯函数：产出可直接喂 _set_memory_in_tx 的 memory dict。
+    正常 create 和所有 promotion 入口都调此。ID/time/embedding/supersedes 参数化。"""
+    from config import AI_ALIASES
+    now = override_created_at or _now_iso()
+    mem_id = override_id or _gen_id()
+    tags_json = json.dumps(tags or [], ensure_ascii=False) if not isinstance(tags, str) else tags
     return {
         # identity
-        "id": mem_id,
-        "content": proposal["content"],
+        "id": mem_id, "content": content,
         # taxonomy
-        "layer": proposal.get("layer", "shared"),
-        "room": proposal.get("proposed_room", "living_room"),
-        "category": proposal.get("category", ""),
-        "owner_ai": canonical_owner,
-        # scoring
-        "importance": float(proposal.get("importance", 0.5)),
-        "emotion_arousal": float(proposal.get("emotion_arousal", 0.3)),
-        "valence": 0.5,           # neutral default — proposal 目前不带 valence
-        "domain": "",             # analyzer 生成，proposal 阶段无
-        "decay_score": 0.5,       # 初始
-        "activation_count": 0,    # 初始
-        "last_activated": "",     # 未激活
+        "layer": layer, "room": room, "category": category,
+        "owner_ai": AI_ALIASES.get(owner_ai, owner_ai),
+        # scoring — 与现有 memory_ops.remember normal create 保持一致
+        "importance": float(importance), "emotion_arousal": float(emotion_arousal),
+        "valence": float(valence), "domain": domain,
+        "decay_score": 1.0,           # ← 与正常 create 一致（v3 写 0.5 是错的）
+        "activation_count": 0, "last_activated": "",
         # provenance
-        "source_ai": canonical_source,
-        "source_platform": proposal.get("source_platform", ""),
-        "tags": tags,
-        "linked_memories": "[]",
-        "supersedes": supersedes,
+        "source_ai": AI_ALIASES.get(source_ai, source_ai),
+        "source_platform": source_platform,
+        "tags": tags_json, "linked_memories": "[]",
+        "supersedes": json.dumps(supersedes or [], ensure_ascii=False),
         "superseded_by": "",
-        "event_date": proposal.get("event_date", ""),
-        "source_context": proposal.get("source_context", ""),
-        "comments": "[]",
-        # vec — embedding at proposal time 可能已缓存；无则 None 由 COALESCE
-        "embedding": proposal.get("embedding"),
+        "event_date": event_date, "source_context": source_context,
+        "comments": "[]", "embedding": embedding,
         # state
-        "status": "active",
-        "created_at": now,
-        "updated_at": now,
+        "status": "active", "created_at": now, "updated_at": now,
+        # history — 与正常 create schema 对齐 {v, content, date, by}
         "history": json.dumps([{
-            "at": now,
-            "action": "promoted_from_proposal",
-            "proposal_id": prop_id,
+            "v": 1, "content": content, "date": now,
+            "by": AI_ALIASES.get(source_ai, source_ai) or "system",
+            "origin": origin,
+            **({"proposal_id": proposal_id} if proposal_id else {}),
         }], ensure_ascii=False),
-        "resolved": None,
-        "anchored": None,
-        "provenance_type": proposal.get("provenance_type", ""),
-        "fact_confidence": proposal.get("confidence"),  # REAL or None
-        "subject_id": proposal.get("subject_id", ""),
-        "source_actor_id": proposal.get("source_actor_id", ""),
-        "info_type": proposal.get("info_type", "fact"),
-        # PR C skeleton fields — promotion 不参与 async skeleton，留空
-        "client_request_id": "",
-        "link_to_real_id": "",
-        "finalize_claim_id": "",
-        "finalize_claim_at": "",
+        "resolved": None, "anchored": None,
+        "provenance_type": provenance_type, "fact_confidence": fact_confidence,
+        "subject_id": subject_id, "source_actor_id": source_actor_id,
+        "info_type": info_type,
+        # PR C skeleton fields — promotion 不参与
+        "client_request_id": "", "link_to_real_id": "",
+        "finalize_claim_id": "", "finalize_claim_at": "",
     }
 ```
 
-**Golden test**（S3）：
-- `test_v3_payload_covers_all_ALL_COLUMNS` — 断言 `_build_promotion_payload(fake_prop)` 返回的 dict key 集合覆盖 `database._ALL_COLUMNS`（不多不少）
-- `test_v3_payload_matches_normal_create_field_by_field` — 造一个走 `remember(quick=True, allow_direct_write=True)` 的对照组 memory + 一个走本 payload 的 memory，逐字段 assert（除 `id`、`created_at`、`updated_at` 允许不同）
-- `test_v3_payload_ai_alias_canonicalized` — `proposer_ai_id='cloudy'` → payload `source_ai='claude'`（若配置里 alias 生效）
-- `test_v3_payload_no_embedding_ok` — `proposal` 无 `embedding` key → payload `embedding is None` → `_set_memory_in_tx` 走 COALESCE 无 crash
+**正常 create 路径迁移**：`memory_ops.remember` 内所有构造 memory dict 的地方改调 `_build_new_memory_payload(...)`。这是 v4 施工内的最大改动 —— 消除"两份近似字典"。
 
-**write_gate 复用**：write_gate 只在 `remember(quick=True)` 阶段（proposal 创建之前）跑 —— 已经验证过的 proposal 到 promotion 阶段不需要再跑。文档明确写死此复用假设，施工时不再 spike。
-
-### C5【H4 修】人工 approve 与 auto 并发防护
-
-`review_proposal(action='approve')` 改造：
+**Promotion payload wrapper**：
 ```python
-async def review_proposal(proposal_id, action, reviewed_by="user", reject_reason=""):
-    proposal = database.get_proposal(proposal_id)
-    if not proposal:
-        return {"error": "not found"}
-    if proposal["status"] != "pending":
-        return {"error": f"already {proposal['status']}"}
+def _promotion_payload_from_proposal(
+    proposal: dict, *, origin: str = "promotion", supersedes: list[str] | None = None,
+) -> dict:
+    return _build_new_memory_payload(
+        content=proposal["content"],
+        layer=proposal.get("layer", "shared"),
+        room=proposal.get("proposed_room", "living_room"),
+        category=proposal.get("category", ""),
+        owner_ai=proposal.get("owner_ai", ""),
+        source_ai=proposal.get("proposer_ai_id", ""),
+        source_platform=proposal.get("source_platform", ""),
+        importance=float(proposal.get("importance", 0.5)),
+        emotion_arousal=float(proposal.get("emotion_arousal", 0.3)),
+        tags=proposal.get("tags"),
+        subject_id=proposal.get("subject_id", ""),
+        source_actor_id=proposal.get("source_actor_id", ""),
+        info_type=proposal.get("info_type", "fact"),
+        event_date=proposal.get("event_date", ""),
+        source_context=proposal.get("source_context", ""),
+        provenance_type=proposal.get("provenance_type", ""),
+        fact_confidence=proposal.get("confidence"),
+        embedding=proposal.get("embedding"),  # None if not cached
+        override_id=f"mem_from_prop_{proposal['id']}",
+        override_created_at=proposal.get("created_at"),
+        origin=origin,
+        supersedes=supersedes,
+        proposal_id=proposal["id"],
+    )
+```
 
-    if action == "approve":
-        # legacy exclusion
-        if proposal.get("promotion_protocol_version", 0) != 2:
-            return {"error": "legacy proposal — please use audit_stuck_proposals script"}
+**Golden 测试**（Codex 要求真正等价）:
+- `test_v4_h4_normal_create_and_promotion_share_builder` — 相同输入调 `_build_new_memory_payload(**args)` + `_build_new_memory_payload(**args, override_id=X, origin='promotion')`，除 `id / created_at / updated_at / history[0].origin / history[0].proposal_id` 外**完全等价**
+- `test_v4_h4_payload_covers_all_ALL_COLUMNS` — dict key 集合 = `_ALL_COLUMNS`（不多不少）
+- `test_v4_h4_no_dupe_payload_construction` — AST 断言 `memory_ops.py` / `database.py` 只有 `_build_new_memory_payload` 一处构造完整 memory dict
 
-        # 人工 claim（可强制取代任何 stale auto claim）
-        token = uuid.uuid4().hex
-        won = database.try_claim_promotion(
-            proposal_id, token,
-            expected_current_claim="",  # 优先抢空 claim
-            stale_after_minutes=0,      # human intent 有更高优先级：允许接管任何 auto claim
+### C5【M1 修】共享 in-tx kernel（加入 `_IN_TX_HELPERS`）
+
+**新增** `database._commit_promotion_in_tx(conn, prop_id, claim_token, mem_payload, terminal_state, reviewed_by, audit_extra)`：
+```python
+def _commit_promotion_in_tx(
+    conn, prop_id, claim_token, mem_payload,
+    terminal_state, reviewed_by, audit_extra=None,
+):
+    """In-tx helper: caller 已开 _write_transaction。
+    ✓ 加入 _IN_TX_HELPERS；仅由 database.py 内 3 个 public wrapper 调用。
+
+    步骤（缺一不可）：
+      1. legacy-exclusion 二次防御（v=2 强制）
+      2. needs_review 防御（terminal_state='auto_approved' 时 triage 白名单）
+      3. Fencing gate: UPDATE proposals ... WHERE id=? AND status='pending'
+                        AND promotion_claim_id=?  → rowcount==1 or raise
+      4. _set_memory_in_tx(conn, mem_payload)
+      5. state_before / state_after 由 kernel 事务内构造（不信 caller）
+      6. audit INSERT
+    """
+    if terminal_state not in ('auto_approved', 'approved'):
+        raise ValueError(f"invalid terminal_state: {terminal_state!r}")
+    now = _now_iso()
+    # 1 & 2 & 3: 读 proposal 完整 row 一次，作 state_before 源
+    prop = conn.execute(
+        "SELECT id, status, triage_reason, promotion_protocol_version, "
+        "       promotion_claim_id, source_message_ids "
+        "FROM proposals WHERE id=?", (prop_id,)
+    ).fetchone()
+    if not prop:
+        raise PromotionClaimLost(f"proposal {prop_id} not found")
+    if prop['promotion_protocol_version'] != 2:
+        raise ValueError(f"refuse to promote v={prop['promotion_protocol_version']}")
+    AUTO_TRIAGES = ('auto_approve', 'auto_approve_silent', 'auto_approve_maintenance')
+    if terminal_state == 'auto_approved' and prop['triage_reason'] not in AUTO_TRIAGES:
+        raise ValueError(
+            f"auto_approved requires triage_reason in {AUTO_TRIAGES}, "
+            f"got {prop['triage_reason']!r}"
         )
-        if not won:
-            # 真的有一个 auto worker 正在执行（fresh claim < 0min）— 罕见
-            return {"error": "concurrent auto promotion in flight, please retry"}
-
-        try:
-            mem_payload = _build_promotion_payload(proposal)
-            database.commit_promotion_atomic(
-                proposal_id, token, mem_payload,
-                audit_row={
-                    "action": "manual_approve",
-                    "source_message_ids": proposal.get("source_message_ids", "[]"),
-                    "decision_reason": f"manually approved by {reviewed_by}",
-                    "state_before": json.dumps({
-                        "proposal_status": "pending",
-                        "triage_reason": proposal.get("triage_reason", ""),
-                    }),
-                    "state_after": json.dumps({
-                        "memory_id": mem_payload['id'],
-                        "proposal_status": "approved",
-                    }),
-                    "source_ai": proposal.get("proposer_ai_id", ""),
-                },
-                terminal_state="approved",
-                reviewed_by=reviewed_by,
-            )
-            return {"proposal_id": proposal_id, "status": "approved",
-                    "memory_id": mem_payload['id']}
-        except PromotionClaimLost:
-            return {"error": "claim lost during commit"}
-        except Exception as e:
-            database.mark_promotion_failed(proposal_id, token, str(e))
-            return {"proposal_id": proposal_id, "status": "promotion_failed", "error": str(e)}
-
-    elif action == "reject":
-        # 不 claim（reject 不写 memory）；但要检查 protocol_version = 2 才能标 rejected
-        # v0 也允许 reject（人工判断"不要"）— reject 无副作用
-        database.update_proposal_status(proposal_id, "rejected", reviewed_by, reject_reason)
-        return {"proposal_id": proposal_id, "status": "rejected", "reason": reject_reason}
-```
-
-**反例测试**（4 组之一）：
-- `test_v3_c5_manual_and_auto_race_only_one_wins` — auto worker 拿 fresh claim，人工同时按 approve，人工 `try_claim_promotion` 遵循 `stale_after_minutes=0` 语义（允许接管）→ 断言恰好 1 条 memory 且 audit 恰好 1 条
-
-### C6【H2 修 - retriage 分离】retriage 只 report
-
-**新 `retriage_pending_proposals_report_only()` (memory_ops.py)** 替换现有函数：
-```python
-async def retriage_pending_proposals_report_only() -> dict:
-    """v3: 不写库！只返回"如果按当前 rule 重跑 triage，多少条会 auto_approve"的报告。
-    生产 endpoint (main.py:776) 仍暴露此函数，返回 JSON 供 Ceci 审查。
-    真要执行 → 走 audit_stuck_proposals.py + Ceci 手动 review_proposal。"""
-    all_pending = database.list_proposals(status="pending", limit=500, offset=0)
-    would_approve, would_still_pending = [], []
-    for prop in all_pending:
-        # ... 重跑 triage 逻辑 ...
-        if decision in ("auto_approve", "auto_approve_silent"):
-            would_approve.append({
-                "id": prop["id"], "content_preview": prop["content"][:80],
-                "protocol_version": prop.get("promotion_protocol_version", 0),
-                "triage_reason": decision,
-            })
-        else:
-            would_still_pending.append({"id": prop["id"], "reason": decision})
+    # 3. fencing CAS
+    cur = conn.execute(
+        "UPDATE proposals SET status=?, applied_memory_id=?, reviewed_at=?, "
+        "reviewed_by=?, promotion_claim_id='', promotion_claim_at='' "
+        "WHERE id=? AND status='pending' AND promotion_claim_id=?",
+        (terminal_state, mem_payload['id'], now, reviewed_by, prop_id, claim_token)
+    )
+    if cur.rowcount != 1:
+        raise PromotionClaimLost(
+            f"proposal {prop_id} claim {claim_token[:8]}... no longer valid"
+        )
+    # 4. memory
+    _set_memory_in_tx(conn, mem_payload)
+    # 5. state_before / state_after 事务内构造（不信 caller）
+    state_before = {
+        "proposal_status": "pending",
+        "triage_reason": prop["triage_reason"],
+        "protocol_version": prop["promotion_protocol_version"],
+        "claim_token_prefix": claim_token[:8],
+    }
+    state_after = {
+        "proposal_status": terminal_state,
+        "applied_memory_id": mem_payload['id'],
+        "reviewed_by": reviewed_by,
+    }
+    # 6. audit — action/reason/metadata from caller; state_* from kernel
+    extra = audit_extra or {}
+    conn.execute(
+        "INSERT INTO maintenance_audit "
+        "(action, target_id, new_content, source_message_ids, "
+        " decision_reason, state_before, state_after, model_id, "
+        " source_ai, auto_executed, prompt_version, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            extra.get("action", "promotion_committed"),
+            mem_payload['id'],
+            mem_payload.get("content", ""),
+            prop["source_message_ids"] or "[]",          # ← 从 proposal 事务内读
+            extra.get("decision_reason", ""),
+            json.dumps(state_before, ensure_ascii=False),
+            json.dumps({**state_after, **{k: v for k, v in extra.items()
+                                         if k not in ("action", "decision_reason")}},
+                       ensure_ascii=False),
+            extra.get("model_id", ""),
+            mem_payload.get("source_ai", ""),
+            1 if terminal_state == 'auto_approved' else 0,
+            extra.get("prompt_version", ""),
+            now,
+        )
+    )
     return {
-        "note": "REPORT-ONLY — no writes performed",
-        "would_approve": would_approve,
-        "would_still_pending": would_still_pending,
-        "total": len(all_pending),
+        "memory_id": mem_payload['id'],
+        "proposal_id": prop_id,
+        "terminal_state": terminal_state,
+        "reviewed_by": reviewed_by,
     }
 ```
 
-`main.py:776` endpoint 保持不变，只是内部函数换成 report-only 版本。
+**3 个 public wrapper（都自己开一次 `_write_transaction`）**：
+1. `commit_promotion_atomic` — auto & manual v=2（无 supersede）
+2. `commit_maintenance_promotion_atomic` — auto & manual v=2 带 supersede
+3. `adopt_legacy_proposal_atomic` — v=0→v=2 人工专用
 
-### C7【M1 修】删除 proposal `_preserve_on_empty` 描述
+三者都在自身 tx 内调 `_commit_promotion_in_tx(conn, ...)`。
 
-v2 说加 `_preserve_on_empty` — 这是 memories 表的 UPSERT 概念，proposals 表没有 UPSERT 需求。**删除**。
+**加入 `_IN_TX_HELPERS`**：`_commit_promotion_in_tx` 加入清单；对应 AST 闸门自动生效（其他生产模块禁引用）。
 
-`promotion_claim_id / promotion_claim_at / promotion_protocol_version` 只通过专用 CAS helpers 修改（`try_claim_promotion` / `commit_promotion_atomic` / `mark_promotion_failed`），从不通过通用 `update_proposal_*` 更新。
+### C6【M2 修】state_before 由 kernel 构造（见 C5 已实现）
 
-### C8【M2 修】sweep 完整生命周期 + batch limit + shutdown event 契约
+在 C5 的 `_commit_promotion_in_tx` 内，`state_before` / `source_message_ids` / claim_token 由事务内 SELECT proposal row 构造。caller 只提供 action / decision_reason / model_id / prompt_version 等 metadata。
 
-```python
-# proposal_sweep.py
-import asyncio, uuid, logging
+### C7【M3 修】补恢复反例（已在 7 组反例内覆盖，见 Q4）
 
-_shutdown = asyncio.Event()
-processed_count = 0
+### C8【L1 修】删 `retriaged_approved` state
 
-async def proposal_recovery_loop(interval_sec: int = 600, batch_size: int = 20):
-    """
-    每轮最多处理 batch_size 条，稳定 ORDER BY created_at ASC。
-    _shutdown 触发时立刻退出 sleep（不等 interval）。
-    """
-    global processed_count
-    while not _shutdown.is_set():
-        try:
-            summary = await _process_one_batch(batch_size)
-            processed_count += summary["processed"]
-            if summary["processed"] > 0:
-                logger.info(
-                    "proposal recovery: processed=%d stale_takeover=%d "
-                    "orphan_claim=%d failed=%d",
-                    summary["processed"], summary["stale"],
-                    summary["orphan"], summary["failed"],
-                )
-        except Exception:
-            logger.exception("proposal_recovery_loop iteration failed")
-        # v3 M2: sleep with wake-on-shutdown
-        try:
-            await asyncio.wait_for(_shutdown.wait(), timeout=interval_sec)
-        except asyncio.TimeoutError:
-            pass
+v3 提到但没 caller。v4 移除。retriage 只 report。
 
-def prepare_for_startup() -> None:
-    """main.py lifespan startup 前调；重置 shutdown event 支持 hot reload。"""
-    global _shutdown, processed_count
-    _shutdown = asyncio.Event()
-    processed_count = 0
-```
+### C9【L2 修】反例数量对齐
 
-`main.py lifespan`：
-```python
-# startup
-proposal_sweep.prepare_for_startup()
-proposal_sweep_task = asyncio.create_task(proposal_sweep.proposal_recovery_loop())
+7 组关键反例（v3 说 4 后来列 5 —— 已统一）。
 
-# shutdown
-proposal_sweep._shutdown.set()
-try:
-    await asyncio.wait_for(proposal_sweep_task, timeout=10)
-except asyncio.TimeoutError:
-    proposal_sweep_task.cancel()
-    await asyncio.gather(proposal_sweep_task, return_exceptions=True)
-logger.info("proposal recovery loop stopped, processed=%d", proposal_sweep.processed_count)
-```
+### C10【L3 修】行号更新
 
-`_process_one_batch` 内 SQL 加 `ORDER BY created_at ASC LIMIT ?`。
-
-### C9【M3 修】audit 保留完整证据链
-
-- `source_message_ids` **必须**从 proposal 原样带入（不能空 `[]`）
-- `state_before` 至少含：`{"proposal_status": ..., "triage_reason": ..., "claim_token": ...}`
-- `state_after` 至少含：`{"memory_id": ..., "proposal_status": ...}`
-
-**新增反例测试**（4 组之一）：
-- `test_v3_c9_audit_failure_rollbacks_all` — mock audit INSERT 抛 sqlite3.IntegrityError → 断言 memory 未写、proposal 未 finalize、claim 未释放
-
-### C10【L1 修】文档 LF line endings
-
-用 `python -c "...replace(b'\r\n', b'\n')..."` 归一 md 文档（PR 提交前一次跑）。
-
-### C11【L2 修】S6 验收标准修正
-
-原：**"40 条池清空"**（跟 C 类留人工审矛盾）
-改：**"旧 40 条全部完成分类，A/B 已处置，C 有明确待审清单"**
+Q2 Entry A 位置：`memory_ops.py:1105-1139`（v3 写 `1301-1327` 已过期）。
 
 ---
 
@@ -518,25 +507,32 @@ logger.info("proposal recovery loop stopped, processed=%d", proposal_sweep.proce
 
 | Step | 工作 | 验收 |
 |---|---|---|
-| **S0** | `audit_stuck_proposals.py --report` 存量分类 | 40 条 A/B/C 分类；`--execute` 主动拒绝 v0 数据 |
-| S1 | migration (3 列幂等) + `_PROPOSAL_COLUMNS` + `PromotionClaimLost` + `_now_iso` shared helper | init_db 重跑幂等；旧行 v=0 / 新行 v=2 |
-| S2 | `try_claim_promotion` / `mark_promotion_failed` / `list_promotion_candidates_for_recovery` / `commit_promotion_atomic` / `commit_maintenance_promotion_atomic` 5 helpers | 单元测试 5 条：claim / stale / mark_failed / candidates (v=2 filter + orphan/stale) / commit atomic (含 needs_review 防御) |
-| S3 | `_build_promotion_payload` + golden 对比 3 条测试（`_ALL_COLUMNS` 覆盖、字段等价、无 embedding） | payload 与 remember(quick=True) 生成的 field-by-field 一致 |
-| S4 | 4 入口全部改造（A / B / C — retriage 单独 S5） | 现有 22 条 proposal 测试全过；新增 12 条 v3 测试通过 |
-| S5 | `retriage_pending_proposals_report_only` + main.py endpoint 换 | endpoint 返 JSON 报告，不写库；测试断言 DB 无变化 |
-| S6 | `proposal_sweep.py` + main.py lifespan wire + shutdown hot reload | sweep 独立起停；`_shutdown.wait()` 唤醒；hot reload 重置 event；批量 limit 20 |
-| S7 | AST 闸门：生产代码非 tests/ 不允许直接调 `_promote_proposal` | 静态断言通过 |
-| S8 | 5 组关键反例（Codex 底线）| 全通过 |
-| S9 | VPS 部署 + Ceci 人工 review 存量 A 类 | 无新增 v=2 卡池；A/B 处理完；C 有清单 |
+| **S0** | `audit_stuck_proposals.py --report` 存量 40 条分类，输出 content sha256 表 | Ceci 拿到 A/B/C 分类 + hash 表，用于 adopt |
+| S1 | Migration (4 列幂等：claim_id/at/protocol_version/target_snapshot_json) + `_PROPOSAL_COLUMNS` + 异常类 | init_db 重跑幂等；旧行 v=0/snapshot=''/claim='' |
+| S2 | `_build_new_memory_payload` 抽取 + 正常 create 路径迁移 | 现有全部 remember 测试通过 + 新增 payload 覆盖测试通过 |
+| S3 | `_commit_promotion_in_tx` in-tx kernel + `_IN_TX_HELPERS` 更新 + AST 闸门 | in-tx helper 合规；生产代码无外部 `_commit_promotion_in_tx` 调用 |
+| S4 | 3 public wrappers: `commit_promotion_atomic` / `commit_maintenance_promotion_atomic` / `adopt_legacy_proposal_atomic` + `reject_proposal_atomic` + `try_claim_promotion` / `mark_promotion_failed` | 单元测试 8 条覆盖 |
+| S5 | 4 入口改造：A auto / B maintenance auto (含 snapshot 持久化 + 新 triage `auto_approve_maintenance`) / C manual approve v=2 / C' adopt v=0；`_promote_proposal` 加 DeprecationWarning | 现有 22 条 proposal 测试通过 + 新增 18 条 v4 测试通过 |
+| S6 | `retriage_pending_proposals_report_only` + main.py endpoint 换 | endpoint 返 JSON，不写库 |
+| S7 | `proposal_sweep.py` + main.py lifespan (`_shutdown` event + batch 20 + ORDER BY + wait_for + hot reload) | sweep 独立起停 |
+| S8 | `audit_stuck_proposals.py`：`--report` 输出 content hash + A/B/C 分类；`--adopt <id> --hash <sha>` 走 review_proposal(adopt_legacy) | dry-run 正确；`--adopt` 单条成功；hash mismatch 拒 |
+| S9 | 7 组关键反例全部通过 | 见下 |
+| S10 | VPS 部署 + Ceci 人工 adopt A 类 | 无新增 v=2 卡池；A 全 adopt；C 有清单 |
 
-**5 组关键反例**（Codex 底线）：
-1. `test_v3_c1_legacy_orphan_never_recovered` — 旧 v=0 orphan **不进入** recovery candidates
-2. `test_v3_c2_maintenance_crash_all_or_nothing` — commit_maintenance_promotion_atomic 中断，旧 memory 未 supersede + 新 memory 未 insert（回滚干净）
-3. `test_v3_c5_manual_and_auto_race_only_one_wins` — 人工 approve 与 auto worker 并发，恰好 1 条 memory
-4. `test_v3_c9_audit_failure_rollbacks_all` — audit INSERT 失败，memory / proposal / claim 全回滚
-5. `test_v3_needs_review_never_auto_promoted` — needs_review triage 硬拒 auto_approved
+**7 组关键反例**（Codex 底线）：
+1. `test_v4_h1_adopt_legacy_hash_drift_rejected` — content hash 漂移 → LegacyContentDrift；DB 无变化
+2. `test_v4_h1_adopt_legacy_from_recovery_raises` — recovery loop 调 adopt → RuntimeError
+3. `test_v4_c1_legacy_orphan_never_recovered_by_sweep` — v=0 orphan 不进 candidates (recovery SQL 硬约束 v=2)
+4. `test_v4_h2_maintenance_restart_recovery_from_snapshot` — v=2+auto_approve_maintenance+target_snapshot proposal 重启后被 sweep 完整处理
+5. `test_v4_h2_maintenance_drift_marks_failed_no_downgrade` — target 漂移 → promotion_failed，new memory 未 insert，旧 memory 未 supersede
+6. `test_v4_h3_reject_vs_auto_race` — 双线程 auto+reject，最终 `auto_approved+1 mem` 或 `rejected+0 mem`，绝无 `rejected+1 mem`
+7. `test_v4_h4_normal_create_and_promotion_share_builder` — 除 id/time/history[origin/proposal_id]，字段完全等价（decay_score=1.0 / domain=[] / history schema 一致）
 
-**总估时**：4 天（v2 是 3 → v3 是 4 —— 多的 1 天是 maintenance entry B 的完整原子 helper 重构）
+外加防御：
+- `test_v4_audit_rollback_on_insert_failure`
+- `test_v4_needs_review_never_auto_promoted`
+
+**总估时**：5 天（v3 是 4，v4 多 1 天：S2 正常 create 路径迁 `_build_new_memory_payload` 是最大改动，需要全套 remember 测试重跑）
 
 ---
 
@@ -544,53 +540,45 @@ logger.info("proposal recovery loop stopped, processed=%d", proposal_sweep.proce
 
 ### 高
 
-1. **`_build_promotion_payload` 与 `remember(quick=True)` 字段 golden 对比**
-   `remember(quick=True)` 内部有多个副作用（write_gate 校验 / analyzer.analyze 生成 domain / …）。golden 对比要**降级到"字段存在性 + 类型正确性"**，而不是完全字段值等价。valence/domain 允许不同（proposal 阶段本来就没算这些）。
-   **缓解**：test 里明确 skip 字段清单，document 每个 skip 的原因。
+1. **S2 正常 create 路径迁移的兼容性**
+   `remember(quick=False)` 现有代码构造 memory dict 的地方可能有隐藏依赖（例如某个 caller 传 `decay_score=0.9`）。抽 `_build_new_memory_payload` 后所有 remember 测试全跑一遍是唯一保障。若发现某处需要 override，加参数扩展（不 fork）。
 
-2. **maintenance entry B 崩溃后 proposal 卡 pending**
-   `commit_maintenance_promotion_atomic` 若在 supersede + set_memory 后但 audit 前崩，全回滚，proposal 保持 pending。recovery 会重试 —— **但 recovery 时 target_mem 已被之前的 supersede 检查判过时**（另一 tx 可能已改）→ drift → 循环 fail。
-   **缓解**：recovery 时用 `_build_promotion_payload(prop, target_mem=None)` 走"只 insert 不 supersede"降级路径；audit 记 `promotion_committed_without_supersede`；下次 Ceci 见到会警觉。
+2. **maintenance 现有 pending 都是"没 target_snapshot"的旧数据**
+   Migration 后新建的 maintenance proposal 才有 snapshot；旧的 v=0 走 adopt legacy 路径（人工提供 target 决策）。若 40 条里有 maintenance 类型的 v=0，adopt 时 reviewed_by 必须显式判断 supersede 决策是否仍合理（不能盲目 adopt）。
+   **缓解**：audit_stuck_proposals.py --report 明确标出 v=0 里 maintenance_action != '' 的 proposal，Ceci 单独人查。
 
 ### 中
 
-3. **`try_claim_promotion` 的 stale_after_minutes=0 语义**
-   人工 approve 传 0 意味着"允许接管任何非空 claim" —— 若 auto worker 正在 in-flight 提交，会被抢占 → auto worker 的 fencing gate 会返 rowcount=0 → PromotionClaimLost → 无副作用。但人工同时会成功。**这是正确行为**（人工优先）。
-
-4. **retriage 长期 report-only 是否够用**
-   Ceci 场景：旧 40 条 report-only 已够；未来若积累新 v=2 卡池（不该发生但保险），可以从 report 手动 review。若真需要自动化，v4 再评估把 retriage 接回 kernel。
+3. **`caller_frame` 断言脆弱**（inspect.stack 慢 + 依赖调用栈名称）
+   AST 闸门是主约束；caller_frame 只当作 defense-in-depth。若测试环境 pytest 装 wrapper 层，可能误伤。
+   **缓解**：断言列表可通过环境变量 `HUB_ADOPT_LEGACY_ALLOW_FRAMES` 扩展。
 
 ### 低
 
-5. **`_ALL_COLUMNS` 未来加列，payload 会漏**
-   `test_v3_payload_covers_all_ALL_COLUMNS` 会立刻红 → forcing 约束。
+4. sweep interval / batch 参数（600s / 20）观察后可调
 
 ---
 
 ## 与 PR1 Step 0-A 的关系
 
-- **硬前置**：Step 0-A 已合入 main (`da88279`)。**不可 fallback 到旧模式再 rebase**（事务边界 helper 所有权变了）
-- `commit_promotion_atomic` / `commit_maintenance_promotion_atomic` 复用 `_write_transaction()` + `_set_memory_in_tx`
-- AST 闸门自动覆盖新 helpers
-- 无新增 `_IN_TX_HELPERS`（两个 public wrapper 都自持锁；内部只调 `_set_memory_in_tx` 一处）
+- 硬前置：已合入 main
+- `_commit_promotion_in_tx` 加入 `_IN_TX_HELPERS`；跨文件 AST 闸门自动覆盖
+- `_build_new_memory_payload` 是纯函数，无事务依赖
+- 3 wrappers 都走 `_write_transaction` + `_set_memory_in_tx`
 
 ---
 
 ## 交付流程
 
-1. 本方案 v3 推分支（doc-only）
-2. Claude + Codex 都审 v3
-3. 都过 → 开开工分支 `phase20/proposal-pending-fix`
-4. 分批施工（S0 → S9），每批 Codex 复审
+1. v4 推分支（doc-only）
+2. Claude + Codex 都审
+3. 都过 → 开工分支 `phase20/proposal-pending-fix`
+4. 分批施工 S0 → S10，每批 Codex 复审
 5. 全套测试通过 → 开 PR → Codex ultra 复审 → 合入
-6. 合入后：
-   - S9 部署 VPS
-   - S0 `--report` 输出 40 条分类给 Ceci
-   - Ceci 手动 approve A 类（走新 fenced kernel）
-- 1 周观察：无新增 v=2 卡池 + 40 条 v=0 全部完成分类 → 修复确认
+6. 合入后 S10 部署 VPS + Ceci 人工 adopt
 
 ---
 
-## 附：Codex 转发的根因 + 5 条约束（v1 存档，不再重复）
+## 附：Codex 转发的根因 + 5 条约束（v1 存档）
 
-根因（4 层）+ 约束（5 条）+ 应急期禁止动作详见 v1 附录（本次不重印，见 git 历史 `779a2c3`）。
+详见 git 历史 `779a2c3`（v1 附录）
