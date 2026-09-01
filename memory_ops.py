@@ -3,13 +3,10 @@
 基于 SQLite 持久化，通过 database.py 做搜索/查询，通过 github_store 做 CRUD
 """
 import json
-import re
 import time
 import math
 import asyncio
 import logging
-import threading
-import unicodedata
 from datetime import datetime, timezone, timedelta
 
 from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
@@ -584,102 +581,21 @@ def _triage_proposal(proposal: dict) -> str:
 
 _SAFE_AUTO_PROVENANCE = {"user_statement", "user_correction", "user_quote"}
 
-_RESOLVE_PATTERNS_ZH = (
-    "已完成", "搞定了", "做完了", "已解决", "完成了",
-    "已经做了", "办好了", "改了", "改完了", "好了",
-    "弄好了", "处理了", "处理完了", "OK了", "ok了",
-    "搞好了", "修好了", "解决了", "已经弄好",
+# Resolve-pattern detection moved to resolve_patterns.py (Phase 2.0 Step 0-A)
+# to break the circular dependency between database.check_auto_resolve_atomic
+# and memory_ops._check_auto_resolve. Re-exported here so existing callers
+# (test_recall_quality imports _matches_resolve_pattern from this module) work.
+from resolve_patterns import (
+    _matches_resolve_pattern,
+    _RESOLVE_PATTERNS_ZH,
+    _RESOLVE_PATTERNS_EN,
+    _RESOLVE_NEGATION_ZH,
+    _RESOLVE_CONDITIONAL_ZH,
+    _RESOLVE_DOUBT_ZH,
+    _RESOLVE_NEGATION_EN,
+    _RESOLVE_CONDITIONAL_EN,
+    _CLAUSE_SPLIT_RE,
 )
-_RESOLVE_PATTERNS_EN = (
-    "Done", "done", "finished", "fixed",
-)
-_RESOLVE_NEGATION_ZH = re.compile(r"(?:没|不|未|还没|没有|别|不要|还不|并没)")
-_RESOLVE_CONDITIONAL_ZH = re.compile(r"(?:如果|要是|假如|若|万一|是不是|不确定|可能|也许|或许|大概)")
-_RESOLVE_DOUBT_ZH = re.compile(r"(?:吗|吧|呢|么|嘛|？|\?)")
-
-_RESOLVE_NEGATION_EN = re.compile(
-    r"\b(?:not|never|haven'?t|hasn'?t|didn'?t|don'?t|doesn'?t|isn'?t|wasn'?t|un)\b",
-    re.IGNORECASE,
-)
-_RESOLVE_CONDITIONAL_EN = re.compile(
-    r"\b(?:if|whether|wonder|maybe|perhaps|might|could|would|should|possibly|probably|unsure|not sure)\b",
-    re.IGNORECASE,
-)
-
-
-# Split on strong clause boundaries and English/Chinese transitional connectives.
-# NOTE: applied AFTER NFKC normalization, so ，；() all become halfwidth.
-# Transitional connectives split whether or not a comma precedes them — they
-# introduce a new independent clause either way.
-_CLAUSE_SPLIT_RE = re.compile(
-    r"[.!。！\n;]"
-    r"|\b(?:but|however)\b\s+"                   # English: word-bounded
-    # Chinese transitionals — 但是/可是/然而 split unconditionally (no common
-    # substring collisions with normal usage). 不过 is deliberately restrictive
-    # because it forms many legit compounds (不过滤/不过期/不过夜/不过分/
-    # 不过是/只不过, and "结果，不过是..." patterns where preceding punctuation
-    # does not disambiguate). 不过 only splits when followed by an explicit
-    # continuation marker — preferring false negatives over false positives,
-    # since a missed auto-resolve is cheap but a wrong auto-resolve is not.
-    r"|(?:但是|可是|然而"
-    r"|不过(?=现在|如今|后来|最终|这次|目前|终于|真的|之前|以前))",
-    re.IGNORECASE,
-)
-
-
-def _matches_resolve_pattern(text: str) -> bool:
-    """Check if text POSITIVELY asserts completion — not just mentions it.
-
-    Splits on strong clause boundaries (. ! 。 ！ ; ；) and transitional
-    connectives (but / 但是 / 不过 / 可是) so a positive clause after a
-    negative/conditional one is still recognized. Each clause must:
-      - contain no question mark (globally rejects doubt);
-      - contain no negation of the resolve verb;
-      - contain no conditional/uncertainty marker before the verb.
-    NFKC-normalized; English uses word boundaries.
-    """
-    normalized = unicodedata.normalize("NFKC", text)
-
-    clauses = _CLAUSE_SPLIT_RE.split(normalized)
-    for clause in clauses:
-        if not clause or not clause.strip():
-            continue
-        if "?" in clause or "？" in clause:
-            continue
-
-        matched = False
-        for pat in _RESOLVE_PATTERNS_EN:
-            for m in re.finditer(r'\b' + re.escape(pat) + r'\b', clause, re.IGNORECASE):
-                before = clause[:m.start()]
-                if _RESOLVE_NEGATION_EN.search(before):
-                    continue
-                if _RESOLVE_CONDITIONAL_EN.search(before):
-                    continue
-                matched = True
-                break
-            if matched:
-                break
-        if matched:
-            return True
-
-        for pat in _RESOLVE_PATTERNS_ZH:
-            for m in re.finditer(re.escape(pat), clause):
-                before = clause[:m.start()]
-                after = clause[m.end():m.end() + 3]
-                if _RESOLVE_NEGATION_ZH.search(before):
-                    continue
-                if _RESOLVE_CONDITIONAL_ZH.search(before):
-                    continue
-                if _RESOLVE_DOUBT_ZH.search(after):
-                    continue
-                matched = True
-                break
-            if matched:
-                break
-        if matched:
-            return True
-
-    return False
 
 
 # Recency boost coefficient (Phase 1.7 块 12).
@@ -710,93 +626,22 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
         item["score"] = round(item.get("score", 0) * boost, 6)
 
 
-# Serializes ALL write transactions on the shared module-level sqlite
-# connection. Two threads cannot safely share one sqlite3.Connection for
-# concurrent transactions (`cannot start a transaction within a transaction`);
-# BEGIN IMMEDIATE only coordinates between distinct connections. Every
-# `BEGIN IMMEDIATE` on `database._get_conn()` in this module (touch, auto-
-# resolve, and any future writer) MUST hold this lock.
-_WRITE_LOCK = threading.Lock()
+# Phase 2.0 Step 0-A #5: _WRITE_LOCK re-export removed. v2.9 contract
+# restored — memory_ops does not touch database's lock or context manager.
+# All write side effects flow through `database.*_atomic()` public helpers.
 
 
 def _touch_recalled_memories(ids: list[str]) -> None:
     """Atomic activation_count increment for recalled memories, plus ±48h ripple.
 
-    Serialized via `_WRITE_LOCK` because the module shares one sqlite connection
-    across threads. Ripple candidates are collected across all reference
-    timestamps (each query bounded by the remaining budget via SQL LIMIT),
-    deduplicated, globally capped at 5*N, then updated in one UPDATE. Any
-    exception is logged but never propagates — touch is best-effort.
+    Thin wrapper around `database.touch_recalled_memories_atomic` — best-effort
+    semantics preserved: any exception is logged but never propagates so recall
+    results are still returned to the caller.
     """
     if not ids:
         return
     try:
-        now = _now()
-        conn = database._get_conn()
-        placeholders = ",".join("?" * len(ids))
-        with _WRITE_LOCK:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    f"UPDATE memories SET "
-                    f"activation_count = COALESCE(activation_count, 0) + 1, "
-                    f"last_activated = ? "
-                    f"WHERE id IN ({placeholders})",
-                    (now, *ids),
-                )
-                ripple_cap = 5 * len(ids)
-                ref_rows = conn.execute(
-                    f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
-                    f"FROM memories WHERE id IN ({placeholders})",
-                    ids,
-                ).fetchall()
-                recalled_set = set(ids)
-                candidates: dict[str, None] = {}
-                for (ref_ts,) in ref_rows:
-                    remaining = ripple_cap - len(candidates)
-                    if remaining <= 0:
-                        break
-                    if not ref_ts:
-                        continue
-                    try:
-                        base = datetime.fromisoformat(ref_ts)
-                        if base.tzinfo is None:
-                            base = base.replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
-                    lo = (base - timedelta(hours=48)).isoformat()
-                    hi = (base + timedelta(hours=48)).isoformat()
-                    # SQL-side LIMIT bounds the scan while the write tx holds
-                    # the lock. Over-fetch a bit (remaining + len(ids)) so
-                    # recalled ids filtered in Python don't shrink the budget.
-                    rows = conn.execute(
-                        "SELECT id FROM memories "
-                        "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
-                        "LIMIT ?",
-                        (lo, hi, remaining + len(ids)),
-                    ).fetchall()
-                    for (mid,) in rows:
-                        if mid in recalled_set or mid in candidates:
-                            continue
-                        candidates[mid] = None
-                        if len(candidates) >= ripple_cap:
-                            break
-                if candidates:
-                    ripple_ids = list(candidates.keys())
-                    rph = ",".join("?" * len(ripple_ids))
-                    conn.execute(
-                        f"UPDATE memories SET activation_count = "
-                        f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
-                        f"WHERE id IN ({rph})",
-                        ripple_ids,
-                    )
-                conn.execute("COMMIT")
-            except Exception:
-                try:
-                    conn.execute("ROLLBACK")
-                except Exception:
-                    pass
-                raise
+        database.touch_recalled_memories_atomic(ids, _now())
     except Exception as e:
         logger.warning(f"recall touch failed (results still returned): {e}")
 
@@ -821,12 +666,17 @@ def _apply_activation_penalty(items: list[dict]) -> None:
 def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) -> list[str]:
     """Find related memories that should be resolved, and resolve them atomically.
 
-    Returns list of resolved memory IDs.
+    Thin wrapper around `database.check_auto_resolve_atomic`. This module still
+    owns the "which related_mems are still unresolved" pre-filter because
+    `related_mems` is caller-provided context (recall output); the database
+    helper re-verifies status inside the tx as an additional TOCTOU guard.
+
+    Returns list of resolved memory IDs. Any exception is caught → return [].
     """
-    if not related_mems or not _matches_resolve_pattern(content):
+    if not related_mems:
         return []
 
-    to_resolve = []
+    to_resolve_ids = []
     for mem in related_mems:
         is_unresolved = (
             mem.get("resolved") == 0
@@ -835,62 +685,16 @@ def _check_auto_resolve(content: str, related_mems: list[dict], source_ai: str) 
                 and not mem.get("resolved"))
         )
         if is_unresolved:
-            to_resolve.append(mem)
+            to_resolve_ids.append(mem["id"])
 
-    if not to_resolve:
+    if not to_resolve_ids:
         return []
 
-    now = _now()
-    resolved_ids: list[str] = []
-    conn = database._get_conn()
     try:
-        with _WRITE_LOCK:
-            conn.execute("BEGIN IMMEDIATE")
-            _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now,
-                                 resolved_ids)
+        return database.check_auto_resolve_atomic(to_resolve_ids, content, source_ai)
     except Exception as e:
         logger.warning(f"Atomic auto-resolve failed: {e}")
         return []
-    return resolved_ids
-
-
-def _run_auto_resolve_tx(conn, to_resolve, content, source_ai, now, resolved_ids):
-    """Body of the auto-resolve transaction. Assumes caller holds _WRITE_LOCK
-    and has already issued BEGIN IMMEDIATE. Commits on success, rolls back on
-    any exception."""
-    try:
-        for mem in to_resolve:
-            # Conditional UPDATE: only touch rows still resolved=0/NULL.
-            # Prevents double-resolve under concurrent writers.
-            cur = conn.execute(
-                "UPDATE memories SET resolved = 1, updated_at = ? "
-                "WHERE id = ? AND (resolved IS NULL OR resolved = 0)",
-                (now, mem["id"]),
-            )
-            if cur.rowcount != 1:
-                continue
-            conn.execute(
-                "INSERT INTO maintenance_audit "
-                "(action, target_id, new_content, source_message_ids, "
-                "decision_reason, state_before, state_after, "
-                "model_id, source_ai, auto_executed, prompt_version, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "resolve_thread", mem["id"], content, "[]",
-                    "auto-resolve: 内容匹配完成模式",
-                    json.dumps({"resolved": mem.get("resolved")}, ensure_ascii=False),
-                    json.dumps({"resolved": 1}, ensure_ascii=False),
-                    "", source_ai or "", 1, "", now,
-                ),
-            )
-            resolved_ids.append(mem["id"])
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 _REOPEN_PATTERNS = ("又出问题了", "没搞定", "还没完", "又复发", "重新开", "再来一次", "还是有问题", "又坏了")
@@ -2131,7 +1935,9 @@ async def recent_interaction(
         viz_params = []
 
     try:
-        conn = database._get_conn()
+        # Codex ultra High: 走 _get_read_conn 避免看到写事务未提交的中间态
+        # (recall path 曾泄漏另一线程 tx 里临时 private → shared 的记忆)
+        conn = database._get_read_conn()
         rows = conn.execute(
             "SELECT * FROM memories "
             "WHERE status = 'active' "

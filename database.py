@@ -5,6 +5,7 @@ SQLite 数据库引擎（替代内存 dict + GitHub 存储）
 - WAL 模式并发读
 - 同步 sqlite3，hot-path 读操作通过 to_thread 离开事件循环
 """
+import contextlib
 import json
 import re
 import struct
@@ -32,13 +33,73 @@ _conn: sqlite3.Connection | None = None
 _local = threading.local()
 
 
+# ── 写锁 + 事务 context manager（Phase 2.0 Step 0-A #2a）──
+# 所有共享 _conn 上的写操作必须包在 _write_transaction() 内。threading.Lock
+# 非重入：同线程嵌套调用立即 RuntimeError（防死锁）。v2.9 H1 修正版：try/finally
+# 保证 _in_write_tx.active 与锁在中间抛异常时也恢复；began flag 控制 ROLLBACK
+# 只对已开事务生效。
+_WRITE_LOCK = threading.Lock()
+_in_write_tx = threading.local()
+
+
+@contextlib.contextmanager
+def _write_transaction():
+    """共享 _conn 上任何写操作必须包在本 ctx 内。
+
+    非重入：同线程嵌套调用立即 RuntimeError（不 deadlock）。正常退出 commit；
+    异常 ROLLBACK 并 re-raise。空 tx（仅读或 no-op）commit 是安全的。
+    """
+    if getattr(_in_write_tx, 'active', False):
+        raise RuntimeError(
+            "nested _write_transaction() forbidden — caller inside a write tx "
+            "must not call another write helper. Refactor to do all work "
+            "inside one _write_transaction() block."
+        )
+    lock_acquired = False
+    began = False
+    conn = None
+    try:
+        _WRITE_LOCK.acquire()
+        lock_acquired = True
+        _in_write_tx.active = True
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        yield conn
+        conn.commit()
+        began = False
+    except BaseException:
+        if began and conn is not None:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    finally:
+        _in_write_tx.active = False
+        if lock_acquired:
+            _WRITE_LOCK.release()
+
+
 def _get_read_conn() -> sqlite3.Connection:
-    """每个线程独立的只读连接，WAL 模式下不会被写锁阻塞。"""
+    """每个线程独立的只读连接，WAL 模式下不会被写锁阻塞。
+
+    Phase 2.0 Step 0-A #4 (v2.9 M2): 缓存 read_conn + read_db_path；DB_PATH 变化
+    时关旧建新（--db-path backfill / test 切库 / init_db(path_B) 后同一线程仍
+    能读到正确的 DB）。
+    """
+    cur_path = str(DB_PATH)
     conn = getattr(_local, "read_conn", None)
-    if conn is not None:
+    cached_path = getattr(_local, "read_db_path", None)
+    if conn is not None and cached_path == cur_path:
         return conn
-    path = str(DB_PATH)
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+    # 路径变了或首次调用 → 关旧（若有）建新
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    conn = sqlite3.connect(f"file:{cur_path}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=200")  # 读连接只等 200ms，不要等 5s
     conn.execute("PRAGMA query_only=ON")
@@ -50,7 +111,24 @@ def _get_read_conn() -> sqlite3.Connection:
     except Exception:
         pass
     _local.read_conn = conn
+    _local.read_db_path = cur_path
     return conn
+
+
+def close_thread_read_conn() -> None:
+    """关闭当前线程的只读连接（进程 shutdown / --db-path 切库前调用）。
+
+    Phase 2.0 Step 0-A #4: 避免 fd 泄漏；主进程 shutdown hook 调用；backfill
+    脚本切库前调用；测试之间隔离亦可复用。
+    """
+    conn = getattr(_local, "read_conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.read_conn = None
+        _local.read_db_path = None
 
 
 async def read_in_thread(fn: Callable[..., T], *args, **kwargs) -> T:
@@ -239,264 +317,325 @@ async def init_db(db_path: str = None) -> None:
     Creates tables, loads the sqlite-vec extension, and sets pragmas.
     The ``async`` signature is for startup-flow compatibility only;
     all work is synchronous.
-    """
-    global _conn
 
-    path = db_path or str(DB_PATH)
+    Phase 2.0 Step 0-A #4 fixup (Codex High): if `db_path` is provided,
+    update the module-level DB_PATH so `_get_read_conn()` will see the new
+    path on its next call and rebuild its cached connection. Otherwise the
+    read helpers would keep pointing at the old DB (write B, read A — real
+    bug scripts/supersede_old_profiles.py would hit).
+
+    Phase 2.0 Step 0-A #4 fixup round-2 (Codex Medium): two-phase swap —
+    all setup (connect / pragmas / vec load / migrations) runs on a local
+    `new_conn`. Only after success do we swap in the new DB_PATH + close
+    old read connections + close old _conn. If any setup step raises, the
+    old state (DB_PATH / _conn / cached read connections) is untouched and
+    the failed `new_conn` is closed to prevent fd leak. Prevents "init B
+    failed → DB_PATH already changed to B → write goes to leftover old
+    _conn (A) → public read helpers hit missing B" split state.
+    """
+    global _conn, DB_PATH
+
+    new_db_path = Path(db_path) if db_path is not None else DB_PATH
+    path = str(new_db_path)
     logger.info(f"Initialising SQLite database at {path}")
 
     conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-
-    # Pragmas
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-
-    # Load sqlite-vec extension
     try:
-        import sqlite_vec
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
-        logger.info("sqlite-vec extension loaded")
-    except Exception as e:
-        logger.error(f"Failed to load sqlite-vec extension: {e}")
+        conn.row_factory = sqlite3.Row
+
+        # Pragmas
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        # Load sqlite-vec extension
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            logger.info("sqlite-vec extension loaded")
+        except Exception as e:
+            logger.error(f"Failed to load sqlite-vec extension: {e}")
+            raise
+
+        # Create main table + indexes
+        conn.executescript(_SCHEMA_MAIN)
+
+        # Create FTS5 virtual table + sync triggers
+        conn.executescript(_SCHEMA_FTS)
+        conn.executescript(_SCHEMA_FTS_TRIGGERS)
+
+        # Create vec id mapping table
+        conn.executescript(_SCHEMA_VEC_ID_MAP)
+
+        # Create sqlite-vec virtual table
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
+            f"USING vec0(embedding float[{EMBEDDING_DIM}])"
+        )
+
+        # ── Migrations for existing databases ──
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "anchored" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
+            logger.info("Migrated: added 'anchored' column")
+        if "provenance_type" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'provenance_type' column")
+        if "fact_confidence" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
+            logger.info("Migrated: added 'fact_confidence' column")
+
+        if "subject_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'subject_id' column")
+        if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'source_actor_id' column")
+        if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
+            logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
+        if "info_type" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
+            logger.info("Migrated: added 'info_type' column")
+
+        # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
+        if "client_request_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'client_request_id' column")
+        if "link_to_real_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'link_to_real_id' column")
+        # PR C round-4 H1: real atomic claim for sweep retries. Without this,
+        # two concurrent sweeps can both spawn a finalize for the same skeleton.
+        if "finalize_claim_id" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'finalize_claim_id' column")
+        if "finalize_claim_at" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'finalize_claim_at' column")
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
+        # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
+            "ON memories(client_request_id) WHERE client_request_id != ''"
+        )
+
+        # ── Proposals table (MemoryProposal 候选区) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS proposals (
+                id                  TEXT PRIMARY KEY,
+                content             TEXT NOT NULL,
+                claim_type          TEXT NOT NULL DEFAULT 'observation',
+                speech_mode         TEXT NOT NULL DEFAULT 'uncertain',
+                conversation_kind   TEXT NOT NULL DEFAULT 'house_chat',
+                proposed_room       TEXT NOT NULL DEFAULT 'living_room',
+                source_message_ids  TEXT NOT NULL DEFAULT '[]',
+                evidence_excerpt    TEXT NOT NULL DEFAULT '',
+                proposer_ai_id      TEXT NOT NULL DEFAULT '',
+                confidence          REAL NOT NULL DEFAULT 0.5,
+                conflicts_with      TEXT NOT NULL DEFAULT '[]',
+                status              TEXT NOT NULL DEFAULT 'pending',
+                layer               TEXT NOT NULL DEFAULT 'shared',
+                owner_ai            TEXT NOT NULL DEFAULT '',
+                importance          REAL NOT NULL DEFAULT 0.5,
+                emotion_arousal     REAL NOT NULL DEFAULT 0.3,
+                category            TEXT NOT NULL DEFAULT '',
+                tags                TEXT NOT NULL DEFAULT '[]',
+                event_date          TEXT NOT NULL DEFAULT '',
+                source_context      TEXT NOT NULL DEFAULT '',
+                source_platform     TEXT NOT NULL DEFAULT '',
+                provenance_type     TEXT NOT NULL DEFAULT '',
+                created_at          TEXT NOT NULL,
+                reviewed_at         TEXT NOT NULL DEFAULT '',
+                reviewed_by         TEXT NOT NULL DEFAULT '',
+                reject_reason       TEXT NOT NULL DEFAULT '',
+                triage_reason       TEXT NOT NULL DEFAULT '',
+                applied_memory_id   TEXT NOT NULL DEFAULT '',
+                failure_reason      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
+        """)
+
+        # ── Proposals table migrations ──
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
+        for col, typedef in [
+            ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
+            ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_actor_id", "TEXT NOT NULL DEFAULT ''"),
+            ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
+            ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
+            ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
+                logger.info(f"Migrated proposals: added '{col}' column")
+        if "source_speaker_id" in existing and "source_actor_id" not in existing:
+            conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
+            logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
+
+        # ── Maintenance Audit table ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS maintenance_audit (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                action              TEXT NOT NULL,
+                target_id           TEXT NOT NULL DEFAULT '',
+                new_content         TEXT NOT NULL DEFAULT '',
+                source_message_ids  TEXT NOT NULL DEFAULT '[]',
+                decision_reason     TEXT NOT NULL DEFAULT '',
+                state_before        TEXT NOT NULL DEFAULT '{}',
+                state_after         TEXT NOT NULL DEFAULT '{}',
+                model_id            TEXT NOT NULL DEFAULT '',
+                source_ai           TEXT NOT NULL DEFAULT '',
+                auto_executed       INTEGER NOT NULL DEFAULT 1,
+                prompt_version      TEXT NOT NULL DEFAULT '',
+                created_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
+            CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
+        """)
+
+        audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
+        if "prompt_version" not in audit_cols:
+            conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated maintenance_audit: added 'prompt_version' column")
+
+        # ── PR C H2: async_remember_ledger ──
+        # Records the terminal outcome of each async remember pipeline. Written
+        # in the SAME transaction as the memory changes (via _commit_ledger),
+        # so a mid-flight crash cannot leave the ledger and memory tables out
+        # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
+        # state exists, sweep applies it without re-running the pipeline.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS async_remember_ledger (
+                skeleton_id       TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL DEFAULT '',
+                terminal_state    TEXT NOT NULL,   -- 'in_flight' | 'active' | 'replaced' | 'failed'
+                result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
+                committed_at      TEXT NOT NULL,
+                owner_token       TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ledger_crq
+                ON async_remember_ledger(client_request_id);
+        """)
+
+        # H1 round-6: owner_token migration for pre-existing ledger tables.
+        ledger_cols = {row[1] for row in conn.execute(
+            "PRAGMA table_info(async_remember_ledger)").fetchall()}
+        if "owner_token" not in ledger_cols:
+            conn.execute(
+                "ALTER TABLE async_remember_ledger "
+                "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated async_remember_ledger: added 'owner_token'")
+
+        # ── Profiles table migration ──
+        try:
+            profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
+            if profile_cols and "status" not in profile_cols:
+                conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                logger.info("Migrated profiles: added 'status' column")
+        except sqlite3.OperationalError:
+            pass
+
+        # ── Dream dedup table (one dream per AI per local day) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS dream_log (
+                ai_id       TEXT NOT NULL,
+                local_day   TEXT NOT NULL,
+                memory_id   TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (ai_id, local_day)
+            );
+        """)
+
+        # ── Persons table (人物名片) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS persons (
+                person_id       TEXT PRIMARY KEY,
+                entity_type     TEXT NOT NULL DEFAULT 'other',
+                canonical_name  TEXT NOT NULL,
+                aliases         TEXT NOT NULL DEFAULT '[]',
+                linked_agent_id TEXT NOT NULL DEFAULT '',
+                note            TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT '',
+                updated_at      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
+            CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
+        """)
+
+        # ── Profiles table (User/Agent/Relationship Profile) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                id              TEXT PRIMARY KEY,
+                profile_type    TEXT NOT NULL,
+                owner_ai        TEXT NOT NULL DEFAULT '',
+                content         TEXT NOT NULL DEFAULT '{}',
+                generated_at    TEXT NOT NULL DEFAULT '',
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                version         INTEGER NOT NULL DEFAULT 1,
+                status          TEXT NOT NULL DEFAULT 'pending_review'
+            );
+            CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
+            CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
+            CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
+        """)
+
+        # ── Activity log table (Phase 2.0 Step 0-A #5: migrated from
+        #    activity_log.init_activity_table so activity_log no longer
+        #    references database._write_transaction directly) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                epoch REAL NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT,
+                memory_id TEXT,
+                ai_id TEXT,
+                model TEXT,
+                tokens_used INTEGER DEFAULT 0,
+                duration_ms INTEGER DEFAULT 0,
+                success INTEGER DEFAULT 1,
+                extra TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_epoch ON activity_log(epoch DESC);
+            CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action);
+        """)
+
+        conn.commit()
+    except BaseException:
+        # Setup failed — close the half-initialised conn and re-raise
+        # WITHOUT touching module globals. DB_PATH / _conn / read_conn
+        # remain pointing at whatever was in place before init_db was called.
+        try:
+            conn.close()
+        except Exception:
+            pass
         raise
 
-    # Create main table + indexes
-    conn.executescript(_SCHEMA_MAIN)
-
-    # Create FTS5 virtual table + sync triggers
-    conn.executescript(_SCHEMA_FTS)
-    conn.executescript(_SCHEMA_FTS_TRIGGERS)
-
-    # Create vec id mapping table
-    conn.executescript(_SCHEMA_VEC_ID_MAP)
-
-    # Create sqlite-vec virtual table
-    conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
-        f"USING vec0(embedding float[{EMBEDDING_DIM}])"
-    )
-
-    # ── Migrations for existing databases ──
-    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
-    if "anchored" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
-        logger.info("Migrated: added 'anchored' column")
-    if "provenance_type" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'provenance_type' column")
-    if "fact_confidence" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
-        logger.info("Migrated: added 'fact_confidence' column")
-
-    if "subject_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'subject_id' column")
-    if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'source_actor_id' column")
-    if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
-        logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
-    if "info_type" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
-        logger.info("Migrated: added 'info_type' column")
-
-    # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
-    if "client_request_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'client_request_id' column")
-    if "link_to_real_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'link_to_real_id' column")
-    # PR C round-4 H1: real atomic claim for sweep retries. Without this,
-    # two concurrent sweeps can both spawn a finalize for the same skeleton.
-    if "finalize_claim_id" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'finalize_claim_id' column")
-    if "finalize_claim_at" not in existing_cols:
-        conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated: added 'finalize_claim_at' column")
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_info_type ON memories(info_type)")
-    # Partial unique index: 空字符串 client_request_id 不受约束（老记忆全部 ''）
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_client_req "
-        "ON memories(client_request_id) WHERE client_request_id != ''"
-    )
-
-    # ── Proposals table (MemoryProposal 候选区) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS proposals (
-            id                  TEXT PRIMARY KEY,
-            content             TEXT NOT NULL,
-            claim_type          TEXT NOT NULL DEFAULT 'observation',
-            speech_mode         TEXT NOT NULL DEFAULT 'uncertain',
-            conversation_kind   TEXT NOT NULL DEFAULT 'house_chat',
-            proposed_room       TEXT NOT NULL DEFAULT 'living_room',
-            source_message_ids  TEXT NOT NULL DEFAULT '[]',
-            evidence_excerpt    TEXT NOT NULL DEFAULT '',
-            proposer_ai_id      TEXT NOT NULL DEFAULT '',
-            confidence          REAL NOT NULL DEFAULT 0.5,
-            conflicts_with      TEXT NOT NULL DEFAULT '[]',
-            status              TEXT NOT NULL DEFAULT 'pending',
-            layer               TEXT NOT NULL DEFAULT 'shared',
-            owner_ai            TEXT NOT NULL DEFAULT '',
-            importance          REAL NOT NULL DEFAULT 0.5,
-            emotion_arousal     REAL NOT NULL DEFAULT 0.3,
-            category            TEXT NOT NULL DEFAULT '',
-            tags                TEXT NOT NULL DEFAULT '[]',
-            event_date          TEXT NOT NULL DEFAULT '',
-            source_context      TEXT NOT NULL DEFAULT '',
-            source_platform     TEXT NOT NULL DEFAULT '',
-            provenance_type     TEXT NOT NULL DEFAULT '',
-            created_at          TEXT NOT NULL,
-            reviewed_at         TEXT NOT NULL DEFAULT '',
-            reviewed_by         TEXT NOT NULL DEFAULT '',
-            reject_reason       TEXT NOT NULL DEFAULT '',
-            triage_reason       TEXT NOT NULL DEFAULT '',
-            applied_memory_id   TEXT NOT NULL DEFAULT '',
-            failure_reason      TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
-        CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
-    """)
-
-    # ── Proposals table migrations ──
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
-    for col, typedef in [
-        ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
-        ("applied_memory_id", "TEXT NOT NULL DEFAULT ''"),
-        ("failure_reason", "TEXT NOT NULL DEFAULT ''"),
-        ("subject_id", "TEXT NOT NULL DEFAULT ''"),
-        ("source_actor_id", "TEXT NOT NULL DEFAULT ''"),
-        ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
-        ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
-        ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
-    ]:
-        if col not in existing:
-            conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
-            logger.info(f"Migrated proposals: added '{col}' column")
-    if "source_speaker_id" in existing and "source_actor_id" not in existing:
-        conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
-        logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
-
-    # ── Maintenance Audit table ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS maintenance_audit (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            action              TEXT NOT NULL,
-            target_id           TEXT NOT NULL DEFAULT '',
-            new_content         TEXT NOT NULL DEFAULT '',
-            source_message_ids  TEXT NOT NULL DEFAULT '[]',
-            decision_reason     TEXT NOT NULL DEFAULT '',
-            state_before        TEXT NOT NULL DEFAULT '{}',
-            state_after         TEXT NOT NULL DEFAULT '{}',
-            model_id            TEXT NOT NULL DEFAULT '',
-            source_ai           TEXT NOT NULL DEFAULT '',
-            auto_executed       INTEGER NOT NULL DEFAULT 1,
-            prompt_version      TEXT NOT NULL DEFAULT '',
-            created_at          TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_audit_created ON maintenance_audit(created_at);
-        CREATE INDEX IF NOT EXISTS idx_audit_action ON maintenance_audit(action);
-        CREATE INDEX IF NOT EXISTS idx_audit_target ON maintenance_audit(target_id);
-    """)
-
-    audit_cols = {row[1] for row in conn.execute("PRAGMA table_info(maintenance_audit)").fetchall()}
-    if "prompt_version" not in audit_cols:
-        conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated maintenance_audit: added 'prompt_version' column")
-
-    # ── PR C H2: async_remember_ledger ──
-    # Records the terminal outcome of each async remember pipeline. Written
-    # in the SAME transaction as the memory changes (via _commit_ledger),
-    # so a mid-flight crash cannot leave the ledger and memory tables out
-    # of sync. Sweep consults the ledger BEFORE retrying — if a terminal
-    # state exists, sweep applies it without re-running the pipeline.
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS async_remember_ledger (
-            skeleton_id       TEXT PRIMARY KEY,
-            client_request_id TEXT NOT NULL DEFAULT '',
-            terminal_state    TEXT NOT NULL,   -- 'in_flight' | 'active' | 'replaced' | 'failed'
-            result_memory_id  TEXT NOT NULL,   -- real memory id after pipeline
-            committed_at      TEXT NOT NULL,
-            owner_token       TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_ledger_crq
-            ON async_remember_ledger(client_request_id);
-    """)
-
-    # H1 round-6: owner_token migration for pre-existing ledger tables.
-    ledger_cols = {row[1] for row in conn.execute(
-        "PRAGMA table_info(async_remember_ledger)").fetchall()}
-    if "owner_token" not in ledger_cols:
-        conn.execute(
-            "ALTER TABLE async_remember_ledger "
-            "ADD COLUMN owner_token TEXT NOT NULL DEFAULT ''")
-        logger.info("Migrated async_remember_ledger: added 'owner_token'")
-
-    # ── Profiles table migration ──
-    try:
-        profile_cols = {row[1] for row in conn.execute("PRAGMA table_info(profiles)").fetchall()}
-        if profile_cols and "status" not in profile_cols:
-            conn.execute("ALTER TABLE profiles ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-            logger.info("Migrated profiles: added 'status' column")
-    except sqlite3.OperationalError:
-        pass
-
-    # ── Dream dedup table (one dream per AI per local day) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS dream_log (
-            ai_id       TEXT NOT NULL,
-            local_day   TEXT NOT NULL,
-            memory_id   TEXT NOT NULL DEFAULT '',
-            created_at  TEXT NOT NULL DEFAULT '',
-            PRIMARY KEY (ai_id, local_day)
-        );
-    """)
-
-    # ── Persons table (人物名片) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS persons (
-            person_id       TEXT PRIMARY KEY,
-            entity_type     TEXT NOT NULL DEFAULT 'other',
-            canonical_name  TEXT NOT NULL,
-            aliases         TEXT NOT NULL DEFAULT '[]',
-            linked_agent_id TEXT NOT NULL DEFAULT '',
-            note            TEXT NOT NULL DEFAULT '',
-            created_at      TEXT NOT NULL DEFAULT '',
-            updated_at      TEXT NOT NULL DEFAULT ''
-        );
-        CREATE INDEX IF NOT EXISTS idx_person_type ON persons(entity_type);
-        CREATE INDEX IF NOT EXISTS idx_person_agent ON persons(linked_agent_id);
-    """)
-
-    # ── Profiles table (User/Agent/Relationship Profile) ──
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            id              TEXT PRIMARY KEY,
-            profile_type    TEXT NOT NULL,
-            owner_ai        TEXT NOT NULL DEFAULT '',
-            content         TEXT NOT NULL DEFAULT '{}',
-            generated_at    TEXT NOT NULL DEFAULT '',
-            source_memory_ids TEXT NOT NULL DEFAULT '[]',
-            version         INTEGER NOT NULL DEFAULT 1,
-            status          TEXT NOT NULL DEFAULT 'pending_review'
-        );
-        CREATE INDEX IF NOT EXISTS idx_profile_type ON profiles(profile_type);
-        CREATE INDEX IF NOT EXISTS idx_profile_owner ON profiles(owner_ai);
-        CREATE INDEX IF NOT EXISTS idx_profile_status ON profiles(status);
-    """)
-
-    conn.commit()
+    # Two-phase swap: only after all setup succeeded do we mutate globals.
+    # Close the previously-installed write conn (if any) to avoid fd leak on
+    # re-init; close the current thread's cached read conn so the next
+    # _get_read_conn() rebuilds against the new DB_PATH.
+    old_conn = _conn
+    DB_PATH = new_db_path
     _conn = conn
+    close_thread_read_conn()
+    if old_conn is not None and old_conn is not conn:
+        try:
+            old_conn.close()
+        except Exception:
+            pass
     logger.info("Database initialised successfully")
 
 
@@ -520,7 +659,7 @@ _ALL_COLUMNS = [
 
 def get_memory(mem_id: str) -> dict | None:
     """Get a single memory by ID. Returns full dict including embedding."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
     if row is None:
         return None
@@ -534,7 +673,7 @@ def get_memory_by_client_request_id(crq: str) -> dict | None:
     regardless of status (pending/active/replaced/failed)."""
     if not crq:
         return None
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT * FROM memories WHERE client_request_id = ? LIMIT 1", (crq,)
     ).fetchone()
@@ -551,7 +690,6 @@ def insert_pending_memory(mem: dict) -> None:
     Historically this method hard-coded '[]' which silently dropped any
     caller-provided values.
     """
-    conn = _get_conn()
     now = mem.get("created_at") or _now_iso()
 
     def _as_json_list(val):
@@ -562,25 +700,25 @@ def insert_pending_memory(mem: dict) -> None:
         # Already-serialized string
         return val
 
-    conn.execute(
-        "INSERT INTO memories ("
-        "  id, content, layer, room, category, owner_ai, importance,"
-        "  source_ai, source_platform, event_date, source_context,"
-        "  status, client_request_id, created_at, updated_at, tags, domain"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
-            mem.get("room", "living_room"), mem.get("category", ""),
-            mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
-            mem.get("source_ai", ""), mem.get("source_platform", ""),
-            mem.get("event_date", ""), mem.get("source_context", ""),
-            mem.get("status", "pending"), mem.get("client_request_id", ""),
-            now, now,
-            _as_json_list(mem.get("tags")),
-            _as_json_list(mem.get("domain")),
-        ),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO memories ("
+            "  id, content, layer, room, category, owner_ai, importance,"
+            "  source_ai, source_platform, event_date, source_context,"
+            "  status, client_request_id, created_at, updated_at, tags, domain"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
+                mem.get("room", "living_room"), mem.get("category", ""),
+                mem.get("owner_ai", ""), float(mem.get("importance") or 0.5),
+                mem.get("source_ai", ""), mem.get("source_platform", ""),
+                mem.get("event_date", ""), mem.get("source_context", ""),
+                mem.get("status", "pending"), mem.get("client_request_id", ""),
+                now, now,
+                _as_json_list(mem.get("tags")),
+                _as_json_list(mem.get("domain")),
+            ),
+        )
 
 
 def update_memory_status(mem_id: str, status: str,
@@ -597,7 +735,6 @@ def update_memory_status(mem_id: str, status: str,
     so downstream can tell WHY the row is in this state
     (e.g. ':pipeline_error' vs ':sweep_timeout'). Idempotent.
     """
-    conn = _get_conn()
     now = _now_iso()
     if source_platform_suffix:
         suffix = source_platform_suffix if source_platform_suffix.startswith(":") \
@@ -618,9 +755,10 @@ def update_memory_status(mem_id: str, status: str,
         sql += " AND status = ?"
         params.append(require_status)
 
-    cur = conn.execute(sql, params)
-    conn.commit()
-    return cur.rowcount
+    with _write_transaction() as conn:
+        cur = conn.execute(sql, params)
+        rowcount = cur.rowcount
+    return rowcount
 
 
 def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
@@ -631,14 +769,13 @@ def mark_replaced(skeleton_id: str, link_to_real_id: str) -> None:
     """
     if not skeleton_id or not link_to_real_id:
         raise ValueError("mark_replaced requires both skeleton_id and link_to_real_id")
-    conn = _get_conn()
     now = _now_iso()
-    conn.execute(
-        "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
-        "updated_at = ? WHERE id = ?",
-        (link_to_real_id, now, skeleton_id),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE memories SET status = 'replaced', link_to_real_id = ?, "
+            "updated_at = ? WHERE id = ?",
+            (link_to_real_id, now, skeleton_id),
+        )
 
 
 def write_intent_ledger(skeleton_id: str, client_request_id: str,
@@ -665,30 +802,29 @@ def write_intent_ledger(skeleton_id: str, client_request_id: str,
         return "created"  # no idempotency requested for this call
     if not owner_token:
         raise ValueError("write_intent_ledger requires a non-empty owner_token")
-    conn = _get_conn()
     now = _now_iso()
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO async_remember_ledger "
-        "(skeleton_id, client_request_id, terminal_state, "
-        " result_memory_id, committed_at, owner_token) "
-        "VALUES (?, ?, 'in_flight', '', ?, ?)",
-        (skeleton_id, client_request_id, now, owner_token),
-    )
-    conn.commit()
-    if cur.rowcount == 1:
-        # We inserted the row — we own the intent.
-        return "created"
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO async_remember_ledger "
+            "(skeleton_id, client_request_id, terminal_state, "
+            " result_memory_id, committed_at, owner_token) "
+            "VALUES (?, ?, 'in_flight', '', ?, ?)",
+            (skeleton_id, client_request_id, now, owner_token),
+        )
+        if cur.rowcount == 1:
+            # We inserted the row — we own the intent.
+            return "created"
 
-    # INSERT ignored — a row already exists. Read the winner's state.
-    row = conn.execute(
-        "SELECT terminal_state FROM async_remember_ledger "
-        "WHERE skeleton_id = ?", (skeleton_id,),
-    ).fetchone()
-    if not row:
-        # Extremely unlikely: no row despite INSERT OR IGNORE not inserting.
-        # Fail-closed: treat as unknown; caller should NOT proceed.
-        return "in_flight"
-    return row[0] if row[0] else "in_flight"
+        # INSERT ignored — a row already exists. Read the winner's state.
+        row = conn.execute(
+            "SELECT terminal_state FROM async_remember_ledger "
+            "WHERE skeleton_id = ?", (skeleton_id,),
+        ).fetchone()
+        if not row:
+            # Extremely unlikely: no row despite INSERT OR IGNORE not inserting.
+            # Fail-closed: treat as unknown; caller should NOT proceed.
+            return "in_flight"
+        return row[0] if row[0] else "in_flight"
 
 
 def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
@@ -699,7 +835,7 @@ def list_stale_intent_ledgers(older_than_minutes: int = 30) -> list[dict]:
 
     Sweep should mark each returned skeleton failed + close out the ledger.
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(minutes=older_than_minutes)).isoformat()
     rows = conn.execute(
@@ -719,17 +855,17 @@ def close_stale_intent(skeleton_id: str, owner_token: str) -> bool:
     """DEPRECATED: kept for backwards compat. Prefer
     close_stale_intent_atomic which reconciles ledger + skeleton + audit
     in one transaction."""
-    conn = _get_conn()
     now = _now_iso()
-    cur = conn.execute(
-        "UPDATE async_remember_ledger "
-        "SET terminal_state = 'failed', committed_at = ? "
-        "WHERE skeleton_id = ? AND terminal_state = 'in_flight' "
-        "  AND owner_token = ?",
-        (now, skeleton_id, owner_token),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE async_remember_ledger "
+            "SET terminal_state = 'failed', committed_at = ? "
+            "WHERE skeleton_id = ? AND terminal_state = 'in_flight' "
+            "  AND owner_token = ?",
+            (now, skeleton_id, owner_token),
+        )
+        rowcount = cur.rowcount
+    return rowcount == 1
 
 
 def close_stale_intent_atomic(
@@ -757,10 +893,8 @@ def close_stale_intent_atomic(
 
     Returns: {"disposition": ..., "transitioned": bool, "skeleton_status": ...}
     """
-    conn = _get_conn()
     now = _now_iso()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction() as conn:
 
         # 1. Re-verify ledger is still our stale in_flight (defense against
         #    race where the ledger raced between our list_stale_* snapshot
@@ -771,7 +905,7 @@ def close_stale_intent_atomic(
         ).fetchone()
         if not ledger_row or ledger_row[0] != "in_flight" \
                 or ledger_row[1] != owner_token:
-            conn.execute("ROLLBACK")
+            # Read-only bail-out — ctx commits an empty tx (no-op).
             return {"disposition": "already_terminaled",
                     "transitioned": False, "skeleton_status": None}
 
@@ -806,7 +940,7 @@ def close_stale_intent_atomic(
                 f"INSERT INTO maintenance_audit "
                 f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_sm_ph})",
                 _sm_vals)
-            conn.commit()
+            # ctx auto-commits on normal exit
             return {"disposition": "skeleton_missing",
                     "transitioned": True, "skeleton_status": None}
         skel_status = skel_row[0]
@@ -847,7 +981,7 @@ def close_stale_intent_atomic(
                 f"({', '.join(_AUDIT_COLUMNS)}) "
                 f"VALUES ({audit_ph})",
                 audit_vals)
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "failed", "transitioned": True,
                     "skeleton_status": "pending"}
 
@@ -862,7 +996,7 @@ def close_stale_intent_atomic(
             conn.execute(
                 "UPDATE memories SET finalize_claim_id='', "
                 "finalize_claim_at='' WHERE id=?", (skeleton_id,))
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "already_active", "transitioned": True,
                     "skeleton_status": "active"}
 
@@ -876,7 +1010,7 @@ def close_stale_intent_atomic(
             conn.execute(
                 "UPDATE memories SET finalize_claim_id='', "
                 "finalize_claim_at='' WHERE id=?", (skeleton_id,))
-            conn.commit()
+            # ctx auto-commits
             return {"disposition": "already_replaced", "transitioned": True,
                     "skeleton_status": "replaced"}
 
@@ -915,18 +1049,10 @@ def close_stale_intent_atomic(
                 f"INSERT INTO maintenance_audit "
                 f"({', '.join(_AUDIT_COLUMNS)}) VALUES ({_nr_ph})",
                 _nr_vals)
-            conn.commit()
-        else:
-            # Already audited this skeleton — nothing new to record.
-            conn.execute("ROLLBACK")
+        # else: already audited this skeleton — nothing new to insert; ctx
+        # commits an empty (SELECT-only) tx which is a no-op.
         return {"disposition": "needs_review", "transitioned": False,
                 "skeleton_status": skel_status}
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 def get_ledger(skeleton_id: str) -> dict | None:
@@ -934,7 +1060,7 @@ def get_ledger(skeleton_id: str) -> dict | None:
     pipeline hasn't committed a terminal state yet."""
     if not skeleton_id:
         return None
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT skeleton_id, client_request_id, terminal_state, "
         "       result_memory_id, committed_at "
@@ -963,29 +1089,28 @@ def try_claim_finalize(skeleton_id: str, claim_token: str,
     """
     if not skeleton_id or not claim_token:
         return False
-    conn = _get_conn()
     now = _now_iso()
     cutoff = (datetime.now(timezone.utc)
               - timedelta(minutes=stale_after_minutes)).isoformat()
-    cur = conn.execute(
-        "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
-        "WHERE id = ? AND status = 'pending' "
-        "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
-        (claim_token, now, skeleton_id, cutoff),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE memories SET finalize_claim_id = ?, finalize_claim_at = ? "
+            "WHERE id = ? AND status = 'pending' "
+            "  AND (finalize_claim_id = '' OR finalize_claim_at < ?)",
+            (claim_token, now, skeleton_id, cutoff),
+        )
+        rowcount = cur.rowcount
+    return rowcount == 1
 
 
 def release_finalize_claim(skeleton_id: str) -> None:
     """H1: release a claim after finalize completes (successful or terminal
     failure). Called from commit_finalize_atomic in the same transaction.
     Standalone helper for the rare non-terminal cleanup paths."""
-    conn = _get_conn()
-    conn.execute(
-        "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
-        "WHERE id = ?", (skeleton_id,))
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE memories SET finalize_claim_id = '', finalize_claim_at = '' "
+            "WHERE id = ?", (skeleton_id,))
 
 
 def commit_finalize_atomic(
@@ -1013,10 +1138,8 @@ def commit_finalize_atomic(
     if terminal_state not in ("active", "replaced", "failed"):
         raise ValueError(f"invalid terminal_state: {terminal_state}")
 
-    conn = _get_conn()
     now = _now_iso()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_transaction() as conn:
         # H2 + H1 round-6: race-losing terminal writer cannot clobber
         # winner. Two constraints on the UPDATE branch:
         #   - terminal_state must still be 'in_flight' (nobody terminaled yet)
@@ -1039,9 +1162,8 @@ def commit_finalize_atomic(
         )
         # H1 round-6: if the ledger UPDATE did not affect our row (someone
         # else already terminaled or owns a different token), do NOT touch
-        # the skeleton. Rollback and return False; caller must reconcile.
+        # the skeleton. Return False; ctx commits (no-op — no rows changed).
         if cur.rowcount != 1:
-            conn.execute("ROLLBACK")
             return False
 
         if skeleton_update:
@@ -1072,14 +1194,8 @@ def commit_finalize_atomic(
                 f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
                 params,
             )
-        conn.commit()
+        # ctx auto-commits
         return True
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
 
 
 class MaintenanceDrift(RuntimeError):
@@ -1109,7 +1225,6 @@ def commit_maintenance_atomic(
     `history` are serialized to JSON if list/dict.
     audit_row: dict with keys matching _AUDIT_COLUMNS.
     """
-    conn = _get_conn()
     now = _now_iso()
 
     # Build memory UPDATE
@@ -1139,9 +1254,7 @@ def commit_maintenance_atomic(
     audit_placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
     audit_cols_str = ", ".join(_AUDIT_COLUMNS)
 
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-
+    with _write_transaction() as conn:
         # H3 round-6: validate ALL rows the decision depends on — not just
         # the target A being mutated. dedup plans use A+B: if B drifted
         # between plan generation and execute, the mutation of A based on
@@ -1150,7 +1263,6 @@ def commit_maintenance_atomic(
             for expect in extra_expected_rows:
                 exp_id = expect.get("id")
                 if not exp_id:
-                    conn.execute("ROLLBACK")
                     raise ValueError(
                         "extra_expected_rows entry missing 'id'")
                 sel = conn.execute(
@@ -1158,19 +1270,16 @@ def commit_maintenance_atomic(
                     (exp_id,),
                 ).fetchone()
                 if not sel:
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion row {exp_id} not found")
                 cur_status, cur_updated = sel[0], sel[1]
                 if ("status" in expect
                         and expect["status"] != cur_status):
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion {exp_id} drifted: expected "
                         f"status={expect['status']!r}, got {cur_status!r}")
                 if ("updated_at" in expect
                         and expect["updated_at"] != cur_updated):
-                    conn.execute("ROLLBACK")
                     raise MaintenanceDrift(
                         f"companion {exp_id} drifted: expected "
                         f"updated_at={expect['updated_at']!r}, "
@@ -1183,8 +1292,8 @@ def commit_maintenance_atomic(
         )
         if cur.rowcount != 1:
             # Drift detected — someone modified the row between snapshot
-            # and now. Rollback both memory UPDATE (no-op) and skip audit.
-            conn.execute("ROLLBACK")
+            # and now. Raise → ctx ROLLBACKs the UPDATE (no-op if nothing
+            # matched) and skips the audit INSERT.
             raise MaintenanceDrift(
                 f"target {memory_id} drifted "
                 f"(expected status={expected_status!r}, "
@@ -1195,22 +1304,14 @@ def commit_maintenance_atomic(
             f"VALUES ({audit_placeholders})",
             audit_values,
         )
-        conn.commit()
-    except MaintenanceDrift:
-        raise
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+        # ctx auto-commits
 
 
 def list_memories_by_status(status: str, older_than_minutes: int = 0,
                              limit: int = 500) -> list[dict]:
     """Return memories in a specific status, optionally older than N minutes.
     Used by the pending sweep to find stuck skeletons."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     if older_than_minutes > 0:
         cutoff = (datetime.now(timezone.utc)
                   - timedelta(minutes=older_than_minutes)).isoformat()
@@ -1231,34 +1332,65 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def set_memory(mem: dict) -> None:
-    """Insert or replace a memory (upsert).
+def _prepare_memory_value(key: str, value):
+    """Memory-field value preparation for INSERT/UPSERT.
 
-    Also maintains the vec_id_map and memories_vec tables for vector search.
-    FTS is handled automatically by triggers.
+    Phase 2.0 Step 0-A: 从 set_memory._prep 原样抽出，供
+    _set_memory_in_tx / _payload_fingerprint (Step 0-B) 共用同一份规范化
+    规则，避免"写入时补 ''、fingerprint 时保 None"造成的漂移。
+
+    5 条既有语义严格保留（v2.9 H1 收敛）：
+      - resolved/anchored → _resolved_to_int
+      - comments/history → JSON dumps；None → "[]"
+      - embedding 原样（bytes/None）
+      - fact_confidence 原样（保留 None 表"未知置信度"，不改成 0.0）
+      - 其他 None → ""
+    state_ttl_days 的默认 7 分支等 Step 0-B（列还没进 _ALL_COLUMNS）。
     """
-    conn = _get_conn()
+    if key in ("resolved", "anchored"):
+        return _resolved_to_int(value)
+    if key in ("comments", "history"):
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, ensure_ascii=False)
+        if value is None:
+            return "[]"
+        return value
+    if key == "embedding":
+        return value  # bytes or None
+    if key == "fact_confidence":
+        return value  # REAL or None
+    if value is None:
+        return ""
+    return value
 
-    # Prepare values — serialise list/dict fields to JSON strings
-    def _prep(key):
-        val = mem.get(key)
-        if key in ("resolved", "anchored"):
-            return _resolved_to_int(val)
-        if key in ("comments", "history"):
-            if isinstance(val, (list, dict)):
-                return json.dumps(val, ensure_ascii=False)
-            if val is None:
-                return "[]"
-            return val
-        if key == "embedding":
-            return val  # bytes or None
-        if key == "fact_confidence":
-            return val  # REAL or None
-        if val is None:
-            return ""
-        return val
 
-    values = [_prep(col) for col in _ALL_COLUMNS]
+def _set_memory_in_tx(conn: sqlite3.Connection, mem: dict) -> None:
+    """UPSERT `mem` into memories + maintain vec_id_map + memories_vec, on an
+    already-open tx (does NOT acquire _WRITE_LOCK, does NOT commit).
+
+    Phase 2.0 Step 0-A #3: extracted from set_memory() with **zero behavioural
+    changes** so future callers already inside `_write_transaction()` (e.g.
+    the state supersede helper coming in Step 0-B) can reuse the full upsert
+    logic without nesting `_write_transaction()` (which would RuntimeError
+    on non-reentrant lock).
+
+    Preserved semantics from set_memory:
+      - `_prepare_memory_value` for column value coercion
+      - `_preserve_on_empty` = {client_request_id, link_to_real_id,
+        finalize_claim_id, finalize_claim_at} — CASE-guarded UPSERT so empty
+        excluded values never clobber a valid stored value
+      - `_preserve_always` = {created_at} — kept unless memories.created_at is
+        currently empty (first insert only)
+      - embedding via COALESCE — never overwrite a non-null stored embedding
+        with NULL from a caller that didn't compute vectors
+      - vec_id_map + memories_vec kept in sync (insert/update/delete based on
+        whether a valid EMBEDDING_DIM*4-sized bytes is present)
+
+    Failure handling: on sqlite3.Error from the main UPSERT, logs + re-raises
+    (caller's tx will roll back). Vec-index writes swallow errors after
+    logging.warning to preserve the original best-effort semantics.
+    """
+    values = [_prepare_memory_value(col, mem.get(col)) for col in _ALL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_ALL_COLUMNS))
     cols = ", ".join(_ALL_COLUMNS)
     # embedding 用 COALESCE：写入方（内存 store / GitHub 快照）经常没有向量，
@@ -1364,7 +1496,198 @@ def set_memory(mem: dict) -> None:
                 pass
             conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
 
-    conn.commit()
+
+def set_memory(mem: dict) -> None:
+    """Insert or replace a memory (upsert).
+
+    Also maintains the vec_id_map and memories_vec tables for vector search.
+    FTS is handled automatically by triggers.
+
+    Public wrapper: opens a `_write_transaction()` and delegates to the
+    in-tx helper `_set_memory_in_tx`. Callers already inside a write tx
+    (e.g. state supersede in Step 0-B) MUST call `_set_memory_in_tx`
+    directly — invoking `set_memory` would hit the non-reentrant lock's
+    RuntimeError guard.
+    """
+    with _write_transaction() as conn:
+        _set_memory_in_tx(conn, mem)
+
+
+# ════════════════════════════════════════════
+#  Phase 2.0 Step 0-A #5: public atomic helpers migrated from memory_ops
+#  and activity_log so those modules never touch _WRITE_LOCK or
+#  _write_transaction directly (v2.9 contract).
+# ════════════════════════════════════════════
+
+def touch_recalled_memories_atomic(mem_ids: list[str], now_iso: str) -> None:
+    """Atomic activation_count increment for recalled memories + ±48h ripple.
+
+    Migrated from memory_ops._touch_recalled_memories with **zero behaviour
+    change**. Caller (memory_ops) MUST wrap in its own try/except for
+    best-effort semantics — this helper does raise on internal SQL errors so
+    the ctx rolls back cleanly.
+
+    - +1 exact activation_count on each id in `mem_ids`
+    - collect ±48h event_date/created_at ripple candidates (globally capped
+      at 5 * len(mem_ids)), then +0.3 on each in one UPDATE
+    """
+    if not mem_ids:
+        return
+    placeholders = ",".join("?" * len(mem_ids))
+    with _write_transaction() as conn:
+        conn.execute(
+            f"UPDATE memories SET "
+            f"activation_count = COALESCE(activation_count, 0) + 1, "
+            f"last_activated = ? "
+            f"WHERE id IN ({placeholders})",
+            (now_iso, *mem_ids),
+        )
+        ripple_cap = 5 * len(mem_ids)
+        ref_rows = conn.execute(
+            f"SELECT COALESCE(NULLIF(event_date, ''), created_at) AS ref_ts "
+            f"FROM memories WHERE id IN ({placeholders})",
+            mem_ids,
+        ).fetchall()
+        recalled_set = set(mem_ids)
+        candidates: dict[str, None] = {}
+        for (ref_ts,) in ref_rows:
+            remaining = ripple_cap - len(candidates)
+            if remaining <= 0:
+                break
+            if not ref_ts:
+                continue
+            try:
+                base = datetime.fromisoformat(ref_ts)
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            lo = (base - timedelta(hours=48)).isoformat()
+            hi = (base + timedelta(hours=48)).isoformat()
+            # SQL-side LIMIT bounds the scan while the write tx holds
+            # the lock. Over-fetch a bit (remaining + len(ids)) so
+            # recalled ids filtered in Python don't shrink the budget.
+            rows = conn.execute(
+                "SELECT id FROM memories "
+                "WHERE status = 'active' AND created_at BETWEEN ? AND ? "
+                "LIMIT ?",
+                (lo, hi, remaining + len(mem_ids)),
+            ).fetchall()
+            for (mid,) in rows:
+                if mid in recalled_set or mid in candidates:
+                    continue
+                candidates[mid] = None
+                if len(candidates) >= ripple_cap:
+                    break
+        if candidates:
+            ripple_ids = list(candidates.keys())
+            rph = ",".join("?" * len(ripple_ids))
+            conn.execute(
+                f"UPDATE memories SET activation_count = "
+                f"ROUND(COALESCE(activation_count, 0) + 0.3, 1) "
+                f"WHERE id IN ({rph})",
+                ripple_ids,
+            )
+
+
+def check_auto_resolve_atomic(candidate_ids: list[str], new_content: str,
+                              source_ai: str) -> list[str]:
+    """v2.9 H1 contract: read candidates + regex match + write resolved +
+    write audit — all inside one `_write_transaction()` to avoid TOCTOU.
+
+    Migrated from memory_ops._check_auto_resolve + _run_auto_resolve_tx.
+    Signature aligned with the v2.9 spec: caller passes IDs it identified as
+    unresolved candidates; this helper re-verifies inside the tx (conditional
+    UPDATE with `WHERE resolved IS NULL OR resolved = 0`) so a concurrent
+    writer can't cause double-resolve.
+
+    Uses `resolve_patterns._matches_resolve_pattern` as the short-circuit
+    gate (empty candidates OR non-matching content → return []).
+    Returns the memory ids that were actually resolved this call.
+    """
+    from resolve_patterns import _matches_resolve_pattern
+
+    if not candidate_ids or not _matches_resolve_pattern(new_content):
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    resolved_ids: list[str] = []
+
+    with _write_transaction() as conn:
+        placeholders = ",".join("?" * len(candidate_ids))
+        # re-verify inside tx: candidates must still be status='active' AND
+        # unresolved. A concurrent writer that archived/superseded/replaced
+        # them between recall and now must not be silently resolved.
+        # (Codex #5 round-2 M: SELECT was missing status='active' filter →
+        # archived candidates could still receive resolve+audit.)
+        rows = conn.execute(
+            f"SELECT id, resolved FROM memories "
+            f"WHERE id IN ({placeholders}) AND status = 'active'",
+            candidate_ids,
+        ).fetchall()
+        for row in rows:
+            mem_id, resolved = row[0], row[1]
+            # Conditional UPDATE: only touch rows still status='active' AND
+            # resolved=0/NULL. Prevents double-resolve AND late-status-drift
+            # (recall → archive → auto-resolve TOCTOU).
+            cur = conn.execute(
+                "UPDATE memories SET resolved = 1, updated_at = ? "
+                "WHERE id = ? AND status = 'active' "
+                "AND (resolved IS NULL OR resolved = 0)",
+                (now, mem_id),
+            )
+            if cur.rowcount != 1:
+                continue
+            conn.execute(
+                "INSERT INTO maintenance_audit "
+                "(action, target_id, new_content, source_message_ids, "
+                "decision_reason, state_before, state_after, "
+                "model_id, source_ai, auto_executed, prompt_version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "resolve_thread", mem_id, new_content, "[]",
+                    "auto-resolve: 内容匹配完成模式",
+                    json.dumps({"resolved": resolved}, ensure_ascii=False),
+                    json.dumps({"resolved": 1}, ensure_ascii=False),
+                    "", source_ai or "", 1, "", now,
+                ),
+            )
+            resolved_ids.append(mem_id)
+    return resolved_ids
+
+
+def append_activity_log_atomic(entry: dict) -> None:
+    """Insert one activity_log row. Migrated from activity_log._persist so
+    that module no longer references database._write_transaction directly
+    (v2.9 contract). `entry` is the same dict format activity_log builds.
+    Caller (activity_log._persist) still swallows exceptions for best-effort
+    logging semantics.
+    """
+    extra_json = json.dumps(entry.get("extra")) if entry.get("extra") else None
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO activity_log (ts, epoch, action, detail, memory_id, ai_id, "
+            "model, tokens_used, duration_ms, success, extra) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry["ts"], entry["epoch"], entry["action"], entry["detail"],
+                entry["memory_id"], entry["ai_id"], entry["model"],
+                entry["tokens_used"], entry["duration_ms"],
+                1 if entry["success"] else 0, extra_json,
+            ),
+        )
+
+
+def trim_activity_log_atomic(keep_last_n: int = 500) -> None:
+    """Delete activity_log rows beyond the most-recent `keep_last_n`.
+    Separate tx from append so INSERT persists even if DELETE fails.
+    """
+    with _write_transaction() as conn:
+        conn.execute(
+            "DELETE FROM activity_log WHERE id NOT IN "
+            "(SELECT id FROM activity_log ORDER BY epoch DESC LIMIT ?)",
+            (keep_last_n,),
+        )
 
 
 def remove_memory(mem_id: str) -> None:
@@ -1372,23 +1695,21 @@ def remove_memory(mem_id: str) -> None:
 
     FTS cleanup is handled by the DELETE trigger. Vec cleanup is explicit.
     """
-    conn = _get_conn()
+    with _write_transaction() as conn:
+        # Clean up vec index
+        row = conn.execute(
+            "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
+        ).fetchone()
+        if row is not None:
+            vec_rowid = row[0]
+            try:
+                conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+            except sqlite3.Error:
+                pass
+            conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
 
-    # Clean up vec index
-    row = conn.execute(
-        "SELECT vec_rowid FROM vec_id_map WHERE memory_id = ?", (mem_id,)
-    ).fetchone()
-    if row is not None:
-        vec_rowid = row[0]
-        try:
-            conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
-        except sqlite3.Error:
-            pass
-        conn.execute("DELETE FROM vec_id_map WHERE vec_rowid = ?", (vec_rowid,))
-
-    # Delete from main table (triggers handle FTS)
-    conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
-    conn.commit()
+        # Delete from main table (triggers handle FTS)
+        conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
 
 
 # ════════════════════════════════════════════
@@ -1418,7 +1739,7 @@ def query_memories(
     include_rooms: list[str] = None,
 ) -> list[dict]:
     """Query memories with filters. Returns dicts without embedding."""
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     clauses: list[str] = []
     params: list = []
@@ -1503,7 +1824,7 @@ def _sanitise_order_by(order_by: str) -> str:
 
 def count_memories(status: str = "active") -> int:
     """Count memories by status."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE status = ?", (status,)
     ).fetchone()
@@ -1529,16 +1850,15 @@ _PROPOSAL_COLUMNS = [
 
 
 def insert_proposal(row: dict) -> None:
-    conn = _get_conn()
     values = [row.get(c, "") for c in _PROPOSAL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_PROPOSAL_COLUMNS))
     cols = ", ".join(_PROPOSAL_COLUMNS)
-    conn.execute(f"INSERT INTO proposals ({cols}) VALUES ({placeholders})", values)
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(f"INSERT INTO proposals ({cols}) VALUES ({placeholders})", values)
 
 
 def get_proposal(pid: str) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute("SELECT * FROM proposals WHERE id = ?", (pid,)).fetchone()
     return dict(row) if row else None
 
@@ -1546,7 +1866,7 @@ def get_proposal(pid: str) -> dict | None:
 def list_proposals(
     status: str = "pending", limit: int = 50, offset: int = 0,
 ) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         (status, limit, offset),
@@ -1558,19 +1878,18 @@ def update_proposal_status(
     pid: str, status: str, reviewed_by: str = "", reject_reason: str = "",
     applied_memory_id: str = "", failure_reason: str = "",
 ) -> None:
-    conn = _get_conn()
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE proposals SET status = ?, reviewed_at = ?, reviewed_by = ?, "
-        "reject_reason = ?, applied_memory_id = ?, failure_reason = ? WHERE id = ?",
-        (status, now, reviewed_by, reject_reason, applied_memory_id, failure_reason, pid),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "UPDATE proposals SET status = ?, reviewed_at = ?, reviewed_by = ?, "
+            "reject_reason = ?, applied_memory_id = ?, failure_reason = ? WHERE id = ?",
+            (status, now, reviewed_by, reject_reason, applied_memory_id, failure_reason, pid),
+        )
 
 
 def count_proposals(status: str = "pending") -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM proposals WHERE status = ?", (status,)
     ).fetchone()
@@ -1589,17 +1908,17 @@ _AUDIT_COLUMNS = [
 
 
 def insert_audit(row: dict) -> int:
-    conn = _get_conn()
     values = [row.get(c, "") for c in _AUDIT_COLUMNS]
     placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
     cols = ", ".join(_AUDIT_COLUMNS)
-    cur = conn.execute(f"INSERT INTO maintenance_audit ({cols}) VALUES ({placeholders})", values)
-    conn.commit()
-    return cur.lastrowid
+    with _write_transaction() as conn:
+        cur = conn.execute(f"INSERT INTO maintenance_audit ({cols}) VALUES ({placeholders})", values)
+        lastrowid = cur.lastrowid
+    return lastrowid
 
 
 def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if action:
         rows = conn.execute(
             "SELECT * FROM maintenance_audit WHERE action = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -1614,7 +1933,7 @@ def list_audits(action: str = None, limit: int = 50, offset: int = 0) -> list[di
 
 
 def count_audits(action: str = None) -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if action:
         row = conn.execute("SELECT COUNT(*) FROM maintenance_audit WHERE action = ?", (action,)).fetchone()
     else:
@@ -1627,49 +1946,48 @@ def count_audits(action: str = None) -> int:
 # ════════════════════════════════════════════
 
 def upsert_profile(profile: dict) -> None:
-    conn = _get_conn()
     pid = profile["id"]
     status = profile.get("status", "pending_review")
-    existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
-    if existing:
-        new_version = existing[0] + 1
-        conn.execute("""
-            UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
-            version = ?, status = ?
-            WHERE id = ?
-        """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
-              new_version, status, pid))
-    else:
-        conn.execute("""
-            INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
-            source_memory_ids, version, status)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-        """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
-              profile["content"], profile["generated_at"],
-              profile.get("source_memory_ids", "[]"), status))
-    conn.commit()
+    with _write_transaction() as conn:
+        existing = conn.execute("SELECT version FROM profiles WHERE id = ?", (pid,)).fetchone()
+        if existing:
+            new_version = existing[0] + 1
+            conn.execute("""
+                UPDATE profiles SET content = ?, generated_at = ?, source_memory_ids = ?,
+                version = ?, status = ?
+                WHERE id = ?
+            """, (profile["content"], profile["generated_at"], profile.get("source_memory_ids", "[]"),
+                  new_version, status, pid))
+        else:
+            conn.execute("""
+                INSERT INTO profiles (id, profile_type, owner_ai, content, generated_at,
+                source_memory_ids, version, status)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """, (pid, profile["profile_type"], profile.get("owner_ai", ""),
+                  profile["content"], profile["generated_at"],
+                  profile.get("source_memory_ids", "[]"), status))
 
 
 def approve_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute(
-        "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
-        (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE profiles SET status = 'active' WHERE id = ? AND status = 'pending_review'",
+            (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def supersede_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute(
-        "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
-        (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE profiles SET status = 'superseded' WHERE id = ? AND status != 'superseded'",
+            (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def get_profile(profile_id: str, status: str = None) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if status:
         row = conn.execute("SELECT * FROM profiles WHERE id = ? AND status = ?",
                            (profile_id, status)).fetchone()
@@ -1679,7 +1997,7 @@ def get_profile(profile_id: str, status: str = None) -> dict | None:
 
 
 def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     conditions = []
     params = []
     if profile_type:
@@ -1696,10 +2014,10 @@ def list_profiles(profile_type: str = None, status: str = None) -> list[dict]:
 
 
 def delete_profile(profile_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 # ════════════════════════════════════════════
@@ -1759,7 +2077,7 @@ def vector_search(
     by the requested criteria at the SQL layer, returning up to ``top_k``
     results with a ``distance`` field (lower is more similar).
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     return _vector_search_impl(
         conn, query_vec, top_k, status, room, include_rooms, exclude_rooms,
         layer, owner_ai, exclude_provenance, exclude_resolved, exclude_superseded,
@@ -1877,7 +2195,7 @@ def fts_search(query: str, top_k: int = 50, status: str = "active",
     Returns memories matching the query with a ``rank`` field
     (more negative = better match in FTS5 bm25 scoring).
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
     return _fts_search_impl(conn, query, top_k, status, exclude_provenance,
                             exclude_resolved, exclude_superseded,
                             include_rooms, exclude_rooms)
@@ -2015,7 +2333,7 @@ def cjk_like_search(query: str, top_k: int = 50, status: str = "active",
                     exclude_rooms: list[str] = None) -> list[dict]:
     """中文子串搜索（LIKE 路）。委托到共享 impl。"""
     return _cjk_like_search_impl(
-        _get_conn(), query, top_k, status, exclude_provenance,
+        _get_read_conn(), query, top_k, status, exclude_provenance,
         exclude_resolved, exclude_superseded, include_rooms, exclude_rooms,
     )
 
@@ -2046,7 +2364,7 @@ def _fts_escape_token(token: str) -> str:
 
 def get_all_memory_ids() -> list[str]:
     """Get all active memory IDs."""
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT id FROM memories WHERE status = 'active'"
     ).fetchall()
@@ -2057,7 +2375,7 @@ def get_memories_batch(ids: list[str]) -> list[dict]:
     """Get multiple memories by ID. Returns dicts without embedding."""
     if not ids:
         return []
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     results = []
     # Process in batches of 500 for SQLite variable limit
@@ -2083,7 +2401,7 @@ def iter_memories(
 
     Yields dicts without embedding, fetching ``batch_size`` rows at a time.
     """
-    conn = _get_conn()
+    conn = _get_read_conn()
 
     clauses: list[str] = []
     params: list = []
@@ -2223,36 +2541,35 @@ def _person_row_to_dict(row: sqlite3.Row) -> dict:
 
 
 def upsert_person(person: dict) -> None:
-    conn = _get_conn()
     aliases = person.get("aliases", [])
     if isinstance(aliases, list):
         aliases = json.dumps(aliases, ensure_ascii=False)
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO persons (person_id, entity_type, canonical_name, aliases, "
-        "linked_agent_id, note, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(person_id) DO UPDATE SET "
-        "entity_type=excluded.entity_type, canonical_name=excluded.canonical_name, "
-        "aliases=excluded.aliases, linked_agent_id=excluded.linked_agent_id, "
-        "note=excluded.note, updated_at=excluded.updated_at",
-        (
-            person["person_id"],
-            person.get("entity_type", "other"),
-            person["canonical_name"],
-            aliases,
-            person.get("linked_agent_id", ""),
-            person.get("note", ""),
-            person.get("created_at", now),
-            now,
-        ),
-    )
-    conn.commit()
+    with _write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO persons (person_id, entity_type, canonical_name, aliases, "
+            "linked_agent_id, note, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(person_id) DO UPDATE SET "
+            "entity_type=excluded.entity_type, canonical_name=excluded.canonical_name, "
+            "aliases=excluded.aliases, linked_agent_id=excluded.linked_agent_id, "
+            "note=excluded.note, updated_at=excluded.updated_at",
+            (
+                person["person_id"],
+                person.get("entity_type", "other"),
+                person["canonical_name"],
+                aliases,
+                person.get("linked_agent_id", ""),
+                person.get("note", ""),
+                person.get("created_at", now),
+                now,
+            ),
+        )
 
 
 def get_person(person_id: str) -> dict | None:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT * FROM persons WHERE person_id = ?", (person_id,)
     ).fetchone()
@@ -2260,7 +2577,7 @@ def get_person(person_id: str) -> dict | None:
 
 
 def list_persons(entity_type: str = None) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     if entity_type:
         rows = conn.execute(
             "SELECT * FROM persons WHERE entity_type = ? ORDER BY canonical_name",
@@ -2274,7 +2591,7 @@ def list_persons(entity_type: str = None) -> list[dict]:
 
 
 def get_memories_by_subject(person_id: str, limit: int = 50, offset: int = 0) -> list[dict]:
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute(
         "SELECT * FROM memories WHERE subject_id = ? AND status = 'active' "
         "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
@@ -2284,7 +2601,7 @@ def get_memories_by_subject(person_id: str, limit: int = 50, offset: int = 0) ->
 
 
 def count_memories_by_subject(person_id: str) -> int:
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT COUNT(*) FROM memories WHERE subject_id = ? AND status = 'active'",
         (person_id,),
@@ -2293,15 +2610,15 @@ def count_memories_by_subject(person_id: str) -> int:
 
 
 def delete_person(person_id: str) -> bool:
-    conn = _get_conn()
-    cur = conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
-    conn.commit()
-    return cur.rowcount > 0
+    with _write_transaction() as conn:
+        cur = conn.execute("DELETE FROM persons WHERE person_id = ?", (person_id,))
+        rowcount = cur.rowcount
+    return rowcount > 0
 
 
 def resolve_alias(name: str, scope: str = "household") -> str | None:
     """根据别名找到 person_id。先精确匹配 canonical_name，再搜 aliases JSON。"""
-    conn = _get_conn()
+    conn = _get_read_conn()
     row = conn.execute(
         "SELECT person_id FROM persons WHERE canonical_name = ?", (name,)
     ).fetchone()
@@ -2323,12 +2640,12 @@ def resolve_alias(name: str, scope: str = "household") -> str | None:
 
 
 def seed_baseline_persons() -> int:
-    """启动时种入基线人物（如果 persons 表为空）。返回种入数量。"""
-    conn = _get_conn()
-    count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
-    if count > 0:
-        return 0
+    """启动时种入基线人物（如果 persons 表为空）。返回真实新增行数。
 
+    Codex #2b M1: COUNT 与 INSERT 必须同一事务，否则两线程同时读到 0 会
+    双重返 len(baseline)（数据靠 INSERT OR IGNORE 不重复，但返回值不真实，
+    且 seed 是写决策不能走独立只读连接——WAL 快照可能是旧的）。
+    """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
 
@@ -2382,21 +2699,27 @@ def seed_baseline_persons() -> int:
         },
     ]
 
-    for p in baseline:
-        conn.execute(
-            "INSERT OR IGNORE INTO persons "
-            "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (p["person_id"], p["entity_type"], p["canonical_name"],
-             p["aliases"], p["linked_agent_id"], p["note"], now, now),
-        )
-    conn.commit()
-    return len(baseline)
+    inserted = 0
+    with _write_transaction() as conn:
+        # v2b M1: COUNT 在事务内查（BEGIN IMMEDIATE 已锁）→ 决策原子
+        count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+        if count > 0:
+            return 0
+        for p in baseline:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO persons "
+                "(person_id, entity_type, canonical_name, aliases, linked_agent_id, note, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (p["person_id"], p["entity_type"], p["canonical_name"],
+                 p["aliases"], p["linked_agent_id"], p["note"], now, now),
+            )
+            inserted += cur.rowcount
+    return inserted
 
 
 def get_all_aliases(scope: str = "household") -> dict[str, str]:
     """返回 {别名: person_id} 映射表，用于批量归一。"""
-    conn = _get_conn()
+    conn = _get_read_conn()
     rows = conn.execute("SELECT person_id, canonical_name, aliases FROM persons").fetchall()
     result: dict[str, str] = {}
     for r in rows:

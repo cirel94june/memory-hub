@@ -116,42 +116,23 @@ _db_ready = False
 
 
 def init_activity_table():
-    """在 SQLite 中创建活动日志表"""
+    """标记 activity_log 已可用并加载最近的日志到内存缓冲。
+
+    Phase 2.0 Step 0-A #5: 建表 DDL 已迁至 database.init_db()，
+    此函数不再自建表，也不再直接引用 database._write_transaction（v2.9 契约恢复）。
+    只做：确认表存在（由 init_db 保证）→ 从只读连接加载最近 200 条 → 置 _db_ready。
+    """
     global _db_ready
     try:
         import database
-        conn = database._get_conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts TEXT NOT NULL,
-                epoch REAL NOT NULL,
-                action TEXT NOT NULL,
-                detail TEXT,
-                memory_id TEXT,
-                ai_id TEXT,
-                model TEXT,
-                tokens_used INTEGER DEFAULT 0,
-                duration_ms INTEGER DEFAULT 0,
-                success INTEGER DEFAULT 1,
-                extra TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_activity_epoch ON activity_log(epoch DESC)
-        """)
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_log(action)
-        """)
-        conn.commit()
-        _db_ready = True
-
-        # 加载最近的日志到内存缓冲
+        # 表已由 database.init_db 建好；此处只读加载最近日志到内存缓冲
+        conn = database._get_read_conn()
         rows = conn.execute(
             "SELECT ts, epoch, action, detail, memory_id, ai_id, model, "
             "tokens_used, duration_ms, success, extra "
             "FROM activity_log ORDER BY epoch DESC LIMIT 200"
         ).fetchall()
+        _db_ready = True
         for row in reversed(rows):
             entry = {
                 "ts": row[0], "epoch": row[1], "action": row[2],
@@ -173,31 +154,23 @@ def init_activity_table():
 
 
 def _persist(entry: dict):
-    """写入一条日志到 SQLite"""
+    """写入一条日志到 SQLite，然后 trim 至最近 500 条。
+
+    Phase 2.0 Step 0-A #5: 走 database 公开 helper (append/trim_atomic)，
+    不再直接引用 database._write_transaction（v2.9 契约恢复）。
+    - INSERT 与 DELETE 是两个独立 tx：INSERT 成功而 trim 失败时 INSERT
+      仍持久化（best-effort semantics 保留）。
+    - 顶层 try/except 兜底任何 helper 抛出的异常（不 crash 主逻辑）。
+    """
     if not _db_ready:
         return
     try:
         import database
-        conn = database._get_conn()
-        extra_json = json.dumps(entry.get("extra")) if entry.get("extra") else None
-        conn.execute(
-            "INSERT INTO activity_log (ts, epoch, action, detail, memory_id, ai_id, "
-            "model, tokens_used, duration_ms, success, extra) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                entry["ts"], entry["epoch"], entry["action"], entry["detail"],
-                entry["memory_id"], entry["ai_id"], entry["model"],
-                entry["tokens_used"], entry["duration_ms"],
-                1 if entry["success"] else 0, extra_json,
-            ),
-        )
-        conn.commit()
-
-        # 清理超过 500 条的旧记录
-        conn.execute(
-            "DELETE FROM activity_log WHERE id NOT IN "
-            "(SELECT id FROM activity_log ORDER BY epoch DESC LIMIT 500)"
-        )
-        conn.commit()
+        database.append_activity_log_atomic(entry)
+    except Exception:
+        return
+    try:
+        import database
+        database.trim_activity_log_atomic(500)
     except Exception:
         pass
