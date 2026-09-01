@@ -812,7 +812,10 @@ def test_recent_interaction_isolates_from_uncommitted_writer_state(initdb):
 
     writer_thread = _th.Thread(target=writer, daemon=True)
     writer_thread.start()
-    tx_entered.wait(timeout=5)
+    # Codex ultra Low: 断言实际发生了事务重叠，否则慢机器可能测了个寂寞
+    assert tx_entered.wait(timeout=5), (
+        "writer thread never entered write tx — test did not exercise overlap"
+    )
 
     # reader 匿名调用（ai_id=""）→ viz_clause = 硬拒 layer='private'
     # 若走 read_conn：读到未提交前的 layer='private' → 被过滤 → 不泄漏（预期）
@@ -828,6 +831,9 @@ def test_recent_interaction_isolates_from_uncommitted_writer_state(initdb):
     finally:
         reader_done.set()
         writer_thread.join(timeout=5)
+        assert not writer_thread.is_alive(), (
+            "writer thread failed to exit after rollback signal"
+        )
 
     assert writer_err_captured, "writer should have raised then been rolled back"
     row = database.get_memory("priv_event")
