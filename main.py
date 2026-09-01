@@ -1083,7 +1083,8 @@ def api_ai_stats(ai_id: str, authorization: str = Header(default="")):
     from config import AI_ALIASES, AI_ALIAS_GROUPS
     canonical = AI_ALIASES.get(ai_id, ai_id)
     all_ids = AI_ALIAS_GROUPS.get(canonical, [canonical])
-    conn = database._get_conn()
+    # Codex ultra High: 走 _get_read_conn 避免看到写事务未提交状态
+    conn = database._get_read_conn()
     placeholders = ",".join(["?"] * len(all_ids))
     rows = conn.execute(
         f"SELECT room, COUNT(*) as cnt FROM memories "

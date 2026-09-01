@@ -290,7 +290,8 @@ def _filter_relationship_group_dynamic(mems: list[dict]) -> list[dict]:
 
 def _gather_memories(rooms: list[str], owner_ai: str = None,
                      info_types: list[str] = None, limit: int = 80) -> list[dict]:
-    conn = database._get_conn()
+    # Codex ultra High: 走 _get_read_conn 避免看到写事务未提交状态
+    conn = database._get_read_conn()
     conditions = ["status = 'active'"]
     params = []
 

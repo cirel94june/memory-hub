@@ -1935,7 +1935,9 @@ async def recent_interaction(
         viz_params = []
 
     try:
-        conn = database._get_conn()
+        # Codex ultra High: 走 _get_read_conn 避免看到写事务未提交的中间态
+        # (recall path 曾泄漏另一线程 tx 里临时 private → shared 的记忆)
+        conn = database._get_read_conn()
         rows = conn.execute(
             "SELECT * FROM memories "
             "WHERE status = 'active' "

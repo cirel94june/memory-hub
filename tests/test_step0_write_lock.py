@@ -15,6 +15,7 @@ import asyncio
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -720,6 +721,119 @@ def test_step0_5_activity_log_atomic_helpers(initdb):
     conn = database._get_read_conn()
     rows = conn.execute("SELECT COUNT(*) FROM activity_log").fetchall()
     assert rows[0][0] == 0
+
+
+def test_ast_gate_no_module_references_get_conn_outside_database():
+    """Codex ultra High: 全生产模块（除 database.py 自身、tests、scripts）
+    禁止引用 database._get_conn。任何 read 走 _get_read_conn；任何 write 走
+    _write_transaction() ctx（内部才用 _get_conn）。
+
+    这条闸门原本 scope-a 承诺覆盖但漏了——批次 #4 只迁 database.py 内 26
+    pure-read helpers，没扫上层生产模块直接调 database._get_conn 的地方。
+    此 gate 防止未来 regressions（含 recent_interaction / bot 房间统计 /
+    profile builder 三处上轮补迁的 callsite）。
+    """
+    project_root = Path(__file__).parent.parent
+    excluded_dirs = {'tests', 'scripts', '__pycache__', '.venv', 'venv',
+                     '.git', 'frontend', 'static-app', 'static', 'data', 'docs'}
+    violations = []
+    for p in project_root.rglob("*.py"):
+        if any(part in excluded_dirs for part in p.parts):
+            continue
+        if p.name == 'database.py':
+            continue
+        try:
+            src = p.read_text(encoding='utf-8')
+        except UnicodeDecodeError:
+            continue
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == '_get_conn':
+                # database._get_conn / db._get_conn 等
+                violations.append((p.name, node.lineno, "attribute _get_conn"))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == '_get_conn':
+                        violations.append((p.name, node.lineno,
+                                           f"imports _get_conn from {node.module!r}"))
+    assert not violations, (
+        f"non-database modules referencing _get_conn (must use _get_read_conn "
+        f"for reads or _write_transaction for writes): {violations}"
+    )
+
+
+def test_recent_interaction_isolates_from_uncommitted_writer_state(initdb):
+    """Codex ultra High 反例：writer 事务里临时把 event 从 private 改成
+    shared（未 commit），reader 走 _get_read_conn 看不到中间态；writer
+    回滚后 layer 仍为 private。
+
+    生产 recent_interaction 是 async + 用 with_person 别名，需要 person
+    先入 persons 表并有 alias 映射。
+    """
+    import threading as _th
+    import memory_ops
+
+    # 建 person 别名映射
+    database.upsert_person({
+        "person_id": "ceci_test",
+        "entity_type": "user",
+        "canonical_name": "ceci",
+        "aliases": [{"name": "ceci", "scope": "any"}],
+    })
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # cloudy 的一条 private event（subject=ceci_test）
+    database.set_memory({
+        "id": "priv_event", "content": "PRIVATE SECRET",
+        "status": "active", "info_type": "event",
+        "subject_id": "ceci_test", "source_actor_id": "ceci_test",
+        "layer": "private", "owner_ai": "cloudy",
+        "source_ai": "cloudy", "created_at": now_iso,
+    })
+
+    tx_entered = _th.Event()
+    reader_done = _th.Event()
+    writer_err_captured = []
+
+    def writer():
+        # writer 事务里把 layer 改 shared，让 reader 抓一下，然后强制回滚
+        try:
+            with database._write_transaction() as conn:
+                conn.execute(
+                    "UPDATE memories SET layer = 'shared' WHERE id = ?",
+                    ("priv_event",),
+                )
+                tx_entered.set()
+                reader_done.wait(timeout=5)
+                raise RuntimeError("intentional rollback trigger")
+        except RuntimeError as e:
+            # 预期路径 — ctx 已 ROLLBACK，捕获避免 pytest 报 unhandled thread
+            writer_err_captured.append(str(e))
+
+    writer_thread = _th.Thread(target=writer, daemon=True)
+    writer_thread.start()
+    tx_entered.wait(timeout=5)
+
+    # reader 匿名调用（ai_id=""）→ viz_clause = 硬拒 layer='private'
+    # 若走 read_conn：读到未提交前的 layer='private' → 被过滤 → 不泄漏（预期）
+    # 若误走共享写 conn：读到 uncommitted layer='shared' → 泄漏 PRIVATE SECRET（bug）
+    try:
+        result = asyncio.run(memory_ops.recent_interaction(
+            with_person="ceci", ai_id="", days=30, limit=10))
+        items = result.get("items") or []
+        assert not any("PRIVATE SECRET" in (it.get("content", "") or "")
+                       for it in items), (
+            f"anonymous reader leaked private event via uncommitted writer state: {items}"
+        )
+    finally:
+        reader_done.set()
+        writer_thread.join(timeout=5)
+
+    assert writer_err_captured, "writer should have raised then been rolled back"
+    row = database.get_memory("priv_event")
+    assert row["layer"] == "private", (
+        f"expected private after rollback, got {row['layer']!r}"
+    )
 
 
 def test_step0_5_ast_gate_activity_log_no_write_ctx_reference():
