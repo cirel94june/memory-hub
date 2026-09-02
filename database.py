@@ -13,6 +13,7 @@ import sqlite3
 import asyncio
 import logging
 import threading
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterator, Callable, TypeVar
@@ -1231,6 +1232,47 @@ class MaintenanceDrift(RuntimeError):
     Transaction is rolled back; no audit is written; caller should skip."""
 
 
+# ═════════════════════════════════════════════════════════════════════
+# v5.1 S3 — promotion kernel exceptions.
+# All are RuntimeError subclasses so callers can `except RuntimeError` in
+# generic recovery loops but tests can pin exact types.
+# ═════════════════════════════════════════════════════════════════════
+
+
+class PromotionClaimLost(RuntimeError):
+    """Fencing CAS lost: proposal is no longer in `pending` with the caller's
+    claim token. Another worker took over, or the row was terminalized.
+    The caller MUST NOT retry immediately with the same token."""
+
+
+class WrongWrapper(RuntimeError):
+    """The wrapper (`normal` vs `maintenance`) does not match the proposal's
+    structural kind (derived from `maintenance_action`). Kernel refuses to
+    write to avoid producing two active memories on the same subject."""
+
+
+class UnsupportedMaintenanceAction(RuntimeError):
+    """The proposal's `maintenance_action` is not one of the promotion-kernel
+    actions (`''`, `'create'`, `'update'`, `'supersede'`). Actions like
+    `reopen_thread` / `resolve_thread` / `annotate` / `supplement` /
+    `correct` have their own executors and must NEVER go through the
+    promotion kernel."""
+
+
+class LegacyContentDrift(RuntimeError):
+    """Operator adoption of a v=0 legacy proposal: the canonical fingerprint
+    computed at report time does not match the fingerprint of the row on
+    disk right now. Adoption is refused; the operator must regenerate the
+    audit report and re-review before trying again."""
+
+
+# ── v5.1 S3 kernel constants (structure-vs-triage separation) ──────────
+NORMAL_MA_VALUES = frozenset({"", "create"})
+MAINT_MA_VALUES = frozenset({"update", "supersede"})
+AUTO_NORMAL_TRIAGES = frozenset({"auto_approve", "auto_approve_silent"})
+AUTO_MAINT_TRIAGES = frozenset({"auto_approve_maintenance"})
+
+
 def commit_maintenance_atomic(
     memory_id: str,
     memory_updates: dict,
@@ -1948,6 +1990,524 @@ def count_proposals(status: str = "pending") -> int:
         "SELECT COUNT(*) FROM proposals WHERE status = ?", (status,)
     ).fetchone()
     return row[0] if row else 0
+
+
+# ═════════════════════════════════════════════════════════════════════
+# v5.1 S3+S4 — Promotion kernel + public wrappers.
+#
+# Contract (see docs/proposal-pending-fix-plan.md v5.1):
+#   auto or manual approve → try_claim_promotion → build payload OUTSIDE tx
+#     (embedding computed here) → commit_promotion_atomic OR
+#     commit_maintenance_promotion_atomic → memory + proposal terminal +
+#     audit all in ONE tx. Fencing via promotion_claim_id CAS.
+#
+# Recovery: crashed workers leave stale claims. A separate sweep (S7)
+# reads pending rows with old promotion_claim_at and calls
+# release_promotion_claim + retry.
+#
+# Legacy: pre-v5.1 rows have promotion_protocol_version=0. Kernel refuses
+# them; adopt_legacy_proposal_atomic (operator-only, called from
+# tools/audit_stuck_proposals.py) is the ONLY path that can advance them.
+# ═════════════════════════════════════════════════════════════════════
+
+
+PROMOTION_STALE_MINUTES = 5  # a claim older than this is presumed abandoned
+
+
+def try_claim_promotion(prop_id: str, ttl_minutes: int = PROMOTION_STALE_MINUTES) -> dict:
+    """Atomic CAS: claim a promotion slot on `prop_id`.
+
+    Returns {"ok": True, "token": "<hex>"} on success. On failure returns
+    {"ok": False, "reason": ...} — possible reasons: 'not_pending',
+    'v0_legacy', 'held_by_active_worker', 'not_found'.
+
+    Only succeeds when:
+      * proposal exists
+      * status == 'pending'
+      * promotion_protocol_version == 2 (v0 legacy → operator CLI only)
+      * promotion_claim_id is empty OR promotion_claim_at is older than TTL
+    """
+    now = _now_iso()
+    token = uuid.uuid4().hex
+    stale_before = (
+        datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
+    ).isoformat()
+    with _write_transaction() as conn:
+        row = conn.execute(
+            "SELECT status, promotion_protocol_version, promotion_claim_id, "
+            "promotion_claim_at FROM proposals WHERE id=?", (prop_id,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+        if row["status"] != "pending":
+            return {"ok": False, "reason": "not_pending", "status": row["status"]}
+        if row["promotion_protocol_version"] != 2:
+            return {"ok": False, "reason": "v0_legacy"}
+        # CAS: overwrite only if the row is genuinely claimable right now.
+        cur = conn.execute(
+            "UPDATE proposals "
+            "SET promotion_claim_id=?, promotion_claim_at=? "
+            "WHERE id=? AND status='pending' AND promotion_protocol_version=2 "
+            "  AND (promotion_claim_id='' OR promotion_claim_at < ?)",
+            (token, now, prop_id, stale_before),
+        )
+        if cur.rowcount != 1:
+            return {"ok": False, "reason": "held_by_active_worker"}
+    return {"ok": True, "token": token}
+
+
+def release_promotion_claim(prop_id: str, claim_token: str) -> bool:
+    """Clear the caller's claim so a subsequent try_claim_promotion can
+    succeed. CAS on claim_token so a stale worker cannot clobber the
+    active worker's claim. Returns True on rowcount==1."""
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE proposals SET promotion_claim_id='', promotion_claim_at='' "
+            "WHERE id=? AND promotion_claim_id=?",
+            (prop_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+
+def mark_promotion_failed(prop_id: str, claim_token: str, reason: str) -> bool:
+    """CAS: mark proposal as promotion_failed and clear the claim in one
+    UPDATE. Fencing on claim_token ensures a stale worker cannot overwrite
+    a newer worker's terminal state. Returns True on rowcount==1."""
+    now = _now_iso()
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE proposals SET status='promotion_failed', failure_reason=?, "
+            "reviewed_at=?, promotion_claim_id='', promotion_claim_at='' "
+            "WHERE id=? AND status='pending' AND promotion_claim_id=?",
+            (reason, now, prop_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+
+def reject_proposal_atomic(
+    prop_id: str, reviewed_by: str, reject_reason: str = "",
+) -> dict:
+    """Human-triggered reject with CAS. Never races with the auto worker:
+      * status != pending → returns {status: <current>, note:'already_finalized'}
+      * claim held (auto worker in flight) → returns {status:'in_flight'}
+      * else → CAS UPDATE to 'rejected'
+    Legacy v=0 rejects are allowed (a v=0 row we don't want to adopt should
+    still be closable by a human).
+    """
+    now = _now_iso()
+    with _write_transaction() as conn:
+        row = conn.execute(
+            "SELECT status, promotion_claim_id, applied_memory_id "
+            "FROM proposals WHERE id=?", (prop_id,),
+        ).fetchone()
+        if not row:
+            return {"error": "not_found"}
+        if row["status"] != "pending":
+            return {"status": row["status"], "note": "already_finalized",
+                    "applied_memory_id": row["applied_memory_id"] or ""}
+        if row["promotion_claim_id"]:
+            return {"status": "in_flight",
+                    "note": "auto worker holds claim, retry later"}
+        cur = conn.execute(
+            "UPDATE proposals SET status='rejected', reviewed_by=?, "
+            "reviewed_at=?, reject_reason=?, "
+            "promotion_claim_id='', promotion_claim_at='' "
+            "WHERE id=? AND status='pending' AND promotion_claim_id=''",
+            (reviewed_by, now, reject_reason, prop_id),
+        )
+        if cur.rowcount != 1:
+            return {"status": "in_flight",
+                    "note": "claim taken between read and CAS update"}
+    return {"status": "rejected", "reviewed_by": reviewed_by,
+            "reject_reason": reject_reason}
+
+
+def _classify_promotion_kind(maintenance_action: str) -> str:
+    """v5.1 A1: three-way split. Anything outside {'','create','update',
+    'supersede'} is NOT a promotion action and must be handled by a
+    dedicated executor (annotate/supplement/resolve_thread/reopen_thread/
+    correct/...). Raises UnsupportedMaintenanceAction otherwise."""
+    ma = (maintenance_action or "").strip()
+    if ma in NORMAL_MA_VALUES:
+        return "normal"
+    if ma in MAINT_MA_VALUES:
+        return "maintenance"
+    raise UnsupportedMaintenanceAction(
+        f"maintenance_action={ma!r} is not a promotion-kernel action "
+        f"(must be handled by its own executor)"
+    )
+
+
+def _commit_promotion_in_tx(
+    conn: sqlite3.Connection,
+    prop_id: str,
+    claim_token: str,
+    mem_payload: dict,
+    terminal_state: str,
+    promotion_kind: str,
+    reviewed_by: str,
+    audit_extra: dict | None = None,
+) -> dict:
+    """v5.1 S3 kernel. Caller MUST already hold _write_transaction().
+    Added to _IN_TX_HELPERS whitelist in tests/test_step0_write_lock.py.
+
+    Guarantees in one tx:
+      1. proposal_kind matches promotion_kind (WrongWrapper else)
+      2. auto terminal → triage in the correct auto whitelist for kind
+      3. fencing CAS on promotion_claim_id (PromotionClaimLost else)
+      4. _set_memory_in_tx(conn, mem_payload) — writes memory + vec index
+      5. state_before / state_after / source_message_ids constructed
+         inside the tx from the proposal row (never trusts caller)
+      6. audit row inserted with terminal_state and mem_payload.id
+    """
+    if terminal_state not in ("auto_approved", "approved"):
+        raise ValueError(f"invalid terminal_state: {terminal_state!r}")
+    if promotion_kind not in ("normal", "maintenance"):
+        raise ValueError(f"invalid promotion_kind: {promotion_kind!r}")
+
+    prop = conn.execute(
+        "SELECT id, status, triage_reason, promotion_protocol_version, "
+        "  promotion_claim_id, source_message_ids, maintenance_action, "
+        "  content, subject_id, source_actor_id "
+        "FROM proposals WHERE id=?", (prop_id,),
+    ).fetchone()
+    if not prop:
+        raise PromotionClaimLost(f"proposal {prop_id} not found")
+
+    # Wrapper<->proposal kind must line up. The wrapper is the only source
+    # of truth for promotion_kind; the proposal's maintenance_action must
+    # classify to the same kind, else fail-closed.
+    expected_kind = _classify_promotion_kind(prop["maintenance_action"])
+    if expected_kind != promotion_kind:
+        raise WrongWrapper(
+            f"wrapper={promotion_kind!r} does not match proposal "
+            f"expected_kind={expected_kind!r} (ma={prop['maintenance_action']!r})"
+        )
+
+    if prop["promotion_protocol_version"] != 2:
+        raise PromotionClaimLost(
+            f"proposal {prop_id} version={prop['promotion_protocol_version']}, "
+            "refuse to promote (v0 legacy must go through operator CLI)"
+        )
+
+    if terminal_state == "auto_approved":
+        allowed = AUTO_NORMAL_TRIAGES if promotion_kind == "normal" else AUTO_MAINT_TRIAGES
+        if prop["triage_reason"] not in allowed:
+            raise ValueError(
+                f"auto {promotion_kind} requires triage in {sorted(allowed)}, "
+                f"got {prop['triage_reason']!r}"
+            )
+
+    # Fencing CAS: only claim holder can finalize.
+    now = _now_iso()
+    cur = conn.execute(
+        "UPDATE proposals SET status=?, applied_memory_id=?, reviewed_at=?, "
+        "reviewed_by=?, promotion_claim_id='', promotion_claim_at='' "
+        "WHERE id=? AND status='pending' AND promotion_claim_id=?",
+        (terminal_state, mem_payload["id"], now, reviewed_by, prop_id, claim_token),
+    )
+    if cur.rowcount != 1:
+        raise PromotionClaimLost(
+            f"proposal {prop_id} claim {claim_token[:8]}... no longer valid"
+        )
+
+    # Write the memory row (UPSERT via _set_memory_in_tx). This is an
+    # _IN_TX_HELPERS call and is already inside the caller's write tx.
+    _set_memory_in_tx(conn, mem_payload)
+
+    # State before/after: reconstructed here, NEVER trusted from caller.
+    state_before = {
+        "proposal_status": "pending",
+        "triage_reason": prop["triage_reason"],
+        "protocol_version": prop["promotion_protocol_version"],
+        "claim_token_prefix": claim_token[:8],
+    }
+    state_after = {
+        "proposal_status": terminal_state,
+        "applied_memory_id": mem_payload["id"],
+        "reviewed_by": reviewed_by,
+    }
+    extra = dict(audit_extra or {})
+    state_after.update({
+        k: v for k, v in extra.items()
+        if k not in ("action", "decision_reason", "model_id", "prompt_version")
+    })
+
+    audit_defaults = {c: "" for c in _AUDIT_COLUMNS}
+    audit_defaults.update({
+        "action": extra.get("action", "promotion_committed"),
+        "target_id": mem_payload["id"],
+        "new_content": mem_payload.get("content", ""),
+        "source_message_ids": prop["source_message_ids"] or "[]",
+        "decision_reason": extra.get("decision_reason", ""),
+        "state_before": json.dumps(state_before, ensure_ascii=False),
+        "state_after": json.dumps(state_after, ensure_ascii=False),
+        "model_id": extra.get("model_id", ""),
+        "source_ai": mem_payload.get("source_ai", ""),
+        "auto_executed": 1 if terminal_state == "auto_approved" else 0,
+        "prompt_version": extra.get("prompt_version", ""),
+        "created_at": now,
+    })
+    audit_values = [audit_defaults[c] for c in _AUDIT_COLUMNS]
+    audit_placeholders = ", ".join(["?"] * len(_AUDIT_COLUMNS))
+    audit_cols_str = ", ".join(_AUDIT_COLUMNS)
+    conn.execute(
+        f"INSERT INTO maintenance_audit ({audit_cols_str}) "
+        f"VALUES ({audit_placeholders})",
+        audit_values,
+    )
+    return {
+        "memory_id": mem_payload["id"],
+        "proposal_id": prop_id,
+        "terminal_state": terminal_state,
+        "reviewed_by": reviewed_by,
+    }
+
+
+def commit_promotion_atomic(
+    prop_id: str, claim_token: str, mem_payload: dict, reviewed_by: str,
+    terminal_state: str = "auto_approved", audit_extra: dict | None = None,
+) -> dict:
+    """Public wrapper for NORMAL create promotion (ma in '' or 'create').
+    Opens its own _write_transaction and calls the S3 kernel with
+    promotion_kind='normal' hardcoded."""
+    with _write_transaction() as conn:
+        return _commit_promotion_in_tx(
+            conn=conn, prop_id=prop_id, claim_token=claim_token,
+            mem_payload=mem_payload, terminal_state=terminal_state,
+            promotion_kind="normal", reviewed_by=reviewed_by,
+            audit_extra=audit_extra,
+        )
+
+
+def commit_maintenance_promotion_atomic(
+    prop_id: str, claim_token: str, mem_payload: dict,
+    snapshot,  # memory_payload.TargetSnapshot (parsed OUTSIDE tx per A3)
+    reviewed_by: str,
+    terminal_state: str = "auto_approved", audit_extra: dict | None = None,
+) -> dict:
+    """Public wrapper for MAINTENANCE promotion (ma in 'update' or
+    'supersede'). Same-tx drift gate on the target from snapshot; on drift
+    raises MaintenanceDrift so the whole tx rolls back and caller marks
+    promotion_failed. Never downgrades to a plain create.
+
+    v5.1 A2/A4:
+      * snapshot MUST be a parsed TargetSnapshot (a plain dict is rejected
+        so no caller can hand in schema-invalid data unchecked)
+      * for auto_approved terminal, expected_status is hardcoded to 'active'
+        (archived / superseded target implies a stale decision → refuse)
+    """
+    # Deferred import to avoid touching memory_payload at module import time
+    # (it isn't wired anywhere else in database.py yet).
+    from memory_payload import TargetSnapshot as _TS
+    if not isinstance(snapshot, _TS):
+        raise ValueError(
+            "commit_maintenance_promotion_atomic requires a parsed TargetSnapshot; "
+            "call memory_payload.parse_target_snapshot() outside the tx first"
+        )
+    if terminal_state == "auto_approved" and snapshot.expected_status != "active":
+        raise ValueError(
+            f"auto maintenance forbids expected_status={snapshot.expected_status!r}; "
+            "only 'active' targets can be auto-superseded"
+        )
+
+    with _write_transaction() as conn:
+        # 1. drift gate — same tx as memory write.
+        row = conn.execute(
+            "SELECT status, updated_at, content, comments, history "
+            "FROM memories WHERE id=?", (snapshot.target_id,),
+        ).fetchone()
+        if not row:
+            raise MaintenanceDrift(
+                f"target {snapshot.target_id} not found (v5.1 maintenance drift)"
+            )
+        if row["status"] != snapshot.expected_status:
+            raise MaintenanceDrift(
+                f"target {snapshot.target_id} status drift: expected "
+                f"{snapshot.expected_status!r}, got {row['status']!r}"
+            )
+        if row["updated_at"] != snapshot.expected_updated_at:
+            raise MaintenanceDrift(
+                f"target {snapshot.target_id} updated_at drift: expected "
+                f"{snapshot.expected_updated_at!r}, got {row['updated_at']!r}"
+            )
+
+        # 2. supersede old row — use pure helper for consistent shape.
+        from memory_payload import append_supersede_note
+        old_mem = dict(row)
+        # comments/history come back as JSON strings from the row; hydrate
+        # for the helper, then _set_memory_in_tx re-serializes on write.
+        try:
+            old_mem["comments"] = json.loads(row["comments"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            old_mem["comments"] = []
+        try:
+            old_mem["history"] = json.loads(row["history"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            old_mem["history"] = []
+        old_mem["id"] = snapshot.target_id  # dict from Row is column-name keyed
+        now = _now_iso()
+        old_mem_updated = append_supersede_note(
+            old_mem, mem_payload["id"], snapshot.reason or "", now,
+            action=snapshot.relation,
+        )
+        _set_memory_in_tx(conn, old_mem_updated)
+
+        # 3. kernel commit — writes new memory + finalizes proposal + audit.
+        result = _commit_promotion_in_tx(
+            conn=conn, prop_id=prop_id, claim_token=claim_token,
+            mem_payload=mem_payload, terminal_state=terminal_state,
+            promotion_kind="maintenance", reviewed_by=reviewed_by,
+            audit_extra={
+                **(audit_extra or {}),
+                "superseded_target": snapshot.target_id,
+                "relation": snapshot.relation,
+                "supersede_reason": snapshot.reason or "",
+            },
+        )
+        result["superseded_target"] = snapshot.target_id
+        return result
+
+
+def adopt_legacy_proposal_atomic(
+    prop_id: str, expected_fingerprint: str, reviewed_by: str,
+    plan_id: str = "",
+) -> dict:
+    """v5.1 C1: OPERATOR CLI ONLY. Advances a v=0 legacy proposal to a
+    fully-committed memory in one tx: hash-guarded canonicalization,
+    protocol version bump 0→2, claim assignment, kernel commit.
+
+    Runtime authority: this function is imported ONLY by
+    tools/audit_stuck_proposals.py. The MCP `review_proposal(action=
+    'adopt_legacy')` returns 'legacy_operator_only' and never reaches
+    here. AST + import gates (test_s3_s6_integration) verify.
+
+    Signature-level guards here are defense-in-depth for the imports gate
+    upstream, not the primary security boundary (that is: filesystem
+    permissions + operator shell).
+    """
+    if not reviewed_by or not reviewed_by.strip():
+        raise ValueError("reviewed_by required for legacy adoption")
+    if not expected_fingerprint or len(expected_fingerprint) != 64:
+        raise ValueError(
+            "expected_fingerprint must be full sha256 hex (64 chars) "
+            "from a report generated by audit_stuck_proposals.py"
+        )
+
+    from memory_payload import (
+        canonical_proposal_fingerprint, promotion_payload_from_proposal,
+        parse_target_snapshot,
+    )
+
+    now = _now_iso()
+    token = uuid.uuid4().hex
+
+    # Read the full row (single connection, still outside tx) so we can
+    # compute the fingerprint and parse the snapshot before opening the tx.
+    conn_ro = _get_read_conn()
+    row = conn_ro.execute(
+        "SELECT * FROM proposals WHERE id=?", (prop_id,),
+    ).fetchone()
+    if not row:
+        return {"error": "not_found", "proposal_id": prop_id}
+    prop = dict(row)
+    if prop["status"] != "pending":
+        return {"error": "not_pending", "status": prop["status"]}
+    if prop["promotion_protocol_version"] != 0:
+        return {"error": "not_legacy_v0",
+                "version": prop["promotion_protocol_version"]}
+
+    kind = _classify_promotion_kind(prop["maintenance_action"])
+    snapshot = None
+    if kind == "maintenance":
+        snap_raw = (prop.get("target_snapshot_json") or "").strip()
+        if not snap_raw:
+            return {"error": "legacy_maintenance_without_snapshot",
+                    "hint": "recreate as fresh v=2 maintenance proposal"}
+        snapshot = parse_target_snapshot(snap_raw)
+
+    current_fp = canonical_proposal_fingerprint(
+        prop, target_snapshot=(snapshot.model_dump() if snapshot else None),
+    )
+    if current_fp != expected_fingerprint:
+        raise LegacyContentDrift(
+            f"proposal {prop_id} fingerprint drift: "
+            f"expected {expected_fingerprint[:12]}..., got {current_fp[:12]}..."
+        )
+
+    # Now enter the tx: bump v0→v2 + claim + finalize via the kernel.
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            "UPDATE proposals SET promotion_protocol_version=2, "
+            "promotion_claim_id=?, promotion_claim_at=? "
+            "WHERE id=? AND status='pending' AND promotion_protocol_version=0",
+            (token, now, prop_id),
+        )
+        if cur.rowcount != 1:
+            raise PromotionClaimLost(
+                f"legacy adoption CAS lost on {prop_id} (concurrent update?)"
+            )
+        # Re-read the row now that version has been bumped, so kernel sees v2.
+        row2 = conn.execute(
+            "SELECT * FROM proposals WHERE id=?", (prop_id,),
+        ).fetchone()
+        prop2 = dict(row2)
+        mem_payload = promotion_payload_from_proposal(
+            prop2, origin="legacy_adoption",
+            supersedes=[snapshot.target_id] if snapshot else None,
+        )
+        audit_extra = {
+            "action": "legacy_adopt",
+            "plan_id": plan_id,
+            "decision_reason": "operator CLI adoption of v=0 legacy proposal",
+        }
+        if kind == "maintenance":
+            # Same-tx supersede via existing wrapper logic. We must re-implement
+            # the drift gate here since we're already inside the tx and
+            # commit_maintenance_promotion_atomic would open a nested tx.
+            row_tgt = conn.execute(
+                "SELECT status, updated_at, content, comments, history "
+                "FROM memories WHERE id=?", (snapshot.target_id,),
+            ).fetchone()
+            if not row_tgt:
+                raise MaintenanceDrift(
+                    f"legacy adopt: target {snapshot.target_id} not found"
+                )
+            if row_tgt["status"] != snapshot.expected_status:
+                raise MaintenanceDrift(
+                    f"legacy adopt target status drift: expected "
+                    f"{snapshot.expected_status!r}, got {row_tgt['status']!r}"
+                )
+            if row_tgt["updated_at"] != snapshot.expected_updated_at:
+                raise MaintenanceDrift(
+                    f"legacy adopt target updated_at drift"
+                )
+            from memory_payload import append_supersede_note
+            old_mem = dict(row_tgt)
+            try:
+                old_mem["comments"] = json.loads(row_tgt["comments"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                old_mem["comments"] = []
+            try:
+                old_mem["history"] = json.loads(row_tgt["history"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                old_mem["history"] = []
+            old_mem["id"] = snapshot.target_id
+            old_mem_updated = append_supersede_note(
+                old_mem, mem_payload["id"], snapshot.reason or "", now,
+                action=snapshot.relation,
+            )
+            _set_memory_in_tx(conn, old_mem_updated)
+            audit_extra["superseded_target"] = snapshot.target_id
+            audit_extra["relation"] = snapshot.relation
+
+        return _commit_promotion_in_tx(
+            conn=conn, prop_id=prop_id, claim_token=token,
+            mem_payload=mem_payload,
+            terminal_state="approved",  # always human decision for adoption
+            promotion_kind=kind, reviewed_by=reviewed_by,
+            audit_extra=audit_extra,
+        )
 
 
 # ════════════════════════════════════════════
