@@ -1,18 +1,22 @@
 """Pure memory payload helpers, shared by database.py and memory_ops.py.
 
-No DB dependency. In S0 only the fingerprint + normalizers ship (used by the
-audit report); S2 grows this module with the full `build_new_memory_payload`
-and `promotion_payload_from_proposal`, then S3-S6 add TargetSnapshot and
-the CLI adoption helpers.
+No DB dependency. S0 shipped fingerprint + tag normalizer for the audit
+report. S2 adds the full pure builder, snapshot parser, and supersede-note
+helper — used by the promotion path in S3+; S2b will migrate the normal
+create path in memory_ops.remember() to call the same builder for drift-
+free equivalence.
 
-The 21 canonical fields listed here are the fingerprint contract: any drift
-between report time and adopt time on any of them will make CLI adoption
-refuse the plan.
+Golden contract: any drift between report-time and adopt-time on the 21
+canonical fields makes CLI adoption refuse the plan.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from datetime import datetime, timezone
+
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 CANONICAL_FIELDS: tuple[str, ...] = (
@@ -96,3 +100,332 @@ def canonical_proposal_fingerprint(
         canonical, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# S2: pure memory payload builder (used by promotion path in S3+;
+# memory_ops.remember() migration deferred to S2b)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _normalize_domain(v) -> str:
+    """analyzer 输出 list；DB 存 canonical JSON 字符串。
+
+    None / '' / [] / '[]' 全部规范化到 '[]'。其他 list 走 canonical JSON
+    (sort_keys)；已经是 str 的先尝试解析再重新 canonical dump；无法解析
+    的字符串包装为单元素 list。
+    """
+    if v in (None, "", [], "[]"):
+        return "[]"
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            return json.dumps([v], ensure_ascii=False)
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    return json.dumps(v, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_json_list(v) -> str:
+    """None / '' / [] → '[]'。其他 → json.dumps(list)。用于 tags / linked_memories /
+    supersedes 的最终 DB 表示（match memory_ops.remember 当前行为：str→str，
+    list→json.dumps）。
+    """
+    if v in (None, "", []):
+        return "[]"
+    if isinstance(v, str):
+        return v  # caller already serialized (matches memory_ops.remember tags=json.dumps(tags))
+    return json.dumps(list(v), ensure_ascii=False)
+
+
+def build_new_memory_payload(
+    *,
+    # required
+    content: str,
+    # taxonomy
+    layer: str = "shared",
+    room: str = "living_room",
+    category: str = "",
+    owner_ai: str = "",
+    # scoring
+    importance: float = 0.5,
+    emotion_arousal: float = 0.3,
+    valence: float = 0.5,
+    domain=None,
+    # provenance
+    source_ai: str = "",
+    source_platform: str = "",
+    subject_id: str = "",
+    source_actor_id: str = "",
+    info_type: str = "",
+    event_date: str = "",
+    source_context: str = "",
+    provenance_type: str = "",
+    fact_confidence: float | None = None,
+    # tags & relations
+    tags=None,
+    linked_memories=None,
+    supersedes=None,
+    # embedding (opaque bytes; None ok)
+    embedding=None,
+    # async / idempotency
+    client_request_id: str = "",
+    # injection hooks — pass override_id / override_now for full determinism
+    # in tests, or leave unset to get uuid + now() at construction time.
+    override_id: str | None = None,
+    override_now: str | None = None,
+    # provenance of THIS record's creation. 'normal_create' → history entry
+    # matches memory_ops.remember() exactly ({v, content, date, by}).
+    # Anything else (e.g. 'promotion', 'legacy_adoption') appends `origin`
+    # and optional `proposal_id` to the SAME entry so downstream readers of
+    # normal-create history see zero shape drift.
+    origin: str = "normal_create",
+    proposal_id: str = "",
+) -> dict:
+    """Pure. No DB, no store, no clock (if override_now given), no RNG (if
+    override_id given). Produces exactly the dict shape that
+    memory_ops.remember() currently writes on the create path.
+
+    Contract equivalence (matched to memory_ops.remember lines 447-480 and
+    386-419): comments is `[]` list (DB layer serializes), history is a
+    list of dicts, linked_memories/supersedes/tags come in as either str
+    or list and go to canonical JSON string.
+    """
+    now = override_now or datetime.now(timezone.utc).isoformat()
+    mem_id = override_id or _default_gen_id()
+    resolved_info_type = info_type or "fact"  # matches `info_type or "fact"` at memory_ops:472
+
+    history_entry: dict = {
+        "v": 1, "content": content, "date": now, "by": source_ai or "system",
+    }
+    if origin != "normal_create":
+        history_entry["origin"] = origin
+        if proposal_id:
+            history_entry["proposal_id"] = proposal_id
+
+    return {
+        # identity
+        "id": mem_id,
+        "content": content,
+        # taxonomy
+        "layer": layer,
+        "room": room,
+        "category": category,
+        "owner_ai": owner_ai,
+        # scoring — decay_score=1.0 matches memory_ops:397/458
+        "importance": float(importance),
+        "emotion_arousal": float(emotion_arousal),
+        "valence": float(valence),
+        "domain": _normalize_domain(domain),
+        "decay_score": 1.0,
+        "activation_count": 0,
+        "last_activated": "",
+        # provenance
+        "source_ai": source_ai,
+        "source_platform": source_platform,
+        "tags": _normalize_json_list(tags),
+        "linked_memories": _normalize_json_list(linked_memories),
+        "supersedes": _normalize_json_list(supersedes),
+        "event_date": event_date,
+        "source_context": source_context,
+        # payload — list, not string (DB layer serializes)
+        "comments": [],
+        "embedding": embedding,
+        # lifecycle
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+        "history": [history_entry],
+        # provenance quality
+        "provenance_type": provenance_type,
+        "fact_confidence": fact_confidence,
+        # subject/actor
+        "subject_id": subject_id,
+        "source_actor_id": source_actor_id,
+        "info_type": resolved_info_type,
+        # async
+        "client_request_id": client_request_id,
+    }
+
+
+def _default_gen_id() -> str:
+    """Fallback id generator. memory_ops has its own _gen_id() which the
+    remember-path migration (S2b) will inject here via override_id so we
+    keep ID semantics identical."""
+    return f"mem_{uuid.uuid4().hex[:12]}"
+
+
+def promotion_payload_from_proposal(
+    proposal: dict,
+    *,
+    origin: str = "promotion",
+    supersedes=None,
+    linked_memories=None,
+    override_now: str | None = None,
+) -> dict:
+    """Build a memory payload from a proposal row. Used by S3 promotion
+    kernel and S6 adopt-legacy. Deterministic id = `mem_from_prop_<pid>`
+    so recovery can idempotently retry without creating dups.
+    """
+    return build_new_memory_payload(
+        content=proposal["content"],
+        layer=proposal.get("layer", "shared"),
+        room=proposal.get("proposed_room", "living_room"),
+        category=proposal.get("category", ""),
+        owner_ai=proposal.get("owner_ai", ""),
+        source_ai=proposal.get("proposer_ai_id", ""),
+        source_platform=proposal.get("source_platform", ""),
+        subject_id=proposal.get("subject_id", ""),
+        source_actor_id=proposal.get("source_actor_id", ""),
+        info_type=proposal.get("info_type", ""),
+        event_date=proposal.get("event_date", ""),
+        source_context=proposal.get("source_context", ""),
+        provenance_type=proposal.get("provenance_type", ""),
+        fact_confidence=proposal.get("confidence"),
+        importance=float(proposal.get("importance", 0.5)),
+        emotion_arousal=float(proposal.get("emotion_arousal", 0.3)),
+        tags=proposal.get("tags"),
+        domain=proposal.get("domain"),
+        embedding=proposal.get("embedding"),
+        linked_memories=linked_memories,
+        supersedes=supersedes,
+        override_id=f"mem_from_prop_{proposal['id']}",
+        override_now=proposal.get("created_at") or override_now,
+        origin=origin,
+        proposal_id=proposal["id"],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TargetSnapshot — maintenance drift-gate persistence contract (v5.1 A2)
+# ═══════════════════════════════════════════════════════════════════════
+
+_ALLOWED_SNAPSHOT_STATUS = {"active", "archived", "superseded"}
+_ALLOWED_SNAPSHOT_RELATION = {"update", "supersede"}
+
+
+class TargetSnapshot(BaseModel):
+    """Persisted per maintenance proposal so restart-recovery can rebuild
+    the drift gate byte-identically. `extra='forbid'` — unknown fields
+    are rejected loudly so a schema change never silently ignores data.
+    """
+    model_config = ConfigDict(extra="forbid")
+    target_id: str
+    expected_status: str
+    expected_updated_at: str
+    relation: str
+    reason: str = ""
+
+    @field_validator("target_id")
+    @classmethod
+    def _target_nonempty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("target_id must be non-empty")
+        return v
+
+    @field_validator("expected_status")
+    @classmethod
+    def _status_allowed(cls, v: str) -> str:
+        if v not in _ALLOWED_SNAPSHOT_STATUS:
+            raise ValueError(
+                f"expected_status={v!r} not in {sorted(_ALLOWED_SNAPSHOT_STATUS)}"
+            )
+        return v
+
+    @field_validator("expected_updated_at")
+    @classmethod
+    def _time_parses(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("expected_updated_at must be non-empty")
+        # Accept ISO 8601, tolerating a trailing 'Z' by normalizing.
+        candidate = v.rstrip("Z")
+        if candidate == v and "+" not in v[10:] and "-" not in v[10:]:
+            candidate = v + "+00:00"
+        try:
+            datetime.fromisoformat(candidate)
+        except ValueError as e:
+            raise ValueError(f"expected_updated_at not ISO 8601: {v!r} ({e})") from e
+        return v
+
+    @field_validator("relation")
+    @classmethod
+    def _relation_allowed(cls, v: str) -> str:
+        if v not in _ALLOWED_SNAPSHOT_RELATION:
+            raise ValueError(
+                f"relation={v!r} not in {sorted(_ALLOWED_SNAPSHOT_RELATION)}"
+            )
+        return v
+
+
+def parse_target_snapshot(raw: str) -> TargetSnapshot:
+    """Parse a target_snapshot_json blob into a validated model.
+
+    Callers (S3+ wrappers) MUST run this OUTSIDE the promotion write
+    transaction — a ValidationError here needs to trigger
+    mark_promotion_failed in its own transaction (see v5.1 A3).
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raise ValueError("target_snapshot_json is empty; cannot parse")
+    return TargetSnapshot.model_validate_json(raw)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# append_supersede_note — preserve existing comment schema exactly
+# (Codex v5 round M3: comment shape stays {date, author, kind, content};
+# history gets a NEW entry with optional supersede metadata layered on
+# top of the existing {v, content, date, by} shape.)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def append_supersede_note(
+    old_mem: dict,
+    new_mem_id: str,
+    reason: str,
+    now: str,
+    action: str = "supersede",
+    author: str = "system",
+) -> dict:
+    """Pure: return a NEW dict for `old_mem` with supersede metadata
+    layered on top. Does not mutate the input.
+
+    Fields updated:
+      - status         → 'superseded'
+      - superseded_by  → new_mem_id
+      - updated_at     → now
+      - comments       → += {date, author, kind:'supersede_note', content}
+      - history        → += {v: last_v+1, content, date, by, op:'supersede',
+                              superseded_by, reason}
+
+    Comment shape matches existing production code (memory_ops.py:902-906,
+    2212-2217). History entry is a v5.1 addition — earlier code did not
+    write history on supersede; the new fields (op / superseded_by /
+    reason) are layered on top of the {v, content, date, by} base so
+    readers of normal-create history see zero schema breakage.
+    """
+    updated = dict(old_mem)
+    updated["status"] = "superseded"
+    updated["superseded_by"] = new_mem_id
+    updated["updated_at"] = now
+
+    comments = list(updated.get("comments") or [])
+    comments.append({
+        "date": now,
+        "author": author,
+        "kind": "supersede_note",
+        "content": f"被新记忆取代（{action}）: {reason}",
+    })
+    updated["comments"] = comments
+
+    history = list(updated.get("history") or [])
+    last_v = max((int(h.get("v", 0)) for h in history if isinstance(h, dict)), default=0)
+    history.append({
+        "v": last_v + 1,
+        "content": updated.get("content", ""),
+        "date": now,
+        "by": author,
+        "op": "supersede",
+        "superseded_by": new_mem_id,
+        "reason": reason,
+    })
+    updated["history"] = history
+    return updated
