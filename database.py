@@ -463,7 +463,7 @@ async def init_db(db_path: str = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_prop_created ON proposals(created_at);
         """)
 
-        # ── Proposals table migrations ──
+        # ── Proposals table migrations (pre-S1, already shipped) ──
         existing = {row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()}
         for col, typedef in [
             ("triage_reason", "TEXT NOT NULL DEFAULT ''"),
@@ -474,19 +474,37 @@ async def init_db(db_path: str = None) -> None:
             ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
             ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
             ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
-            # v5.1 S1 — promotion fencing columns. Default 0 tags legacy rows
-            # as protocol_version=0 so recovery / kernel refuses to auto-promote
-            # them; insert_proposal() overrides to 2 for new proposals so old
-            # data is never silently promoted alongside new. `target_snapshot_json`
-            # is populated later by the maintenance path when it lands.
-            ("promotion_claim_id", "TEXT NOT NULL DEFAULT ''"),
-            ("promotion_claim_at", "TEXT NOT NULL DEFAULT ''"),
-            ("promotion_protocol_version", "INTEGER NOT NULL DEFAULT 0"),
-            ("target_snapshot_json", "TEXT NOT NULL DEFAULT ''"),
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
                 logger.info(f"Migrated proposals: added '{col}' column")
+
+        # ── Proposals table v5.1 S1 promotion fencing (atomic) ─────────
+        # These 4 columns MUST be added as one unit — leaving a partial set
+        # on disk after a failure would let a subsequent init look like the
+        # migration ran while actually only half the fencing is in place.
+        # Python's sqlite3 module auto-commits DDL by default, so we open an
+        # explicit BEGIN and roll back on any failure.
+        v51_cols = [
+            ("promotion_claim_id", "TEXT NOT NULL DEFAULT ''"),
+            ("promotion_claim_at", "TEXT NOT NULL DEFAULT ''"),
+            ("promotion_protocol_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("target_snapshot_json", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        existing_after_pre_s1 = {
+            row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()
+        }
+        v51_to_add = [(c, t) for c, t in v51_cols if c not in existing_after_pre_s1]
+        if v51_to_add:
+            conn.execute("BEGIN")
+            try:
+                for col, typedef in v51_to_add:
+                    conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
+                    logger.info(f"Migrated proposals: added '{col}' column")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
         if "source_speaker_id" in existing and "source_actor_id" not in existing:
             conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
             logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
@@ -1870,15 +1888,14 @@ PROMOTION_PROTOCOL_VERSION = 2
 def _prepare_new_proposal(row: dict) -> dict:
     """Stamp promotion metadata on a new proposal row.
 
-    Callers may already set some fields (e.g. tests replaying an old row);
-    only overwrite when the caller left the field unset. This keeps the
-    boundary strict: this function is the only place a fresh v=2 tag is
-    stamped on inserts.
+    The public `insert_proposal()` path ALWAYS produces v=2 rows; there is
+    no escape hatch to inject a v=0 row through this entry point. Legacy
+    v=0 rows only exist because they were migrated from a pre-S1 schema
+    (default 0 for pre-existing rows). S6 adopt-legacy will *update* those
+    existing v=0 rows in place — it must never insert a fresh v=0 row.
     """
     prepared = dict(row)
-    # Only tag new proposals; do not touch rows explicitly replaying v=0.
-    if "promotion_protocol_version" not in prepared:
-        prepared["promotion_protocol_version"] = PROMOTION_PROTOCOL_VERSION
+    prepared["promotion_protocol_version"] = PROMOTION_PROTOCOL_VERSION
     prepared.setdefault("promotion_claim_id", "")
     prepared.setdefault("promotion_claim_at", "")
     prepared.setdefault("target_snapshot_json", "")

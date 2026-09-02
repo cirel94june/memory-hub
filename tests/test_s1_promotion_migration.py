@@ -234,12 +234,15 @@ def test_s1_migration_failure_leaves_db_untouched(isolated_db, monkeypatch):
     # connection with a delegating proxy instead of patching the class.
     real_connect = database.sqlite3.connect
 
+    # Fail on the THIRD v5.1 column (promotion_protocol_version). The first
+    # two ALTERs succeed inside the same explicit transaction; the failure
+    # must trigger ROLLBACK and leave zero of the four columns behind.
     class SabotageConn:
         def __init__(self, real):
             self._r = real
         def execute(self, sql, *a, **kw):
-            if "ALTER TABLE PROPOSALS ADD COLUMN PROMOTION_CLAIM_ID" in sql.strip().upper():
-                raise sqlite3.OperationalError("simulated failure mid-migration")
+            if "ALTER TABLE PROPOSALS ADD COLUMN PROMOTION_PROTOCOL_VERSION" in sql.strip().upper():
+                raise sqlite3.OperationalError("simulated failure on 3rd v5.1 ALTER")
             return self._r.execute(sql, *a, **kw)
         def __getattr__(self, name):
             return getattr(self._r, name)
@@ -291,23 +294,60 @@ def test_s1_proposal_columns_list_matches_schema(isolated_db):
         assert c in list_cols, f"{c!r} must be in _PROPOSAL_COLUMNS for INSERT to hit it"
 
 
-# ── Test 8: 显式传 v=0 的 insert 尊重 caller（未来 adopt 路径需要）──────
-def test_s1_insert_respects_explicit_protocol_version_zero(isolated_db):
-    """The adopt-legacy CLI (S6) will need to replay a v=0 row explicitly.
-    _prepare_new_proposal must NOT clobber an explicit version 0."""
+# ── Test 8: insert_proposal 永远写 v=2 —— caller 无法伪造 v=0 新行 ─────
+def test_s1_insert_proposal_forces_v2_even_when_caller_passes_zero(isolated_db):
+    """The public insert path must be fail-closed: any caller that hands in
+    version=0 (mistakenly or maliciously) still gets a v=2 row, so recovery
+    can never miss a fresh insert. S6 adopt-legacy will UPDATE existing v=0
+    rows in place — it must never insert a new v=0 row through this path."""
     asyncio.run(database.init_db(str(isolated_db)))
     now = datetime.now(timezone.utc).isoformat()
     database.insert_proposal({
-        "id": "explicit_v0",
-        "content": "legacy replay",
+        "id": "attempted_v0",
+        "content": "caller tries to inject v=0 here",
         "created_at": now,
-        "promotion_protocol_version": 0,
+        "promotion_protocol_version": 0,   # ← ignored
     })
     conn = sqlite3.connect(str(isolated_db))
     try:
         v = conn.execute(
-            "SELECT promotion_protocol_version FROM proposals WHERE id='explicit_v0'"
+            "SELECT promotion_protocol_version FROM proposals WHERE id='attempted_v0'"
         ).fetchone()[0]
     finally:
         conn.close()
-    assert v == 0, "explicit v=0 must survive; _prepare_new_proposal only sets default"
+    assert v == 2, "insert_proposal MUST clobber caller-supplied v=0; no escape hatch"
+
+
+# ── Test 9: 第二列 ALTER 失败也全 rollback（补 Codex Medium 反例）─────
+def test_s1_second_column_failure_rolls_back_all_four(isolated_db, monkeypatch):
+    """Migration must be atomic across the four v5.1 columns; if the second
+    ALTER fails, the first ALTER must be rolled back too — so the DB looks
+    like the migration never ran and the next init_db can try again cleanly."""
+    _seed_pre_v51_proposals_db(isolated_db)
+    real_connect = database.sqlite3.connect
+
+    class Sabotage2:
+        def __init__(self, real): self._r = real
+        def execute(self, sql, *a, **kw):
+            if "ALTER TABLE PROPOSALS ADD COLUMN PROMOTION_CLAIM_AT" in sql.strip().upper():
+                raise sqlite3.OperationalError("simulated failure on 2nd v5.1 ALTER")
+            return self._r.execute(sql, *a, **kw)
+        def __getattr__(self, name): return getattr(self._r, name)
+        def __setattr__(self, name, value):
+            if name == "_r": object.__setattr__(self, name, value)
+            else: setattr(self._r, name, value)
+        def __enter__(self): self._r.__enter__(); return self
+        def __exit__(self, *a): return self._r.__exit__(*a)
+
+    monkeypatch.setattr(database.sqlite3, "connect",
+                        lambda *a, **kw: Sabotage2(real_connect(*a, **kw)))
+    with pytest.raises(sqlite3.OperationalError):
+        asyncio.run(database.init_db(str(isolated_db)))
+    monkeypatch.setattr(database.sqlite3, "connect", real_connect)
+
+    cols_now = set(_table_cols(isolated_db).keys())
+    leaked = NEW_COLS & cols_now
+    assert not leaked, (
+        f"atomic v5.1 migration leaked partial columns: {leaked}. "
+        "Second-column failure must ROLLBACK first-column ALTER too."
+    )
