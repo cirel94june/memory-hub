@@ -553,9 +553,15 @@ Medium:
 **修复**：wrapper 分派改按 `(terminal_state, maintenance_action)` 二维强绑定，triage 只负责判断能否 auto。
 
 ```python
-# database._commit_promotion_in_tx 新签名（v5.1）
+# database._commit_promotion_in_tx 新签名（v5.1，含 v5.1.1 三分修正）
 AUTO_NORMAL_TRIAGES = frozenset({'auto_approve', 'auto_approve_silent'})
 AUTO_MAINT_TRIAGES  = frozenset({'auto_approve_maintenance'})
+
+# maintenance_action 三分（v5.1.1）：
+NORMAL_MA_VALUES = frozenset({'', 'create'})                   # 走 promotion kernel (normal)
+MAINT_MA_VALUES  = frozenset({'update', 'supersede'})          # 走 promotion kernel (maintenance)
+# 其余动作 (reopen_thread / resolve_thread / correct / annotate / supplement / ...)
+# 由各自 maintenance executor 处理，绝不走 promotion kernel。
 
 def _commit_promotion_in_tx(
     conn, prop_id, claim_token, mem_payload,
@@ -566,13 +572,24 @@ def _commit_promotion_in_tx(
 ):
     prop = _fetch_promotion_row(conn, prop_id)
     ma = (prop.get('maintenance_action') or '').strip()
-    is_maint_prop = ma in ('update', 'supersede')
 
-    # 1. wrapper ↔ proposal 结构强绑定
-    if promotion_kind == 'normal' and is_maint_prop:
-        raise WrongWrapper(f"normal wrapper cannot promote maintenance proposal (ma={ma!r})")
-    if promotion_kind == 'maintenance' and not is_maint_prop:
-        raise WrongWrapper(f"maintenance wrapper requires ma in (update,supersede), got {ma!r}")
+    # 1. maintenance_action 三分 —— 未知动作 fail-closed
+    if ma in NORMAL_MA_VALUES:
+        expected_kind = 'normal'
+    elif ma in MAINT_MA_VALUES:
+        expected_kind = 'maintenance'
+    else:
+        raise UnsupportedMaintenanceAction(
+            f"proposal {prop_id} maintenance_action={ma!r} is not a promotion action "
+            f"(must be handled by its own executor, not promotion kernel)"
+        )
+
+    # 2. wrapper ↔ proposal 结构强绑定
+    if promotion_kind != expected_kind:
+        raise WrongWrapper(
+            f"wrapper={promotion_kind!r} does not match proposal expected_kind={expected_kind!r} "
+            f"(ma={ma!r})"
+        )
 
     # 2. auto 终态额外看 triage 是否允许
     if terminal_state == 'auto_approved':
@@ -630,6 +647,10 @@ async def review_proposal(proposal_id, action, reviewed_by, ...):
 **新增反例**（补入 S8）：
 - `test_v51_a1_manual_approve_sensitive_room_ok` — triage='sensitive_room' 人工 approve 走普通 wrapper 成功
 - `test_v51_a1_manual_approve_maintenance_update_via_maintenance_wrapper_only` — maintenance proposal 走普通 wrapper → WrongWrapper；走 maintenance wrapper OK
+- `test_v51_1_unsupported_ma_fails_closed_normal` — ma='reopen_thread' 走普通 wrapper → UnsupportedMaintenanceAction；memory 未创建
+- `test_v51_1_unsupported_ma_fails_closed_maintenance` — ma='resolve_thread' 走 maintenance wrapper → UnsupportedMaintenanceAction；memory 未创建
+- `test_v51_1_ma_create_goes_normal` — ma='create' 走普通 wrapper OK；走 maintenance wrapper → WrongWrapper
+- `test_v51_1_mark_promotion_failed_requires_claim_token` — 无 claim / 错 claim → rowcount=0，proposal 状态不变
 
 ## A2【H2 修】Canonical fingerprint 补 4 类字段 + 硬 raise
 
@@ -695,15 +716,34 @@ def commit_maintenance_promotion_atomic(prop_id, claim_token, mem_payload, snap,
             raise ValueError("valid TargetSnapshot required")
         # ... drift gate → supersede → kernel commit
 
-# review_proposal 侧处理：
+# review_proposal 侧处理（v5.1.1 修正：mark_promotion_failed 带 claim token 且自释放）：
 try:
     snap = memory_payload.parse_target_snapshot(prop["target_snapshot_json"])
 except (ValidationError, ValueError) as e:
-    # 事务外调用，安全
-    database.mark_promotion_failed(prop["id"], f"snapshot_invalid: {e}")
-    database.release_promotion_claim(prop["id"], claim_token)
+    # 事务外调用，安全；带 claim token → 只标记"当前持有者"的 proposal
+    marked = database.mark_promotion_failed(
+        prop["id"], claim_token, f"snapshot_invalid: {e}",
+    )
+    if not marked:
+        # 已被新 worker 接管，claim 早已易主 —— 不能覆盖新 worker 的状态
+        return {"error": "claim_lost", "detail": "proposal was reclaimed by another worker"}
+    # mark_promotion_failed 自身在 CAS 成功时清 claim；不再额外 release
     return {"error": "snapshot_invalid", "detail": str(e)}
 ```
+
+**`mark_promotion_failed` SQL 规约**（v5.1.1）：
+```sql
+UPDATE proposals
+SET status='promotion_failed',
+    failure_reason=?,
+    reviewed_at=?,
+    promotion_claim_id='',
+    promotion_claim_at=''
+WHERE id=?
+  AND status='pending'
+  AND promotion_claim_id=?
+```
+返回 `rowcount == 1` → True；否则 False（caller 视为 claim_lost，不重复标记）。
 
 Recovery 循环同样在事务外先 parse，失败 → mark_failed + 跳过。
 

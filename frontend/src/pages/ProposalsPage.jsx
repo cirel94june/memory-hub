@@ -59,7 +59,12 @@ export default function ProposalsPage() {
       }
     } catch (e) {
       if (e.name === "AbortError") {
-        alert(`后端 ${APPROVE_TIMEOUT_MS / 1000}s 内未响应。approve 路径可能卡在 promotion（v5 修复中），此条 proposal 未被修改，可稍后再试。`);
+        alert(
+          `客户端已停止等待（${APPROVE_TIMEOUT_MS / 1000}s），但后端可能仍在处理中，当前结果未知。\n\n` +
+          "请勿重复点击。稍等几秒后系统会自动刷新列表，请以刷新后的状态为准。"
+        );
+        // 5s 后自动刷新一次，让 Ceci 看到后端最终落地状态
+        setTimeout(() => load(status, page), 5000);
       } else {
         alert("操作失败：" + (e.message || "网络错误"));
       }
@@ -118,6 +123,7 @@ export default function ProposalsPage() {
 
   return (
     <div style={{ maxWidth: 800, margin: "0 auto", padding: "20px 16px" }}>
+      <style>{`@keyframes proposal-spin { to { transform: rotate(360deg); } }`}</style>
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
         <ClipboardList size={22} />
         <h2 style={{ margin: 0, fontSize: 20 }}>记忆候选区</h2>
@@ -146,11 +152,7 @@ export default function ProposalsPage() {
           <button onClick={retriage} disabled={loading} style={btnStyle}>
             <RefreshCw size={14} /> Retriage
           </button>
-          {items.length > 0 && (
-            <button onClick={approveAll} disabled={loading} style={{ ...btnStyle, background: "#22c55e", color: "#fff" }}>
-              <Check size={14} /> 全部通过 ({items.length})
-            </button>
-          )}
+          {/* "全部通过" 已隐藏：v5 修复前 approveAll 无 timeout 且不校验响应，会误报成功。v5 落地后再放开。 */}
           {retriageResult && (
             <span style={{ fontSize: 13, color: "var(--text-muted)", alignSelf: "center" }}>
               通过 {retriageResult.approved} / 失败 {retriageResult.failed} / 仍待审 {retriageResult.still_pending}
@@ -205,7 +207,7 @@ export default function ProposalsPage() {
                     disabled={!!acting[p.id]}
                     style={{ ...actionBtn, background: "#22c55e", color: "#fff", opacity: acting[p.id] ? 0.6 : 1 }}
                     title={acting[p.id] === "approve" ? "审批中（最长 60s）..." : "通过"}
-                  >{acting[p.id] === "approve" ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <Check size={16} />}</button>
+                  >{acting[p.id] === "approve" ? <Loader2 size={16} style={{ animation: "proposal-spin 1s linear infinite" }} /> : <Check size={16} />}</button>
                   <button
                     onClick={() => {
                       const reason = prompt("拒绝原因（可选）：");
@@ -214,7 +216,7 @@ export default function ProposalsPage() {
                     disabled={!!acting[p.id]}
                     style={{ ...actionBtn, background: "#ef4444", color: "#fff", opacity: acting[p.id] ? 0.6 : 1 }}
                     title={acting[p.id] === "reject" ? "拒绝中..." : "拒绝"}
-                  >{acting[p.id] === "reject" ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <X size={16} />}</button>
+                  >{acting[p.id] === "reject" ? <Loader2 size={16} style={{ animation: "proposal-spin 1s linear infinite" }} /> : <X size={16} />}</button>
                 </div>
               )}
             </div>
