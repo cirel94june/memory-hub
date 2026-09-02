@@ -474,6 +474,15 @@ async def init_db(db_path: str = None) -> None:
             ("info_type", "TEXT NOT NULL DEFAULT 'fact'"),
             ("maintenance_action", "TEXT NOT NULL DEFAULT ''"),
             ("maintenance_target_id", "TEXT NOT NULL DEFAULT ''"),
+            # v5.1 S1 — promotion fencing columns. Default 0 tags legacy rows
+            # as protocol_version=0 so recovery / kernel refuses to auto-promote
+            # them; insert_proposal() overrides to 2 for new proposals so old
+            # data is never silently promoted alongside new. `target_snapshot_json`
+            # is populated later by the maintenance path when it lands.
+            ("promotion_claim_id", "TEXT NOT NULL DEFAULT ''"),
+            ("promotion_claim_at", "TEXT NOT NULL DEFAULT ''"),
+            ("promotion_protocol_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("target_snapshot_json", "TEXT NOT NULL DEFAULT ''"),
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} {typedef}")
@@ -1846,10 +1855,38 @@ _PROPOSAL_COLUMNS = [
     "triage_reason", "applied_memory_id", "failure_reason",
     "subject_id", "source_actor_id",
     "info_type", "maintenance_action", "maintenance_target_id",
+    # v5.1 S1 — promotion fencing (write side). Legacy rows keep default 0
+    # because they were inserted before this list carried these columns;
+    # new inserts explicitly write 2 via _prepare_new_proposal below.
+    "promotion_claim_id", "promotion_claim_at",
+    "promotion_protocol_version", "target_snapshot_json",
 ]
+
+# v5.1 protocol version for new proposals. Old rows stay at column default 0
+# and are only reachable through the operator CLI adoption path (S6).
+PROMOTION_PROTOCOL_VERSION = 2
+
+
+def _prepare_new_proposal(row: dict) -> dict:
+    """Stamp promotion metadata on a new proposal row.
+
+    Callers may already set some fields (e.g. tests replaying an old row);
+    only overwrite when the caller left the field unset. This keeps the
+    boundary strict: this function is the only place a fresh v=2 tag is
+    stamped on inserts.
+    """
+    prepared = dict(row)
+    # Only tag new proposals; do not touch rows explicitly replaying v=0.
+    if "promotion_protocol_version" not in prepared:
+        prepared["promotion_protocol_version"] = PROMOTION_PROTOCOL_VERSION
+    prepared.setdefault("promotion_claim_id", "")
+    prepared.setdefault("promotion_claim_at", "")
+    prepared.setdefault("target_snapshot_json", "")
+    return prepared
 
 
 def insert_proposal(row: dict) -> None:
+    row = _prepare_new_proposal(row)
     values = [row.get(c, "") for c in _PROPOSAL_COLUMNS]
     placeholders = ", ".join(["?"] * len(_PROPOSAL_COLUMNS))
     cols = ", ".join(_PROPOSAL_COLUMNS)
