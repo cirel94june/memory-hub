@@ -88,24 +88,6 @@ export default function ProposalsPage() {
     }
   };
 
-  const approveAll = async () => {
-    if (!confirm(`批量通过当前 ${items.length} 条？`)) return;
-    setLoading(true);
-    let ok = 0;
-    for (const item of items) {
-      try {
-        await fetch(`/api/proposals/${item.id}/review`, {
-          method: "POST",
-          headers: { ...auth, "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "approve", reviewed_by: "user" }),
-        });
-        ok++;
-      } catch {}
-    }
-    alert(`已通过 ${ok} 条`);
-    load(status, page);
-  };
-
   const toggle = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
 
   const confBar = (conf) => {
@@ -152,7 +134,7 @@ export default function ProposalsPage() {
           <button onClick={retriage} disabled={loading} style={btnStyle}>
             <RefreshCw size={14} /> Retriage
           </button>
-          {/* "全部通过" 已隐藏：v5 修复前 approveAll 无 timeout 且不校验响应，会误报成功。v5 落地后再放开。 */}
+          {/* "全部通过" 按钮已移除；v5.1 后端落地后如需重新加入，需实现 timeout + 逐条响应校验。 */}
           {retriageResult && (
             <span style={{ fontSize: 13, color: "var(--text-muted)", alignSelf: "center" }}>
               通过 {retriageResult.approved} / 失败 {retriageResult.failed} / 仍待审 {retriageResult.still_pending}
