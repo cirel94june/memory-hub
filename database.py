@@ -1935,12 +1935,21 @@ def _prepare_new_proposal(row: dict) -> dict:
     v=0 rows only exist because they were migrated from a pre-S1 schema
     (default 0 for pre-existing rows). S6 adopt-legacy will *update* those
     existing v=0 rows in place — it must never insert a fresh v=0 row.
+
+    Also seeds JSON-list-typed columns with '[]' when caller omitted them,
+    so downstream json.loads() over these fields never explodes on an
+    empty-string default. Pre-S1 code paths already relied on schema
+    DEFAULT '[]' which insert_proposal's blanket `row.get(c, "")` was
+    silently overriding.
     """
     prepared = dict(row)
     prepared["promotion_protocol_version"] = PROMOTION_PROTOCOL_VERSION
     prepared.setdefault("promotion_claim_id", "")
     prepared.setdefault("promotion_claim_at", "")
     prepared.setdefault("target_snapshot_json", "")
+    for jsl_col in ("source_message_ids", "conflicts_with", "tags"):
+        if jsl_col not in prepared:
+            prepared[jsl_col] = "[]"
     return prepared
 
 

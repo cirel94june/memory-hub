@@ -277,6 +277,18 @@ def _default_gen_id() -> str:
     return f"mem_{uuid.uuid4().hex[:12]}"
 
 
+def _safe_float(v, default: float) -> float:
+    """Proposal rows come from insert_proposal which stores empty strings
+    for unset numeric fields. Coerce to float with fallback so builder
+    remains callable on real DB rows without exploding."""
+    if v in ("", None):
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def promotion_payload_from_proposal(
     proposal: dict,
     *,
@@ -289,10 +301,11 @@ def promotion_payload_from_proposal(
     kernel and S6 adopt-legacy. Deterministic id = `mem_from_prop_<pid>`
     so recovery can idempotently retry without creating dups.
     """
+    confidence = proposal.get("confidence")
     return build_new_memory_payload(
         content=proposal["content"],
-        layer=proposal.get("layer", "shared"),
-        room=proposal.get("proposed_room", "living_room"),
+        layer=proposal.get("layer") or "shared",
+        room=proposal.get("proposed_room") or "living_room",
         category=proposal.get("category", ""),
         owner_ai=proposal.get("owner_ai", ""),
         source_ai=proposal.get("proposer_ai_id", ""),
@@ -303,9 +316,10 @@ def promotion_payload_from_proposal(
         event_date=proposal.get("event_date", ""),
         source_context=proposal.get("source_context", ""),
         provenance_type=proposal.get("provenance_type", ""),
-        fact_confidence=proposal.get("confidence"),
-        importance=float(proposal.get("importance", 0.5)),
-        emotion_arousal=float(proposal.get("emotion_arousal", 0.3)),
+        fact_confidence=(_safe_float(confidence, 0.5)
+                         if confidence not in ("", None) else None),
+        importance=_safe_float(proposal.get("importance"), 0.5),
+        emotion_arousal=_safe_float(proposal.get("emotion_arousal"), 0.3),
         tags=proposal.get("tags"),
         domain=proposal.get("domain"),
         embedding=proposal.get("embedding"),

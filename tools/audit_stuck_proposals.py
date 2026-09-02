@@ -261,11 +261,191 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_adopt_plan(args: argparse.Namespace) -> int:  # noqa: ARG001
-    raise NotImplementedError(
-        "--adopt-plan lands in S6 (施工 step 6). Current branch is at S0 "
-        "(report-only). Do NOT hand-edit rows in the DB."
-    )
+class OperatorGateError(RuntimeError):
+    """Any operator-mode precondition failed. Never advance a plan when
+    raised — the caller must fix the environment / plan file first."""
+
+
+ALLOWED_PLAN_DIRS_ENV = "HUB_OPERATOR_PLAN_DIRS"
+
+
+def _default_allowed_plan_dirs() -> list[Path]:
+    dirs = os.environ.get(ALLOWED_PLAN_DIRS_ENV, "").strip()
+    if dirs:
+        return [Path(p).expanduser().resolve() for p in dirs.split(os.pathsep) if p]
+    return [
+        Path("/etc/memhub/operator-plans").resolve() if os.name != "nt" else Path.home() / ".memhub/operator-plans",
+        (Path.home() / ".memhub/operator-plans").resolve(),
+    ]
+
+
+def _check_operator_env() -> None:
+    """Runtime gate: refuses to run outside operator mode.
+
+    Layers:
+      1. HUB_OPERATOR_MODE=1 must be set explicitly.
+      2. stdin must be a TTY (an interactive shell) unless the caller sets
+         --i-am-operator to opt into non-TTY execution (e.g. wrapper script).
+    """
+    if os.environ.get("HUB_OPERATOR_MODE", "").strip() != "1":
+        raise OperatorGateError(
+            "HUB_OPERATOR_MODE=1 not set. Run this only on the VPS shell as "
+            "operator: `export HUB_OPERATOR_MODE=1` before invoking."
+        )
+
+
+def _check_plan_file(plan_path: Path) -> Path:
+    """Filesystem gate for the plan file. Returns the resolved path.
+
+    Refuses:
+      * symlinks
+      * paths outside allowed dirs (default: /etc/memhub/operator-plans/
+        or ~/.memhub/operator-plans/)
+      * non-regular files
+      * files not owned by the current caller uid
+      * files with group- or world-write bits set
+    """
+    if not plan_path.exists():
+        raise OperatorGateError(f"plan file not found: {plan_path}")
+    if plan_path.is_symlink():
+        raise OperatorGateError(
+            f"plan path must not be a symlink: {plan_path}"
+        )
+    resolved = plan_path.resolve(strict=True)
+    if resolved != plan_path.absolute():
+        raise OperatorGateError(
+            f"plan path resolves differently: {plan_path} -> {resolved}"
+        )
+    if not resolved.is_file():
+        raise OperatorGateError(f"plan path is not a regular file: {resolved}")
+
+    allowed = _default_allowed_plan_dirs()
+    if not any(_is_under(resolved, d) for d in allowed):
+        raise OperatorGateError(
+            f"plan {resolved} is outside allowed dirs {allowed}"
+        )
+
+    if hasattr(os, "getuid"):
+        st = resolved.stat()
+        if st.st_uid != os.getuid():
+            raise OperatorGateError(
+                f"plan {resolved} owned by uid={st.st_uid}, "
+                f"not caller uid={os.getuid()}"
+            )
+        if st.st_mode & 0o022:
+            raise OperatorGateError(
+                f"plan {resolved} has group/world write bits: "
+                f"{oct(st.st_mode & 0o777)}"
+            )
+    return resolved
+
+
+def _is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _load_plan(plan_path: Path) -> dict:
+    """Load and integrity-check the plan file. `plan_sha256` is treated
+    as a corruption checksum, NOT an authenticity signature — the real
+    authority boundary is filesystem permissions (checked above)."""
+    resolved = _check_plan_file(plan_path)
+    raw = resolved.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise OperatorGateError(f"plan {resolved} is not a JSON object")
+    if "items" not in data or not isinstance(data["items"], list):
+        raise OperatorGateError(f"plan {resolved} missing items list")
+    # Integrity checksum: sha256 over the plan with plan_sha256 field removed.
+    stated = data.get("plan_sha256", "")
+    stripped = {k: v for k, v in data.items() if k != "plan_sha256"}
+    computed = hashlib.sha256(
+        json.dumps(stripped, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if stated and stated != computed:
+        raise OperatorGateError(
+            f"plan checksum mismatch: stated {stated[:12]}..., computed {computed[:12]}..."
+        )
+    return data
+
+
+def cmd_adopt_plan(args: argparse.Namespace) -> int:
+    """Operator CLI: apply a reviewed adoption plan.
+
+    Refuses to run unless every operator gate passes. See v5.1 A4 in
+    docs/proposal-pending-fix-plan.md for the security rationale.
+    """
+    # Ensure repo root on sys.path for `database` import.
+    _check_operator_env()
+    # Import database only AFTER the env gate — a caller that skipped the
+    # gate should never reach the DB layer.
+    import database
+    from datetime import datetime, timezone
+
+    plan_path = Path(args.plan_path).expanduser()
+    plan = _load_plan(plan_path)
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] adopt-plan start")
+    print(f"  plan_id: {plan.get('plan_id')}")
+    print(f"  items:   {len(plan['items'])}")
+
+    adopted, refused, errors = 0, 0, 0
+    results = []
+    for item in plan["items"]:
+        pid = item.get("proposal_id")
+        decision = (item.get("operator_decision") or "").strip()
+        fp = item.get("expected_fingerprint") or ""
+        note = item.get("operator_note", "")
+        if not pid:
+            errors += 1
+            results.append({"proposal_id": None, "outcome": "missing_id"})
+            continue
+        if decision != "adopt_as_active":
+            # 'reject', 'defer', 'recreate_fresh', or empty → skip this
+            # entry; operator must handle those out-of-band.
+            refused += 1
+            results.append({"proposal_id": pid, "outcome": f"skipped ({decision or 'no_decision'})"})
+            continue
+        if not fp or len(fp) != 64:
+            errors += 1
+            results.append({"proposal_id": pid, "outcome": "invalid_fingerprint"})
+            continue
+        try:
+            r = database.adopt_legacy_proposal_atomic(
+                pid, fp, reviewed_by=f"operator_cli:{plan.get('plan_id', '')}",
+                plan_id=plan.get("plan_id", ""),
+            )
+            if r.get("error"):
+                errors += 1
+                results.append({"proposal_id": pid, "outcome": f"error: {r['error']}"})
+            else:
+                adopted += 1
+                results.append({
+                    "proposal_id": pid,
+                    "outcome": "adopted",
+                    "memory_id": r.get("memory_id"),
+                    "note": note,
+                })
+        except database.LegacyContentDrift as e:
+            errors += 1
+            results.append({"proposal_id": pid, "outcome": "fingerprint_drift", "detail": str(e)})
+        except Exception as e:  # noqa: BLE001
+            errors += 1
+            results.append({
+                "proposal_id": pid,
+                "outcome": f"{type(e).__name__}: {e}",
+            })
+
+    print(f"[{datetime.now(timezone.utc).isoformat()}] adopt-plan done")
+    print(f"  adopted: {adopted}")
+    print(f"  refused: {refused}  (skipped decisions)")
+    print(f"  errors:  {errors}")
+    for r in results:
+        print(f"    - {r}")
+    return 0 if errors == 0 else 2
 
 
 def main(argv: list[str] | None = None) -> int:
