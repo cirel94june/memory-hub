@@ -127,15 +127,37 @@ def _normalize_domain(v) -> str:
 
 
 def _normalize_json_list(v) -> str:
-    """None / '' / [] → '[]'。其他 → json.dumps(list)。用于 tags / linked_memories /
-    supersedes 的最终 DB 表示（match memory_ops.remember 当前行为：str→str，
-    list→json.dumps）。
+    """Return a canonical JSON-list string for tags / linked_memories /
+    supersedes fields. Fail-closed for anything that is not a real list.
+
+    Accepted inputs:
+      * None / '' / []  → '[]'
+      * list            → json.dumps(list)
+      * str '[...]'     → parsed, must yield list, then re-dumped canonical
+    Rejected (raises ValueError):
+      * strings that are not JSON, or JSON that is not a list
+        (e.g. 'mem_a', 'null', '{"x":1}', '"mem_a"')
+      * numbers, dicts, other objects
     """
     if v in (None, "", []):
         return "[]"
     if isinstance(v, str):
-        return v  # caller already serialized (matches memory_ops.remember tags=json.dumps(tags))
-    return json.dumps(list(v), ensure_ascii=False)
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"_normalize_json_list expected JSON list string, got {v!r}: {e}"
+            ) from e
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"_normalize_json_list expected list, got {type(parsed).__name__}: {v!r}"
+            )
+        return json.dumps(parsed, ensure_ascii=False)
+    if isinstance(v, list):
+        return json.dumps(v, ensure_ascii=False)
+    raise ValueError(
+        f"_normalize_json_list expected list-like, got {type(v).__name__}: {v!r}"
+    )
 
 
 def build_new_memory_payload(
@@ -337,10 +359,23 @@ class TargetSnapshot(BaseModel):
     def _time_parses(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("expected_updated_at must be non-empty")
-        # Accept ISO 8601, tolerating a trailing 'Z' by normalizing.
-        candidate = v.rstrip("Z")
-        if candidate == v and "+" not in v[10:] and "-" not in v[10:]:
+        # Require an explicit time component. A date-only string like
+        # "2026-01-01" would otherwise silently parse to midnight, letting
+        # a caller pass a value that could match many different snapshots.
+        if "T" not in v and " " not in v:
+            raise ValueError(
+                f"expected_updated_at needs time component (T or space separator): {v!r}"
+            )
+        # Accept a SINGLE trailing 'Z' as UTC. Reject 'ZZ' etc. — those
+        # indicate a caller bug, not a legitimate ISO 8601 variant.
+        if v.endswith("ZZ"):
+            raise ValueError(f"expected_updated_at has stacked Z suffix: {v!r}")
+        if v.endswith("Z"):
+            candidate = v[:-1] + "+00:00"
+        elif "+" not in v[10:] and "-" not in v[10:]:
             candidate = v + "+00:00"
+        else:
+            candidate = v
         try:
             datetime.fromisoformat(candidate)
         except ValueError as e:
@@ -407,7 +442,11 @@ def append_supersede_note(
     updated["superseded_by"] = new_mem_id
     updated["updated_at"] = now
 
-    comments = list(updated.get("comments") or [])
+    # Match memory_ops.py production defense: `if not isinstance(x, list): x = []`.
+    # Using `list(x)` on a string would split into characters, silently
+    # corrupting the payload S3 maintenance promotion writes back to disk.
+    raw_comments = updated.get("comments")
+    comments = list(raw_comments) if isinstance(raw_comments, list) else []
     comments.append({
         "date": now,
         "author": author,
@@ -416,7 +455,8 @@ def append_supersede_note(
     })
     updated["comments"] = comments
 
-    history = list(updated.get("history") or [])
+    raw_history = updated.get("history")
+    history = list(raw_history) if isinstance(raw_history, list) else []
     last_v = max((int(h.get("v", 0)) for h in history if isinstance(h, dict)), default=0)
     history.append({
         "v": last_v + 1,

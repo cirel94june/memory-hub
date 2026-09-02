@@ -320,21 +320,84 @@ def test_supersede_history_v_increments_with_supersede_metadata():
     assert "content" in last
 
 
-def test_supersede_recovers_when_comments_is_not_a_list():
-    """Defensive: an older row might have `comments` stored as a string or
-    None; helper must still produce a valid comments list."""
+def test_supersede_replaces_non_list_comments_with_fresh_list():
+    """Matches memory_ops.py's `if not isinstance(comments, list): comments = []`
+    defense. `list("bad")` would split the string into chars — that would
+    silently corrupt the payload S3 promotion writes back to disk."""
     weird = {**_old_mem(), "comments": None}
     out = mp.append_supersede_note(weird, "mem_new", "r", FIXED_NOW)
-    assert isinstance(out["comments"], list)
-    assert out["comments"][-1]["kind"] == "supersede_note"
+    assert out["comments"] == [{
+        "date": FIXED_NOW, "author": "system",
+        "kind": "supersede_note",
+        "content": "被新记忆取代（supersede）: r",
+    }], "None comments must become [] before append"
 
     weird2 = {**_old_mem(), "comments": "not-a-list"}
     out = mp.append_supersede_note(weird2, "mem_new", "r", FIXED_NOW)
-    # `list("not-a-list")` yields characters — that's undesirable but is
-    # the caller's mistake. We accept it as-is and just ensure the new
-    # note is at the end and the helper does not crash.
-    assert isinstance(out["comments"], list)
-    assert out["comments"][-1]["kind"] == "supersede_note"
+    # NO character split — the list has exactly ONE dict (the new note).
+    assert len(out["comments"]) == 1
+    assert out["comments"][0]["kind"] == "supersede_note"
+    # Same defense for history.
+    weird3 = {**_old_mem(), "history": "corrupt"}
+    out = mp.append_supersede_note(weird3, "mem_new", "r", FIXED_NOW)
+    assert len(out["history"]) == 1
+    assert out["history"][0]["op"] == "supersede"
+    assert out["history"][0]["v"] == 1  # fresh list → last_v defaults to 0
+
+
+# ═══ _normalize_json_list — fail-closed (S2a fixup Low) ════════════════
+
+def test_normalize_json_list_accepts_valid_forms():
+    assert mp._normalize_json_list(None) == "[]"
+    assert mp._normalize_json_list("") == "[]"
+    assert mp._normalize_json_list([]) == "[]"
+    assert mp._normalize_json_list(["a", "b"]) == '["a", "b"]'
+    assert mp._normalize_json_list("[]") == "[]"
+    # str '["a"]' round-trips through JSON parse+dump (canonical)
+    out = mp._normalize_json_list('["a", "b"]')
+    assert json.loads(out) == ["a", "b"]
+
+
+def test_normalize_json_list_rejects_non_list_strings():
+    """S2a Low-1: str inputs that aren't JSON list must fail-closed,
+    not silently pass through as garbage into a list field."""
+    for bad in ("mem_a", "null", '{"x": 1}', '"mem_a"', "42", "true"):
+        with pytest.raises(ValueError):
+            mp._normalize_json_list(bad)
+
+
+def test_normalize_json_list_rejects_non_list_scalars():
+    for bad in (42, True, {"x": 1}, 3.14):
+        with pytest.raises(ValueError):
+            mp._normalize_json_list(bad)
+
+
+# ═══ TargetSnapshot time validator — S2a Low-2 ═══════════════════════════
+
+def test_snapshot_rejects_date_only():
+    with pytest.raises(ValidationError):
+        mp.parse_target_snapshot(_snap_json(expected_updated_at="2026-01-01"))
+
+
+def test_snapshot_rejects_stacked_z():
+    with pytest.raises(ValidationError):
+        mp.parse_target_snapshot(
+            _snap_json(expected_updated_at="2026-08-30T12:00:00ZZ")
+        )
+    with pytest.raises(ValidationError):
+        mp.parse_target_snapshot(
+            _snap_json(expected_updated_at="2026-08-30T12:00:00ZZZ")
+        )
+
+
+def test_snapshot_accepts_exactly_one_z_suffix():
+    snap = mp.parse_target_snapshot(_snap_json(expected_updated_at="2026-08-30T12:00:00Z"))
+    assert snap.expected_updated_at.endswith("Z")
+
+
+def test_snapshot_accepts_iso_with_explicit_offset():
+    snap = mp.parse_target_snapshot(_snap_json(expected_updated_at="2026-08-30T12:00:00+08:00"))
+    assert snap.expected_updated_at.endswith("+08:00")
 
 
 # ═══ canonical_proposal_fingerprint (S0 shipped, no change here) ═══════
