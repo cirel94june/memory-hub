@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import { ClipboardList, Check, X, RefreshCw, ChevronDown, ChevronUp } from "lucide-react";
+import { ClipboardList, Check, X, RefreshCw, ChevronDown, ChevronUp, Loader2 } from "lucide-react";
+
+const APPROVE_TIMEOUT_MS = 60_000;
 
 const CLAIM_LABELS = { fact: "事实", observation: "观察", hypothesis: "推测" };
 const SPEECH_LABELS = { literal: "直述", playful: "玩梗", hypothetical: "假设", fictional: "虚构", uncertain: "不确定" };
@@ -39,11 +41,14 @@ export default function ProposalsPage() {
 
   const review = async (id, action, reason = "") => {
     setActing((a) => ({ ...a, [id]: action }));
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), APPROVE_TIMEOUT_MS);
     try {
       const resp = await fetch(`/api/proposals/${id}/review`, {
         method: "POST",
         headers: { ...auth, "Content-Type": "application/json" },
         body: JSON.stringify({ action, reviewed_by: "user", reject_reason: reason }),
+        signal: ctrl.signal,
       });
       const result = await resp.json();
       if (result.error) {
@@ -52,10 +57,16 @@ export default function ProposalsPage() {
         setItems((prev) => prev.filter((p) => p.id !== id));
         setTotal((t) => Math.max(0, t - 1));
       }
-    } catch {
-      alert("操作失败");
+    } catch (e) {
+      if (e.name === "AbortError") {
+        alert(`后端 ${APPROVE_TIMEOUT_MS / 1000}s 内未响应。approve 路径可能卡在 promotion（v5 修复中），此条 proposal 未被修改，可稍后再试。`);
+      } else {
+        alert("操作失败：" + (e.message || "网络错误"));
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setActing((a) => ({ ...a, [id]: null }));
     }
-    setActing((a) => ({ ...a, [id]: null }));
   };
 
   const retriage = async () => {
@@ -192,18 +203,18 @@ export default function ProposalsPage() {
                   <button
                     onClick={() => review(p.id, "approve")}
                     disabled={!!acting[p.id]}
-                    style={{ ...actionBtn, background: "#22c55e", color: "#fff" }}
-                    title="通过"
-                  ><Check size={16} /></button>
+                    style={{ ...actionBtn, background: "#22c55e", color: "#fff", opacity: acting[p.id] ? 0.6 : 1 }}
+                    title={acting[p.id] === "approve" ? "审批中（最长 60s）..." : "通过"}
+                  >{acting[p.id] === "approve" ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <Check size={16} />}</button>
                   <button
                     onClick={() => {
                       const reason = prompt("拒绝原因（可选）：");
                       if (reason !== null) review(p.id, "reject", reason);
                     }}
                     disabled={!!acting[p.id]}
-                    style={{ ...actionBtn, background: "#ef4444", color: "#fff" }}
-                    title="拒绝"
-                  ><X size={16} /></button>
+                    style={{ ...actionBtn, background: "#ef4444", color: "#fff", opacity: acting[p.id] ? 0.6 : 1 }}
+                    title={acting[p.id] === "reject" ? "拒绝中..." : "拒绝"}
+                  >{acting[p.id] === "reject" ? <Loader2 size={16} style={{ animation: "spin 1s linear infinite" }} /> : <X size={16} />}</button>
                 </div>
               )}
             </div>

@@ -539,3 +539,241 @@ Medium:
 4. 分批施工 S0 → S8，每批 Codex 复审
 5. 全套 30+ 测试通过 → 开 PR → Codex ultra 复审 → 合入
 6. 合入后：S6 CLI 部署到 VPS；Ceci 生成 report → 复核 → 我在 SSH root 上跑 `--adopt-plan`
+
+---
+
+# v5.1 Amendment（Codex v5 review 收敛：2 High + 4 Medium）
+
+> Codex v5 review 结论：架构闭环成立，无 Critical。不做 v6 大改，本 amendment 写死 4 条即可开工。
+
+## A1【H1 修】人工审批 wrapper 强绑定改为 `maintenance_action` 而非 triage 枚举
+
+**问题**：v5 的 `MANUAL_TRIAGES={'needs_review'}` 与真实 `_triage_proposal()`（`memory_ops.py:542`）返回值不符 —— 实际人工待审 triage 包括 `sensitive_room / game_content / playful_speech_mode / uncertain_speech_mode / provenance_unknown / observation_low_confidence / conflicts_with_existing / maintenance_update / maintenance_supersede` 等开放式集合。**大多数人工 approve 会被 v5 kernel 抛 WrongWrapper 打回**。同时两个 wrapper 都含 `MANUAL_TRIAGES` → 不互斥。
+
+**修复**：wrapper 分派改按 `(terminal_state, maintenance_action)` 二维强绑定，triage 只负责判断能否 auto。
+
+```python
+# database._commit_promotion_in_tx 新签名（v5.1）
+AUTO_NORMAL_TRIAGES = frozenset({'auto_approve', 'auto_approve_silent'})
+AUTO_MAINT_TRIAGES  = frozenset({'auto_approve_maintenance'})
+
+def _commit_promotion_in_tx(
+    conn, prop_id, claim_token, mem_payload,
+    terminal_state,               # 'auto_approved' | 'approved'
+    promotion_kind,               # 'normal' | 'maintenance' — wrapper 强制传入
+    reviewed_by,
+    audit_extra=None,
+):
+    prop = _fetch_promotion_row(conn, prop_id)
+    ma = (prop.get('maintenance_action') or '').strip()
+    is_maint_prop = ma in ('update', 'supersede')
+
+    # 1. wrapper ↔ proposal 结构强绑定
+    if promotion_kind == 'normal' and is_maint_prop:
+        raise WrongWrapper(f"normal wrapper cannot promote maintenance proposal (ma={ma!r})")
+    if promotion_kind == 'maintenance' and not is_maint_prop:
+        raise WrongWrapper(f"maintenance wrapper requires ma in (update,supersede), got {ma!r}")
+
+    # 2. auto 终态额外看 triage 是否允许
+    if terminal_state == 'auto_approved':
+        if promotion_kind == 'normal':
+            if prop['triage_reason'] not in AUTO_NORMAL_TRIAGES:
+                raise ValueError(f"auto normal requires triage in {AUTO_NORMAL_TRIAGES}, got {prop['triage_reason']!r}")
+        else:  # maintenance
+            if prop['triage_reason'] not in AUTO_MAINT_TRIAGES:
+                raise ValueError(f"auto maintenance requires triage in {AUTO_MAINT_TRIAGES}, got {prop['triage_reason']!r}")
+    elif terminal_state == 'approved':
+        # manual 分支：只看结构，不枚举 triage（任何非 auto 或 auto_x 都允许人工 approve）
+        pass
+    else:
+        raise ValueError(f"invalid terminal_state: {terminal_state!r}")
+
+    # ... 后续 fencing + set_memory + audit 同 v5
+```
+
+**wrapper 参数固定**：
+| Wrapper | `promotion_kind` (hardcode) | 允许的 `terminal_state` |
+|---|---|---|
+| `commit_promotion_atomic` | `'normal'` | `auto_approved` \| `approved` |
+| `commit_maintenance_promotion_atomic` | `'maintenance'` | `auto_approved` \| `approved` |
+| `adopt_legacy_proposal_atomic`（operator CLI） | 按 proposal.maintenance_action 分流到上面两个 wrapper | `approved` |
+
+**`review_proposal(action='approve')` 补 claim_token 来源**（Codex 明确指出 v5 伪代码缺失）：
+```python
+async def review_proposal(proposal_id, action, reviewed_by, ...):
+    prop = await get_proposal(proposal_id)
+    if action == "approve":
+        if prop["promotion_protocol_version"] == 0:
+            return {"error": "legacy_operator_only"}
+        # 先取 claim（fencing token 必须先拿）
+        claim = database.try_claim_promotion(proposal_id)
+        if not claim.get("ok"):
+            return {"error": "already_in_flight", "detail": claim.get("reason")}
+        claim_token = claim["token"]
+        try:
+            ma = (prop.get("maintenance_action") or "").strip()
+            if ma in ("update", "supersede"):
+                snap = memory_payload.parse_target_snapshot(prop["target_snapshot_json"])
+                mem_payload = memory_payload.promotion_payload_from_proposal(prop, supersedes=[snap.target_id])
+                return database.commit_maintenance_promotion_atomic(
+                    proposal_id, claim_token, mem_payload, snap, reviewed_by,
+                )
+            mem_payload = memory_payload.promotion_payload_from_proposal(prop)
+            return database.commit_promotion_atomic(
+                proposal_id, claim_token, mem_payload, reviewed_by,
+            )
+        except Exception:
+            database.release_promotion_claim(proposal_id, claim_token)
+            raise
+```
+
+**新增反例**（补入 S8）：
+- `test_v51_a1_manual_approve_sensitive_room_ok` — triage='sensitive_room' 人工 approve 走普通 wrapper 成功
+- `test_v51_a1_manual_approve_maintenance_update_via_maintenance_wrapper_only` — maintenance proposal 走普通 wrapper → WrongWrapper；走 maintenance wrapper OK
+
+## A2【H2 修】Canonical fingerprint 补 4 类字段 + 硬 raise
+
+**v5 漏字段（进入正式 memory 或 audit 或审批决策）**：
+
+新增 `memory_payload.canonical_proposal_fingerprint()` 参与字段：
+```python
+CANONICAL_FIELDS_V51 = (
+    # === v5 已有 ===
+    "content", "layer", "proposed_room", "category", "owner_ai",
+    "proposer_ai_id", "source_platform", "source_context",
+    "subject_id", "source_actor_id", "info_type",
+    "tags", "importance", "emotion_arousal",
+    "provenance_type", "confidence", "event_date",
+    "maintenance_action",
+    # === v5.1 新增 ===
+    "created_at",              # 直接进 memory.created_at
+    "source_message_ids",      # audit 事务内读取，漂移改证据链
+    "triage_reason",           # 决定是否允许 auto，人工审核上下文
+    "claim_type",              # fact/observation/hypothesis
+    "speech_mode",             # literal/playful/hypothetical/fictional/uncertain
+    "conversation_kind",       # 决定证据强度
+)
+
+def canonical_proposal_fingerprint(proposal, target_snapshot=None):
+    if proposal.get("maintenance_action"):
+        if target_snapshot is None:
+            raise ValueError("maintenance proposal requires target_snapshot for fingerprint")  # ← 硬 raise，非 assert
+    ...
+```
+
+**TargetSnapshot 新增 `reason` 字段**（进入 supersede comment/history/audit）：
+```python
+class TargetSnapshot(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    target_id: str
+    expected_status: str
+    expected_updated_at: str
+    relation: str
+    reason: str = ""             # ← v5.1 新增，会写入 supersede comment
+```
+
+**fingerprint 内 snapshot 段**同步加 `reason`。
+
+**测试参数化**（Codex 要求"不只抽测 tags/importance/owner_ai"）：
+```python
+@pytest.mark.parametrize("field", CANONICAL_FIELDS_V51)
+def test_v51_a2_fingerprint_covers_every_canonical_field(field):
+    """对每个 canonical 字段：修改后 fingerprint 必变。"""
+```
+
+## A3【M2 修】Snapshot 解析失败 → 事务外标 failed
+
+**问题**：v5 写 `commit_maintenance_promotion_atomic()` 内 `parse_target_snapshot` 失败后直接调 `mark_promotion_failed()`，但后者会开新事务，Step 0-A 的 nested-transaction 禁止会抛 error。
+
+**修复流程**（写死到 wrapper 签名）：
+```python
+def commit_maintenance_promotion_atomic(prop_id, claim_token, mem_payload, snap, reviewed_by):
+    """caller 已在事务外完成 parse_target_snapshot(...)，此函数只接 model 实例。"""
+    with _write_transaction() as conn:
+        # snap 已是 TargetSnapshot 实例；若为 None 直接 raise
+        if snap is None or not isinstance(snap, TargetSnapshot):
+            raise ValueError("valid TargetSnapshot required")
+        # ... drift gate → supersede → kernel commit
+
+# review_proposal 侧处理：
+try:
+    snap = memory_payload.parse_target_snapshot(prop["target_snapshot_json"])
+except (ValidationError, ValueError) as e:
+    # 事务外调用，安全
+    database.mark_promotion_failed(prop["id"], f"snapshot_invalid: {e}")
+    database.release_promotion_claim(prop["id"], claim_token)
+    return {"error": "snapshot_invalid", "detail": str(e)}
+```
+
+Recovery 循环同样在事务外先 parse，失败 → mark_failed + 跳过。
+
+## A4【M1 修】Operator plan 文件强化：resolve + symlink + owner + mode
+
+**v5 白名单目录检查不够**，`/etc/memhub/operator-plans/` 里的 symlink 可指向 `/tmp/attacker.json`。
+
+**CLI 加载 plan 前的检查清单**（`tools/audit_stuck_proposals.py` `_load_plan()`）：
+```python
+ALLOWED_PLAN_DIRS = [Path("/etc/memhub/operator-plans"), Path.home() / ".memhub/operator-plans"]
+
+def _load_plan(plan_path_str: str) -> dict:
+    raw_path = Path(plan_path_str)
+    if raw_path.is_symlink():
+        raise SecurityError(f"plan path must not be a symlink: {plan_path_str}")
+    resolved = raw_path.resolve(strict=True)
+    if resolved != raw_path.absolute():
+        raise SecurityError(f"plan path resolves differently: {plan_path_str} → {resolved}")
+    if not resolved.is_file():
+        raise SecurityError(f"plan path is not a regular file: {resolved}")
+    if not any(resolved.is_relative_to(d.resolve()) for d in ALLOWED_PLAN_DIRS):
+        raise SecurityError(f"plan {resolved} outside allowed dirs {ALLOWED_PLAN_DIRS}")
+    st = resolved.stat()
+    if st.st_uid != os.getuid():
+        raise SecurityError(f"plan {resolved} owned by uid={st.st_uid}, not caller uid={os.getuid()}")
+    if st.st_mode & 0o022:  # group/world writable
+        raise SecurityError(f"plan {resolved} has group/world write bits: {oct(st.st_mode)}")
+    data = json.loads(resolved.read_text(encoding='utf-8'))
+    # plan_sha256 是完整性 checksum（不是身份认证），文档措辞更正
+    stated_hash = data.pop('plan_sha256', None)
+    computed = hashlib.sha256(
+        json.dumps(data, sort_keys=True, ensure_ascii=False).encode('utf-8')
+    ).hexdigest()
+    if stated_hash != computed:
+        raise SecurityError(f"plan checksum mismatch: stated {stated_hash}, computed {computed}")
+    data['plan_sha256'] = stated_hash
+    return data
+```
+
+**文档措辞更正**：v5 中 "plan_sha256 自签" → v5.1 改称 **"完整性 checksum"**。真正的授权边界是文件系统权限 + operator shell 访问。
+
+## v5.1 其他 Low（Codex Medium 4 拆到实现层）
+
+- **正常 create ID 保持 `_gen_id()`**：`build_new_memory_payload` 的 `override_id` 参数在 memory_ops.remember() 调用时始终传 `_gen_id()`，只有 promotion 路径传 `mem_from_prop_{id}`。避免正常 create 语义无关变化。
+- **auto maintenance snapshot `expected_status='active'` 硬约束**：kernel 内加一条 `if promotion_kind=='maintenance' and terminal_state=='auto_approved' and snap.expected_status != 'active': raise`。archived/superseded target 只能人工重出 proposal。
+- **旧 proposal `updated_at=''` 处理**：CLI report 阶段发现 target 的 `updated_at` 空 → 用当前 target 实际 updated_at 作 snapshot（生成 plan 时补稳定值），而不是让 Pydantic 判 invalid。
+
+---
+
+## v5.1 修改点清单（施工时直接改这些函数）
+
+| 位置 | v5 版 | v5.1 版 |
+|---|---|---|
+| `_commit_promotion_in_tx` | 参数 `allowed_triages` | 参数 `promotion_kind` (`'normal'`\|`'maintenance'`) |
+| `MANUAL_TRIAGES` 常量 | 存在 | **删除**（不再枚举人工 triage） |
+| `AUTO_NORMAL_TRIAGES` / `AUTO_MAINT_TRIAGES` | — | 新增，只用于 auto 分支 |
+| wrapper 参数 | `allowed_triages=frozenset(...)` | `promotion_kind='normal'` \| `'maintenance'` |
+| `review_proposal(action='approve')` 伪代码 | `claim_token` 无来源 | 显式 `try_claim_promotion` + 失败 release |
+| `CANONICAL_FIELDS` | 15 项 | +6 项 = 21 项（含 created_at / source_message_ids / triage_reason / claim_type / speech_mode / conversation_kind） |
+| `TargetSnapshot` | 4 字段 | +`reason` = 5 字段 |
+| fingerprint 缺 snapshot | `assert` | **`raise ValueError`** |
+| `commit_maintenance_promotion_atomic` | 内部 parse snapshot + mark_failed | caller 在事务外 parse + mark_failed；wrapper 只收 `TargetSnapshot` 实例 |
+| operator plan 加载 | 白名单目录 | +resolve / +symlink 拒 / +uid 校验 / +mode 校验 |
+| plan_sha256 措辞 | "自签" | "完整性 checksum" |
+
+## v5.1 后总反例数：14 组（v5 的 12 + A1×2）
+
+## v5.1 工期增量
+
+**+0 天**（这 4 条都在 S3 / S4 / S5 / S6 施工范围内一次做到位，不新开 step）
+
+**总工期依然 6.5 天**。
+
