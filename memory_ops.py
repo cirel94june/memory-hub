@@ -14,6 +14,7 @@ from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
 from embedding import get_embedding, pack_embedding, unpack_embedding, cosine_similarity
 import github_store as store
 import database
+import memory_payload
 import analyzer
 
 logger = logging.getLogger("memory_hub.ops")
@@ -383,40 +384,26 @@ async def remember(
                 mem_id = existing_id or _gen_id()
                 now = _now()
 
-                mem = {
-                    "id": mem_id,
-                    "content": content,
-                    "layer": layer,
-                    "room": room,
-                    "category": category,
-                    "owner_ai": owner_ai,
-                    "importance": importance,
-                    "emotion_arousal": emotion_arousal,
-                    "valence": valence,
-                    "domain": json.dumps(domain),
-                    "decay_score": 1.0,
-                    "provenance_type": provenance_type,
-                    "fact_confidence": fact_confidence,
-                    "activation_count": 0,
-                    "last_activated": "",
-                    "source_ai": source_ai,
-                    "source_platform": source_platform,
-                    "tags": json.dumps(tags or []),
-                    "linked_memories": json.dumps(linked_ids),
-                    "supersedes": json.dumps(superseded_ids),
-                    "event_date": event_date,
-                    "source_context": source_context,
-                    "subject_id": subject_id,
-                    "source_actor_id": source_actor_id,
-                    "info_type": info_type or "fact",
-                    "comments": [],
-                    "embedding": pack_embedding(query_vec) if query_vec else None,
-                    "status": "active",
-                    "client_request_id": client_request_id,
-                    "created_at": now,
-                    "updated_at": now,
-                    "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
-                }
+                # v5.1 S2b: shared builder — same normal-create shape as
+                # promotion_payload_from_proposal so both paths stay drift-free.
+                mem = memory_payload.build_new_memory_payload(
+                    content=content, layer=layer, room=room, category=category,
+                    owner_ai=owner_ai, importance=importance,
+                    emotion_arousal=emotion_arousal, valence=valence,
+                    domain=domain, source_ai=source_ai,
+                    source_platform=source_platform, subject_id=subject_id,
+                    source_actor_id=source_actor_id, info_type=info_type,
+                    event_date=event_date, source_context=source_context,
+                    provenance_type=provenance_type,
+                    fact_confidence=fact_confidence,
+                    tags=(tags or []),
+                    linked_memories=linked_ids,
+                    supersedes=superseded_ids,
+                    embedding=pack_embedding(query_vec) if query_vec else None,
+                    client_request_id=client_request_id,
+                    override_id=mem_id, override_now=now,
+                    origin="normal_create",
+                )
 
                 store.set_memory(mem)
 
@@ -444,40 +431,22 @@ async def remember(
     now = _now()
     vec = await get_embedding(content)
 
-    mem = {
-        "id": mem_id,
-        "content": content,
-        "layer": layer,
-        "room": room,
-        "category": category,
-        "owner_ai": owner_ai,
-        "importance": importance,
-        "emotion_arousal": emotion_arousal,
-        "valence": valence,
-        "domain": json.dumps(domain),
-        "decay_score": 1.0,
-        "provenance_type": provenance_type,
-        "fact_confidence": fact_confidence,
-        "activation_count": 0,
-        "last_activated": "",
-        "source_ai": source_ai,
-        "source_platform": source_platform,
-        "tags": json.dumps(tags or []),
-        "linked_memories": "[]",
-        "supersedes": "[]",
-        "event_date": event_date,
-        "source_context": source_context,
-        "subject_id": subject_id,
-        "source_actor_id": source_actor_id,
-        "info_type": info_type or "fact",
-        "comments": [],
-        "embedding": pack_embedding(vec) if vec else None,
-        "status": "active",
-        "client_request_id": client_request_id,
-        "created_at": now,
-        "updated_at": now,
-        "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
-    }
+    # v5.1 S2b: shared builder (no-relation path).
+    mem = memory_payload.build_new_memory_payload(
+        content=content, layer=layer, room=room, category=category,
+        owner_ai=owner_ai, importance=importance,
+        emotion_arousal=emotion_arousal, valence=valence,
+        domain=domain, source_ai=source_ai,
+        source_platform=source_platform, subject_id=subject_id,
+        source_actor_id=source_actor_id, info_type=info_type,
+        event_date=event_date, source_context=source_context,
+        provenance_type=provenance_type, fact_confidence=fact_confidence,
+        tags=(tags or []),
+        embedding=pack_embedding(vec) if vec else None,
+        client_request_id=client_request_id,
+        override_id=mem_id, override_now=now,
+        origin="normal_create",
+    )
 
     store.set_memory(mem)
     result = {"id": mem_id, "status": "created", "category": category, "domain": domain, "linked": [], "superseded": []}
@@ -1056,26 +1025,57 @@ async def _create_proposal(
                     return {"id": target_id, "status": "no_change", "maintenance_action": "no_change", "reason": reason}
 
                 if _is_auto_executable(action, provenance_type):
+                    if action in ("update", "supersede"):
+                        # v5.1 S5 Entry B: kernel-driven maintenance promotion.
+                        # Old flow: pre-supersede target + separate promote in
+                        # separate tx (crash left orphan). New flow: proposal
+                        # carries snapshot; commit_maintenance_promotion_atomic
+                        # does supersede+insert+audit in one tx via kernel.
+                        if not _can_supersede(provenance_type, target_mem):
+                            _write_audit(
+                                action, target_id, content,
+                                f"blocked by provenance guard: {reason}",
+                                {}, {}, False, source_ai,
+                            )
+                            return None
+                        snapshot_json = json.dumps({
+                            "target_id": target_id,
+                            "expected_status": target_mem.get("status", "active"),
+                            "expected_updated_at": target_mem.get("updated_at", ""),
+                            "relation": action,
+                            "reason": reason,
+                        }, ensure_ascii=False)
+                        proposal["maintenance_action"] = action
+                        proposal["maintenance_target_id"] = target_id
+                        proposal["triage_reason"] = "auto_approve_maintenance"
+                        proposal["target_snapshot_json"] = snapshot_json
+                        proposal["status"] = "pending"
+                        database.insert_proposal(proposal)
+                        promo = await _promote_via_kernel(
+                            prop_id, reviewed_by="system",
+                            terminal_state="auto_approved",
+                        )
+                        if promo.get("error"):
+                            return {
+                                "id": prop_id, "status": "proposed",
+                                "maintenance_action": action,
+                                "error": promo.get("error"),
+                                "detail": promo.get("detail"),
+                            }
+                        return {
+                            "id": promo["memory_id"],
+                            "proposal_id": prop_id,
+                            "status": "created",
+                            "maintenance_action": action,
+                            "superseded_id": target_id,
+                            "superseded_target": target_id,
+                        }
+                    # Non-promotion maintenance action (annotate / supplement /
+                    # resolve_thread / reopen_thread) keeps its own executor.
                     result = await _execute_maintenance_action(
                         action, target_mem, content, reason, source_ai, provenance_type,
                     )
                     if result:
-                        if action in ("update", "supersede") and result.get("superseded_id"):
-                            proposal["maintenance_action"] = action
-                            proposal["maintenance_target_id"] = target_id
-                            proposal["status"] = "pending"
-                            database.insert_proposal(proposal)
-                            try:
-                                create_result = await _promote_proposal(proposal)
-                                mem_id = create_result.get("id", "")
-                                database.update_proposal_status(prop_id, "auto_approved", "system", applied_memory_id=mem_id)
-                                create_result["proposal_id"] = prop_id
-                                create_result["maintenance_action"] = action
-                                create_result["superseded_id"] = result.get("superseded_id")
-                                return create_result
-                            except Exception as e:
-                                database.update_proposal_status(prop_id, "promotion_failed", "system", failure_reason=str(e))
-                                return {"id": prop_id, "status": "proposed", "maintenance_action": action, "error": str(e)}
                         return result
 
                 # 不能自动执行的动作 → 创建 pending proposal 并标记维护动作
@@ -1111,32 +1111,33 @@ async def _create_proposal(
             proposal["tags"] = json.dumps(existing_tags)
         proposal["status"] = "pending"
         database.insert_proposal(proposal)
-        try:
-            result = await _promote_proposal(proposal)
-            mem_id = result.get("id", "")
-            database.update_proposal_status(
-                prop_id, "auto_approved", "system", applied_memory_id=mem_id,
-            )
-            _write_audit("create", mem_id, content, f"auto_approve: {decision}", {}, {"id": mem_id}, True, source_ai)
-            result["proposal_id"] = prop_id
-            result["proposal_status"] = "auto_approved"
-            result["maintenance_action"] = "create"
-            if decision == "auto_approve_silent":
-                result["recall_policy"] = "silent"
-            return result
-        except Exception as e:
-            database.update_proposal_status(
-                prop_id, "promotion_failed", "system", failure_reason=str(e),
-            )
-            logger.error(f"Proposal auto-promote failed: {prop_id} - {e}")
+        # v5.1 S5 Entry A: kernel-driven auto promotion. Replaces the old
+        # _promote_proposal (which used remember(quick=False) — mostly
+        # duplicated dedup work and had no fencing/atomicity).
+        result = await _promote_via_kernel(
+            prop_id, reviewed_by="system", terminal_state="auto_approved",
+        )
+        if result.get("error"):
+            logger.error(f"Proposal auto-promote failed: {prop_id} - {result}")
             return {
-                "id": prop_id,
-                "status": "proposed",
+                "id": prop_id, "status": "proposed",
                 "proposal_status": "promotion_failed",
-                "triage_reason": decision,
-                "maintenance_action": "create",
-                "error": str(e),
+                "triage_reason": decision, "maintenance_action": "create",
+                "error": result.get("error"), "detail": result.get("detail"),
             }
+        mem_id = result["memory_id"]
+        _write_audit("create", mem_id, content,
+                     f"auto_approve: {decision}", {}, {"id": mem_id}, True, source_ai)
+        out = {
+            "id": mem_id,
+            "proposal_id": prop_id,
+            "proposal_status": "auto_approved",
+            "status": "created",
+            "maintenance_action": "create",
+        }
+        if decision == "auto_approve_silent":
+            out["recall_policy"] = "silent"
+        return out
     else:
         proposal["status"] = "pending"
         database.insert_proposal(proposal)
@@ -1151,8 +1152,123 @@ async def _create_proposal(
         }
 
 
+# ═════════════════════════════════════════════════════════════════════
+# v5.1 S5 — kernel-driven promotion (replaces the old three-step
+# insert-then-supersede-then-promote flow that could crash mid-way).
+# ═════════════════════════════════════════════════════════════════════
+
+
+async def _promote_via_kernel(
+    prop_id: str, *, reviewed_by: str, terminal_state: str,
+    human_retry: bool = False,
+) -> dict:
+    """Common pattern: claim → embedding OUTSIDE tx → dispatch to wrapper.
+    Wrapper (via kernel) builds payload from proposal row itself; caller
+    only supplies `embedding`. mark_promotion_failed on exception.
+
+    v5.1 H1: caller no longer passes a payload — kernel is the sole builder
+    to prevent payload-vs-proposal drift.
+    v5.1 H5: `human_retry=True` lets the human path reclaim a
+    promotion_failed row atomically (auto sweep never sets this).
+    """
+    import memory_payload
+    claim = database.try_claim_promotion(prop_id, human_retry=human_retry)
+    if not claim.get("ok"):
+        return {"error": "claim_refused", "proposal_id": prop_id,
+                "reason": claim.get("reason")}
+    claim_token = claim["token"]
+    try:
+        prop = database.get_proposal(prop_id)
+        if not prop:
+            database.release_promotion_claim(prop_id, claim_token)
+            return {"error": "not_found", "proposal_id": prop_id}
+
+        vec = await get_embedding(prop["content"])
+        embedding = pack_embedding(vec) if vec else None
+
+        ma = (prop.get("maintenance_action") or "").strip()
+        if ma in database.MAINT_MA_VALUES:
+            snap_raw = (prop.get("target_snapshot_json") or "").strip()
+            if not snap_raw:
+                database.mark_promotion_failed(
+                    prop_id, claim_token, "maintenance_missing_snapshot",
+                )
+                return {"error": "maintenance_missing_snapshot",
+                        "proposal_id": prop_id}
+            try:
+                snap = memory_payload.parse_target_snapshot(snap_raw)
+            except Exception as e:
+                database.mark_promotion_failed(
+                    prop_id, claim_token, f"snapshot_invalid: {e}",
+                )
+                return {"error": "snapshot_invalid", "proposal_id": prop_id,
+                        "detail": str(e)}
+            try:
+                r = database.commit_maintenance_promotion_atomic(
+                    prop_id, claim_token, snap,
+                    reviewed_by=reviewed_by, embedding=embedding,
+                    terminal_state=terminal_state,
+                )
+                try:
+                    m_new = database.get_memory(r["memory_id"])
+                    if m_new is not None:
+                        store.set_memory(m_new)
+                    m_old = database.get_memory(snap.target_id)
+                    if m_old is not None:
+                        store.set_memory(m_old)
+                except Exception as mirror_e:
+                    logger.warning("store mirror after maintenance promotion failed: %s", mirror_e)
+                return r
+            except database.MaintenanceDrift as e:
+                database.mark_promotion_failed(
+                    prop_id, claim_token, f"target_drifted: {e}",
+                )
+                return {"error": "target_drifted", "proposal_id": prop_id,
+                        "detail": str(e)}
+        elif ma in database.NORMAL_MA_VALUES:
+            r = database.commit_promotion_atomic(
+                prop_id, claim_token,
+                reviewed_by=reviewed_by, embedding=embedding,
+                terminal_state=terminal_state,
+            )
+            try:
+                mem = database.get_memory(r["memory_id"])
+                if mem is not None:
+                    store.set_memory(mem)
+            except Exception as mirror_e:
+                logger.warning("store mirror after promotion failed: %s", mirror_e)
+            return r
+        else:
+            database.mark_promotion_failed(
+                prop_id, claim_token,
+                f"unsupported_maintenance_action: {ma!r}",
+            )
+            return {"error": "unsupported_maintenance_action",
+                    "proposal_id": prop_id, "maintenance_action": ma}
+
+    except database.PromotionClaimLost as e:
+        logger.warning("Promotion claim lost for %s: %s", prop_id, e)
+        return {"error": "claim_lost", "proposal_id": prop_id,
+                "detail": str(e)}
+    except (database.WrongWrapper, database.UnsupportedMaintenanceAction) as e:
+        database.mark_promotion_failed(prop_id, claim_token, str(e))
+        return {"error": type(e).__name__, "proposal_id": prop_id,
+                "detail": str(e)}
+    except Exception as e:
+        logger.exception("Unexpected promotion failure for %s", prop_id)
+        database.mark_promotion_failed(
+            prop_id, claim_token, f"{type(e).__name__}: {e}",
+        )
+        return {"error": "promotion_failed", "proposal_id": prop_id,
+                "detail": str(e)}
+
+
 async def _promote_proposal(proposal: dict) -> dict:
-    """Promote an approved proposal to a canonical memory via remember(quick=False).
+    """DEPRECATED (v5.1 S5): kept only for legacy test fixtures. New code
+    must call _promote_via_kernel. Left as-is until S2b migration lands
+    to avoid churn in tests that spy on this helper.
+
+    Promote an approved proposal to a canonical memory via remember(quick=False).
 
     Goes through the full merge/supersede/relation-classify path,
     so promoted proposals don't create duplicates or skip supersede logic.
@@ -1194,43 +1310,90 @@ async def list_proposals(status: str = "pending", limit: int = 50, page: int = 1
 async def review_proposal(
     proposal_id: str, action: str, reviewed_by: str = "user", reject_reason: str = "",
 ) -> dict:
+    """v5.1 S5 Entry C + reject/adopt dispatch.
+
+    - action='adopt_legacy' is REFUSED at MCP/REST layer (returns
+      legacy_operator_only). The only path for v=0 legacy adoption is
+      tools/audit_stuck_proposals.py --adopt-plan on the VPS shell.
+      This is a Critical: reviewed_by is caller-supplied and cannot be
+      trusted to be Ceci; a v=0 write from any AI must be blocked here.
+    """
     proposal = database.get_proposal(proposal_id)
     if not proposal:
         return {"error": f"Proposal {proposal_id} not found"}
     if proposal["status"] not in ("pending", "promotion_failed"):
         return {"error": f"Proposal already {proposal['status']}"}
 
+    if action == "adopt_legacy":
+        return {
+            "error": "legacy_operator_only",
+            "hint": ("v=0 legacy adoption requires the operator CLI "
+                     "(tools/audit_stuck_proposals.py --adopt-plan) "
+                     "so that reviewed_by cannot be spoofed by any caller."),
+        }
+
     if action == "approve":
-        try:
-            result = await _promote_proposal(proposal)
-            mem_id = result.get("id", "")
-            database.update_proposal_status(
-                proposal_id, "approved", reviewed_by, applied_memory_id=mem_id,
-            )
-            result["proposal_id"] = proposal_id
-            result["proposal_status"] = "approved"
-            return result
-        except Exception as e:
-            database.update_proposal_status(
-                proposal_id, "promotion_failed", reviewed_by, failure_reason=str(e),
-            )
-            return {"proposal_id": proposal_id, "status": "promotion_failed", "error": str(e)}
+        # Legacy v=0 rows cannot be approved via MCP even by manual click.
+        if proposal.get("promotion_protocol_version", 0) == 0:
+            return {
+                "error": "legacy_operator_only",
+                "proposal_id": proposal_id,
+                "hint": ("This is a pre-v5.1 legacy proposal; approve it via "
+                         "the operator CLI adoption path."),
+            }
+        # v5.1 H5: human_retry=True lets Ceci reclaim a promotion_failed row
+        # atomically (auto sweep never sets this — a failed row stays failed
+        # for the auto path until the human either retries or rejects).
+        human_retry = proposal.get("status") == "promotion_failed"
+        result = await _promote_via_kernel(
+            proposal_id, reviewed_by=reviewed_by, terminal_state="approved",
+            human_retry=human_retry,
+        )
+        if result.get("error"):
+            return {
+                "proposal_id": proposal_id,
+                "proposal_status": "promotion_failed",
+                "error": result.get("error"),
+                "detail": result.get("detail"),
+            }
+        # Legacy shape parity: callers (frontend + tests) expect
+        # {id, status:'created', proposal_id, proposal_status:'approved'}.
+        return {
+            "id": result["memory_id"],
+            "status": "created",
+            "proposal_id": proposal_id,
+            "proposal_status": "approved",
+            "reviewed_by": reviewed_by,
+        }
     elif action == "reject":
-        database.update_proposal_status(proposal_id, "rejected", reviewed_by, reject_reason)
-        return {"proposal_id": proposal_id, "status": "rejected", "reason": reject_reason}
+        # v5.1 S4: CAS reject. Never races with the auto worker.
+        return database.reject_proposal_atomic(
+            proposal_id, reviewed_by, reject_reason,
+        )
     else:
         return {"error": f"Unknown action: {action}"}
 
 
 async def retriage_pending_proposals() -> dict:
-    """Re-evaluate all pending proposals with current triage rules.
-    Auto-approve those that now pass; leave others as pending."""
+    """v5.1 S5 Entry D: REPORT-ONLY. Re-runs the triage rules on every
+    pending proposal and returns what would happen IF the batch were run
+    for real — but writes nothing to the DB.
+
+    Rationale: the pre-v5.1 retriage handler could sweep up 40 stuck
+    legacy rows in one click and put the whole DB in an inconsistent
+    state if any promotion crashed mid-batch. Ceci审 memory content
+    one proposal at a time; batch changes are Codex's Critical.
+    """
     all_pending = database.list_proposals(status="pending", limit=500, offset=0)
-    approved = 0
-    failed = 0
-    still_pending = 0
+    would_auto = 0
+    would_stay = 0
+    legacy_v0 = 0
+    breakdown: dict[str, int] = {}
     for prop in all_pending:
-        # Re-derive claim_type/speech_mode if provenance changed
+        if prop.get("promotion_protocol_version", 0) == 0:
+            legacy_v0 += 1
+            breakdown["legacy_v0"] = breakdown.get("legacy_v0", 0) + 1
+            continue
         prov = (prop.get("provenance_type") or "").strip()
         if not prov and "auto_capture" in (prop.get("source_platform") or ""):
             prov = "ai_summary"
@@ -1240,26 +1403,22 @@ async def retriage_pending_proposals() -> dict:
         if not prop.get("speech_mode") or prop.get("speech_mode") == "uncertain":
             prop["speech_mode"] = _provenance_to_speech_mode(prov)
         decision = _triage_proposal(prop)
+        breakdown[decision] = breakdown.get(decision, 0) + 1
         if decision in ("auto_approve", "auto_approve_silent"):
-            if decision == "auto_approve_silent":
-                prop["importance"] = min(float(prop.get("importance", 0.5)), 0.4)
-                existing_tags = json.loads(prop.get("tags", "[]")) if isinstance(prop.get("tags"), str) else (prop.get("tags") or [])
-                if "auto_observation" not in existing_tags:
-                    existing_tags.append("auto_observation")
-                prop["tags"] = json.dumps(existing_tags)
-            try:
-                result = await _promote_proposal(prop)
-                mem_id = result.get("id", "")
-                database.update_proposal_status(
-                    prop["id"], "auto_approved", "retriage", applied_memory_id=mem_id,
-                )
-                approved += 1
-            except Exception as e:
-                logger.error(f"Retriage promote failed: {prop['id']} - {e}")
-                failed += 1
+            would_auto += 1
         else:
-            still_pending += 1
-    return {"approved": approved, "failed": failed, "still_pending": still_pending, "total": len(all_pending)}
+            would_stay += 1
+    return {
+        "mode": "report_only",
+        "total": len(all_pending),
+        "legacy_v0_skipped": legacy_v0,
+        "would_auto_approve": would_auto,
+        "would_stay_pending": would_stay,
+        "breakdown_by_triage": breakdown,
+        "note": ("Retriage does not write. To promote a specific proposal, "
+                 "click Approve in the UI (v=2 rows only) or run the "
+                 "operator CLI adopt-plan (v=0 legacy)."),
+    }
 
 
 def _find_similar_candidates(query_vec, domain: list, threshold: float = 0.55, top_k: int = 5) -> list[dict]:

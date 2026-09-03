@@ -78,6 +78,24 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logging.getLogger("main").exception(
                 "pending_sweep failed to start (continuing without it): %s", e)
+
+        # v5.1 S7: proposal_sweep — recovers pending proposals whose inline
+        # promotion never completed (crash between insert_proposal and
+        # commit_promotion_atomic). Uses the same kernel path so recovery
+        # produces identical rows to the happy path.
+        proposal_sweep_task = None
+        proposal_sweep_shutdown = asyncio.Event()
+        try:
+            import proposal_sweep as _proposal_sweep
+            proposal_sweep_task = asyncio.create_task(
+                _proposal_sweep.sweep_loop(proposal_sweep_shutdown)
+            )
+            print("[Memory Hub] Proposal sweep loop started "
+                  f"(interval={_proposal_sweep.SWEEP_INTERVAL_SECONDS}s "
+                  f"batch={_proposal_sweep.SWEEP_BATCH_SIZE})")
+        except Exception as e:
+            logging.getLogger("main").exception(
+                "proposal_sweep failed to start (continuing without it): %s", e)
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -95,6 +113,10 @@ async def lifespan(app: FastAPI):
             cancel_list = [daemon_task, lag_task, bg_worker_task]
             if sweep_task is not None:
                 cancel_list.append(sweep_task)
+            # v5.1 S7: cooperative shutdown for proposal_sweep.
+            if proposal_sweep_task is not None:
+                proposal_sweep_shutdown.set()
+                cancel_list.append(proposal_sweep_task)
             for t in cancel_list:
                 t.cancel()
             await asyncio.gather(*cancel_list, return_exceptions=True)
