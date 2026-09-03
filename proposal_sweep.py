@@ -31,33 +31,31 @@ SWEEP_BATCH_SIZE = int(os.environ.get("HUB_PROPOSAL_SWEEP_BATCH", "20"))
 
 
 async def sweep_once() -> dict:
-    """Run one pass over pending v=2 proposals and re-drive promotion.
+    """Run one pass over recoverable auto-promotion proposals.
+
+    v5.1 S7 Critical fix: uses database.list_recoverable_promotions which
+    filters IN SQL for auto-triage + kind consistency + v=2 + reclaimable.
+    Sweep NEVER touches rows that need human review (sensitive_room,
+    needs_review, etc.) — those stay pending until Ceci clicks Approve.
+
+    Hardcoded terminal_state='auto_approved' — the SQL guarantees every
+    row here came from an auto triage, so the kernel's auto whitelist
+    check will always pass.
 
     Returns {'scanned': N, 'promoted': N, 'skipped': N, 'errors': N}.
     """
     scanned = promoted = skipped = errors = 0
-    rows = database.list_proposals(
-        status="pending", limit=SWEEP_BATCH_SIZE, offset=0,
-    )
+    rows = database.list_recoverable_promotions(limit=SWEEP_BATCH_SIZE)
     for prop in rows:
-        # Sweep only touches v=2 rows. try_claim_promotion refuses v=0
-        # (with reason 'v0_legacy'), so this check is a fast-path exit.
-        if prop.get("promotion_protocol_version", 0) != 2:
-            skipped += 1
-            continue
         scanned += 1
-        # Sweep is auto-only (never sets human_retry=True), so
-        # promotion_failed rows are ignored and stay for human review.
         result = await memory_ops._promote_via_kernel(
             prop["id"], reviewed_by="proposal_sweep",
-            terminal_state="auto_approved" if prop.get("triage_reason") in (
-                "auto_approve", "auto_approve_silent", "auto_approve_maintenance",
-            ) else "approved",
+            terminal_state="auto_approved",
             human_retry=False,
         )
         if result.get("error"):
-            # 'claim_refused' with reason 'held_by_active_worker' is
-            # expected (another live worker owns it) — count as skipped.
+            # Benign races (another live worker grabbed it, row was just
+            # rejected, etc.) count as skipped, not errors.
             if result.get("error") == "claim_refused" and result.get("reason") in (
                 "held_by_active_worker", "v0_legacy", "not_pending",
                 "terminalized", "not_found",

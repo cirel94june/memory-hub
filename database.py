@@ -2001,6 +2001,63 @@ def count_proposals(status: str = "pending") -> int:
     return row[0] if row else 0
 
 
+def list_recoverable_promotions(
+    limit: int, ttl_minutes: int | None = None,
+) -> list[dict]:
+    """v5.1 S7 Critical fix: SQL-level filter for the sweep worker.
+
+    Returns ONLY rows the auto sweep is allowed to promote — never a row
+    that requires human review. Filter is applied before LIMIT so a wall
+    of pending needs_review rows can't starve real auto-approve recoveries.
+
+    Selection criteria:
+      * status = 'pending'
+      * promotion_protocol_version = 2 (v0 legacy excluded)
+      * claim is empty OR older than TTL
+      * (triage_reason in AUTO_NORMAL_TRIAGES AND ma in NORMAL_MA_VALUES)
+        OR
+        (triage_reason = auto_approve_maintenance AND ma in MAINT_MA_VALUES)
+
+    Sweep MUST call promotion with terminal_state='auto_approved' for every
+    row this helper returns — the SQL guarantees that's what the triage
+    permitted.
+    """
+    if ttl_minutes is None:
+        ttl_minutes = PROMOTION_STALE_MINUTES
+    stale_before = (
+        datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
+    ).isoformat()
+    normal_placeholders = ",".join(["?"] * len(AUTO_NORMAL_TRIAGES))
+    normal_ma_placeholders = ",".join(["?"] * len(NORMAL_MA_VALUES))
+    maint_placeholders = ",".join(["?"] * len(AUTO_MAINT_TRIAGES))
+    maint_ma_placeholders = ",".join(["?"] * len(MAINT_MA_VALUES))
+    sql = (
+        "SELECT * FROM proposals "
+        "WHERE status = 'pending' "
+        "  AND promotion_protocol_version = 2 "
+        "  AND (promotion_claim_id = '' OR promotion_claim_at < ?) "
+        "  AND ("
+        f"    (triage_reason IN ({normal_placeholders}) "
+        f"       AND maintenance_action IN ({normal_ma_placeholders})) "
+        "    OR "
+        f"    (triage_reason IN ({maint_placeholders}) "
+        f"       AND maintenance_action IN ({maint_ma_placeholders}))"
+        "  ) "
+        "ORDER BY created_at ASC LIMIT ?"
+    )
+    params = (
+        stale_before,
+        *sorted(AUTO_NORMAL_TRIAGES),
+        *sorted(NORMAL_MA_VALUES),
+        *sorted(AUTO_MAINT_TRIAGES),
+        *sorted(MAINT_MA_VALUES),
+        int(limit),
+    )
+    conn = _get_read_conn()
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ═════════════════════════════════════════════════════════════════════
 # v5.1 S3+S4 — Promotion kernel + public wrappers.
 #
