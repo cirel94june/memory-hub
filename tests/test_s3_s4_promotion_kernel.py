@@ -70,6 +70,9 @@ def _mk_pending_v2(pid: str, triage: str = "auto_approve",
     }
     if target_snapshot is not None:
         row["target_snapshot_json"] = json.dumps(target_snapshot)
+        # v5.1 H1: kernel cross-checks proposal.maintenance_target_id ==
+        # snapshot.target_id, so seed helper mirrors it.
+        row["maintenance_target_id"] = target_snapshot.get("target_id", "")
     database.insert_proposal(row)
 
 
@@ -118,7 +121,7 @@ def test_claim_not_pending_refused(db):
     conn.execute("UPDATE proposals SET status='approved' WHERE id='p1'"); conn.commit(); conn.close()
     r = database.try_claim_promotion("p1")
     assert r["ok"] is False
-    assert r["reason"] == "not_pending"
+    assert r["reason"] == "terminalized"
 
 
 def test_claim_currently_held_refused(db):
@@ -208,15 +211,15 @@ def test_kernel_normal_auto_happy_path(db):
     _mk_pending_v2("p1", triage="auto_approve")
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_new_1")
-    r = database.commit_promotion_atomic("p1", c["token"], payload, reviewed_by="system")
-    assert r["memory_id"] == "mem_new_1"
+    r = database.commit_promotion_atomic("p1", c["token"], reviewed_by="system")
+    assert r["memory_id"] == "mem_from_prop_p1"
     assert r["terminal_state"] == "auto_approved"
     # memory row exists
-    assert database.get_memory("mem_new_1") is not None
+    assert database.get_memory("mem_from_prop_p1") is not None
     # proposal terminalized, applied_memory_id set, claim cleared
     row = database.get_proposal("p1")
     assert row["status"] == "auto_approved"
-    assert row["applied_memory_id"] == "mem_new_1"
+    assert row["applied_memory_id"] == "mem_from_prop_p1"
     assert row["promotion_claim_id"] == ""
 
 
@@ -229,7 +232,7 @@ def test_kernel_manual_approve_accepts_non_auto_triage(db):
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_manual_1")
     r = database.commit_promotion_atomic(
-        "p1", c["token"], payload, reviewed_by="ceci",
+        "p1", c["token"], reviewed_by="ceci",
         terminal_state="approved",
     )
     assert r["terminal_state"] == "approved"
@@ -247,9 +250,9 @@ def test_kernel_wrong_wrapper_maintenance_via_normal_fails_closed(db):
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_new_2")
     with pytest.raises(database.WrongWrapper):
-        database.commit_promotion_atomic("p1", c["token"], payload, "system")
+        database.commit_promotion_atomic("p1", c["token"], "system")
     # Rolled back: memory not written, proposal still pending.
-    assert database.get_memory("mem_new_2") is None
+    assert database.get_memory("mem_from_prop_p1") is None
     assert database.get_proposal("p1")["status"] == "pending"
 
 
@@ -258,8 +261,8 @@ def test_kernel_unsupported_maintenance_action_fails_closed(db):
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_new_3")
     with pytest.raises(database.UnsupportedMaintenanceAction):
-        database.commit_promotion_atomic("p1", c["token"], payload, "system")
-    assert database.get_memory("mem_new_3") is None
+        database.commit_promotion_atomic("p1", c["token"], "system")
+    assert database.get_memory("mem_from_prop_p1") is None
     assert database.get_proposal("p1")["status"] == "pending"
 
 
@@ -268,7 +271,7 @@ def test_kernel_wrong_triage_for_auto_normal_rejected(db):
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_new_4")
     with pytest.raises(ValueError):
-        database.commit_promotion_atomic("p1", c["token"], payload, "system",
+        database.commit_promotion_atomic("p1", c["token"], "system",
                                          terminal_state="auto_approved")
     assert database.get_proposal("p1")["status"] == "pending"
 
@@ -278,7 +281,7 @@ def test_kernel_v0_refused(db):
     # Can't even claim v0, but simulate a caller that skipped the claim step.
     payload = _payload_for("p1", override_id="mem_x")
     with pytest.raises(database.PromotionClaimLost):
-        database.commit_promotion_atomic("p1", "faketoken", payload, "system")
+        database.commit_promotion_atomic("p1", "faketoken", "system")
 
 
 def test_kernel_claim_lost_after_release(db):
@@ -287,7 +290,7 @@ def test_kernel_claim_lost_after_release(db):
     database.release_promotion_claim("p1", c["token"])
     payload = _payload_for("p1", override_id="mem_after_release")
     with pytest.raises(database.PromotionClaimLost):
-        database.commit_promotion_atomic("p1", c["token"], payload, "system")
+        database.commit_promotion_atomic("p1", c["token"], "system")
 
 
 # ═══ commit_maintenance_promotion_atomic ═════════════════════════════
@@ -314,9 +317,7 @@ def test_maintenance_wrapper_requires_parsed_snapshot(db):
     payload = _payload_for("p1", override_id="mem_new_maint")
     # Passing a raw dict must be refused
     with pytest.raises(ValueError, match="TargetSnapshot"):
-        database.commit_maintenance_promotion_atomic(
-            "p1", c["token"], payload,
-            {"target_id": "mem_target", "expected_status": "active",
+        database.commit_maintenance_promotion_atomic("p1", c["token"], {"target_id": "mem_target", "expected_status": "active",
              "expected_updated_at": NOW, "relation": "supersede"},
             reviewed_by="system",
         )
@@ -333,8 +334,7 @@ def test_maintenance_wrapper_auto_forbids_non_active_expected_status(db):
     payload = _payload_for("p1", override_id="mem_new_arch")
     snap = mp.parse_target_snapshot(database.get_proposal("p1")["target_snapshot_json"])
     with pytest.raises(ValueError, match="'active'"):
-        database.commit_maintenance_promotion_atomic(
-            "p1", c["token"], payload, snap, reviewed_by="system",
+        database.commit_maintenance_promotion_atomic("p1", c["token"], snap, reviewed_by="system",
         )
 
 
@@ -353,11 +353,10 @@ def test_maintenance_wrapper_drift_marks_no_downgrade(db):
     payload = _payload_for("p1", override_id="mem_new_drift")
     snap = mp.parse_target_snapshot(database.get_proposal("p1")["target_snapshot_json"])
     with pytest.raises(database.MaintenanceDrift):
-        database.commit_maintenance_promotion_atomic(
-            "p1", c["token"], payload, snap, reviewed_by="system",
+        database.commit_maintenance_promotion_atomic("p1", c["token"], snap, reviewed_by="system",
         )
     # No new memory, no target status change, no create fallback.
-    assert database.get_memory("mem_new_drift") is None
+    assert database.get_memory("mem_from_prop_p1") is None
     tgt = database.get_memory("mem_target")
     assert tgt["status"] == "active"
 
@@ -373,15 +372,14 @@ def test_maintenance_wrapper_happy_path_supersedes_and_writes(db):
     c = database.try_claim_promotion("p1")
     payload = _payload_for("p1", override_id="mem_new_ok")
     snap = mp.parse_target_snapshot(database.get_proposal("p1")["target_snapshot_json"])
-    r = database.commit_maintenance_promotion_atomic(
-        "p1", c["token"], payload, snap, reviewed_by="system",
+    r = database.commit_maintenance_promotion_atomic("p1", c["token"], snap, reviewed_by="system",
     )
     assert r["superseded_target"] == "mem_target"
     # New memory written; old target superseded; proposal terminalized.
-    assert database.get_memory("mem_new_ok") is not None
+    assert database.get_memory("mem_from_prop_p1") is not None
     old = database.get_memory("mem_target")
     assert old["status"] == "superseded"
-    assert old["superseded_by"] == "mem_new_ok"
+    assert old["superseded_by"] == "mem_from_prop_p1"
     assert database.get_proposal("p1")["status"] == "auto_approved"
     # Supersede note appended with correct schema (get_memory returns
     # comments already deserialised to list).

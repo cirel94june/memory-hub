@@ -14,6 +14,7 @@ from config import (DECAY_LAMBDA, DECAY_LAMBDA_FAST, DECAY_THRESHOLD,
 from embedding import get_embedding, pack_embedding, unpack_embedding, cosine_similarity
 import github_store as store
 import database
+import memory_payload
 import analyzer
 
 logger = logging.getLogger("memory_hub.ops")
@@ -383,40 +384,26 @@ async def remember(
                 mem_id = existing_id or _gen_id()
                 now = _now()
 
-                mem = {
-                    "id": mem_id,
-                    "content": content,
-                    "layer": layer,
-                    "room": room,
-                    "category": category,
-                    "owner_ai": owner_ai,
-                    "importance": importance,
-                    "emotion_arousal": emotion_arousal,
-                    "valence": valence,
-                    "domain": json.dumps(domain),
-                    "decay_score": 1.0,
-                    "provenance_type": provenance_type,
-                    "fact_confidence": fact_confidence,
-                    "activation_count": 0,
-                    "last_activated": "",
-                    "source_ai": source_ai,
-                    "source_platform": source_platform,
-                    "tags": json.dumps(tags or []),
-                    "linked_memories": json.dumps(linked_ids),
-                    "supersedes": json.dumps(superseded_ids),
-                    "event_date": event_date,
-                    "source_context": source_context,
-                    "subject_id": subject_id,
-                    "source_actor_id": source_actor_id,
-                    "info_type": info_type or "fact",
-                    "comments": [],
-                    "embedding": pack_embedding(query_vec) if query_vec else None,
-                    "status": "active",
-                    "client_request_id": client_request_id,
-                    "created_at": now,
-                    "updated_at": now,
-                    "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
-                }
+                # v5.1 S2b: shared builder — same normal-create shape as
+                # promotion_payload_from_proposal so both paths stay drift-free.
+                mem = memory_payload.build_new_memory_payload(
+                    content=content, layer=layer, room=room, category=category,
+                    owner_ai=owner_ai, importance=importance,
+                    emotion_arousal=emotion_arousal, valence=valence,
+                    domain=domain, source_ai=source_ai,
+                    source_platform=source_platform, subject_id=subject_id,
+                    source_actor_id=source_actor_id, info_type=info_type,
+                    event_date=event_date, source_context=source_context,
+                    provenance_type=provenance_type,
+                    fact_confidence=fact_confidence,
+                    tags=(tags or []),
+                    linked_memories=linked_ids,
+                    supersedes=superseded_ids,
+                    embedding=pack_embedding(query_vec) if query_vec else None,
+                    client_request_id=client_request_id,
+                    override_id=mem_id, override_now=now,
+                    origin="normal_create",
+                )
 
                 store.set_memory(mem)
 
@@ -444,40 +431,22 @@ async def remember(
     now = _now()
     vec = await get_embedding(content)
 
-    mem = {
-        "id": mem_id,
-        "content": content,
-        "layer": layer,
-        "room": room,
-        "category": category,
-        "owner_ai": owner_ai,
-        "importance": importance,
-        "emotion_arousal": emotion_arousal,
-        "valence": valence,
-        "domain": json.dumps(domain),
-        "decay_score": 1.0,
-        "provenance_type": provenance_type,
-        "fact_confidence": fact_confidence,
-        "activation_count": 0,
-        "last_activated": "",
-        "source_ai": source_ai,
-        "source_platform": source_platform,
-        "tags": json.dumps(tags or []),
-        "linked_memories": "[]",
-        "supersedes": "[]",
-        "event_date": event_date,
-        "source_context": source_context,
-        "subject_id": subject_id,
-        "source_actor_id": source_actor_id,
-        "info_type": info_type or "fact",
-        "comments": [],
-        "embedding": pack_embedding(vec) if vec else None,
-        "status": "active",
-        "client_request_id": client_request_id,
-        "created_at": now,
-        "updated_at": now,
-        "history": [{"v": 1, "content": content, "date": now, "by": source_ai or "system"}],
-    }
+    # v5.1 S2b: shared builder (no-relation path).
+    mem = memory_payload.build_new_memory_payload(
+        content=content, layer=layer, room=room, category=category,
+        owner_ai=owner_ai, importance=importance,
+        emotion_arousal=emotion_arousal, valence=valence,
+        domain=domain, source_ai=source_ai,
+        source_platform=source_platform, subject_id=subject_id,
+        source_actor_id=source_actor_id, info_type=info_type,
+        event_date=event_date, source_context=source_context,
+        provenance_type=provenance_type, fact_confidence=fact_confidence,
+        tags=(tags or []),
+        embedding=pack_embedding(vec) if vec else None,
+        client_request_id=client_request_id,
+        override_id=mem_id, override_now=now,
+        origin="normal_create",
+    )
 
     store.set_memory(mem)
     result = {"id": mem_id, "status": "created", "category": category, "domain": domain, "linked": [], "superseded": []}
@@ -1191,22 +1160,19 @@ async def _create_proposal(
 
 async def _promote_via_kernel(
     prop_id: str, *, reviewed_by: str, terminal_state: str,
+    human_retry: bool = False,
 ) -> dict:
-    """Common pattern: claim → compute embedding OUTSIDE tx → build payload
-    → dispatch to normal or maintenance wrapper → mark_promotion_failed on
-    exception.
+    """Common pattern: claim → embedding OUTSIDE tx → dispatch to wrapper.
+    Wrapper (via kernel) builds payload from proposal row itself; caller
+    only supplies `embedding`. mark_promotion_failed on exception.
 
-    Returns {'memory_id': ..., 'proposal_id': ..., 'terminal_state': ...}
-    on success, or {'error': ..., 'proposal_id': ...} on any failure.
-
-    Caller responsibilities:
-      * proposal already inserted with promotion_protocol_version=2 (default
-        for insert_proposal)
-      * for maintenance path, proposal.target_snapshot_json must be present
-        (see _run_maintenance_auto_promotion for the auto path)
+    v5.1 H1: caller no longer passes a payload — kernel is the sole builder
+    to prevent payload-vs-proposal drift.
+    v5.1 H5: `human_retry=True` lets the human path reclaim a
+    promotion_failed row atomically (auto sweep never sets this).
     """
     import memory_payload
-    claim = database.try_claim_promotion(prop_id)
+    claim = database.try_claim_promotion(prop_id, human_retry=human_retry)
     if not claim.get("ok"):
         return {"error": "claim_refused", "proposal_id": prop_id,
                 "reason": claim.get("reason")}
@@ -1217,13 +1183,11 @@ async def _promote_via_kernel(
             database.release_promotion_claim(prop_id, claim_token)
             return {"error": "not_found", "proposal_id": prop_id}
 
-        # Compute embedding outside tx (network / GPU).
         vec = await get_embedding(prop["content"])
         embedding = pack_embedding(vec) if vec else None
 
         ma = (prop.get("maintenance_action") or "").strip()
         if ma in database.MAINT_MA_VALUES:
-            # Maintenance path — needs target snapshot.
             snap_raw = (prop.get("target_snapshot_json") or "").strip()
             if not snap_raw:
                 database.mark_promotion_failed(
@@ -1239,17 +1203,12 @@ async def _promote_via_kernel(
                 )
                 return {"error": "snapshot_invalid", "proposal_id": prop_id,
                         "detail": str(e)}
-            payload = memory_payload.promotion_payload_from_proposal(
-                prop, supersedes=[snap.target_id],
-            )
-            payload["embedding"] = embedding
             try:
                 r = database.commit_maintenance_promotion_atomic(
-                    prop_id, claim_token, payload, snap,
-                    reviewed_by=reviewed_by, terminal_state=terminal_state,
+                    prop_id, claim_token, snap,
+                    reviewed_by=reviewed_by, embedding=embedding,
+                    terminal_state=terminal_state,
                 )
-                # Mirror new memory + updated (superseded) target — see
-                # normal-path comment for rationale.
                 try:
                     m_new = database.get_memory(r["memory_id"])
                     if m_new is not None:
@@ -1267,17 +1226,11 @@ async def _promote_via_kernel(
                 return {"error": "target_drifted", "proposal_id": prop_id,
                         "detail": str(e)}
         elif ma in database.NORMAL_MA_VALUES:
-            payload = memory_payload.promotion_payload_from_proposal(prop)
-            payload["embedding"] = embedding
             r = database.commit_promotion_atomic(
-                prop_id, claim_token, payload,
-                reviewed_by=reviewed_by, terminal_state=terminal_state,
+                prop_id, claim_token,
+                reviewed_by=reviewed_by, embedding=embedding,
+                terminal_state=terminal_state,
             )
-            # Mirror to store so any store-observing consumers (in-memory
-            # test fixtures, future caches) see the new memory. Production
-            # `store.set_memory` delegates to `database.set_memory` so this
-            # is a no-op idempotent write in prod. Failure to mirror is
-            # non-fatal — the DB is the source of truth.
             try:
                 mem = database.get_memory(r["memory_id"])
                 if mem is not None:
@@ -1388,8 +1341,13 @@ async def review_proposal(
                 "hint": ("This is a pre-v5.1 legacy proposal; approve it via "
                          "the operator CLI adoption path."),
             }
+        # v5.1 H5: human_retry=True lets Ceci reclaim a promotion_failed row
+        # atomically (auto sweep never sets this — a failed row stays failed
+        # for the auto path until the human either retries or rejects).
+        human_retry = proposal.get("status") == "promotion_failed"
         result = await _promote_via_kernel(
             proposal_id, reviewed_by=reviewed_by, terminal_state="approved",
+            human_retry=human_retry,
         )
         if result.get("error"):
             return {

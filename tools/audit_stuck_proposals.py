@@ -279,19 +279,31 @@ def _default_allowed_plan_dirs() -> list[Path]:
     ]
 
 
-def _check_operator_env() -> None:
+def _check_operator_env(i_am_operator: bool = False) -> None:
     """Runtime gate: refuses to run outside operator mode.
 
     Layers:
       1. HUB_OPERATOR_MODE=1 must be set explicitly.
-      2. stdin must be a TTY (an interactive shell) unless the caller sets
-         --i-am-operator to opt into non-TTY execution (e.g. wrapper script).
+      2. stdin must be a TTY (interactive shell), unless the caller passes
+         --i-am-operator to opt into non-TTY execution (wrapper script,
+         cron, etc.). Non-TTY without the flag is refused.
     """
     if os.environ.get("HUB_OPERATOR_MODE", "").strip() != "1":
         raise OperatorGateError(
             "HUB_OPERATOR_MODE=1 not set. Run this only on the VPS shell as "
             "operator: `export HUB_OPERATOR_MODE=1` before invoking."
         )
+    if not i_am_operator:
+        try:
+            is_tty = sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            is_tty = False
+        if not is_tty:
+            raise OperatorGateError(
+                "stdin is not a TTY; refusing to run adopt-plan in a "
+                "non-interactive shell. If this is intentional (wrapper "
+                "script, cron job) pass --i-am-operator to confirm."
+            )
 
 
 def _check_plan_file(plan_path: Path) -> Path:
@@ -351,7 +363,12 @@ def _is_under(child: Path, parent: Path) -> bool:
 def _load_plan(plan_path: Path) -> dict:
     """Load and integrity-check the plan file. `plan_sha256` is treated
     as a corruption checksum, NOT an authenticity signature — the real
-    authority boundary is filesystem permissions (checked above)."""
+    authority boundary is filesystem permissions (checked above).
+
+    v5.1 H4: `plan_sha256` is REQUIRED (Codex saw plans missing the field
+    slip through). Must be exactly 64 lowercase hex chars AND match the
+    computed sha256 over the rest of the plan.
+    """
     resolved = _check_plan_file(plan_path)
     raw = resolved.read_text(encoding="utf-8")
     data = json.loads(raw)
@@ -359,13 +376,22 @@ def _load_plan(plan_path: Path) -> dict:
         raise OperatorGateError(f"plan {resolved} is not a JSON object")
     if "items" not in data or not isinstance(data["items"], list):
         raise OperatorGateError(f"plan {resolved} missing items list")
-    # Integrity checksum: sha256 over the plan with plan_sha256 field removed.
     stated = data.get("plan_sha256", "")
+    if not stated:
+        raise OperatorGateError(
+            f"plan {resolved} missing required field plan_sha256; run the "
+            "audit report first and re-sign the plan."
+        )
+    if (len(stated) != 64
+            or any(c not in "0123456789abcdef" for c in stated.lower())):
+        raise OperatorGateError(
+            f"plan_sha256 must be 64-char lowercase hex; got {stated!r}"
+        )
     stripped = {k: v for k, v in data.items() if k != "plan_sha256"}
     computed = hashlib.sha256(
         json.dumps(stripped, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    if stated and stated != computed:
+    if stated != computed:
         raise OperatorGateError(
             f"plan checksum mismatch: stated {stated[:12]}..., computed {computed[:12]}..."
         )
@@ -378,12 +404,22 @@ def cmd_adopt_plan(args: argparse.Namespace) -> int:
     Refuses to run unless every operator gate passes. See v5.1 A4 in
     docs/proposal-pending-fix-plan.md for the security rationale.
     """
-    # Ensure repo root on sys.path for `database` import.
-    _check_operator_env()
+    _check_operator_env(i_am_operator=getattr(args, "i_am_operator", False))
     # Import database only AFTER the env gate — a caller that skipped the
     # gate should never reach the DB layer.
     import database
     from datetime import datetime, timezone
+
+    # v5.1 H3: independent CLI processes have no globally-init'd database
+    # connection. Explicitly init it against --db-path (or HUB_DB_PATH) so
+    # commit_promotion_atomic / adopt_legacy_proposal_atomic can write.
+    db_path = getattr(args, "db_path", None) or os.environ.get("HUB_DB_PATH")
+    if not db_path:
+        raise OperatorGateError(
+            "no DB path — pass --db-path or set HUB_DB_PATH before running"
+        )
+    import asyncio
+    asyncio.run(database.init_db(str(Path(db_path).expanduser())))
 
     plan_path = Path(args.plan_path).expanduser()
     plan = _load_plan(plan_path)
@@ -457,8 +493,13 @@ def main(argv: list[str] | None = None) -> int:
     p_report.add_argument("--out", default="./audit-out")
     p_report.set_defaults(func=cmd_report)
 
-    p_adopt = sub.add_parser("adopt-plan", help="[S6, not yet implemented] apply reviewed plan")
+    p_adopt = sub.add_parser("adopt-plan", help="Apply a reviewed operator plan")
     p_adopt.add_argument("plan_path")
+    p_adopt.add_argument("--db-path", default=os.environ.get("HUB_DB_PATH"),
+                         help="Path to memory-hub SQLite DB (or set HUB_DB_PATH).")
+    p_adopt.add_argument("--i-am-operator", action="store_true",
+                         help="Confirm non-interactive execution (wrapper "
+                              "script, cron). Otherwise stdin must be a TTY.")
     p_adopt.set_defaults(func=cmd_adopt_plan)
 
     args = parser.parse_args(argv)

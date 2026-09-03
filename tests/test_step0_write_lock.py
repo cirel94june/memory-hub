@@ -425,6 +425,12 @@ _IN_TX_HELPERS = frozenset({
     # would nest _write_transaction, which is fail-closed at that layer,
     # but AST gate here prevents accidental external references too.
     '_commit_promotion_in_tx',
+    # v5.1 Critical fix: targeted UPDATE of ONLY the 5 supersede fields
+    # (status/superseded_by/updated_at/comments/history). caller is
+    # commit_maintenance_promotion_atomic and adopt_legacy_proposal_atomic,
+    # both of which already hold _write_transaction(). Not used by any
+    # module outside database.py.
+    '_supersede_target_in_tx',
 })
 
 

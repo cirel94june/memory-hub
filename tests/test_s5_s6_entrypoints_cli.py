@@ -228,7 +228,7 @@ def test_s6_cli_refuses_without_operator_env(tmp_path, monkeypatch):
     """Missing HUB_OPERATOR_MODE=1 → immediate refusal."""
     monkeypatch.delenv("HUB_OPERATOR_MODE", raising=False)
     from tools.audit_stuck_proposals import cmd_adopt_plan, OperatorGateError
-    ns = type("NS", (), {"plan_path": str(tmp_path / "x.json")})()
+    ns = type("NS", (), {"plan_path": str(tmp_path / "x.json"), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     with pytest.raises(OperatorGateError, match="HUB_OPERATOR_MODE"):
         cmd_adopt_plan(ns)
 
@@ -246,7 +246,7 @@ def test_s6_cli_refuses_symlink(tmp_path, monkeypatch):
     except (OSError, NotImplementedError):
         pytest.skip("symlink not supported on this filesystem")
     from tools.audit_stuck_proposals import cmd_adopt_plan, OperatorGateError
-    ns = type("NS", (), {"plan_path": str(link)})()
+    ns = type("NS", (), {"plan_path": str(link), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     with pytest.raises(OperatorGateError, match="symlink"):
         cmd_adopt_plan(ns)
 
@@ -260,7 +260,7 @@ def test_s6_cli_refuses_outside_allowed_dirs(tmp_path, monkeypatch):
     plan = tmp_path / "sneaky.json"
     plan.write_text('{"items":[]}', encoding="utf-8")
     from tools.audit_stuck_proposals import cmd_adopt_plan, OperatorGateError
-    ns = type("NS", (), {"plan_path": str(plan)})()
+    ns = type("NS", (), {"plan_path": str(plan), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     with pytest.raises(OperatorGateError, match="outside allowed"):
         cmd_adopt_plan(ns)
 
@@ -275,7 +275,7 @@ def test_s6_cli_refuses_bad_checksum(tmp_path, monkeypatch):
         "plan_sha256": "0" * 64,  # wrong
     }), encoding="utf-8")
     from tools.audit_stuck_proposals import cmd_adopt_plan, OperatorGateError
-    ns = type("NS", (), {"plan_path": str(plan)})()
+    ns = type("NS", (), {"plan_path": str(plan), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     with pytest.raises(OperatorGateError, match="checksum"):
         cmd_adopt_plan(ns)
 
@@ -317,7 +317,7 @@ def test_s6_cli_adopts_v0_legacy_end_to_end(env, tmp_path, monkeypatch, capsys):
     plan_path.write_text(json.dumps(plan_dict, ensure_ascii=False), encoding="utf-8")
 
     from tools.audit_stuck_proposals import cmd_adopt_plan
-    ns = type("NS", (), {"plan_path": str(plan_path)})()
+    ns = type("NS", (), {"plan_path": str(plan_path), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     rc = cmd_adopt_plan(ns)
     assert rc == 0
 
@@ -357,7 +357,7 @@ def test_s6_cli_refuses_legacy_maintenance_without_snapshot(env, tmp_path, monke
     plan_path.write_text(json.dumps(plan_dict, ensure_ascii=False), encoding="utf-8")
 
     from tools.audit_stuck_proposals import cmd_adopt_plan
-    ns = type("NS", (), {"plan_path": str(plan_path)})()
+    ns = type("NS", (), {"plan_path": str(plan_path), "i_am_operator": True, "db_path": str(env["db"]) if "env" in dir() else ":memory:"})()
     rc = cmd_adopt_plan(ns)
     assert rc == 2  # errors > 0
 
