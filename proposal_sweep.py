@@ -26,8 +26,39 @@ import memory_ops
 
 logger = logging.getLogger(__name__)
 
-SWEEP_INTERVAL_SECONDS = int(os.environ.get("HUB_PROPOSAL_SWEEP_INTERVAL", "600"))
-SWEEP_BATCH_SIZE = int(os.environ.get("HUB_PROPOSAL_SWEEP_BATCH", "20"))
+def _parse_positive_int(env_name: str, default: int, lo: int, hi: int) -> int:
+    """Defensive env parser: non-int / non-positive / out-of-range → default.
+
+    Codex noted the previous naive `int(os.environ.get(...))` would raise on
+    a malformed value (making the sweep task fail to start) or silently
+    accept a negative value (SQLite LIMIT interprets negative as no cap).
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r not an integer; falling back to default %d",
+            env_name, raw, default,
+        )
+        return default
+    if v < lo or v > hi:
+        logger.warning(
+            "%s=%d out of allowed range [%d, %d]; falling back to default %d",
+            env_name, v, lo, hi, default,
+        )
+        return default
+    return v
+
+
+SWEEP_INTERVAL_SECONDS = _parse_positive_int(
+    "HUB_PROPOSAL_SWEEP_INTERVAL", 600, lo=10, hi=86400,
+)
+SWEEP_BATCH_SIZE = _parse_positive_int(
+    "HUB_PROPOSAL_SWEEP_BATCH", 20, lo=1, hi=100,
+)
 
 
 async def sweep_once() -> dict:
