@@ -537,6 +537,28 @@ async def init_db(db_path: str = None) -> None:
             conn.execute("ALTER TABLE maintenance_audit ADD COLUMN prompt_version TEXT NOT NULL DEFAULT ''")
             logger.info("Migrated maintenance_audit: added 'prompt_version' column")
 
+        # ── Dropped proposals audit (subject-guardrail Layer 3) ──
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS audit_dropped_proposals (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                drop_reason       TEXT NOT NULL,
+                subject_name      TEXT NOT NULL DEFAULT '',
+                subject_id        TEXT NOT NULL DEFAULT '',
+                resolved_role     TEXT NOT NULL DEFAULT '',
+                speaker_name      TEXT NOT NULL DEFAULT '',
+                content_preview   TEXT NOT NULL DEFAULT '',
+                source_platform   TEXT NOT NULL DEFAULT '',
+                source_context    TEXT NOT NULL DEFAULT '',
+                proposer_ai_id    TEXT NOT NULL DEFAULT '',
+                decision_json     TEXT NOT NULL DEFAULT '{}',
+                created_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dropped_created
+                ON audit_dropped_proposals(created_at);
+            CREATE INDEX IF NOT EXISTS idx_dropped_reason
+                ON audit_dropped_proposals(drop_reason);
+        """)
+
         # ── PR C H2: async_remember_ledger ──
         # Records the terminal outcome of each async remember pipeline. Written
         # in the SAME transaction as the memory changes (via _commit_ledger),
@@ -2704,6 +2726,63 @@ def count_audits(action: str = None) -> int:
         row = conn.execute("SELECT COUNT(*) FROM maintenance_audit WHERE action = ?", (action,)).fetchone()
     else:
         row = conn.execute("SELECT COUNT(*) FROM maintenance_audit").fetchone()
+    return row[0] if row else 0
+
+
+_DROPPED_PROPOSAL_COLUMNS = (
+    "drop_reason", "subject_name", "subject_id", "resolved_role",
+    "speaker_name", "content_preview", "source_platform", "source_context",
+    "proposer_ai_id", "decision_json", "created_at",
+)
+
+
+def insert_dropped_proposal_audit(row: dict) -> int:
+    """Log a subject-guardrail drop. Best-effort — a failure here must
+    NOT stop conversation intake, so caller wraps in try/except.
+    """
+    row = dict(row)
+    row.setdefault("created_at", _now_iso())
+    values = [row.get(c, "") for c in _DROPPED_PROPOSAL_COLUMNS]
+    placeholders = ", ".join(["?"] * len(_DROPPED_PROPOSAL_COLUMNS))
+    cols = ", ".join(_DROPPED_PROPOSAL_COLUMNS)
+    with _write_transaction() as conn:
+        cur = conn.execute(
+            f"INSERT INTO audit_dropped_proposals ({cols}) VALUES ({placeholders})",
+            values,
+        )
+        return cur.lastrowid
+
+
+def list_dropped_proposal_audits(
+    drop_reason: str | None = None, limit: int = 50, offset: int = 0,
+) -> list[dict]:
+    conn = _get_read_conn()
+    if drop_reason:
+        rows = conn.execute(
+            "SELECT * FROM audit_dropped_proposals WHERE drop_reason = ? "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (drop_reason, limit, offset),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM audit_dropped_proposals "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_dropped_proposal_audits(drop_reason: str | None = None) -> int:
+    conn = _get_read_conn()
+    if drop_reason:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_dropped_proposals WHERE drop_reason = ?",
+            (drop_reason,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM audit_dropped_proposals"
+        ).fetchone()
     return row[0] if row else 0
 
 
