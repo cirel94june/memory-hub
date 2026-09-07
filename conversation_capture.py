@@ -21,6 +21,57 @@ from typing import Optional
 
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
 import database
+import subject_guardrail
+
+
+def _guardrail_check_and_audit(
+    *, item: dict, subj_name: str, subject_id: str, spkr_name: str,
+    content: str, provenance: str, source_ctx: str,
+    source_platform: str, proposer_ai_id: str,
+) -> subject_guardrail.GuardrailVerdict | None:
+    """Run subject-guardrail; on drop, write audit and return the verdict
+    (caller uses `.blocked` to skip). On allow or exception, returns
+    verdict or None; caller must NOT gate on None.
+
+    Consolidated so both `_extract_and_remember` (auto-capture) and
+    `extract_from_messages` (manual MCP extract) share exactly the same
+    identity-checking gate — no drift risk."""
+    try:
+        verdict = subject_guardrail.verify_subject_provenance(
+            subject_name=subj_name, speaker_name=spkr_name,
+            content=content, provenance_type=provenance,
+            claim_type=item.get("claim_type", ""),
+        )
+    except Exception as e:
+        logger.warning(f"subject_guardrail unavailable ({e}); allowing")
+        return None
+    if verdict.blocked:
+        try:
+            database.insert_dropped_proposal_audit({
+                "drop_reason": verdict.drop_reason,
+                "subject_name": subj_name,
+                "subject_id": subject_id,
+                "resolved_role": verdict.resolved_role,
+                "speaker_name": spkr_name,
+                "content_preview": content[:200],
+                "source_platform": source_platform,
+                "source_context": (source_ctx or "")[:1000],
+                "proposer_ai_id": proposer_ai_id,
+                "decision_json": json.dumps({
+                    "verdict": verdict.verdict,
+                    "note": verdict.note,
+                    "provenance": provenance,
+                    "claim_type": item.get("claim_type", ""),
+                    "info_type": item.get("info_type", ""),
+                }, ensure_ascii=False),
+            })
+        except Exception as audit_e:
+            logger.warning(f"dropped-proposal audit write failed: {audit_e}")
+        logger.info(
+            f"subject-guardrail dropped: reason={verdict.drop_reason} "
+            f"subject={subj_name!r} content={content[:60]!r}"
+        )
+    return verdict
 
 logger = logging.getLogger("memory_hub.capture")
 
@@ -453,6 +504,16 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
         source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
 
+        verdict = _guardrail_check_and_audit(
+            item=item, subj_name=subj_name, subject_id=subject_id,
+            spkr_name=spkr_name, content=content, provenance=provenance,
+            source_ctx=source_ctx,
+            source_platform=f"auto_capture:{platform}:{chat_type}",
+            proposer_ai_id=ai_id,
+        )
+        if verdict is not None and verdict.blocked:
+            continue
+
         result = await memory_ops.remember(
             content=content,
             layer="private" if is_private_memory else "shared",
@@ -567,6 +628,16 @@ async def extract_from_messages(
         spkr_name = item.get("speaker_name", "")
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
         source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+
+        verdict = _guardrail_check_and_audit(
+            item=item, subj_name=subj_name, subject_id=subject_id,
+            spkr_name=spkr_name, content=content, provenance=provenance,
+            source_ctx=conversation_text[:1500],
+            source_platform="mcp_extract",
+            proposer_ai_id=ai_id,
+        )
+        if verdict is not None and verdict.blocked:
+            continue
 
         result = await memory_ops.remember(
             content=content,
