@@ -40,11 +40,10 @@ KNOWN_ROLES: frozenset[str] = frozenset({
 # Populated by Ceci from Telegram admin panel. Numeric ids only.
 # Missing sender_ids fall through to name-based match below.
 TELEGRAM_SENDER_ROLE: dict[int, str] = {
-    # TODO(ceci): fill in real ids, e.g.
-    # 8821013839: ROLE_LUCIEN,
-    # <your_user_id>: ROLE_CECI,
-    # <cloudy_bot_id>: ROLE_CLOUDY,
-    # <jasper_bot_id>: ROLE_JASPER,
+    8749953218: ROLE_CECI,
+    8638070562: ROLE_CLOUDY,
+    8821013839: ROLE_LUCIEN,
+    8553463347: ROLE_JASPER,
 }
 
 

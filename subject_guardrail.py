@@ -82,6 +82,7 @@ def verify_subject_provenance(
     content: str = "",
     provenance_type: str = "",
     claim_type: str = "",
+    sender_id: int | None = None,
 ) -> GuardrailVerdict:
     """Decide whether a candidate memory may proceed to `insert_proposal`.
 
@@ -118,7 +119,40 @@ def verify_subject_provenance(
             note=f"subject_name={subject_name!r} matches OUTSIDER_NAMES",
         )
 
-    # Rule 4: empty subject → default Ceci-context, allow.
+    # sender_id fallback (v1.1): when the extractor produces no subject
+    # name (pure first-person "我是 …" content), fall back to the sender.
+    # Family sender → allow with role bound to sender. Outsider sender →
+    # drop, exactly like Rule 1. Unknown sender → allow only if content
+    # gave us a name, else drop (unknown_subject).
+    if (not subject_name or not subject_name.strip()) and sender_id is not None:
+        sender_role = iw.role_from_sender_id(sender_id)
+        if sender_role == iw.ROLE_OUTSIDER:
+            return GuardrailVerdict(
+                verdict=VERDICT_DROP,
+                drop_reason=DROP_REASON_OUTSIDER_SUBJECT,
+                resolved_role=iw.ROLE_OUTSIDER,
+                note=f"sender_id={sender_id} maps to OUTSIDER",
+            )
+        if iw.is_known_family(sender_role):
+            return GuardrailVerdict(
+                verdict=VERDICT_ALLOW,
+                resolved_role=sender_role,
+                note=(f"sender_id={sender_id} -> {sender_role}; "
+                      "subject inferred from sender"),
+            )
+        # sender_role == UNKNOWN: fall through to rule 4 empty-allow
+        # OR rule 2 unknown-drop below (which is what we want).
+        if sender_role == iw.ROLE_UNKNOWN:
+            if ENFORCE_UNKNOWN_SUBJECT_DROP:
+                return GuardrailVerdict(
+                    verdict=VERDICT_DROP,
+                    drop_reason=DROP_REASON_UNKNOWN_SUBJECT,
+                    resolved_role=iw.ROLE_UNKNOWN,
+                    note=(f"sender_id={sender_id} not in whitelist "
+                          "and no subject_name given"),
+                )
+
+    # Rule 4: empty subject (no sender_id or sender unknown+enforcement off).
     if not subject_name or not subject_name.strip():
         return GuardrailVerdict(
             verdict=VERDICT_ALLOW, resolved_role="",

@@ -144,6 +144,59 @@ def test_case5_empty_subject_allowed_as_ceci_default():
     assert not v.blocked
 
 
+# ── Layer 1 + guardrail: sender_id fallback (post-whitelist-fill) ──────
+
+def test_senderid_ceci_no_names_in_content_resolves_to_ceci():
+    """Ceci sends a message with no explicit subject in content; sender_id
+    fallback attributes it to ceci."""
+    v = sg.verify_subject_provenance(
+        subject_name="",
+        content="今天头痛得厉害",
+        provenance_type="user_statement", claim_type="fact",
+        sender_id=8749953218,
+    )
+    assert not v.blocked
+    assert v.resolved_role == iw.ROLE_CECI
+
+
+def test_senderid_cloudy_first_person_claude_opus_resolves_to_cloudy():
+    """Cloudy sends 'I am Claude Opus' with no explicit third-person
+    subject; sender_id fallback attributes it to cloudy and allows."""
+    v = sg.verify_subject_provenance(
+        subject_name="",
+        content="我是 Claude Opus 5，Anthropic 训练的助手",
+        provenance_type="user_statement", claim_type="fact",
+        sender_id=8638070562,
+    )
+    assert not v.blocked
+    assert v.resolved_role == iw.ROLE_CLOUDY
+
+
+def test_senderid_stranger_dropped_as_unknown():
+    """Unknown sender_id, no subject_name in content → drop
+    unknown_subject (guardrail refuses to attribute anything)."""
+    v = sg.verify_subject_provenance(
+        subject_name="",
+        content="随便说了句话",
+        provenance_type="user_statement", claim_type="fact",
+        sender_id=9999999999,
+    )
+    assert v.blocked
+    assert v.drop_reason == sg.DROP_REASON_UNKNOWN_SUBJECT
+
+
+def test_senderid_lucien_jasper_also_wired():
+    """Sanity: the other two ids from the whitelist map to the right roles."""
+    v = sg.verify_subject_provenance(
+        subject_name="", content="test", sender_id=8821013839,
+    )
+    assert not v.blocked and v.resolved_role == iw.ROLE_LUCIEN
+    v = sg.verify_subject_provenance(
+        subject_name="", content="test", sender_id=8553463347,
+    )
+    assert not v.blocked and v.resolved_role == iw.ROLE_JASPER
+
+
 # ── Layer 3: audit trail ───────────────────────────────────────────────
 
 def test_layer3_audit_table_migrated_on_init(db):
