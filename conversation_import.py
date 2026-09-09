@@ -219,7 +219,9 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
     "content": "一个原子事实（≤200字，保留具体细节）",
     "room": "房间ID",
     "importance": 0.4到1.0,
-    "event_date": "事件日期或空字符串"
+    "event_date": "事件日期或空字符串",
+    "subject_name": "这条记忆关于谁（留空=用户自己）",
+    "speaker_name": "谁说的（留空=用户自己）"
   }}
 ]
 只输出 JSON。"""

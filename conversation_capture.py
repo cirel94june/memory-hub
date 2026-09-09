@@ -485,20 +485,6 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
         source_ctx = conversation_text[:1500]
         is_private_memory = chat_type == "private"
 
-        if provenance == "user_correction":
-            # 用户在纠正错误信息：错误版失效，纠正版成为 canonical
-            result = await memory_ops.apply_user_correction(
-                corrected_value=content,
-                old_value=str(item.get("corrects_old_value", "")).strip(),
-                source_ai=ai_id,
-                room=item.get("room", "living_room"),
-                source_context=source_ctx,
-                layer="private" if is_private_memory else "shared",
-                owner_ai=ai_id if is_private_memory else "",
-            )
-            memories.append(result)
-            continue
-
         subj_name = item.get("subject_name", "")
         spkr_name = item.get("speaker_name", "")
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
@@ -512,6 +498,19 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             proposer_ai_id=ai_id,
         )
         if verdict is not None and verdict.blocked:
+            continue
+
+        if provenance == "user_correction":
+            result = await memory_ops.apply_user_correction(
+                corrected_value=content,
+                old_value=str(item.get("corrects_old_value", "")).strip(),
+                source_ai=ai_id,
+                room=item.get("room", "living_room"),
+                source_context=source_ctx,
+                layer="private" if is_private_memory else "shared",
+                owner_ai=ai_id if is_private_memory else "",
+            )
+            memories.append(result)
             continue
 
         result = await memory_ops.remember(
@@ -613,19 +612,6 @@ async def extract_from_messages(
         if provenance not in valid_prov:
             provenance = ""
 
-        if provenance == "user_correction":
-            result = await memory_ops.apply_user_correction(
-                corrected_value=content,
-                old_value=str(item.get("corrects_old_value", "")).strip(),
-                source_ai=ai_id,
-                room=item.get("room", "living_room"),
-                source_context=conversation_text[:1500],
-                layer="private" if chat_type == "private" else "shared",
-                owner_ai=ai_id if chat_type == "private" else "",
-            )
-            memories.append(result)
-            continue
-
         subj_name = item.get("subject_name", "")
         spkr_name = item.get("speaker_name", "")
         subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
@@ -639,6 +625,19 @@ async def extract_from_messages(
             proposer_ai_id=ai_id,
         )
         if verdict is not None and verdict.blocked:
+            continue
+
+        if provenance == "user_correction":
+            result = await memory_ops.apply_user_correction(
+                corrected_value=content,
+                old_value=str(item.get("corrects_old_value", "")).strip(),
+                source_ai=ai_id,
+                room=item.get("room", "living_room"),
+                source_context=conversation_text[:1500],
+                layer="private" if chat_type == "private" else "shared",
+                owner_ai=ai_id if chat_type == "private" else "",
+            )
+            memories.append(result)
             continue
 
         result = await memory_ops.remember(

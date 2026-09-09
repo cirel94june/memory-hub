@@ -527,11 +527,16 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
 class GrowRequest(BaseModel):
     content: str
     source_ai: str = ""
+    subject_name: str = ""
+    speaker_name: str = ""
 
 @app.post("/api/memory/grow")
 async def api_grow(body: GrowRequest, authorization: str = Header(default="")):
     verify_secret(authorization)
-    result = await memory_ops.grow(content=body.content, source_ai=body.source_ai)
+    result = await memory_ops.grow(
+        content=body.content, source_ai=body.source_ai,
+        subject_name=body.subject_name, speaker_name=body.speaker_name,
+    )
     return result
 
 

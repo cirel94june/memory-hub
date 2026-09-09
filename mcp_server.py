@@ -1341,7 +1341,7 @@ async def batch_remember(
             merged += 1
         elif status == "dedup_skipped":
             skipped += 1
-        elif result.get("blocked"):
+        elif status in ("guardrail_blocked", "guardrail_unavailable") or result.get("blocked"):
             blocked += 1
         elif status == "failed":
             failed += 1

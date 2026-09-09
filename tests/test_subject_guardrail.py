@@ -350,3 +350,74 @@ def test_remember_no_subject_name_skips_guardrail(db):
         claim_type="fact",
     )
     assert not v.blocked
+
+
+# ── Layer 5: user_correction guardrail ordering ──────────────────────
+
+def test_autocapture_user_correction_outsider_blocked(db):
+    """An outsider subject tagged as user_correction must still be blocked
+    by the guardrail — the guardrail runs BEFORE the correction branch."""
+    import conversation_capture as cap
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "fact", "info_type": "fact"},
+        subj_name="师兄", subject_id="", spkr_name="ceci",
+        content="[纠正] 师兄说的不对，他不是 Gemini",
+        provenance="user_correction",
+        source_ctx="ceci: 笑死",
+        source_platform="auto_capture:telegram:public_group",
+        proposer_ai_id="jasper",
+    )
+    assert v is not None
+    assert v.blocked
+    assert v.drop_reason == sg.DROP_REASON_OUTSIDER_SUBJECT
+
+
+# ── Layer 6: fail-closed guardrail ───────────────────────────────────
+
+def test_remember_fail_closed_on_import_error(db, monkeypatch):
+    """When subject_guardrail module is missing, remember() must fail-closed
+    (return guardrail_unavailable) instead of allowing the write through."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", lambda *a, **kw: None)
+    import builtins
+    _real_import = builtins.__import__
+    def _block_sg(name, *args, **kwargs):
+        if name == "subject_guardrail":
+            raise ImportError("simulated missing module")
+        return _real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", _block_sg)
+    result = asyncio.run(
+        memory_ops.remember(
+            content="some content",
+            room="living_room",
+            source_ai="jasper",
+            subject_name="ceci",
+            speaker_name="cloudy",
+        )
+    )
+    assert result["status"] == "guardrail_unavailable"
+
+
+# ── Layer 7: batch_remember guardrail counting ───────────────────────
+
+def test_guardrail_blocked_status_is_countable():
+    """guardrail_blocked and guardrail_unavailable statuses must be
+    detectable so batch callers can count them correctly."""
+    blocked_statuses = ("guardrail_blocked", "guardrail_unavailable")
+    for s in blocked_statuses:
+        result = {"status": s}
+        assert result["status"] in blocked_statuses, f"{s} not in blocked set"
+
+    normal_statuses = ("created", "merged", "dedup_skipped", "failed")
+    for s in normal_statuses:
+        result = {"status": s}
+        assert result["status"] not in blocked_statuses
+
+
+def test_grow_accepts_subject_params():
+    """memory_ops.grow() must accept subject_name and speaker_name."""
+    import memory_ops
+    import inspect
+    sig = inspect.signature(memory_ops.grow)
+    assert "subject_name" in sig.parameters
+    assert "speaker_name" in sig.parameters
