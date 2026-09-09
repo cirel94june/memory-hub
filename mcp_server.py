@@ -208,6 +208,7 @@ async def _safe_remember_impl(
     existing_id: str = "",
     client_request_id: str = "",
     subject_name: str = "",
+    speaker_name: str = "",
 ) -> dict:
     original = str(content or "")
     neutral = _compact_content(original)
@@ -218,7 +219,7 @@ async def _safe_remember_impl(
             source_ai=source_ai, source_platform=source_platform, event_date=event_date,
             force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai,
             existing_id=existing_id, client_request_id=client_request_id,
-            subject_name=subject_name,
+            subject_name=subject_name, speaker_name=speaker_name,
         )
         _audit("remember_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(neutral))
         return {"safe_write": "original_or_compact", **result}
@@ -237,7 +238,7 @@ async def _safe_remember_impl(
                 source_ai=source_ai, source_platform=f"{source_platform}:safe_retry", event_date=event_date,
                 force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai, auto_merge=False,
                 existing_id=existing_id, client_request_id=client_request_id,
-                subject_name=subject_name,
+                subject_name=subject_name, speaker_name=speaker_name,
             )
             _audit("remember_safe_retry_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(safe_content))
             return {"safe_write": "neutral_summary_retry", "original_error": str(exc), **result}
@@ -495,6 +496,8 @@ async def safe_remember(
     importance: float = 0.5,
     source_ai: str = "claude",
     event_date: str = "",
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> str:
     """安全降敏写入一条记忆。适合心理、关系、边界、创伤、长文本等容易被平台安全检查拦截的内容。
 
@@ -508,10 +511,13 @@ async def safe_remember(
         importance: 重要度 0-1，敏感摘要建议不要超过 0.7
         source_ai: 来源AI
         event_date: 事件日期
+        subject_name: 记忆主体姓名（guardrail 检查用）
+        speaker_name: 发言者姓名（guardrail 检查用）
     """
     result = await _safe_remember_impl(
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, retry_on_fail=True,
+        subject_name=subject_name, speaker_name=speaker_name,
     )
     return json.dumps(result, ensure_ascii=False)
 
@@ -520,6 +526,8 @@ async def safe_remember(
 async def grow(
     content: str,
     source_ai: str = "claude",
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> str:
     """把一大段混合内容（日记、对话总结等）拆分成多条独立记忆。
     系统自动拆分主题、分配房间、打标签、合并重复。
@@ -527,8 +535,13 @@ async def grow(
     Args:
         content: 要整理的长文本
         source_ai: 来源AI
+        subject_name: 记忆主体姓名（guardrail 检查用）
+        speaker_name: 发言者姓名（guardrail 检查用）
     """
-    result = await memory_ops.grow(content=content, source_ai=source_ai)
+    result = await memory_ops.grow(
+        content=content, source_ai=source_ai,
+        subject_name=subject_name, speaker_name=speaker_name,
+    )
     summary = f"{result['total']}条|新{result['created']}合{result['merged']}"
     result["summary"] = summary
     return json.dumps(result, ensure_ascii=False)
@@ -1316,6 +1329,8 @@ async def batch_remember(
                 force_create=item.get("force_create", False),
                 tags=item.get("tags"),
                 retry_on_fail=True,
+                subject_name=item.get("subject_name", ""),
+                speaker_name=item.get("speaker_name", ""),
             )
         except Exception as exc:
             result = {"status": "failed", "error": str(exc), "error_type": type(exc).__name__}

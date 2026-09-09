@@ -286,6 +286,8 @@ async def build_corridor(ai_id: str) -> str:
         seen_norms.add(_norm(m.get("content", "")))
     for txt in anchor_contents:
         seen_norms.add(_norm(txt))
+    for d in dreams:
+        seen_norms.add(_norm(d.get("content", "")))
 
     pool = [
         m for m in visible_mems.values()

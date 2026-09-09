@@ -255,6 +255,8 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform="import",
+            subject_name=item.get("subject_name", ""),
+            speaker_name=item.get("speaker_name", ""),
         )
         memories.append({"content": content, "room": item.get("room"), **result})
 

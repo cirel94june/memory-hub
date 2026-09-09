@@ -291,9 +291,11 @@ async def remember(
                 )
                 return {"status": "guardrail_blocked", "reason": verdict.drop_reason}
         except ImportError:
-            logger.warning("subject_guardrail module not available; allowing")
+            logger.warning("subject_guardrail module not available — fail-closed")
+            return {"status": "guardrail_unavailable", "reason": "subject_guardrail module missing"}
         except Exception:
-            logger.warning("subject_guardrail check failed; allowing", exc_info=True)
+            logger.warning("subject_guardrail check failed — fail-closed", exc_info=True)
+            return {"status": "guardrail_unavailable", "reason": "subject_guardrail check raised"}
 
     if quick:
         auto_merge = False
@@ -1587,11 +1589,14 @@ async def grow(
     source_ai: str = "",
     auto_merge: bool = True,
     quick: bool = False,
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> dict:
     """把长文本拆分成多条独立记忆，每条独立走合并检测"""
     items = await analyzer.digest(content)
     if not items:
-        result = await remember(content, source_ai=source_ai, auto_merge=auto_merge)
+        result = await remember(content, source_ai=source_ai, auto_merge=auto_merge,
+                                subject_name=subject_name, speaker_name=speaker_name)
         return {"total": 1, "created": 1, "merged": 0, "items": [result]}
 
     created = 0
@@ -1608,6 +1613,8 @@ async def grow(
             tags=item.get("tags"),
             auto_analyze=False,
             auto_merge=auto_merge,
+            subject_name=subject_name,
+            speaker_name=speaker_name,
         )
         # Set domain/valence from digest result
         if r.get("status") == "created":
