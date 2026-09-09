@@ -250,6 +250,10 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
         if imp < 0.3:
             continue
 
+        item_subject = str(item.get("subject_name", "")).strip()
+        item_speaker = str(item.get("speaker_name", "")).strip()
+        if not item_speaker:
+            item_speaker = ai_id
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
@@ -257,8 +261,8 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform="import",
-            subject_name=item.get("subject_name", ""),
-            speaker_name=item.get("speaker_name", ""),
+            subject_name=item_subject,
+            speaker_name=item_speaker,
         )
         memories.append({"content": content, "room": item.get("room"), **result})
 

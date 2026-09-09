@@ -1613,8 +1613,8 @@ async def grow(
             tags=item.get("tags"),
             auto_analyze=False,
             auto_merge=auto_merge,
-            subject_name=subject_name,
-            speaker_name=speaker_name,
+            subject_name=item.get("subject_name") or subject_name,
+            speaker_name=item.get("speaker_name") or speaker_name,
         )
         # Set domain/valence from digest result
         if r.get("status") == "created":

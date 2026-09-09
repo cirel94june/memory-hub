@@ -43,8 +43,13 @@ def _guardrail_check_and_audit(
             claim_type=item.get("claim_type", ""),
         )
     except Exception as e:
-        logger.warning(f"subject_guardrail unavailable ({e}); allowing")
-        return None
+        logger.warning(f"subject_guardrail unavailable ({e}); fail-closed")
+        return subject_guardrail.GuardrailVerdict(
+            verdict="drop",
+            drop_reason="guardrail_unavailable",
+            resolved_role="unknown",
+            note=f"guardrail exception: {e}",
+        )
     if verdict.blocked:
         try:
             database.insert_dropped_proposal_audit({

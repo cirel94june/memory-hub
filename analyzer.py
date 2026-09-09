@@ -418,6 +418,8 @@ async def digest(content: str) -> list[dict]:
                 "tags": (item.get("tags") or [])[:6],
                 "importance": max(0.1, min(1.0, float(item.get("importance", 0.5)))),
                 "room": str(item.get("room", "living_room")),
+                "subject_name": str(item.get("subject_name", "")),
+                "speaker_name": str(item.get("speaker_name", "")),
             })
         activity_log.log_activity(
             "digest",

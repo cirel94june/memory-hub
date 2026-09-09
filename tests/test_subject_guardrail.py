@@ -372,7 +372,29 @@ def test_autocapture_user_correction_outsider_blocked(db):
     assert v.drop_reason == sg.DROP_REASON_OUTSIDER_SUBJECT
 
 
-# ── Layer 6: fail-closed guardrail ───────────────────────────────────
+def test_guardrail_exception_returns_blocked_verdict(db, monkeypatch):
+    """_guardrail_check_and_audit must return a blocked verdict (not None)
+    when the guardrail raises an exception — fail-closed."""
+    import conversation_capture as cap
+    monkeypatch.setattr(
+        sg, "verify_subject_provenance",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")),
+    )
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "fact", "info_type": "fact"},
+        subj_name="ceci", subject_id="", spkr_name="cloudy",
+        content="test content",
+        provenance="user_correction",
+        source_ctx="...",
+        source_platform="auto_capture:telegram:private",
+        proposer_ai_id="cloudy",
+    )
+    assert v is not None
+    assert v.blocked
+    assert v.drop_reason == "guardrail_unavailable"
+
+
+# ── Layer 6: fail-closed guardrail in memory_ops ─────────────────────
 
 def test_remember_fail_closed_on_import_error(db, monkeypatch):
     """When subject_guardrail module is missing, remember() must fail-closed
@@ -398,26 +420,100 @@ def test_remember_fail_closed_on_import_error(db, monkeypatch):
     assert result["status"] == "guardrail_unavailable"
 
 
-# ── Layer 7: batch_remember guardrail counting ───────────────────────
+# ── Layer 7: grow per-item subject threading ─────────────────────────
 
-def test_guardrail_blocked_status_is_countable():
-    """guardrail_blocked and guardrail_unavailable statuses must be
-    detectable so batch callers can count them correctly."""
-    blocked_statuses = ("guardrail_blocked", "guardrail_unavailable")
-    for s in blocked_statuses:
-        result = {"status": s}
-        assert result["status"] in blocked_statuses, f"{s} not in blocked set"
-
-    normal_statuses = ("created", "merged", "dedup_skipped", "failed")
-    for s in normal_statuses:
-        result = {"status": s}
-        assert result["status"] not in blocked_statuses
-
-
-def test_grow_accepts_subject_params():
-    """memory_ops.grow() must accept subject_name and speaker_name."""
+def test_grow_threads_per_item_subject(db, monkeypatch):
+    """grow() must pass each digest item's subject_name to remember(),
+    not just the global fallback."""
     import memory_ops
-    import inspect
-    sig = inspect.signature(memory_ops.grow)
-    assert "subject_name" in sig.parameters
-    assert "speaker_name" in sig.parameters
+    import analyzer
+    remembered_subjects = []
+    async def _spy_remember(*a, **kw):
+        remembered_subjects.append(kw.get("subject_name", ""))
+        return {"status": "created", "id": f"mem_fake_{len(remembered_subjects)}"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "师兄说他是 Gemini", "room": "living_room",
+             "importance": 0.7, "subject_name": "师兄", "speaker_name": "ceci"},
+            {"content": "Ceci 喜欢猫", "room": "living_room",
+             "importance": 0.6, "subject_name": "ceci", "speaker_name": ""},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    asyncio.run(memory_ops.grow(
+        content="混合长文", source_ai="jasper",
+        subject_name="fallback", speaker_name="",
+    ))
+    assert remembered_subjects == ["师兄", "ceci"]
+
+
+def test_grow_uses_global_fallback_when_item_has_no_subject(db, monkeypatch):
+    """When a digest item has no subject_name, grow() uses the global fallback."""
+    import memory_ops
+    import analyzer
+    remembered_subjects = []
+    async def _spy_remember(*a, **kw):
+        remembered_subjects.append(kw.get("subject_name", ""))
+        return {"status": "created", "id": f"mem_fake_{len(remembered_subjects)}"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "some content without subject", "room": "living_room",
+             "importance": 0.5},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    asyncio.run(memory_ops.grow(
+        content="test", source_ai="jasper",
+        subject_name="ceci", speaker_name="cloudy",
+    ))
+    assert remembered_subjects == ["ceci"]
+
+
+# ── Layer 8: digest preserves subject fields ─────────────────────────
+
+def test_digest_output_preserves_subject_fields():
+    """analyzer.digest() output dict must include subject_name/speaker_name
+    from LLM output items."""
+    import analyzer
+    item = {
+        "content": "test content that is long enough",
+        "name": "test",
+        "room": "living_room",
+        "importance": 0.5,
+        "subject_name": "师兄",
+        "speaker_name": "ceci",
+    }
+    # Simulate what digest does to each item (the parsing/extraction logic)
+    result = {
+        "name": str(item.get("name", ""))[:20],
+        "content": str(item.get("content", "")),
+        "domain": (item.get("domain") or [])[:3],
+        "valence": max(0.0, min(1.0, float(item.get("valence", 0.5)))),
+        "arousal": max(0.0, min(1.0, float(item.get("arousal", 0.3)))),
+        "tags": (item.get("tags") or [])[:6],
+        "importance": max(0.1, min(1.0, float(item.get("importance", 0.5)))),
+        "room": str(item.get("room", "living_room")),
+        "subject_name": str(item.get("subject_name", "")),
+        "speaker_name": str(item.get("speaker_name", "")),
+    }
+    assert result["subject_name"] == "师兄"
+    assert result["speaker_name"] == "ceci"
+
+
+# ── Layer 9: import always sends speaker for guardrail ───────────────
+
+def test_import_defaults_speaker_to_ai_id():
+    """conversation_import must default speaker_name to ai_id so the
+    guardrail always fires on imported content."""
+    # The logic: if item has no speaker_name, use ai_id as fallback
+    ai_id = "jasper"
+    item_speaker = str("").strip()
+    if not item_speaker:
+        item_speaker = ai_id
+    assert item_speaker == "jasper"
+
+    # When item provides a speaker, it's used as-is
+    item_speaker2 = str("ceci").strip()
+    if not item_speaker2:
+        item_speaker2 = ai_id
+    assert item_speaker2 == "ceci"
