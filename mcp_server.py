@@ -207,6 +207,7 @@ async def _safe_remember_impl(
     retry_on_fail: bool = True,
     existing_id: str = "",
     client_request_id: str = "",
+    subject_name: str = "",
 ) -> dict:
     original = str(content or "")
     neutral = _compact_content(original)
@@ -217,6 +218,7 @@ async def _safe_remember_impl(
             source_ai=source_ai, source_platform=source_platform, event_date=event_date,
             force_create=force_create, tags=tags, layer=layer, owner_ai=owner_ai,
             existing_id=existing_id, client_request_id=client_request_id,
+            subject_name=subject_name,
         )
         _audit("remember_result", status=result.get("status", "ok"), memory_id=result.get("id"), source_ai=source_ai, chars=len(neutral))
         return {"safe_write": "original_or_compact", **result}
@@ -294,7 +296,7 @@ from async_remember import _idempotent_response  # noqa: E402,F401
 async def _finalize_pending_memory(
     skeleton_id: str, *, content: str, room: str, category: str,
     importance: float, source_ai: str, event_date: str, force_create: bool,
-    client_request_id: str = "",
+    client_request_id: str = "", subject_name: str = "",
 ) -> None:
     """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
     All reconciliation logic (real_id match / mark_replaced / mark failed)
@@ -305,7 +307,7 @@ async def _finalize_pending_memory(
         impl_fn=_safe_remember_impl,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
-        client_request_id=client_request_id,
+        client_request_id=client_request_id, subject_name=subject_name,
     )
 
 
@@ -319,6 +321,7 @@ async def remember(
     event_date: str = "",
     force_create: bool = False,
     client_request_id: str = "",
+    subject_name: str = "",
 ) -> str:
     """存储一条新记忆——**异步管线**，立即返回，后台跑 embedding + 分类 + 合并检测。
 
@@ -339,6 +342,10 @@ async def remember(
     - 独立 sweep 任务每 10 分钟检查一次：超过 10 分钟的 pending 会重跑 pipeline，
       超过 60 分钟仍是 pending 会被标 failed
 
+    ## 身份校验
+    - 传 subject_name 时，系统会校验该主语是否为已知家庭成员
+    - 外部人物（outsider）或未知身份会被拦截，不写入记忆
+
     ## 房间选择
     - living_room: 核心身份（永远注入）
     - career/psychology/health/learning/relationships/preferences: 各主题共享房间
@@ -355,6 +362,7 @@ async def remember(
         event_date: 事件发生日期（可选）
         force_create: 强制新建，跳过自动合并
         client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
+        subject_name: 记忆主语的原始名称（可选，传了会做身份校验）
     """
     # M1: namespace the client_request_id by source_ai so two different AIs
     # can safely reuse the same client-side counter. Compute a content
@@ -467,7 +475,7 @@ async def remember(
         skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
-        client_request_id=effective_crq,
+        client_request_id=effective_crq, subject_name=subject_name,
     ))
 
     # 4. Return immediately (<2s target). Return the original crq the caller
