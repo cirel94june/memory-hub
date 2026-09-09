@@ -788,7 +788,7 @@ AGENT_PROFILE_PROMPT = """你是一个记忆整理助手。根据以下经过证
 async def rebuild_agent_profile(ai_id: str, force: bool = False) -> dict | None:
     ai_name = PROFILE_NAMES.get(ai_id, ai_id)
 
-    rooms = ["personality", "diary", "dreams", "social", "living_room"]
+    rooms = ["personality", "diary", "social", "living_room"]
     raw_mems = _gather_memories(rooms, owner_ai=ai_id, limit=60)
 
     mems = _filter_evidence(raw_mems, "agent")

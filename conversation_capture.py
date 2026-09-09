@@ -29,12 +29,49 @@ def _guardrail_check_and_audit(
     content: str, provenance: str, source_ctx: str,
     source_platform: str, proposer_ai_id: str,
 ) -> subject_guardrail.GuardrailVerdict | None:
-    """DEPRECATED — guardrail now lives in memory_ops.remember().
+    """Run subject-guardrail; on drop, write audit and return the verdict
+    (caller uses `.blocked` to skip). On allow or exception, returns
+    verdict or None; caller must NOT gate on None.
 
-    Kept as a thin pass-through so callers that haven't migrated yet
-    don't break. Returns None (= allow) unconditionally; the real check
-    happens inside remember() when subject_name/speaker_name are passed."""
-    return None
+    Consolidated so both `_extract_and_remember` (auto-capture) and
+    `extract_from_messages` (manual MCP extract) share exactly the same
+    identity-checking gate — no drift risk."""
+    try:
+        verdict = subject_guardrail.verify_subject_provenance(
+            subject_name=subj_name, speaker_name=spkr_name,
+            content=content, provenance_type=provenance,
+            claim_type=item.get("claim_type", ""),
+        )
+    except Exception as e:
+        logger.warning(f"subject_guardrail unavailable ({e}); allowing")
+        return None
+    if verdict.blocked:
+        try:
+            database.insert_dropped_proposal_audit({
+                "drop_reason": verdict.drop_reason,
+                "subject_name": subj_name,
+                "subject_id": subject_id,
+                "resolved_role": verdict.resolved_role,
+                "speaker_name": spkr_name,
+                "content_preview": content[:200],
+                "source_platform": source_platform,
+                "source_context": (source_ctx or "")[:1000],
+                "proposer_ai_id": proposer_ai_id,
+                "decision_json": json.dumps({
+                    "verdict": verdict.verdict,
+                    "note": verdict.note,
+                    "provenance": provenance,
+                    "claim_type": item.get("claim_type", ""),
+                    "info_type": item.get("info_type", ""),
+                }, ensure_ascii=False),
+            })
+        except Exception as audit_e:
+            logger.warning(f"dropped-proposal audit write failed: {audit_e}")
+        logger.info(
+            f"subject-guardrail dropped: reason={verdict.drop_reason} "
+            f"subject={subj_name!r} content={content[:60]!r}"
+        )
+    return verdict
 
 logger = logging.getLogger("memory_hub.capture")
 

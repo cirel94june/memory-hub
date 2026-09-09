@@ -154,7 +154,8 @@ async def _finalize_pending_memory(
           skeleton_id, impl_fn=impl_fn, content=content, room=room,
           category=category, importance=importance, source_ai=source_ai,
           event_date=event_date, force_create=force_create,
-          client_request_id=client_request_id, subject_name=subject_name,
+          client_request_id=client_request_id,
+          subject_name=subject_name,
       )
 
 
@@ -212,7 +213,8 @@ async def _finalize_pending_memory_inner(
             content=content, room=room, category=category, importance=importance,
             source_ai=source_ai, event_date=event_date, force_create=force_create,
             existing_id=skeleton_id,
-            client_request_id=client_request_id, subject_name=subject_name,
+            client_request_id=client_request_id,
+            subject_name=subject_name,
         )
         real_id = (result or {}).get("id", "")
         if real_id == skeleton_id:

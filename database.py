@@ -417,6 +417,9 @@ async def init_db(db_path: str = None) -> None:
         if "finalize_claim_at" not in existing_cols:
             conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
             logger.info("Migrated: added 'finalize_claim_at' column")
+        if "subject_name" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN subject_name TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'subject_name' column")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
@@ -755,8 +758,9 @@ def insert_pending_memory(mem: dict) -> None:
             "INSERT INTO memories ("
             "  id, content, layer, room, category, owner_ai, importance,"
             "  source_ai, source_platform, event_date, source_context,"
-            "  status, client_request_id, created_at, updated_at, tags, domain"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "  status, client_request_id, created_at, updated_at, tags, domain,"
+            "  subject_name"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
                 mem.get("room", "living_room"), mem.get("category", ""),
@@ -767,6 +771,7 @@ def insert_pending_memory(mem: dict) -> None:
                 now, now,
                 _as_json_list(mem.get("tags")),
                 _as_json_list(mem.get("domain")),
+                mem.get("subject_name", ""),
             ),
         )
 

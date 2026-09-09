@@ -243,8 +243,8 @@ async def remember(
     subject_id: 这条记忆关于谁（person_id）。
     source_actor_id: 动作来源（person_id，user/ai/system）。
     info_type: 记忆生命周期类型（identity/state/event/task/reflection/relationship/fact）。
-    subject_name: 原始主语名（用于 subject guardrail 身份校验）。
-    speaker_name: 原始说话人名（用于 subject guardrail 身份校验）。"""
+    subject_name: 记忆主体姓名（guardrail 检查用）。
+    speaker_name: 发言者姓名（guardrail 检查用）。"""
     if fact_confidence is None:
         fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
     # 归一化 AI 别名（cloudy → claude）
@@ -252,18 +252,21 @@ async def remember(
     source_ai = AI_ALIASES.get(source_ai, source_ai)
     owner_ai = AI_ALIASES.get(owner_ai, owner_ai)
 
-    # Subject guardrail: 统一入口层身份校验，所有写入路径共享
+    # Subject guardrail: 在所有写入路径统一拦截
     if subject_name or speaker_name:
         try:
             import subject_guardrail
             verdict = subject_guardrail.verify_subject_provenance(
-                subject_name=subject_name, speaker_name=speaker_name,
-                content=content, provenance_type=provenance_type,
+                subject_name=subject_name,
+                speaker_name=speaker_name,
+                content=content,
+                provenance_type=provenance_type,
                 claim_type=claim_type,
             )
             if verdict.blocked:
                 try:
-                    database.insert_dropped_proposal_audit({
+                    import database as _db
+                    _db.insert_dropped_proposal_audit({
                         "drop_reason": verdict.drop_reason,
                         "subject_name": subject_name,
                         "subject_id": subject_id,
@@ -278,19 +281,19 @@ async def remember(
                             "note": verdict.note,
                             "provenance": provenance_type,
                             "claim_type": claim_type,
-                            "info_type": info_type,
                         }, ensure_ascii=False),
                     })
-                except Exception as audit_e:
-                    logger.warning(f"dropped-proposal audit write failed: {audit_e}")
+                except Exception:
+                    logger.warning("guardrail audit write failed", exc_info=True)
                 logger.info(
-                    f"subject-guardrail blocked in remember(): reason={verdict.drop_reason} "
-                    f"subject={subject_name!r} content={content[:60]!r}"
+                    "subject-guardrail blocked remember: reason=%s subject=%r",
+                    verdict.drop_reason, subject_name,
                 )
-                return {"id": "", "status": "guardrail_blocked",
-                        "reason": verdict.drop_reason}
+                return {"status": "guardrail_blocked", "reason": verdict.drop_reason}
         except ImportError:
-            logger.warning("subject_guardrail module unavailable; allowing")
+            logger.warning("subject_guardrail module not available; allowing")
+        except Exception:
+            logger.warning("subject_guardrail check failed; allowing", exc_info=True)
 
     if quick:
         auto_merge = False

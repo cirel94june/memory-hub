@@ -461,6 +461,8 @@ class RememberRequest(BaseModel):
     source_platform: str = ""
     tags: list[str] = []
     event_date: str = ""
+    subject_name: str = ""
+    speaker_name: str = ""
 
 @app.post("/api/memory/remember")
 async def api_remember(body: RememberRequest, authorization: str = Header(default="")):
@@ -471,6 +473,7 @@ async def api_remember(body: RememberRequest, authorization: str = Header(defaul
         importance=body.importance, emotion_arousal=body.emotion_arousal,
         source_ai=body.source_ai, source_platform=body.source_platform,
         tags=body.tags, event_date=body.event_date,
+        subject_name=body.subject_name, speaker_name=body.speaker_name,
     )
     return result
 

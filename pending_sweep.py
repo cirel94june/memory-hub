@@ -259,6 +259,7 @@ async def sweep_stuck_pending() -> dict:
                 event_date=skel.get("event_date", ""),
                 force_create=False,
                 client_request_id=crq,
+                subject_name=skel.get("subject_name", ""),
             ))
             _write_audit(
                 skel["id"], "sweep_retry",

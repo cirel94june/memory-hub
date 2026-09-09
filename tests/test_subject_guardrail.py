@@ -261,37 +261,92 @@ def test_layer3_migration_idempotent_no_dup_columns(db):
 
 
 def test_layer3_end_to_end_drop_writes_audit(db, monkeypatch):
-    """Outsider subject via memory_ops.remember() → guardrail_blocked
-    AND audit row inserted with correct fields."""
-    import memory_ops
-    result = asyncio.run(memory_ops.remember(
+    """Full slice through _guardrail_check_and_audit: outsider subject
+    → verdict.blocked=True AND audit row inserted with correct fields."""
+    import conversation_capture as cap
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "observation", "info_type": "fact"},
+        subj_name="师兄", subject_id="", spkr_name="ceci",
         content="师兄声称自己也是 Gemini",
-        room="living_room",
-        source_ai="jasper",
+        provenance="ai_summary",
+        source_ctx="ceci: 笑死\njasper: 别理师兄",
         source_platform="auto_capture:telegram:public_group",
-        provenance_type="ai_summary",
-        claim_type="observation",
-        subject_name="师兄",
-        speaker_name="ceci",
-    ))
-    assert result["status"] == "guardrail_blocked"
-    assert result["reason"] == sg.DROP_REASON_OUTSIDER_SUBJECT
+        proposer_ai_id="jasper",
+    )
+    assert v is not None
+    assert v.blocked
     rows = database.list_dropped_proposal_audits()
     assert len(rows) == 1
     r = rows[0]
     assert r["drop_reason"] == sg.DROP_REASON_OUTSIDER_SUBJECT
     assert r["subject_name"] == "师兄"
     assert r["resolved_role"] == iw.ROLE_OUTSIDER
+    assert r["proposer_ai_id"] == "jasper"
     decision = json.loads(r["decision_json"])
     assert decision["verdict"] == sg.VERDICT_DROP
 
 
 def test_layer3_end_to_end_allow_no_audit(db):
-    """Allowed subject via memory_ops.remember() must not write audit row."""
-    v = sg.verify_subject_provenance(
-        subject_name="cloudy", speaker_name="cloudy",
+    """Allowed proposal must not write any audit row."""
+    import conversation_capture as cap
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "fact", "info_type": "fact"},
+        subj_name="cloudy", subject_id="p_cloudy", spkr_name="cloudy",
         content="cloudy 自我介绍：我是 Claude Opus 5",
-        provenance_type="user_statement", claim_type="fact",
+        provenance="user_statement", source_ctx="cloudy: ...",
+        source_platform="mcp_extract", proposer_ai_id="cloudy",
+    )
+    assert v is not None
+    assert not v.blocked
+    assert database.count_dropped_proposal_audits() == 0
+
+
+# ── Layer 4: guardrail inside memory_ops.remember() ──────────────────
+
+def test_remember_blocks_outsider_subject(db, monkeypatch):
+    """memory_ops.remember() must block when subject_name is an outsider,
+    returning guardrail_blocked and writing an audit row."""
+    import memory_ops
+    # Stub out embedding/LLM so remember() doesn't need real API keys
+    monkeypatch.setattr(memory_ops, "get_embedding", lambda *a, **kw: None)
+    result = asyncio.run(
+        memory_ops.remember(
+            content="师兄说他也是 Gemini",
+            room="living_room",
+            source_ai="jasper",
+            subject_name="师兄",
+            speaker_name="ceci",
+        )
+    )
+    assert result["status"] == "guardrail_blocked"
+    assert result["reason"] == sg.DROP_REASON_OUTSIDER_SUBJECT
+    rows = database.list_dropped_proposal_audits()
+    assert len(rows) >= 1
+    assert rows[-1]["subject_name"] == "师兄"
+
+
+def test_remember_allows_known_family_subject(db):
+    """memory_ops.remember() guardrail must NOT block known family subjects.
+    We only test the guardrail gate, not the full pipeline."""
+    v = sg.verify_subject_provenance(
+        subject_name="ceci",
+        speaker_name="cloudy",
+        content="ceci 今天心情不错",
+        provenance_type="user_statement",
+        claim_type="fact",
     )
     assert not v.blocked
     assert database.count_dropped_proposal_audits() == 0
+
+
+def test_remember_no_subject_name_skips_guardrail(db):
+    """When subject_name is empty, guardrail does not fire (backwards compat).
+    The guardrail in remember() only runs when subject_name or speaker_name
+    is non-empty."""
+    v = sg.verify_subject_provenance(
+        subject_name="",
+        content="random fact",
+        provenance_type="user_statement",
+        claim_type="fact",
+    )
+    assert not v.blocked

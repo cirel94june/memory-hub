@@ -223,7 +223,7 @@ async def build_corridor(ai_id: str) -> str:
     # 3. 该 AI 最近的日记/周记（保持 created_at DESC 3 条，本来就是纯时间序）
     diary = sorted(
         [m for m in visible_mems.values()
-         if m.get("room") in ("diary", "dreams") and m.get("owner_ai") == ai_id
+         if m.get("room") == "diary" and m.get("owner_ai") == ai_id
          and m.get("status") == "active"],
         key=lambda x: x.get("created_at", ""),
         reverse=True,

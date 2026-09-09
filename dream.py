@@ -223,7 +223,7 @@ def _fetch_memory_residue(conn: sqlite3.Connection, canonical: str, alias_ids: l
     cutoff_old = (now - timedelta(hours=168)).isoformat()
     placeholders = ",".join("?" * len(alias_ids))
 
-    per_ai_rooms = ("diary", "dreams", "relationship", "personality")
+    per_ai_rooms = ("diary", "relationship", "personality")
     per_ai_ph = ",".join("?" * len(per_ai_rooms))
     subj_ph = ",".join("?" * len(alias_ids))
 
