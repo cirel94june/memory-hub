@@ -229,6 +229,15 @@ async def build_corridor(ai_id: str) -> str:
         reverse=True,
     )[:3]
 
+    # 3.5. 该 AI 最近的梦（room=dreams，最多 1 条，独立于日记）
+    dreams = sorted(
+        [m for m in visible_mems.values()
+         if m.get("room") == "dreams" and m.get("owner_ai") == ai_id
+         and m.get("status") == "active"],
+        key=lambda x: x.get("created_at", ""),
+        reverse=True,
+    )[:1]
+
     # 4. 该 AI 的自我认知 — 3 条，recency-weighted
     personality_mems = [m for m in visible_mems.values()
                         if m.get("room") == "personality"
@@ -356,6 +365,9 @@ async def build_corridor(ai_id: str) -> str:
 
     if diary:
         sections.append("【你最近的日记】\n" + "\n".join(f"· {d['content'][:300]}" for d in diary))
+
+    if dreams:
+        sections.append("【最近的梦】\n" + "\n".join(f"· {d['content'][:300]}" for d in dreams))
 
     # 6.5 (render) 近期重要事件 — 放在日记之后，跨房间兜底
     # dedup 已在候选筛选阶段完成，这里直接渲染。
