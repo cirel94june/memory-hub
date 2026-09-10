@@ -71,22 +71,55 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
         log.warning(f"raw_vault log failed: {e}")
 
 
-def search(query: str, ai_id: str = "", limit: int = 10) -> list[dict]:
-    """按关键词查原话（LIKE 匹配，新的在前）。"""
+def search(query: str, ai_id: str = "", limit: int = 10,
+           speaker_filter: str = "") -> list[dict]:
+    """按关键词查原话（LIKE 匹配 + 同义词展开，新的在前）。
+
+    speaker_filter:
+        ""       → 搜全部（user_text + ai_text）
+        "user"   → 只搜 user_text
+        "ai"     → 只搜 ai_text
+    ai_id:
+        ""       → 不限 AI（但 chat_type='private' 的 DM 只在
+                    ai_id 匹配时才返回，防止跨 AI 泄露私聊）
+        "claude" → 只看该 AI 参与的对话
+    """
     if not (query or "").strip():
         return []
+
+    import synonym_pairs
+    keywords = synonym_pairs.expand(query.strip())
+
     conn = _connect()
     conn.row_factory = sqlite3.Row
-    like = f"%{query.strip()}%"
-    params: list = [like, like]
-    ai_filter = ""
+    params: list = []
+
+    text_clauses = []
+    for kw in keywords:
+        like = f"%{kw}%"
+        if speaker_filter == "user":
+            text_clauses.append("user_text LIKE ?")
+            params.append(like)
+        elif speaker_filter == "ai":
+            text_clauses.append("ai_text LIKE ?")
+            params.append(like)
+        else:
+            text_clauses.append("(user_text LIKE ? OR ai_text LIKE ?)")
+            params.extend([like, like])
+
+    text_where = "(" + " OR ".join(text_clauses) + ")"
+
+    extra = ""
     if ai_id:
-        ai_filter = " AND ai_id = ? "
+        extra += " AND ai_id = ? "
         params.append(ai_id)
+    else:
+        extra += " AND chat_type != 'private' "
+
     params.append(limit)
     cur = conn.execute(
         "SELECT id, ai_id, platform, chat_id, chat_type, user_text, ai_text, created_at "
-        "FROM raw_events WHERE (user_text LIKE ? OR ai_text LIKE ?)" + ai_filter +
+        f"FROM raw_events WHERE {text_where}{extra}"
         "ORDER BY created_at DESC LIMIT ?",
         tuple(params),
     )

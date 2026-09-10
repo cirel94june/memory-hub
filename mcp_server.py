@@ -1017,17 +1017,21 @@ async def doctor_report() -> str:
 
 
 @mcp.tool()
-async def search_raw(query: str, ai_id: str = "", limit: int = 5) -> str:
+async def search_raw(query: str, ai_id: str = "", limit: int = 5,
+                     speaker_filter: str = "") -> str:
     """在原文保险箱里查当时的原始对话（未经加工的原话）。
     记忆内容存疑、或用户问"当时到底怎么说的"时用这个对照原文。
+    支持同义词自动展开（如搜"妈妈"也能找到"母亲"）。
 
     Args:
-        query: 关键词
-        ai_id: 限定某个 AI 的对话（留空=全部）
+        query: 关键词（自动展开同义词）
+        ai_id: 限定某个 AI 的对话（留空=搜全部公开对话；传值=含该 AI 的私聊）
         limit: 最多返回条数
+        speaker_filter: 留空=搜全部发言人, "user"=只搜用户说的, "ai"=只搜 AI 说的
     """
     import raw_vault
-    hits = raw_vault.search(query, ai_id=ai_id, limit=limit)
+    hits = raw_vault.search(query, ai_id=ai_id, limit=limit,
+                            speaker_filter=speaker_filter)
     return json.dumps({"results": hits, "stats": raw_vault.stats()}, ensure_ascii=False, indent=2)
 
 
