@@ -126,6 +126,7 @@ async def _finalize_pending_memory(
     event_date: str,
     force_create: bool,
     client_request_id: str = "",
+    subject_name: str = "",
 ) -> None:
     """Background pipeline: run the injected sync impl and reconcile the
     skeleton row.
@@ -154,6 +155,7 @@ async def _finalize_pending_memory(
           category=category, importance=importance, source_ai=source_ai,
           event_date=event_date, force_create=force_create,
           client_request_id=client_request_id,
+          subject_name=subject_name,
       )
 
 
@@ -169,6 +171,7 @@ async def _finalize_pending_memory_inner(
     event_date: str,
     force_create: bool,
     client_request_id: str = "",
+    subject_name: str = "",
 ) -> None:
     """Inner (post-semaphore) body — split so the semaphore acquire happens
     at the outer layer only, keeping the transactional logic testable
@@ -211,6 +214,7 @@ async def _finalize_pending_memory_inner(
             source_ai=source_ai, event_date=event_date, force_create=force_create,
             existing_id=skeleton_id,
             client_request_id=client_request_id,
+            subject_name=subject_name,
         )
         real_id = (result or {}).get("id", "")
         if real_id == skeleton_id:

@@ -232,6 +232,8 @@ async def remember(
     info_type: str = "",
     existing_id: str = "",
     client_request_id: str = "",
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> dict:
     """写入一条新记忆，自动打标 + 智能关系检测（更新/取代/合并/新建）
 
@@ -240,13 +242,60 @@ async def remember(
     fact_confidence: 事实置信度，不传时按 provenance 默认。
     subject_id: 这条记忆关于谁（person_id）。
     source_actor_id: 动作来源（person_id，user/ai/system）。
-    info_type: 记忆生命周期类型（identity/state/event/task/reflection/relationship/fact）。"""
+    info_type: 记忆生命周期类型（identity/state/event/task/reflection/relationship/fact）。
+    subject_name: 记忆主体姓名（guardrail 检查用）。
+    speaker_name: 发言者姓名（guardrail 检查用）。"""
     if fact_confidence is None:
         fact_confidence = _PROVENANCE_CONFIDENCE.get(provenance_type, 0.6)
     # 归一化 AI 别名（cloudy → claude）
     from config import AI_ALIASES
     source_ai = AI_ALIASES.get(source_ai, source_ai)
     owner_ai = AI_ALIASES.get(owner_ai, owner_ai)
+
+    # Subject guardrail: 在所有写入路径统一拦截
+    if subject_name or speaker_name:
+        try:
+            import subject_guardrail
+            verdict = subject_guardrail.verify_subject_provenance(
+                subject_name=subject_name,
+                speaker_name=speaker_name,
+                content=content,
+                provenance_type=provenance_type,
+                claim_type=claim_type,
+            )
+            if verdict.blocked:
+                try:
+                    import database as _db
+                    _db.insert_dropped_proposal_audit({
+                        "drop_reason": verdict.drop_reason,
+                        "subject_name": subject_name,
+                        "subject_id": subject_id,
+                        "resolved_role": verdict.resolved_role,
+                        "speaker_name": speaker_name,
+                        "content_preview": content[:200],
+                        "source_platform": source_platform,
+                        "source_context": (source_context or "")[:1000],
+                        "proposer_ai_id": source_ai,
+                        "decision_json": json.dumps({
+                            "verdict": verdict.verdict,
+                            "note": verdict.note,
+                            "provenance": provenance_type,
+                            "claim_type": claim_type,
+                        }, ensure_ascii=False),
+                    })
+                except Exception:
+                    logger.warning("guardrail audit write failed", exc_info=True)
+                logger.info(
+                    "subject-guardrail blocked remember: reason=%s subject=%r",
+                    verdict.drop_reason, subject_name,
+                )
+                return {"status": "guardrail_blocked", "reason": verdict.drop_reason}
+        except ImportError:
+            logger.warning("subject_guardrail module not available — fail-closed")
+            return {"status": "guardrail_unavailable", "reason": "subject_guardrail module missing"}
+        except Exception:
+            logger.warning("subject_guardrail check failed — fail-closed", exc_info=True)
+            return {"status": "guardrail_unavailable", "reason": "subject_guardrail check raised"}
 
     if quick:
         auto_merge = False
@@ -1540,17 +1589,28 @@ async def grow(
     source_ai: str = "",
     auto_merge: bool = True,
     quick: bool = False,
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> dict:
     """把长文本拆分成多条独立记忆，每条独立走合并检测"""
     items = await analyzer.digest(content)
     if not items:
-        result = await remember(content, source_ai=source_ai, auto_merge=auto_merge)
+        if not subject_name.strip():
+            return {"total": 0, "created": 0, "merged": 0,
+                    "skipped_no_subject": 1, "items": []}
+        result = await remember(content, source_ai=source_ai, auto_merge=auto_merge,
+                                subject_name=subject_name, speaker_name=speaker_name)
         return {"total": 1, "created": 1, "merged": 0, "items": [result]}
 
     created = 0
     merged = 0
     results = []
     for item in items:
+        effective_subject = str(item.get("subject_name") or subject_name or "").strip()
+        if not effective_subject:
+            results.append({"status": "skipped_no_subject",
+                            "content": item.get("content", "")[:200]})
+            continue
         r = await remember(
             content=item["content"],
             room=item.get("room", "living_room"),
@@ -1561,6 +1621,8 @@ async def grow(
             tags=item.get("tags"),
             auto_analyze=False,
             auto_merge=auto_merge,
+            subject_name=effective_subject,
+            speaker_name=item.get("speaker_name") or speaker_name,
         )
         # Set domain/valence from digest result
         if r.get("status") == "created":
@@ -1574,7 +1636,9 @@ async def grow(
             merged += 1
         results.append(r)
 
-    return {"total": len(results), "created": created, "merged": merged, "items": results}
+    skipped = sum(1 for r in results if r.get("status") == "skipped_no_subject")
+    return {"total": len(results) - skipped, "created": created, "merged": merged,
+            "skipped_no_subject": skipped, "items": results}
 
 
 # ── 更新记忆 ──

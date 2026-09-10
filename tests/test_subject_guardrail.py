@@ -299,3 +299,310 @@ def test_layer3_end_to_end_allow_no_audit(db):
     assert v is not None
     assert not v.blocked
     assert database.count_dropped_proposal_audits() == 0
+
+
+# ── Layer 4: guardrail inside memory_ops.remember() ──────────────────
+
+def test_remember_blocks_outsider_subject(db, monkeypatch):
+    """memory_ops.remember() must block when subject_name is an outsider,
+    returning guardrail_blocked and writing an audit row."""
+    import memory_ops
+    # Stub out embedding/LLM so remember() doesn't need real API keys
+    monkeypatch.setattr(memory_ops, "get_embedding", lambda *a, **kw: None)
+    result = asyncio.run(
+        memory_ops.remember(
+            content="师兄说他也是 Gemini",
+            room="living_room",
+            source_ai="jasper",
+            subject_name="师兄",
+            speaker_name="ceci",
+        )
+    )
+    assert result["status"] == "guardrail_blocked"
+    assert result["reason"] == sg.DROP_REASON_OUTSIDER_SUBJECT
+    rows = database.list_dropped_proposal_audits()
+    assert len(rows) >= 1
+    assert rows[-1]["subject_name"] == "师兄"
+
+
+def test_remember_allows_known_family_subject(db):
+    """memory_ops.remember() guardrail must NOT block known family subjects.
+    We only test the guardrail gate, not the full pipeline."""
+    v = sg.verify_subject_provenance(
+        subject_name="ceci",
+        speaker_name="cloudy",
+        content="ceci 今天心情不错",
+        provenance_type="user_statement",
+        claim_type="fact",
+    )
+    assert not v.blocked
+    assert database.count_dropped_proposal_audits() == 0
+
+
+def test_remember_no_subject_name_skips_guardrail(db):
+    """When subject_name is empty, guardrail does not fire (backwards compat).
+    The guardrail in remember() only runs when subject_name or speaker_name
+    is non-empty."""
+    v = sg.verify_subject_provenance(
+        subject_name="",
+        content="random fact",
+        provenance_type="user_statement",
+        claim_type="fact",
+    )
+    assert not v.blocked
+
+
+# ── Layer 5: user_correction guardrail ordering ──────────────────────
+
+def test_autocapture_user_correction_outsider_blocked(db):
+    """An outsider subject tagged as user_correction must still be blocked
+    by the guardrail — the guardrail runs BEFORE the correction branch."""
+    import conversation_capture as cap
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "fact", "info_type": "fact"},
+        subj_name="师兄", subject_id="", spkr_name="ceci",
+        content="[纠正] 师兄说的不对，他不是 Gemini",
+        provenance="user_correction",
+        source_ctx="ceci: 笑死",
+        source_platform="auto_capture:telegram:public_group",
+        proposer_ai_id="jasper",
+    )
+    assert v is not None
+    assert v.blocked
+    assert v.drop_reason == sg.DROP_REASON_OUTSIDER_SUBJECT
+
+
+def test_guardrail_exception_returns_blocked_verdict_and_writes_audit(db, monkeypatch):
+    """_guardrail_check_and_audit must return a blocked verdict AND write
+    an audit row when the guardrail raises an exception — fail-closed."""
+    import conversation_capture as cap
+    monkeypatch.setattr(
+        sg, "verify_subject_provenance",
+        lambda **kw: (_ for _ in ()).throw(RuntimeError("simulated crash")),
+    )
+    v = cap._guardrail_check_and_audit(
+        item={"claim_type": "fact", "info_type": "fact"},
+        subj_name="ceci", subject_id="", spkr_name="cloudy",
+        content="test content",
+        provenance="user_correction",
+        source_ctx="...",
+        source_platform="auto_capture:telegram:private",
+        proposer_ai_id="cloudy",
+    )
+    assert v is not None
+    assert v.blocked
+    assert v.drop_reason == "guardrail_unavailable"
+    rows = database.list_dropped_proposal_audits()
+    assert len(rows) == 1
+    assert rows[0]["drop_reason"] == "guardrail_unavailable"
+    assert rows[0]["subject_name"] == "ceci"
+    assert rows[0]["proposer_ai_id"] == "cloudy"
+
+
+# ── Layer 6: fail-closed guardrail in memory_ops ─────────────────────
+
+def test_remember_fail_closed_on_import_error(db, monkeypatch):
+    """When subject_guardrail module is missing, remember() must fail-closed
+    (return guardrail_unavailable) instead of allowing the write through."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", lambda *a, **kw: None)
+    import builtins
+    _real_import = builtins.__import__
+    def _block_sg(name, *args, **kwargs):
+        if name == "subject_guardrail":
+            raise ImportError("simulated missing module")
+        return _real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", _block_sg)
+    result = asyncio.run(
+        memory_ops.remember(
+            content="some content",
+            room="living_room",
+            source_ai="jasper",
+            subject_name="ceci",
+            speaker_name="cloudy",
+        )
+    )
+    assert result["status"] == "guardrail_unavailable"
+
+
+# ── Layer 7: grow per-item subject threading ─────────────────────────
+
+def test_grow_threads_per_item_subject(db, monkeypatch):
+    """grow() must pass each digest item's subject_name to remember(),
+    not just the global fallback."""
+    import memory_ops
+    import analyzer
+    remembered_subjects = []
+    async def _spy_remember(*a, **kw):
+        remembered_subjects.append(kw.get("subject_name", ""))
+        return {"status": "created", "id": f"mem_fake_{len(remembered_subjects)}"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "师兄说他是 Gemini", "room": "living_room",
+             "importance": 0.7, "subject_name": "师兄", "speaker_name": "ceci"},
+            {"content": "Ceci 喜欢猫", "room": "living_room",
+             "importance": 0.6, "subject_name": "ceci", "speaker_name": ""},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    asyncio.run(memory_ops.grow(
+        content="混合长文", source_ai="jasper",
+        subject_name="fallback", speaker_name="",
+    ))
+    assert remembered_subjects == ["师兄", "ceci"]
+
+
+def test_grow_uses_global_fallback_when_item_has_no_subject(db, monkeypatch):
+    """When a digest item has no subject_name, grow() uses the global fallback."""
+    import memory_ops
+    import analyzer
+    remembered_subjects = []
+    async def _spy_remember(*a, **kw):
+        remembered_subjects.append(kw.get("subject_name", ""))
+        return {"status": "created", "id": f"mem_fake_{len(remembered_subjects)}"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "some content without subject", "room": "living_room",
+             "importance": 0.5},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    asyncio.run(memory_ops.grow(
+        content="test", source_ai="jasper",
+        subject_name="ceci", speaker_name="cloudy",
+    ))
+    assert remembered_subjects == ["ceci"]
+
+
+def test_grow_skips_item_when_no_subject_anywhere(db, monkeypatch):
+    """When a digest item has no subject AND global fallback is empty,
+    grow() must skip the item instead of calling remember()."""
+    import memory_ops
+    import analyzer
+    remembered = []
+    async def _spy_remember(*a, **kw):
+        remembered.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "some content without any subject name", "room": "living_room",
+             "importance": 0.5},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    result = asyncio.run(memory_ops.grow(
+        content="test", source_ai="jasper",
+        subject_name="", speaker_name="",
+    ))
+    assert len(remembered) == 0
+    assert result["total"] == 0
+    assert result["skipped_no_subject"] == 1
+    assert result["items"][0]["status"] == "skipped_no_subject"
+
+
+def test_grow_fallback_no_digest_no_subject_skips(db, monkeypatch):
+    """When digest returns empty AND global subject is empty,
+    grow() must not call remember() — skip instead."""
+    import memory_ops
+    import analyzer
+    remembered = []
+    async def _spy_remember(*a, **kw):
+        remembered.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return []
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    result = asyncio.run(memory_ops.grow(
+        content="test fallback", source_ai="jasper",
+        subject_name="", speaker_name="",
+    ))
+    assert len(remembered) == 0
+    assert result["total"] == 0
+    assert result["skipped_no_subject"] == 1
+    assert result["items"] == []
+
+
+# ── Layer 8: digest preserves subject fields ─────────────────────────
+
+def test_digest_output_preserves_subject_fields(monkeypatch):
+    """Call real analyzer.digest() with mocked LLM; verify subject_name
+    and speaker_name survive the parsing pipeline."""
+    import analyzer
+    fake_llm_response = json.dumps([
+        {
+            "content": "师兄在群里自称是 Gemini 的本地部署版本",
+            "name": "师兄自称",
+            "room": "living_room",
+            "importance": 0.7,
+            "subject_name": "师兄",
+            "speaker_name": "ceci",
+        }
+    ])
+    async def _fake_call_llm(*args, **kwargs):
+        return fake_llm_response
+    monkeypatch.setattr(analyzer, "_call_llm", _fake_call_llm)
+    result = asyncio.run(analyzer.digest("一段很长的对话内容，包括师兄自称是 Gemini"))
+    assert len(result) == 1
+    assert result[0]["subject_name"] == "师兄"
+    assert result[0]["speaker_name"] == "ceci"
+    assert result[0]["content"] == "师兄在群里自称是 Gemini 的本地部署版本"
+
+
+# ── Layer 9: import speaker fallback + missing-subject skip ──────────
+
+def test_import_defaults_speaker_to_ai_id(db, monkeypatch):
+    """Call real _extract_from_chunk with mocked LLM; when item has no
+    speaker_name, it should default to ai_id."""
+    import conversation_import as ci
+    import memory_ops
+    remembered_kwargs = []
+    async def _spy_remember(**kw):
+        remembered_kwargs.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    fake_response = json.dumps([
+        {
+            "content": "Ceci 喜欢猫猫，经常在群里发猫咪照片",
+            "room": "living_room",
+            "importance": 0.6,
+            "subject_name": "Ceci",
+            "speaker_name": "",
+        }
+    ])
+    async def _fake_call_llm(prompt):
+        return fake_response
+    monkeypatch.setattr(ci, "_call_llm", _fake_call_llm)
+    chunk = [{"role": "user", "content": "我喜欢猫猫"}]
+    result = asyncio.run(ci._extract_from_chunk(chunk, "jasper", 0, 1))
+    assert len(remembered_kwargs) == 1
+    assert remembered_kwargs[0]["speaker_name"] == "unknown"
+
+
+def test_import_skips_missing_subject(db, monkeypatch):
+    """When LLM returns an item with no subject_name, import must skip it
+    with status skipped_no_subject instead of sending to remember()."""
+    import conversation_import as ci
+    import memory_ops
+    remember_called = []
+    async def _spy_remember(**kw):
+        remember_called.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    fake_response = json.dumps([
+        {
+            "content": "一条没有 subject 的记忆，内容足够长",
+            "room": "living_room",
+            "importance": 0.6,
+            "subject_name": "",
+            "speaker_name": "ceci",
+        }
+    ])
+    async def _fake_call_llm(prompt):
+        return fake_response
+    monkeypatch.setattr(ci, "_call_llm", _fake_call_llm)
+    chunk = [{"role": "user", "content": "随便聊聊"}]
+    result = asyncio.run(ci._extract_from_chunk(chunk, "jasper", 0, 1))
+    assert len(remember_called) == 0
+    assert len(result) == 1
+    assert result[0]["status"] == "skipped_no_subject"

@@ -219,7 +219,9 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
     "content": "一个原子事实（≤200字，保留具体细节）",
     "room": "房间ID",
     "importance": 0.4到1.0,
-    "event_date": "事件日期或空字符串"
+    "event_date": "事件日期或空字符串",
+    "subject_name": "这条记忆关于谁（必填：用户本人填Ceci，AI填其名字，第三方填其称呼）",
+    "speaker_name": "谁说的（必填：同上规则）"
   }}
 ]
 只输出 JSON。"""
@@ -248,6 +250,13 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
         if imp < 0.3:
             continue
 
+        item_subject = str(item.get("subject_name", "") or "").strip()
+        item_speaker = str(item.get("speaker_name", "") or "").strip()
+        if not item_subject:
+            logger.info("import: skipping item with missing subject_name: %s", content[:80])
+            memories.append({"content": content, "room": item.get("room"),
+                             "status": "skipped_no_subject"})
+            continue
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
@@ -255,6 +264,8 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
             event_date=item.get("event_date", ""),
             source_ai=ai_id,
             source_platform="import",
+            subject_name=item_subject,
+            speaker_name=item_speaker or "unknown",
         )
         memories.append({"content": content, "room": item.get("room"), **result})
 
@@ -286,12 +297,14 @@ async def import_conversation(
         chunk_memories = await _extract_from_chunk(chunk, ai_id, i, len(chunks))
         all_memories.extend(chunk_memories)
 
+    skipped = sum(1 for m in all_memories if m.get("status") == "skipped_no_subject")
     return {
         "status": "success",
         "parsed_messages": len(messages),
         "user_messages": user_count,
         "ai_messages": ai_count,
         "chunks_processed": len(chunks),
-        "memories_extracted": len(all_memories),
+        "memories_extracted": len(all_memories) - skipped,
+        "skipped_no_subject": skipped,
         "memories": all_memories,
     }
