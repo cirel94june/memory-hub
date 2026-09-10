@@ -474,6 +474,51 @@ def test_grow_uses_global_fallback_when_item_has_no_subject(db, monkeypatch):
     assert remembered_subjects == ["ceci"]
 
 
+def test_grow_skips_item_when_no_subject_anywhere(db, monkeypatch):
+    """When a digest item has no subject AND global fallback is empty,
+    grow() must skip the item instead of calling remember()."""
+    import memory_ops
+    import analyzer
+    remembered = []
+    async def _spy_remember(*a, **kw):
+        remembered.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return [
+            {"content": "some content without any subject name", "room": "living_room",
+             "importance": 0.5},
+        ]
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    result = asyncio.run(memory_ops.grow(
+        content="test", source_ai="jasper",
+        subject_name="", speaker_name="",
+    ))
+    assert len(remembered) == 0
+    assert result["items"][0]["status"] == "skipped_no_subject"
+
+
+def test_grow_fallback_no_digest_no_subject_skips(db, monkeypatch):
+    """When digest returns empty AND global subject is empty,
+    grow() must not call remember() — skip instead."""
+    import memory_ops
+    import analyzer
+    remembered = []
+    async def _spy_remember(*a, **kw):
+        remembered.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    async def _fake_digest(content):
+        return []
+    monkeypatch.setattr(analyzer, "digest", _fake_digest)
+    result = asyncio.run(memory_ops.grow(
+        content="test fallback", source_ai="jasper",
+        subject_name="", speaker_name="",
+    ))
+    assert len(remembered) == 0
+    assert result["items"][0]["status"] == "skipped_no_subject"
+
+
 # ── Layer 8: digest preserves subject fields ─────────────────────────
 
 def test_digest_output_preserves_subject_fields(monkeypatch):
@@ -527,7 +572,7 @@ def test_import_defaults_speaker_to_ai_id(db, monkeypatch):
     chunk = [{"role": "user", "content": "我喜欢猫猫"}]
     result = asyncio.run(ci._extract_from_chunk(chunk, "jasper", 0, 1))
     assert len(remembered_kwargs) == 1
-    assert remembered_kwargs[0]["speaker_name"] == "jasper"
+    assert remembered_kwargs[0]["speaker_name"] == "unknown"
 
 
 def test_import_skips_missing_subject(db, monkeypatch):

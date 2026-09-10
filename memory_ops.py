@@ -1595,6 +1595,10 @@ async def grow(
     """把长文本拆分成多条独立记忆，每条独立走合并检测"""
     items = await analyzer.digest(content)
     if not items:
+        if not subject_name.strip():
+            return {"total": 0, "created": 0, "merged": 0,
+                    "items": [{"status": "skipped_no_subject",
+                               "content": content[:200]}]}
         result = await remember(content, source_ai=source_ai, auto_merge=auto_merge,
                                 subject_name=subject_name, speaker_name=speaker_name)
         return {"total": 1, "created": 1, "merged": 0, "items": [result]}
@@ -1603,6 +1607,11 @@ async def grow(
     merged = 0
     results = []
     for item in items:
+        effective_subject = str(item.get("subject_name") or subject_name or "").strip()
+        if not effective_subject:
+            results.append({"status": "skipped_no_subject",
+                            "content": item.get("content", "")[:200]})
+            continue
         r = await remember(
             content=item["content"],
             room=item.get("room", "living_room"),
@@ -1613,7 +1622,7 @@ async def grow(
             tags=item.get("tags"),
             auto_analyze=False,
             auto_merge=auto_merge,
-            subject_name=item.get("subject_name") or subject_name,
+            subject_name=effective_subject,
             speaker_name=item.get("speaker_name") or speaker_name,
         )
         # Set domain/valence from digest result

@@ -265,7 +265,7 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
             source_ai=ai_id,
             source_platform="import",
             subject_name=item_subject,
-            speaker_name=item_speaker or ai_id,
+            speaker_name=item_speaker or "unknown",
         )
         memories.append({"content": content, "room": item.get("room"), **result})
 
@@ -297,12 +297,14 @@ async def import_conversation(
         chunk_memories = await _extract_from_chunk(chunk, ai_id, i, len(chunks))
         all_memories.extend(chunk_memories)
 
+    skipped = sum(1 for m in all_memories if m.get("status") == "skipped_no_subject")
     return {
         "status": "success",
         "parsed_messages": len(messages),
         "user_messages": user_count,
         "ai_messages": ai_count,
         "chunks_processed": len(chunks),
-        "memories_extracted": len(all_memories),
+        "memories_extracted": len(all_memories) - skipped,
+        "skipped_no_subject": skipped,
         "memories": all_memories,
     }
