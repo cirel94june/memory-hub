@@ -32,6 +32,14 @@ _RECENT_DAYS = 30
 _RECENT_SHARE = 0.3
 _RECENT_DECAY = 30.0  # e-fold days for recency_score = exp(-days/30)
 
+# Activation-count penalty (P1): memories recalled too often get demoted
+# so fresh/rare content surfaces.  Top-5% of candidate pool penalised 0.5x;
+# above hard threshold (>200, i.e. 201+) penalised 0.3x.
+_ACTIVATION_PENALTY_P95 = 0.5
+_ACTIVATION_PENALTY_HARD = 0.3
+_ACTIVATION_HARD_THRESHOLD = 200  # 201+ triggers hard penalty
+_ACTIVATION_MIN_POOL = 5
+
 
 def _safe_float(val, default: float = 0.5) -> float:
     if val is None or val == "":
@@ -63,6 +71,51 @@ def _recency_score(iso_ts: str, now_utc: datetime | None = None) -> float:
     if d == float("inf"):
         return 0.0
     return math.exp(-d / _RECENT_DECAY)
+
+
+def _safe_act_count(val) -> float:
+    """Normalise activation_count: None / '' / non-numeric / inf / nan → 0.0."""
+    if val is None or val == "":
+        return 0.0
+    try:
+        n = float(val)
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    if not math.isfinite(n):
+        return 0.0
+    return max(n, 0.0)
+
+
+def _activation_multiplier(count: float, p95: float | None) -> float:
+    """Return sort-key multiplier based on activation_count.
+
+    - count > 200 (hard threshold, i.e. 201+): 0.3x
+    - count >= cutoff (top-5% of pool):         0.5x
+    - otherwise:                                 1.0x
+    """
+    if count > _ACTIVATION_HARD_THRESHOLD:
+        return _ACTIVATION_PENALTY_HARD
+    if p95 is not None and count >= p95:
+        return _ACTIVATION_PENALTY_P95
+    return 1.0
+
+
+def _pool_p95(candidates: list[dict]) -> float | None:
+    """Compute top-5% activation_count cutoff for a candidate pool.
+
+    Returns None when pool < _ACTIVATION_MIN_POOL or all counts are zero.
+    Cutoff is computed from positive counts only so a sparse pool with
+    mostly-zero activation doesn't penalise everyone; top_k is still
+    based on total pool size (ties at the cutoff are all penalised)."""
+    if len(candidates) < _ACTIVATION_MIN_POOL:
+        return None
+    counts = sorted(_safe_act_count(m.get("activation_count", 0))
+                    for m in candidates)
+    positive = [c for c in counts if c > 0]
+    if not positive:
+        return None
+    top_k = min(len(positive), max(1, math.ceil(len(counts) * 0.05)))
+    return positive[-top_k]
 
 
 def _pick_recency_weighted(
@@ -115,16 +168,20 @@ def _pick_recency_weighted(
 
     recent_quota = min(len(recent), math.ceil(quota * recent_share))
 
+    p95_all = _pool_p95(candidates)
+
     recent.sort(
         key=lambda m: _recency_score(m.get("created_at", ""), now_utc)
-                      * max(_safe_float(m.get("importance"), 0.5), 0.1),
+                      * max(_safe_float(m.get("importance"), 0.5), 0.1)
+                      * _activation_multiplier(_safe_act_count(m.get("activation_count")), p95_all),
         reverse=True,
     )
     picked_recent = recent[:recent_quota]
 
     old.sort(
         key=lambda m: _safe_float(m.get("importance"), 0.5)
-                      * _recency_score(m.get("created_at", ""), now_utc),
+                      * _recency_score(m.get("created_at", ""), now_utc)
+                      * _activation_multiplier(_safe_act_count(m.get("activation_count")), p95_all),
         reverse=True,
     )
     remaining = quota - len(picked_recent)

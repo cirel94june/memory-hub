@@ -648,3 +648,257 @@ class TestRecentInteractionRobustness:
             "MCP wrapper missing try/except — internal error would leak traceback"
         assert '"error": "internal_error"' in body, \
             "MCP wrapper must return error='internal_error' on unexpected exceptions"
+
+
+# ── Corridor activation_count P95 penalty ─────────────────────────────
+
+class TestCorridorActivationPenalty:
+    """P1: _pick_recency_weighted must demote memories with very high
+    activation_count so they don't permanently hog corridor slots."""
+
+    def _mem(self, mid, days_ago=5, importance=0.8, activation_count=0):
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        return {
+            "id": mid,
+            "content": f"content of {mid}",
+            "importance": importance,
+            "activation_count": activation_count,
+            "created_at": (now - timedelta(days=days_ago)).isoformat(),
+        }
+
+    # ── _safe_act_count sanitiser ───────────────────────────────────
+
+    def test_safe_act_count_normal(self):
+        assert corridor._safe_act_count(42) == 42.0
+
+    def test_safe_act_count_none(self):
+        assert corridor._safe_act_count(None) == 0.0
+
+    def test_safe_act_count_empty_string(self):
+        assert corridor._safe_act_count("") == 0.0
+
+    def test_safe_act_count_string_number(self):
+        assert corridor._safe_act_count("15") == 15.0
+
+    def test_safe_act_count_negative(self):
+        assert corridor._safe_act_count(-3) == 0.0
+
+    def test_safe_act_count_garbage(self):
+        assert corridor._safe_act_count("abc") == 0.0
+
+    def test_safe_act_count_float(self):
+        assert corridor._safe_act_count(1.3) == 1.3
+
+    def test_safe_act_count_string_float(self):
+        assert corridor._safe_act_count("201.0") == 201.0
+
+    def test_safe_act_count_fractional(self):
+        assert corridor._safe_act_count(0.3) == 0.3
+
+    def test_safe_act_count_inf(self):
+        assert corridor._safe_act_count(float("inf")) == 0.0
+
+    def test_safe_act_count_nan(self):
+        assert corridor._safe_act_count(float("nan")) == 0.0
+
+    # ── _activation_multiplier tiers ────────────────────────────────
+
+    def test_multiplier_below_p95(self):
+        assert corridor._activation_multiplier(5, p95=10) == 1.0
+
+    def test_multiplier_at_p95_boundary(self):
+        """count == p95 → penalised (>= cutoff)."""
+        assert corridor._activation_multiplier(10, p95=10) == 0.5
+
+    def test_multiplier_above_p95(self):
+        assert corridor._activation_multiplier(15, p95=10) == 0.5
+
+    def test_multiplier_at_hard_threshold_200(self):
+        """200 exactly → NOT hard-penalised (> 200 required)."""
+        assert corridor._activation_multiplier(200, p95=10) == 0.5
+        assert corridor._activation_multiplier(200, p95=None) == 1.0
+
+    def test_multiplier_at_201(self):
+        """201 → hard penalty 0.3x."""
+        assert corridor._activation_multiplier(201, p95=10) == 0.3
+        assert corridor._activation_multiplier(201, p95=None) == 0.3
+
+    def test_multiplier_way_above_hard(self):
+        assert corridor._activation_multiplier(1200, p95=10) == 0.3
+
+    def test_multiplier_p95_none_no_penalty(self):
+        """P95=None (disabled) → no P95 penalty, only hard threshold."""
+        assert corridor._activation_multiplier(50, p95=None) == 1.0
+
+    # ── _pool_p95 computation ───────────────────────────────────────
+
+    def test_pool_p95_too_small(self):
+        pool = [self._mem(f"m{i}", activation_count=i*10) for i in range(4)]
+        assert corridor._pool_p95(pool) is None
+
+    def test_pool_p95_exactly_5(self):
+        """5 candidates: top_k = ceil(5*0.05)=1, cutoff = counts[-1]."""
+        pool = [self._mem(f"m{i}", activation_count=(i+1)*10) for i in range(5)]
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 50
+
+    def test_pool_p95_6_candidates(self):
+        """6 candidates [1..6]: top_k = ceil(6*0.05)=1, cutoff = counts[5]=6."""
+        pool = [self._mem(f"m{i}", activation_count=i+1) for i in range(6)]
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 6
+
+    def test_pool_p95_20_candidates(self):
+        """20 candidates [1..20]: top_k = ceil(20*0.05)=1, cutoff = counts[19]=20."""
+        pool = [self._mem(f"m{i}", activation_count=i+1) for i in range(20)]
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 20
+
+    def test_pool_p95_dirty_values(self):
+        """Pool with empty-string and None activation_count must not crash."""
+        pool = [
+            self._mem("a", activation_count=""),
+            self._mem("b", activation_count=None),
+            self._mem("c", activation_count=10),
+            self._mem("d", activation_count="5"),
+            self._mem("e", activation_count=20),
+        ]
+        p95 = corridor._pool_p95(pool)
+        assert isinstance(p95, float)
+        assert p95 == 20.0
+
+    def test_pool_p95_outlier_among_zeros(self):
+        """19 zeros + 1 outlier: cutoff from positive only → 100."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(19)]
+        pool.append(self._mem("outlier", activation_count=100))
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 100.0
+
+    def test_pool_p95_all_zeros(self):
+        """All-zero pool → None (no penalty)."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(10)]
+        assert corridor._pool_p95(pool) is None
+
+    def test_pool_p95_sparse_99_zeros_1_outlier(self):
+        """99 zeros + 1 outlier: top_k = ceil(100*0.05) = 5, but only 1
+        positive, so top_k clamped to 1. Only the outlier is penalised."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(99)]
+        pool.append(self._mem("outlier", activation_count=100))
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 100.0
+
+    def test_pool_p95_sparse_95_zeros_5_positive(self):
+        """95 zeros + 5 positive [10,20,30,40,50]: top_k = ceil(100*0.05)=5,
+        clamped to min(5,5)=5. cutoff = positive[-5] = 10."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(95)]
+        for j, c in enumerate([10, 20, 30, 40, 50]):
+            pool.append(self._mem(f"p{j}", activation_count=c))
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 10.0
+
+    def test_pool_p95_per_call_independence(self):
+        low_pool = [self._mem(f"l{i}", activation_count=i+1) for i in range(6)]
+        high_pool = [self._mem(f"h{i}", activation_count=(i+1)*100) for i in range(6)]
+        assert corridor._pool_p95(high_pool) > corridor._pool_p95(low_pool)
+
+    # ── End-to-end _pick_recency_weighted ───────────────────────────
+
+    def test_hard_cap_demotes_hog(self):
+        """1200 activation (>200) gets 0.3x; same importance/recency → ranks lower."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("hog", days_ago=5, importance=0.8, activation_count=1200),
+            self._mem("normal", days_ago=5, importance=0.8, activation_count=3),
+        ] + [self._mem(f"f{i}", days_ago=10, importance=0.4, activation_count=i)
+             for i in range(8)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("normal") < ids.index("hog")
+
+    def test_hard_201_vs_200(self):
+        """201 gets hard penalty, 200 does not (only P95 if applicable)."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("at200", days_ago=5, importance=0.9, activation_count=200),
+            self._mem("at201", days_ago=5, importance=0.9, activation_count=201),
+        ] + [self._mem(f"f{i}", days_ago=10, importance=0.3, activation_count=i)
+             for i in range(8)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("at200") < ids.index("at201")
+
+    def test_p95_penalty_changes_ranking(self):
+        """Top-5% candidate (below hard cap) gets 0.5x penalty, changing rank.
+        Pool of 6: top_k=1, so the highest activation gets penalised.
+        top_act: importance 0.8 * 0.5 = 0.4 effective
+        mid_act: importance 0.6 * 1.0 = 0.6 effective → ranks higher."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("top_act", days_ago=5, importance=0.8, activation_count=50),
+            self._mem("mid_act", days_ago=5, importance=0.6, activation_count=1),
+            self._mem("c", days_ago=5, importance=0.5, activation_count=2),
+            self._mem("d", days_ago=5, importance=0.5, activation_count=3),
+            self._mem("e", days_ago=5, importance=0.5, activation_count=4),
+            self._mem("f", days_ago=5, importance=0.5, activation_count=5),
+        ]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("mid_act") < ids.index("top_act"), \
+            f"mid_act (0.6*1.0) should beat top_act (0.8*0.5), got {ids}"
+
+    def test_small_pool_no_p95_but_hard_cap_works(self):
+        """<5 candidates: no P95 penalty, but hard cap 201+ still applies."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("hard", days_ago=5, importance=0.9, activation_count=250),
+            self._mem("ok", days_ago=5, importance=0.5, activation_count=1),
+        ]
+        picked = corridor._pick_recency_weighted(candidates, quota=2, now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("ok") < ids.index("hard")
+
+    def test_dirty_activation_count_no_crash(self):
+        """Empty-string / None activation_count in candidates must not crash."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("clean", days_ago=5, importance=0.8, activation_count=5),
+            {**self._mem("dirty1", days_ago=5, importance=0.8), "activation_count": ""},
+            {**self._mem("dirty2", days_ago=5, importance=0.8), "activation_count": None},
+            {**self._mem("dirty3", days_ago=5, importance=0.8), "activation_count": "abc"},
+            self._mem("e", days_ago=5, importance=0.5, activation_count=2),
+            self._mem("f", days_ago=5, importance=0.5, activation_count=3),
+        ]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        assert len(picked) == len(candidates)
+
+    def test_sparse_pool_only_outlier_penalised(self):
+        """99 zeros + 1 outlier (count=100): only the outlier gets P95
+        penalty; zeros must NOT be penalised (cutoff from positive only)."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("outlier", days_ago=5, importance=0.8, activation_count=100),
+            self._mem("zero_high", days_ago=5, importance=0.7, activation_count=0),
+        ] + [self._mem(f"z{i}", days_ago=10, importance=0.3, activation_count=0)
+             for i in range(98)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("zero_high") < ids.index("outlier"), \
+            f"zero_high (0.7*1.0) should beat outlier (0.8*0.5), got {ids[:5]}"
+
+    def test_float_activation_count_201(self):
+        """activation_count=201.0 (string) must trigger hard penalty."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            {**self._mem("str201", days_ago=5, importance=0.9), "activation_count": "201.0"},
+            self._mem("normal", days_ago=5, importance=0.5, activation_count=1),
+        ] + [self._mem(f"f{i}", days_ago=10, importance=0.3, activation_count=i)
+             for i in range(8)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("normal") < ids.index("str201")
