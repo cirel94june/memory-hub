@@ -372,9 +372,9 @@ def test_autocapture_user_correction_outsider_blocked(db):
     assert v.drop_reason == sg.DROP_REASON_OUTSIDER_SUBJECT
 
 
-def test_guardrail_exception_returns_blocked_verdict(db, monkeypatch):
-    """_guardrail_check_and_audit must return a blocked verdict (not None)
-    when the guardrail raises an exception — fail-closed."""
+def test_guardrail_exception_returns_blocked_verdict_and_writes_audit(db, monkeypatch):
+    """_guardrail_check_and_audit must return a blocked verdict AND write
+    an audit row when the guardrail raises an exception — fail-closed."""
     import conversation_capture as cap
     monkeypatch.setattr(
         sg, "verify_subject_provenance",
@@ -392,6 +392,11 @@ def test_guardrail_exception_returns_blocked_verdict(db, monkeypatch):
     assert v is not None
     assert v.blocked
     assert v.drop_reason == "guardrail_unavailable"
+    rows = database.list_dropped_proposal_audits()
+    assert len(rows) == 1
+    assert rows[0]["drop_reason"] == "guardrail_unavailable"
+    assert rows[0]["subject_name"] == "ceci"
+    assert rows[0]["proposer_ai_id"] == "cloudy"
 
 
 # ── Layer 6: fail-closed guardrail in memory_ops ─────────────────────
@@ -471,49 +476,84 @@ def test_grow_uses_global_fallback_when_item_has_no_subject(db, monkeypatch):
 
 # ── Layer 8: digest preserves subject fields ─────────────────────────
 
-def test_digest_output_preserves_subject_fields():
-    """analyzer.digest() output dict must include subject_name/speaker_name
-    from LLM output items."""
+def test_digest_output_preserves_subject_fields(monkeypatch):
+    """Call real analyzer.digest() with mocked LLM; verify subject_name
+    and speaker_name survive the parsing pipeline."""
     import analyzer
-    item = {
-        "content": "test content that is long enough",
-        "name": "test",
-        "room": "living_room",
-        "importance": 0.5,
-        "subject_name": "师兄",
-        "speaker_name": "ceci",
-    }
-    # Simulate what digest does to each item (the parsing/extraction logic)
-    result = {
-        "name": str(item.get("name", ""))[:20],
-        "content": str(item.get("content", "")),
-        "domain": (item.get("domain") or [])[:3],
-        "valence": max(0.0, min(1.0, float(item.get("valence", 0.5)))),
-        "arousal": max(0.0, min(1.0, float(item.get("arousal", 0.3)))),
-        "tags": (item.get("tags") or [])[:6],
-        "importance": max(0.1, min(1.0, float(item.get("importance", 0.5)))),
-        "room": str(item.get("room", "living_room")),
-        "subject_name": str(item.get("subject_name", "")),
-        "speaker_name": str(item.get("speaker_name", "")),
-    }
-    assert result["subject_name"] == "师兄"
-    assert result["speaker_name"] == "ceci"
+    fake_llm_response = json.dumps([
+        {
+            "content": "师兄在群里自称是 Gemini 的本地部署版本",
+            "name": "师兄自称",
+            "room": "living_room",
+            "importance": 0.7,
+            "subject_name": "师兄",
+            "speaker_name": "ceci",
+        }
+    ])
+    async def _fake_call_llm(*args, **kwargs):
+        return fake_llm_response
+    monkeypatch.setattr(analyzer, "_call_llm", _fake_call_llm)
+    result = asyncio.run(analyzer.digest("一段很长的对话内容，包括师兄自称是 Gemini"))
+    assert len(result) == 1
+    assert result[0]["subject_name"] == "师兄"
+    assert result[0]["speaker_name"] == "ceci"
+    assert result[0]["content"] == "师兄在群里自称是 Gemini 的本地部署版本"
 
 
-# ── Layer 9: import always sends speaker for guardrail ───────────────
+# ── Layer 9: import speaker fallback + missing-subject skip ──────────
 
-def test_import_defaults_speaker_to_ai_id():
-    """conversation_import must default speaker_name to ai_id so the
-    guardrail always fires on imported content."""
-    # The logic: if item has no speaker_name, use ai_id as fallback
-    ai_id = "jasper"
-    item_speaker = str("").strip()
-    if not item_speaker:
-        item_speaker = ai_id
-    assert item_speaker == "jasper"
+def test_import_defaults_speaker_to_ai_id(db, monkeypatch):
+    """Call real _extract_from_chunk with mocked LLM; when item has no
+    speaker_name, it should default to ai_id."""
+    import conversation_import as ci
+    import memory_ops
+    remembered_kwargs = []
+    async def _spy_remember(**kw):
+        remembered_kwargs.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    fake_response = json.dumps([
+        {
+            "content": "Ceci 喜欢猫猫，经常在群里发猫咪照片",
+            "room": "living_room",
+            "importance": 0.6,
+            "subject_name": "Ceci",
+            "speaker_name": "",
+        }
+    ])
+    async def _fake_call_llm(prompt):
+        return fake_response
+    monkeypatch.setattr(ci, "_call_llm", _fake_call_llm)
+    chunk = [{"role": "user", "content": "我喜欢猫猫"}]
+    result = asyncio.run(ci._extract_from_chunk(chunk, "jasper", 0, 1))
+    assert len(remembered_kwargs) == 1
+    assert remembered_kwargs[0]["speaker_name"] == "jasper"
 
-    # When item provides a speaker, it's used as-is
-    item_speaker2 = str("ceci").strip()
-    if not item_speaker2:
-        item_speaker2 = ai_id
-    assert item_speaker2 == "ceci"
+
+def test_import_skips_missing_subject(db, monkeypatch):
+    """When LLM returns an item with no subject_name, import must skip it
+    with status skipped_no_subject instead of sending to remember()."""
+    import conversation_import as ci
+    import memory_ops
+    remember_called = []
+    async def _spy_remember(**kw):
+        remember_called.append(kw)
+        return {"status": "created", "id": "fake_1"}
+    monkeypatch.setattr(memory_ops, "remember", _spy_remember)
+    fake_response = json.dumps([
+        {
+            "content": "一条没有 subject 的记忆，内容足够长",
+            "room": "living_room",
+            "importance": 0.6,
+            "subject_name": "",
+            "speaker_name": "ceci",
+        }
+    ])
+    async def _fake_call_llm(prompt):
+        return fake_response
+    monkeypatch.setattr(ci, "_call_llm", _fake_call_llm)
+    chunk = [{"role": "user", "content": "随便聊聊"}]
+    result = asyncio.run(ci._extract_from_chunk(chunk, "jasper", 0, 1))
+    assert len(remember_called) == 0
+    assert len(result) == 1
+    assert result[0]["status"] == "skipped_no_subject"

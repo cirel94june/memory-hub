@@ -220,8 +220,8 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
     "room": "房间ID",
     "importance": 0.4到1.0,
     "event_date": "事件日期或空字符串",
-    "subject_name": "这条记忆关于谁（留空=用户自己）",
-    "speaker_name": "谁说的（留空=用户自己）"
+    "subject_name": "这条记忆关于谁（必填：用户本人填Ceci，AI填其名字，第三方填其称呼）",
+    "speaker_name": "谁说的（必填：同上规则）"
   }}
 ]
 只输出 JSON。"""
@@ -250,10 +250,13 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
         if imp < 0.3:
             continue
 
-        item_subject = str(item.get("subject_name", "")).strip()
-        item_speaker = str(item.get("speaker_name", "")).strip()
-        if not item_speaker:
-            item_speaker = ai_id
+        item_subject = str(item.get("subject_name", "") or "").strip()
+        item_speaker = str(item.get("speaker_name", "") or "").strip()
+        if not item_subject:
+            logger.info("import: skipping item with missing subject_name: %s", content[:80])
+            memories.append({"content": content, "room": item.get("room"),
+                             "status": "skipped_no_subject"})
+            continue
         result = await memory_ops.remember(
             content=content,
             room=item.get("room", "living_room"),
@@ -262,7 +265,7 @@ async def _extract_from_chunk(chunk: list[dict], ai_id: str, chunk_index: int, t
             source_ai=ai_id,
             source_platform="import",
             subject_name=item_subject,
-            speaker_name=item_speaker,
+            speaker_name=item_speaker or ai_id,
         )
         memories.append({"content": content, "room": item.get("room"), **result})
 

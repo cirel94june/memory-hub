@@ -44,7 +44,7 @@ def _guardrail_check_and_audit(
         )
     except Exception as e:
         logger.warning(f"subject_guardrail unavailable ({e}); fail-closed")
-        return subject_guardrail.GuardrailVerdict(
+        verdict = subject_guardrail.GuardrailVerdict(
             verdict="drop",
             drop_reason="guardrail_unavailable",
             resolved_role="unknown",
