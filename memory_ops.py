@@ -1597,8 +1597,7 @@ async def grow(
     if not items:
         if not subject_name.strip():
             return {"total": 0, "created": 0, "merged": 0,
-                    "items": [{"status": "skipped_no_subject",
-                               "content": content[:200]}]}
+                    "skipped_no_subject": 1, "items": []}
         result = await remember(content, source_ai=source_ai, auto_merge=auto_merge,
                                 subject_name=subject_name, speaker_name=speaker_name)
         return {"total": 1, "created": 1, "merged": 0, "items": [result]}
@@ -1637,7 +1636,9 @@ async def grow(
             merged += 1
         results.append(r)
 
-    return {"total": len(results), "created": created, "merged": merged, "items": results}
+    skipped = sum(1 for r in results if r.get("status") == "skipped_no_subject")
+    return {"total": len(results) - skipped, "created": created, "merged": merged,
+            "skipped_no_subject": skipped, "items": results}
 
 
 # ── 更新记忆 ──

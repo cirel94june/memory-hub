@@ -495,6 +495,8 @@ def test_grow_skips_item_when_no_subject_anywhere(db, monkeypatch):
         subject_name="", speaker_name="",
     ))
     assert len(remembered) == 0
+    assert result["total"] == 0
+    assert result["skipped_no_subject"] == 1
     assert result["items"][0]["status"] == "skipped_no_subject"
 
 
@@ -516,7 +518,9 @@ def test_grow_fallback_no_digest_no_subject_skips(db, monkeypatch):
         subject_name="", speaker_name="",
     ))
     assert len(remembered) == 0
-    assert result["items"][0]["status"] == "skipped_no_subject"
+    assert result["total"] == 0
+    assert result["skipped_no_subject"] == 1
+    assert result["items"] == []
 
 
 # ── Layer 8: digest preserves subject fields ─────────────────────────
