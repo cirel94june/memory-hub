@@ -669,22 +669,37 @@ class TestCorridorActivationPenalty:
     # ── _safe_act_count sanitiser ───────────────────────────────────
 
     def test_safe_act_count_normal(self):
-        assert corridor._safe_act_count(42) == 42
+        assert corridor._safe_act_count(42) == 42.0
 
     def test_safe_act_count_none(self):
-        assert corridor._safe_act_count(None) == 0
+        assert corridor._safe_act_count(None) == 0.0
 
     def test_safe_act_count_empty_string(self):
-        assert corridor._safe_act_count("") == 0
+        assert corridor._safe_act_count("") == 0.0
 
     def test_safe_act_count_string_number(self):
-        assert corridor._safe_act_count("15") == 15
+        assert corridor._safe_act_count("15") == 15.0
 
     def test_safe_act_count_negative(self):
-        assert corridor._safe_act_count(-3) == 0
+        assert corridor._safe_act_count(-3) == 0.0
 
     def test_safe_act_count_garbage(self):
-        assert corridor._safe_act_count("abc") == 0
+        assert corridor._safe_act_count("abc") == 0.0
+
+    def test_safe_act_count_float(self):
+        assert corridor._safe_act_count(1.3) == 1.3
+
+    def test_safe_act_count_string_float(self):
+        assert corridor._safe_act_count("201.0") == 201.0
+
+    def test_safe_act_count_fractional(self):
+        assert corridor._safe_act_count(0.3) == 0.3
+
+    def test_safe_act_count_inf(self):
+        assert corridor._safe_act_count(float("inf")) == 0.0
+
+    def test_safe_act_count_nan(self):
+        assert corridor._safe_act_count(float("nan")) == 0.0
 
     # ── _activation_multiplier tiers ────────────────────────────────
 
@@ -749,15 +764,37 @@ class TestCorridorActivationPenalty:
             self._mem("e", activation_count=20),
         ]
         p95 = corridor._pool_p95(pool)
-        assert isinstance(p95, int)
-        assert p95 == 20
+        assert isinstance(p95, float)
+        assert p95 == 20.0
 
     def test_pool_p95_outlier_among_zeros(self):
-        """19 zeros + 1 outlier: top_k=1, cutoff = sorted[-1] = 100."""
+        """19 zeros + 1 outlier: cutoff from positive only → 100."""
         pool = [self._mem(f"z{i}", activation_count=0) for i in range(19)]
         pool.append(self._mem("outlier", activation_count=100))
         p95 = corridor._pool_p95(pool)
-        assert p95 == 100
+        assert p95 == 100.0
+
+    def test_pool_p95_all_zeros(self):
+        """All-zero pool → None (no penalty)."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(10)]
+        assert corridor._pool_p95(pool) is None
+
+    def test_pool_p95_sparse_99_zeros_1_outlier(self):
+        """99 zeros + 1 outlier: top_k = ceil(100*0.05) = 5, but only 1
+        positive, so top_k clamped to 1. Only the outlier is penalised."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(99)]
+        pool.append(self._mem("outlier", activation_count=100))
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 100.0
+
+    def test_pool_p95_sparse_95_zeros_5_positive(self):
+        """95 zeros + 5 positive [10,20,30,40,50]: top_k = ceil(100*0.05)=5,
+        clamped to min(5,5)=5. cutoff = positive[-5] = 10."""
+        pool = [self._mem(f"z{i}", activation_count=0) for i in range(95)]
+        for j, c in enumerate([10, 20, 30, 40, 50]):
+            pool.append(self._mem(f"p{j}", activation_count=c))
+        p95 = corridor._pool_p95(pool)
+        assert p95 == 10.0
 
     def test_pool_p95_per_call_independence(self):
         low_pool = [self._mem(f"l{i}", activation_count=i+1) for i in range(6)]
@@ -837,3 +874,31 @@ class TestCorridorActivationPenalty:
         picked = corridor._pick_recency_weighted(
             candidates, quota=len(candidates), now_utc=now)
         assert len(picked) == len(candidates)
+
+    def test_sparse_pool_only_outlier_penalised(self):
+        """99 zeros + 1 outlier (count=100): only the outlier gets P95
+        penalty; zeros must NOT be penalised (cutoff from positive only)."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("outlier", days_ago=5, importance=0.8, activation_count=100),
+            self._mem("zero_high", days_ago=5, importance=0.7, activation_count=0),
+        ] + [self._mem(f"z{i}", days_ago=10, importance=0.3, activation_count=0)
+             for i in range(98)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("zero_high") < ids.index("outlier"), \
+            f"zero_high (0.7*1.0) should beat outlier (0.8*0.5), got {ids[:5]}"
+
+    def test_float_activation_count_201(self):
+        """activation_count=201.0 (string) must trigger hard penalty."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            {**self._mem("str201", days_ago=5, importance=0.9), "activation_count": "201.0"},
+            self._mem("normal", days_ago=5, importance=0.5, activation_count=1),
+        ] + [self._mem(f"f{i}", days_ago=10, importance=0.3, activation_count=i)
+             for i in range(8)]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert ids.index("normal") < ids.index("str201")

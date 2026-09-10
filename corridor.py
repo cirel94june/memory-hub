@@ -73,18 +73,20 @@ def _recency_score(iso_ts: str, now_utc: datetime | None = None) -> float:
     return math.exp(-d / _RECENT_DECAY)
 
 
-def _safe_act_count(val) -> int:
-    """Normalise activation_count: None / '' / non-numeric → 0."""
+def _safe_act_count(val) -> float:
+    """Normalise activation_count: None / '' / non-numeric / inf / nan → 0.0."""
     if val is None or val == "":
-        return 0
+        return 0.0
     try:
-        n = int(val)
-        return max(n, 0)
-    except (ValueError, TypeError):
-        return 0
+        n = float(val)
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    if not math.isfinite(n):
+        return 0.0
+    return max(n, 0.0)
 
 
-def _activation_multiplier(count: int, p95: int | None) -> float:
+def _activation_multiplier(count: float, p95: float | None) -> float:
     """Return sort-key multiplier based on activation_count.
 
     - count > 200 (hard threshold, i.e. 201+): 0.3x
@@ -98,16 +100,22 @@ def _activation_multiplier(count: int, p95: int | None) -> float:
     return 1.0
 
 
-def _pool_p95(candidates: list[dict]) -> int | None:
+def _pool_p95(candidates: list[dict]) -> float | None:
     """Compute top-5% activation_count cutoff for a candidate pool.
 
-    Returns None (= no P95 penalty) when pool < _ACTIVATION_MIN_POOL."""
+    Returns None when pool < _ACTIVATION_MIN_POOL or all counts are zero.
+    Cutoff is computed from positive counts only so a sparse pool with
+    mostly-zero activation doesn't penalise everyone; top_k is still
+    based on total pool size (ties at the cutoff are all penalised)."""
     if len(candidates) < _ACTIVATION_MIN_POOL:
         return None
     counts = sorted(_safe_act_count(m.get("activation_count", 0))
                     for m in candidates)
-    top_k = max(1, math.ceil(len(counts) * 0.05))
-    return counts[len(counts) - top_k]
+    positive = [c for c in counts if c > 0]
+    if not positive:
+        return None
+    top_k = min(len(positive), max(1, math.ceil(len(counts) * 0.05)))
+    return positive[-top_k]
 
 
 def _pick_recency_weighted(
