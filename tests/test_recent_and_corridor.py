@@ -648,3 +648,92 @@ class TestRecentInteractionRobustness:
             "MCP wrapper missing try/except — internal error would leak traceback"
         assert '"error": "internal_error"' in body, \
             "MCP wrapper must return error='internal_error' on unexpected exceptions"
+
+
+# ── Corridor activation_count P95 penalty ─────────────────────────────
+
+class TestCorridorActivationPenalty:
+    """P1: _pick_recency_weighted must demote memories with very high
+    activation_count so they don't permanently hog corridor slots."""
+
+    def _mem(self, mid, days_ago=5, importance=0.8, activation_count=0):
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        return {
+            "id": mid,
+            "content": f"content of {mid}",
+            "importance": importance,
+            "activation_count": activation_count,
+            "created_at": (now - timedelta(days=days_ago)).isoformat(),
+        }
+
+    def test_high_activation_demoted_below_normal(self):
+        """A memory with 1000+ activation_count (> hard cap 200) gets 0.3x
+        penalty. Same importance/recency as normal — hog ranks lower."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("hog", days_ago=5, importance=0.8, activation_count=1200),
+            self._mem("normal", days_ago=5, importance=0.8, activation_count=3),
+        ] + [
+            self._mem(f"filler_{i}", days_ago=10, importance=0.4, activation_count=i)
+            for i in range(8)
+        ]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert "normal" in ids
+        assert "hog" in ids
+        assert ids.index("normal") < ids.index("hog"), \
+            f"normal should rank above hog, got {ids}"
+
+    def test_hard_cap_200_gets_harshest_penalty(self):
+        """activation_count > 200 should use 0.3x penalty regardless of P95.
+        over_cap: 0.9 * 0.3 = 0.27 effective vs moderate: 0.7 * 1.0 = 0.7."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("over_cap", days_ago=5, importance=0.9, activation_count=250),
+            self._mem("moderate", days_ago=5, importance=0.7, activation_count=5),
+        ] + [
+            self._mem(f"fill_{i}", days_ago=15, importance=0.3, activation_count=i)
+            for i in range(8)
+        ]
+        picked = corridor._pick_recency_weighted(
+            candidates, quota=len(candidates), now_utc=now)
+        ids = [m["id"] for m in picked]
+        assert "moderate" in ids
+        assert "over_cap" in ids
+        assert ids.index("moderate") < ids.index("over_cap"), \
+            f"moderate (0.7 * 1.0) should beat over_cap (0.9 * 0.3), got {ids}"
+
+    def test_small_pool_no_penalty(self):
+        """With fewer than 5 candidates, P95 should not be computed
+        (but hard cap 200 still applies)."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        candidates = [
+            self._mem("high_act", days_ago=5, importance=0.8, activation_count=50),
+            self._mem("low_act", days_ago=5, importance=0.8, activation_count=1),
+        ]
+        picked = corridor._pick_recency_weighted(candidates, quota=2, now_utc=now)
+        assert len(picked) == 2
+
+    def test_p95_computed_per_pool_call(self):
+        """Each _pick_recency_weighted call computes P95 from its own
+        candidates, not a global value."""
+        now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+        low_pool = [
+            self._mem(f"low_{i}", days_ago=5, importance=0.5, activation_count=i+1)
+            for i in range(6)
+        ]
+        p95_low = corridor._pool_p95(low_pool)
+        high_pool = [
+            self._mem(f"high_{i}", days_ago=5, importance=0.5, activation_count=(i+1)*100)
+            for i in range(6)
+        ]
+        p95_high = corridor._pool_p95(high_pool)
+        assert p95_high > p95_low
+
+    def test_activation_multiplier_tiers(self):
+        """Direct test of _activation_multiplier: 3 tiers."""
+        assert corridor._activation_multiplier(5, p95=10) == 1.0
+        assert corridor._activation_multiplier(15, p95=10) == 0.5
+        assert corridor._activation_multiplier(250, p95=10) == 0.3
+        assert corridor._activation_multiplier(250, p95=0) == 0.3

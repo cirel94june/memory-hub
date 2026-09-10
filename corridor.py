@@ -32,6 +32,14 @@ _RECENT_DAYS = 30
 _RECENT_SHARE = 0.3
 _RECENT_DECAY = 30.0  # e-fold days for recency_score = exp(-days/30)
 
+# Activation-count penalty for corridor (P1): memories recalled too often
+# get demoted so fresh/rare content surfaces.  Per-pool P95 threshold;
+# hard cap at 200 uses an even harsher penalty.
+_ACTIVATION_PENALTY_P95 = 0.5
+_ACTIVATION_PENALTY_HARD = 0.3
+_ACTIVATION_HARD_CAP = 200
+_ACTIVATION_MIN_POOL = 5  # need ≥5 candidates to compute meaningful P95
+
 
 def _safe_float(val, default: float = 0.5) -> float:
     if val is None or val == "":
@@ -63,6 +71,31 @@ def _recency_score(iso_ts: str, now_utc: datetime | None = None) -> float:
     if d == float("inf"):
         return 0.0
     return math.exp(-d / _RECENT_DECAY)
+
+
+def _activation_multiplier(count: int, p95: int) -> float:
+    """Return sort-key multiplier based on activation_count.
+
+    - count > hard cap (200): 0.3x
+    - count > P95:            0.5x
+    - otherwise:              1.0x (no penalty)
+    """
+    if count > _ACTIVATION_HARD_CAP:
+        return _ACTIVATION_PENALTY_HARD
+    if p95 > 0 and count > p95:
+        return _ACTIVATION_PENALTY_P95
+    return 1.0
+
+
+def _pool_p95(candidates: list[dict]) -> int:
+    """Compute P95 activation_count for a candidate pool.
+
+    Returns 0 (= no penalty) when pool is too small."""
+    if len(candidates) < _ACTIVATION_MIN_POOL:
+        return 0
+    counts = sorted(m.get("activation_count", 0) for m in candidates)
+    idx = math.ceil(len(counts) * 0.95) - 1
+    return counts[min(idx, len(counts) - 1)]
 
 
 def _pick_recency_weighted(
@@ -115,16 +148,20 @@ def _pick_recency_weighted(
 
     recent_quota = min(len(recent), math.ceil(quota * recent_share))
 
+    p95_all = _pool_p95(candidates)
+
     recent.sort(
         key=lambda m: _recency_score(m.get("created_at", ""), now_utc)
-                      * max(_safe_float(m.get("importance"), 0.5), 0.1),
+                      * max(_safe_float(m.get("importance"), 0.5), 0.1)
+                      * _activation_multiplier(m.get("activation_count", 0), p95_all),
         reverse=True,
     )
     picked_recent = recent[:recent_quota]
 
     old.sort(
         key=lambda m: _safe_float(m.get("importance"), 0.5)
-                      * _recency_score(m.get("created_at", ""), now_utc),
+                      * _recency_score(m.get("created_at", ""), now_utc)
+                      * _activation_multiplier(m.get("activation_count", 0), p95_all),
         reverse=True,
     )
     remaining = quota - len(picked_recent)
