@@ -451,12 +451,24 @@ async def build_corridor(ai_id: str) -> str:
         pass
 
     # 8. Unresolved 记忆（待办事项提醒）
-    # 排除 auto_capture 来源的 social 记忆（社交互动不是待办）
-    unresolved_mems = [m for m in visible_mems.values()
-                       if m.get("resolved") == False and m.get("status") == "active"
-                       and not (m.get("room") == "social" and "auto_capture" in (m.get("source_platform") or ""))]
+    # 只展示 task/event 类型；排除已被其他段展示的；按新旧排序。
+    _TODO_TYPES = {"task", "event"}
+    _TODO_STALE_DAYS = 14
+    unresolved_mems = [
+        m for m in visible_mems.values()
+        if m.get("resolved") == False
+        and m.get("status") == "active"
+        and m.get("info_type", "fact") in _TODO_TYPES
+        and _norm(m.get("content", "")) not in seen_norms
+    ]
+    unresolved_mems.sort(key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
     if unresolved_mems:
-        lines = [f"· {m['content'][:200]}" for m in unresolved_mems[:3]]
+        lines = []
+        for m in unresolved_mems[:3]:
+            age = _days_ago(m.get("updated_at") or m.get("created_at", ""), now_utc)
+            stale = f" [{int(age)}天前]" if age > _TODO_STALE_DAYS else ""
+            lines.append(f"· {m['content'][:200]}{stale}")
+            seen_norms.add(_norm(m.get("content", "")))
         sections.append("【待办/未完成】\n如果这些事项和当前对话相关，请主动提醒、推进，或询问是否已经完成。\n" + "\n".join(lines))
 
     corridor_text = "\n\n".join(sections)
