@@ -520,6 +520,109 @@ class TestCorridorSnapshot:
 
 
 # ════════════════════════════════════════════
+#  Corridor TODO section filtering
+# ════════════════════════════════════════════
+
+class TestCorridorTodoSection:
+    """The 【待办/未完成】 section should only show task/event type,
+    dedup against other sections, and label stale items."""
+
+    def test_task_type_shown_in_todo(self, db_env):
+        """info_type='task' + unresolved → appears in 待办 section.
+        importance=0.5 so it doesn't get captured by 近期重要事件 first."""
+        _insert_event("todo_task", "修改 prompt 限制动物身份",
+                      info_type="task", resolved=False,
+                      room="work_tasks", importance=0.5)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【待办/未完成】" in text
+        assert "修改 prompt 限制动物身份" in text
+
+    def test_fact_type_excluded_from_todo(self, db_env):
+        """info_type='fact' + unresolved → should NOT appear in 待办."""
+        _insert_event("fact_unresolved", "ceci 自称纯代码小白",
+                      info_type="fact", resolved=False,
+                      room="living_room", importance=0.6)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        if "【待办/未完成】" in text:
+            todo_start = text.index("【待办/未完成】")
+            todo_end = text.find("【", todo_start + 1)
+            todo_section = text[todo_start:todo_end] if todo_end != -1 else text[todo_start:]
+            assert "纯代码小白" not in todo_section
+
+    def test_identity_type_excluded_from_todo(self, db_env):
+        """info_type='identity' + unresolved → should NOT appear in 待办."""
+        _insert_event("id_unresolved", "某个身份记忆",
+                      info_type="identity", resolved=False,
+                      room="living_room", importance=0.6)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        if "【待办/未完成】" in text:
+            todo_start = text.index("【待办/未完成】")
+            todo_end = text.find("【", todo_start + 1)
+            todo_section = text[todo_start:todo_end] if todo_end != -1 else text[todo_start:]
+            assert "某个身份记忆" not in todo_section
+
+    def test_stale_todo_gets_age_label(self, db_env):
+        """A task older than 14 days gets [Xd ago] label."""
+        old_date = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        _insert_event("stale_task", "很久以前的待办",
+                      info_type="task", resolved=False,
+                      room="work_tasks", importance=0.6,
+                      created_at=old_date)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【待办/未完成】" in text
+        assert "很久以前的待办" in text
+        assert "天前]" in text
+
+    def test_fresh_todo_no_age_label(self, db_env):
+        """A task within 14 days has no age label.
+        importance=0.5 so it doesn't get captured by 近期重要事件 first."""
+        fresh_date = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        _insert_event("fresh_task", "新鲜待办事项",
+                      info_type="task", resolved=False,
+                      room="work_tasks", importance=0.5,
+                      created_at=fresh_date)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert "新鲜待办事项" in text
+        todo_start = text.index("【待办/未完成】")
+        todo_end = text.find("【", todo_start + 1)
+        todo_section = text[todo_start:todo_end] if todo_end != -1 else text[todo_start:]
+        assert "天前]" not in todo_section
+
+    def test_resolved_task_excluded(self, db_env):
+        """resolved=True → not in 待办."""
+        _insert_event("done_task", "已完成的任务",
+                      info_type="task", resolved=True,
+                      room="work_tasks", importance=0.6)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        if "【待办/未完成】" in text:
+            assert "已完成的任务" not in text
+
+    def test_todo_dedup_against_recent_events(self, db_env):
+        """A task that already appears in 近期重要事件 should not
+        duplicate in 待办."""
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        _insert_event("dup_task", "重复的重要任务",
+                      info_type="task", resolved=False,
+                      room="work_tasks", importance=0.9,
+                      created_at=recent)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        assert text.count("重复的重要任务") == 1, \
+            "task appears in both 近期重要事件 and 待办"
+
+    def test_event_type_shown_in_todo(self, db_env):
+        """info_type='event' + unresolved → appears in 待办."""
+        _insert_event("todo_event", "下周要去体检",
+                      info_type="event", resolved=False,
+                      room="health", importance=0.6)
+        text = asyncio.run(corridor.build_corridor("claude"))
+        if "【待办/未完成】" in text:
+            todo_start = text.index("【待办/未完成】")
+            todo_end = text.find("【", todo_start + 1)
+            todo_section = text[todo_start:todo_end] if todo_end != -1 else text[todo_start:]
+            assert "下周要去体检" in todo_section
+
+
+# ════════════════════════════════════════════
 #  Edge cases from Codex round-1 review
 # ════════════════════════════════════════════
 
