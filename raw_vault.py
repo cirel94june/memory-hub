@@ -71,22 +71,64 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
         log.warning(f"raw_vault log failed: {e}")
 
 
-def search(query: str, ai_id: str = "", limit: int = 10) -> list[dict]:
-    """按关键词查原话（LIKE 匹配，新的在前）。"""
+_LIKE_ESCAPE_TABLE = str.maketrans({"%": "\\%", "_": "\\_", "\\": "\\\\"})
+_PUBLIC_CHAT_TYPES = ("public_group", "group", "supergroup")
+_VALID_SPEAKER_FILTERS = {"", "user", "ai"}
+_LIMIT_MAX = 50
+
+
+def search(query: str, ai_id: str = "", limit: int = 10,
+           speaker_filter: str = "") -> list[dict]:
+    """按关键词查原话（LIKE 匹配 + 同义词展开，新的在前）。
+
+    speaker_filter: "" → 搜全部, "user" → 只搜 user_text, "ai" → 只搜 ai_text
+    ai_id: 必须是服务端验证过的身份。传值 → 含该 AI 私聊；空 → 只搜公开对话。
+    """
     if not (query or "").strip():
         return []
+
+    speaker_filter = (speaker_filter or "").strip().casefold()
+    if speaker_filter not in _VALID_SPEAKER_FILTERS:
+        return []
+
+    limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 10, _LIMIT_MAX))
+
+    import synonym_pairs
+    keywords = synonym_pairs.expand(query.strip())
+
     conn = _connect()
     conn.row_factory = sqlite3.Row
-    like = f"%{query.strip()}%"
-    params: list = [like, like]
-    ai_filter = ""
+    params: list = []
+
+    text_clauses = []
+    for kw in keywords:
+        escaped = kw.translate(_LIKE_ESCAPE_TABLE)
+        like = f"%{escaped}%"
+        if speaker_filter == "user":
+            text_clauses.append("user_text LIKE ? ESCAPE '\\'")
+            params.append(like)
+        elif speaker_filter == "ai":
+            text_clauses.append("ai_text LIKE ? ESCAPE '\\'")
+            params.append(like)
+        else:
+            text_clauses.append("(user_text LIKE ? ESCAPE '\\' OR ai_text LIKE ? ESCAPE '\\')")
+            params.extend([like, like])
+
+    text_where = "(" + " OR ".join(text_clauses) + ")"
+
+    extra = ""
     if ai_id:
-        ai_filter = " AND ai_id = ? "
+        extra += " AND ai_id = ? "
         params.append(ai_id)
+    else:
+        placeholders = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+        extra += f" AND LOWER(TRIM(COALESCE(chat_type, ''))) IN ({placeholders}) "
+        params.extend(_PUBLIC_CHAT_TYPES)
+
     params.append(limit)
     cur = conn.execute(
         "SELECT id, ai_id, platform, chat_id, chat_type, user_text, ai_text, created_at "
-        "FROM raw_events WHERE (user_text LIKE ? OR ai_text LIKE ?)" + ai_filter +
+        f"FROM raw_events WHERE {text_where}{extra}"
         "ORDER BY created_at DESC LIMIT ?",
         tuple(params),
     )
