@@ -47,15 +47,13 @@ def _init_table():
             created_at TEXT NOT NULL
         )
     """)
-    for col_ddl in (
-        "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE chat_digests ADD COLUMN source_fp TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''",
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(chat_digests)").fetchall()}
+    for col_name, col_ddl in (
+        ("chat_type", "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''"),
+        ("turn_id", "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"),
     ):
-        try:
+        if col_name not in existing:
             conn.execute(col_ddl)
-        except Exception:
-            pass
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
         "ON chat_digests(ai_id, created_at DESC)"

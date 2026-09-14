@@ -42,10 +42,9 @@ def _init_db():
             created_at TEXT NOT NULL
         )
     """)
-    try:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
+    if "turn_id" not in existing:
         conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
-    except Exception:
-        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
     conn.commit()
