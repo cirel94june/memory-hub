@@ -190,13 +190,20 @@ def get_recent_digests(
 
 
 def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
-    """获取该 AI 最近的对话摘要（纯时间倒序，不排除任何窗口）。"""
+    """获取该 AI 最近的对话摘要（纯时间倒序，不排除任何窗口）。
+    自动展开别名组：cloudy/claude 视为同一 AI。"""
+    if not (ai_id or "").strip():
+        return []
+    limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 5, 50))
+    from config import AI_ALIAS_GROUPS
+    ai_ids = AI_ALIAS_GROUPS.get(ai_id, [ai_id])
     conn = _connect()
     conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
-        "SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
-        "WHERE ai_id = ? ORDER BY created_at DESC LIMIT ?",
-        (ai_id, limit),
+        f"SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
+        f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+        (*ai_ids, limit),
     )
     results = [dict(r) for r in cur]
     conn.close()

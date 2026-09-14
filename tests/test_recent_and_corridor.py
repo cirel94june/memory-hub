@@ -579,9 +579,11 @@ class TestCorridorRecentChat:
     def test_ai_isolation(self, db_env):
         """Each AI's corridor should only get its own digests (via ai_id param)."""
         from unittest.mock import patch, call
-        with patch("chat_digest.get_latest_same_ai", return_value=[]) as mock_fn:
+        with patch("chat_digest.get_latest_same_ai", return_value=[]) as mock_digest, \
+             patch("raw_vault.get_recent_turns", return_value=[]) as mock_raw:
             asyncio.run(corridor.build_corridor("claude"))
-            mock_fn.assert_called_once_with("claude", limit=5)
+            mock_digest.assert_called_once_with("claude", limit=5)
+            mock_raw.assert_called_once_with("claude", limit=4)
 
     def test_import_failure_graceful(self, db_env):
         """If chat_digest import fails, section is absent, corridor still builds."""
@@ -598,6 +600,52 @@ class TestCorridorRecentChat:
             text = asyncio.run(corridor.build_corridor("claude"))
         assert "【最近的对话】" not in text
         assert "你是" in text
+
+    def test_alias_cloudy_found_by_claude(self, db_env):
+        """H1: data stored under 'cloudy' must appear when building claude's corridor."""
+        from unittest.mock import patch
+        mock_digests = [
+            {"chat_id": "g1", "summary": "cloudy存的摘要", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "cloudy存的摘要" in text
+
+    def test_merge_stale_digest_fresh_raw(self, db_env):
+        """H2: a fresh raw turn must appear even when an older digest exists."""
+        from unittest.mock import patch
+        stale_digest = [
+            {"chat_id": "g1", "summary": "旧摘要", "created_at": "2026-09-10T00:00:00"},
+        ]
+        fresh_raw = [
+            {"user": "刚刚说的话", "ai": "刚刚的回复", "created_at": "2026-09-14T12:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=stale_digest), \
+             patch("raw_vault.get_recent_turns", return_value=fresh_raw):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        lines_section = text[text.index("【最近的对话】"):]
+        next_section = lines_section.find("【", 1)
+        if next_section != -1:
+            lines_section = lines_section[:next_section]
+        assert "刚刚说的话" in lines_section
+        assert "旧摘要" in lines_section
+        # Fresh raw should come before stale digest (sorted by created_at desc)
+        assert lines_section.index("刚刚说的话") < lines_section.index("旧摘要")
+
+    def test_cross_section_dedup(self, db_env):
+        """M1: same summary shown in 【最近的对话】 must not repeat in 【其他窗口】."""
+        from unittest.mock import patch
+        shared_summary = "讨论了周末去爬山的计划"
+        mock_digests = [
+            {"chat_id": "g1", "summary": shared_summary, "created_at": "2026-09-14T10:00:00"},
+        ]
+        # cross_window uses get_recent_digests which is a different function;
+        # the dedup is in the rendering code via _recent_chat_summaries set
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert text.count(shared_summary) == 1, \
+            "same summary appeared in both 最近的对话 and 其他窗口"
 
 
 # ════════════════════════════════════════════

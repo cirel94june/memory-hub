@@ -138,16 +138,23 @@ def search(query: str, ai_id: str = "", limit: int = 10,
 
 
 def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
-    """获取该 AI 最近几轮原始对话（用于走廊 fallback，截断到合理长度）。"""
+    """获取该 AI 最近几轮原始对话（用于走廊 fallback，截断到合理长度）。
+    自动展开别名组：cloudy/claude 视为同一 AI。"""
     if not ai_id:
         return []
     limit = max(1, min(limit, 10))
+    try:
+        from config import AI_ALIAS_GROUPS
+        ai_ids = AI_ALIAS_GROUPS.get(ai_id, [ai_id])
+    except Exception:
+        ai_ids = [ai_id]
     conn = _connect()
     conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
-        "SELECT user_text, ai_text, created_at FROM raw_events "
-        "WHERE ai_id = ? ORDER BY created_at DESC LIMIT ?",
-        (ai_id, limit),
+        f"SELECT user_text, ai_text, created_at FROM raw_events "
+        f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+        (*ai_ids, limit),
     )
     rows = []
     for r in cur:

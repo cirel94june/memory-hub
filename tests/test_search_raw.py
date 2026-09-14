@@ -411,6 +411,62 @@ class TestGetRecentTurns:
             turns = raw_vault.get_recent_turns("claude", limit=4)
             assert len(turns) == 0
 
+    def test_alias_cloudy_found_by_claude(self, tmp_path):
+        """H1: data stored as 'cloudy' must be returned when querying 'claude'."""
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("cloudy", "", "", "public_group", "cloudy存的对话", "cloudy回复",
+                 "2026-09-14T12:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+            turns = raw_vault.get_recent_turns("claude", limit=4)
+            assert len(turns) == 1
+            assert "cloudy存的对话" in turns[0]["user"]
+
+
+class TestGetLatestSameAiAlias:
+    """chat_digest.get_latest_same_ai() alias expansion via real SQLite."""
+
+    def test_alias_cloudy_found_by_claude(self, tmp_path):
+        """H1: digest stored as 'cloudy' must be returned when querying 'claude'."""
+        import chat_digest
+        db_path = tmp_path / "memories.db"
+        with patch.object(chat_digest, "DB_PATH", db_path):
+            chat_digest._init_table()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
+                "VALUES (?,?,?,?,?)",
+                ("cloudy", "g1", "public_group", "cloudy存的摘要",
+                 "2026-09-14T10:00:00"),
+            )
+            conn.commit()
+            conn.close()
+            results = chat_digest.get_latest_same_ai("claude", limit=5)
+            assert len(results) == 1
+            assert results[0]["summary"] == "cloudy存的摘要"
+
+    def test_empty_ai_id_returns_empty(self):
+        import chat_digest
+        assert chat_digest.get_latest_same_ai("") == []
+        assert chat_digest.get_latest_same_ai("   ") == []
+
+    def test_limit_clamped(self, tmp_path):
+        import chat_digest
+        db_path = tmp_path / "memories.db"
+        with patch.object(chat_digest, "DB_PATH", db_path):
+            chat_digest._init_table()
+            results = chat_digest.get_latest_same_ai("claude", limit=-5)
+            assert isinstance(results, list)
+            results2 = chat_digest.get_latest_same_ai("claude", limit=999)
+            assert isinstance(results2, list)
+
 
 class TestMCPContract:
     """MCP search_raw must not accept ai_id — checked via AST since mcp module not in test env."""
