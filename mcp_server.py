@@ -300,6 +300,7 @@ async def _finalize_pending_memory(
     importance: float, source_ai: str, event_date: str, force_create: bool,
     client_request_id: str = "",
     subject_name: str = "",
+    speaker_name: str = "",
 ) -> None:
     """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
     All reconciliation logic (real_id match / mark_replaced / mark failed)
@@ -312,6 +313,7 @@ async def _finalize_pending_memory(
         source_ai=source_ai, event_date=event_date, force_create=force_create,
         client_request_id=client_request_id,
         subject_name=subject_name,
+        speaker_name=speaker_name,
     )
 
 
@@ -498,11 +500,19 @@ async def safe_remember(
     event_date: str = "",
     subject_name: str = "",
     speaker_name: str = "",
+    client_request_id: str = "",
 ) -> str:
-    """安全降敏写入一条记忆。适合心理、关系、边界、创伤、长文本等容易被平台安全检查拦截的内容。
+    """安全降敏写入一条记忆——**异步管线**，立即返回，后台跑完整 pipeline。
 
+    适合心理、关系、边界、创伤、长文本等容易被平台安全检查拦截的内容。
     策略：先压缩长文本并中性写入；如果后端写入失败，会自动改写成更中性的摘要再重试一次。
-    如果 ChatGPT 在调用前就提示安全拦截，Memory Hub 不会收到请求；可用 mcp_health 查看最近到达日志。
+
+    ## 返回时间
+    - 传统同步管线要 30-70 秒，MCP 客户端会超时；这里在 <2 秒内返回 queued
+    - 完整 pipeline（含安全降级重试）完成后记忆变 active
+
+    ## 幂等
+    - 传 client_request_id 去重，同一 crq 第二次调用返回 idempotent=True
 
     Args:
         content: 要写入的内容。建议一条只写一个事实/洞察，不要整段批量塞入。
@@ -513,13 +523,99 @@ async def safe_remember(
         event_date: 事件日期
         subject_name: 记忆主体姓名（guardrail 检查用）
         speaker_name: 发言者姓名（guardrail 检查用）
+        client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
     """
-    result = await _safe_remember_impl(
+    effective_crq = (f"{source_ai}::{client_request_id}"
+                     if client_request_id else "")
+    content_fingerprint = hashlib.sha256(
+        (content or "").encode("utf-8")).hexdigest()[:16]
+
+    if effective_crq:
+        existing = database.get_memory_by_client_request_id(effective_crq)
+        if existing:
+            existing_fp = hashlib.sha256(
+                (existing.get("content") or "").encode("utf-8")).hexdigest()[:16]
+            if existing_fp != content_fingerprint:
+                return json.dumps({
+                    "status": "error",
+                    "error": "crq_content_conflict",
+                    "memory_id": "",
+                    "client_request_id": client_request_id,
+                    "hint": ("Reusing client_request_id with a different "
+                             "content payload. Pick a new key, or send the "
+                             "exact same content to get the idempotent "
+                             "response for the original."),
+                }, ensure_ascii=False)
+            return _idempotent_response(existing)
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _new_skeleton_id() -> str:
+        ts = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
+        h = hashlib.md5(
+            (content + str(ts) + os.urandom(8).hex()).encode()
+        ).hexdigest()[:8]
+        return f"mem_{ts}_{h}"
+
+    skeleton_id = _new_skeleton_id()
+    _MAX_ID_RETRIES = 3
+    inserted = False
+    for attempt in range(_MAX_ID_RETRIES + 1):
+        try:
+            database.insert_pending_memory({
+                "id": skeleton_id, "content": content, "room": room,
+                "category": category, "importance": importance,
+                "source_ai": source_ai, "event_date": event_date,
+                "source_platform": "mcp:safe", "status": "pending",
+                "client_request_id": effective_crq,
+                "created_at": now,
+                "subject_name": subject_name,
+            })
+            inserted = True
+            break
+        except sqlite3.IntegrityError:
+            if effective_crq:
+                existing = database.get_memory_by_client_request_id(effective_crq)
+                if existing:
+                    existing_fp = hashlib.sha256(
+                        (existing.get("content") or "").encode("utf-8")
+                    ).hexdigest()[:16]
+                    if existing_fp != content_fingerprint:
+                        return json.dumps({
+                            "status": "error",
+                            "error": "crq_content_conflict",
+                            "memory_id": "",
+                            "client_request_id": client_request_id,
+                        }, ensure_ascii=False)
+                    return _idempotent_response(existing)
+            if attempt < _MAX_ID_RETRIES:
+                skeleton_id = _new_skeleton_id()
+                continue
+            _LOG.error("skeleton_id collision after %d retries; returning error",
+                       _MAX_ID_RETRIES)
+    if not inserted:
+        return json.dumps({
+            "status": "error",
+            "error": "id_collision_max_retry",
+            "memory_id": "",
+            "client_request_id": client_request_id,
+        }, ensure_ascii=False)
+
+    _spawn_background_task(_finalize_pending_memory(
+        skeleton_id,
         content=content, room=room, category=category, importance=importance,
-        source_ai=source_ai, event_date=event_date, retry_on_fail=True,
-        subject_name=subject_name, speaker_name=speaker_name,
-    )
-    return json.dumps(result, ensure_ascii=False)
+        source_ai=source_ai, event_date=event_date, force_create=False,
+        client_request_id=effective_crq,
+        subject_name=subject_name,
+        speaker_name=speaker_name,
+    ))
+
+    return json.dumps({
+        "status": "queued",
+        "memory_id": skeleton_id,
+        "client_request_id": client_request_id,
+        "safe_write": True,
+    }, ensure_ascii=False)
 
 
 @mcp.tool()
