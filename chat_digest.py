@@ -4,6 +4,7 @@
 每次对话后生成一句话摘要，存入 chat_digests 表。
 下次在别的窗口开聊时，自动注入最近几条其他窗口的摘要。
 """
+import hashlib
 import sqlite3
 import logging
 from datetime import datetime, timezone
@@ -11,6 +12,12 @@ from pathlib import Path
 
 import httpx
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
+
+
+def source_fp(chat_id: str, user_text: str) -> str:
+    """Stable fingerprint tying a digest back to its source conversation turn."""
+    key = f"{chat_id}:{(user_text or '')[:100]}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
 
 logger = logging.getLogger("memory_hub.chat_digest")
 
@@ -47,10 +54,14 @@ def _init_table():
             created_at TEXT NOT NULL
         )
     """)
-    try:
-        conn.execute("ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''")
-    except Exception:
-        pass
+    for col_ddl in (
+        "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE chat_digests ADD COLUMN source_fp TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(col_ddl)
+        except Exception:
+            pass
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
         "ON chat_digests(ai_id, created_at DESC)"
@@ -128,11 +139,12 @@ async def generate_and_save(
         summary = summary[:97] + "..."
 
     now = datetime.now(timezone.utc).isoformat()
+    fp = source_fp(chat_id, user_message)
     conn = _connect()
     conn.execute(
-        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (ai_id, chat_id, chat_type, summary, now),
+        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at, source_fp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (ai_id, chat_id, chat_type, summary, now, fp),
     )
 
     limit = RETENTION_LIMITS.get(chat_type, RETENTION_DEFAULT)
@@ -202,7 +214,8 @@ def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
-        f"SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
+        f"SELECT chat_id, chat_type, summary, created_at, "
+        f"COALESCE(source_fp, '') AS source_fp FROM chat_digests "
         f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
         (*ai_ids, limit),
     )

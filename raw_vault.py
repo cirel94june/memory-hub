@@ -153,15 +153,19 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
-        f"SELECT user_text, ai_text, created_at FROM raw_events "
+        f"SELECT chat_id, user_text, ai_text, created_at FROM raw_events "
         f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
         (*ai_ids, limit),
     )
     rows = []
     for r in cur:
-        user = (r["user_text"] or "")[:120]
+        user_full = r["user_text"] or ""
+        user = user_full[:120]
         ai = (r["ai_text"] or "")[:120]
-        rows.append({"user": user, "ai": ai, "created_at": r["created_at"]})
+        from chat_digest import source_fp
+        fp = source_fp(r["chat_id"] or "", user_full)
+        rows.append({"user": user, "ai": ai, "created_at": r["created_at"],
+                      "source_fp": fp})
     conn.close()
     return rows
 
