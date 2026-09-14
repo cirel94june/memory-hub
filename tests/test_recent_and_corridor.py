@@ -520,6 +520,228 @@ class TestCorridorSnapshot:
 
 
 # ════════════════════════════════════════════
+#  Corridor 【最近的对话】 section
+# ════════════════════════════════════════════
+
+class TestCorridorRecentChat:
+    """The 【最近的对话】 section should show digest summaries if available,
+    fall back to raw_vault turns, and not appear when empty."""
+
+    def test_section_appears_with_digests(self, db_env):
+        """When chat_digest has data, section shows digest summaries."""
+        from unittest.mock import patch
+        mock_digests = [
+            {"chat_id": "g1", "chat_type": "public_group", "summary": "聊了晚饭吃什么", "created_at": "2026-09-14T10:00:00"},
+            {"chat_id": "dm1", "chat_type": "private", "summary": "讨论了周末计划", "created_at": "2026-09-14T09:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "聊了晚饭吃什么" in text
+        assert "讨论了周末计划" in text
+
+    def test_section_fallback_to_raw_vault(self, db_env):
+        """When no digest exists, raw_vault turns fill the section."""
+        from unittest.mock import patch
+        mock_turns = [
+            {"user": "今天好累", "ai": "辛苦了，要不要休息一下", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=[]), \
+             patch("raw_vault.get_recent_turns", return_value=mock_turns):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "今天好累" in text
+        assert "辛苦了" in text
+
+    def test_section_absent_when_no_data(self, db_env):
+        """When neither digest nor raw_vault has data, section is absent."""
+        from unittest.mock import patch
+        with patch("chat_digest.get_latest_same_ai", return_value=[]), \
+             patch("raw_vault.get_recent_turns", return_value=[]):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+
+    def test_section_placed_before_about_owner(self, db_env):
+        """最近的对话 should appear before 关于主人."""
+        from unittest.mock import patch
+        _insert_event("liv_test", "主人喜欢猫", room="living_room", importance=0.5)
+        mock_digests = [
+            {"chat_id": "g1", "chat_type": "public_group", "summary": "聊了天气", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        chat_pos = text.find("【最近的对话】")
+        owner_pos = text.find("【关于主人】")
+        assert chat_pos != -1
+        assert owner_pos != -1
+        assert chat_pos < owner_pos
+
+    def test_ai_isolation(self, db_env):
+        """Each AI's corridor should only get its own digests (via ai_id param)."""
+        from unittest.mock import patch, call
+        with patch("chat_digest.get_latest_same_ai", return_value=[]) as mock_digest, \
+             patch("raw_vault.get_recent_turns", return_value=[]) as mock_raw:
+            asyncio.run(corridor.build_corridor("claude"))
+            mock_digest.assert_called_once_with("claude", limit=5)
+            mock_raw.assert_called_once_with("claude", limit=4)
+
+    def test_import_failure_graceful(self, db_env):
+        """If chat_digest import fails, section is absent, corridor still builds."""
+        from unittest.mock import patch
+        with patch.dict("sys.modules", {"chat_digest": None}):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+        assert "你是" in text
+
+    def test_digest_error_graceful(self, db_env):
+        """If get_latest_same_ai raises, section is absent, corridor still builds."""
+        from unittest.mock import patch
+        with patch("chat_digest.get_latest_same_ai", side_effect=RuntimeError("db locked")):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+        assert "你是" in text
+
+    def test_alias_cloudy_found_by_claude(self, db_env):
+        """H1: data stored under 'cloudy' must appear when building claude's corridor."""
+        from unittest.mock import patch
+        mock_digests = [
+            {"chat_id": "g1", "summary": "cloudy存的摘要", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "cloudy存的摘要" in text
+
+    def test_merge_stale_digest_fresh_raw(self, db_env):
+        """H2: a raw turn newer than the newest digest must appear alongside it."""
+        from unittest.mock import patch
+        stale_digest = [
+            {"chat_id": "g1", "summary": "旧摘要", "created_at": "2026-09-10T00:00:00"},
+        ]
+        fresh_raw = [
+            {"user": "刚刚说的话", "ai": "刚刚的回复", "created_at": "2026-09-14T12:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=stale_digest), \
+             patch("raw_vault.get_recent_turns", return_value=fresh_raw):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        lines_section = text[text.index("【最近的对话】"):]
+        next_section = lines_section.find("【", 1)
+        if next_section != -1:
+            lines_section = lines_section[:next_section]
+        assert "刚刚说的话" in lines_section
+        assert "旧摘要" in lines_section
+        assert lines_section.index("刚刚说的话") < lines_section.index("旧摘要")
+
+    def test_same_turn_digest_and_raw_no_duplicate(self, db_env):
+        """Same turn_id in digest and raw → raw is excluded."""
+        from unittest.mock import patch
+        tid = "abc123def456"
+        digest = [
+            {"chat_id": "g1", "summary": "讨论晚餐选择并决定吃火锅",
+             "created_at": "2026-09-14T10:00:20", "turn_id": tid},
+        ]
+        covered_raw = [
+            {"user": "今晚吃啥好呢", "ai": "火锅吧",
+             "created_at": "2026-09-14T10:00:00", "turn_id": tid},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest), \
+             patch("raw_vault.get_recent_turns", return_value=covered_raw):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "讨论晚餐选择" in text
+        assert "今晚吃啥好呢" not in text
+
+    def test_concurrent_digest_delay_preserves_newer_raw(self, db_env):
+        """Different turn_id → raw is NOT suppressed even if digest timestamp
+        is later (delayed LLM generation)."""
+        from unittest.mock import patch
+        digest_a = [
+            {"chat_id": "g1", "summary": "讨论了A轮的晚饭",
+             "created_at": "2026-09-14T10:00:20", "turn_id": "turn_aaa"},
+        ]
+        raw_b = [
+            {"user": "B轮全新话题", "ai": "B轮回复",
+             "created_at": "2026-09-14T10:00:10", "turn_id": "turn_bbb"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest_a), \
+             patch("raw_vault.get_recent_turns", return_value=raw_b):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "讨论了A轮的晚饭" in text
+        assert "B轮全新话题" in text
+
+    def test_same_content_different_turn_id_both_preserved(self, db_env):
+        """R5 反例：同一 chat 两次说"继续"，turn_id 不同，新 raw 必须保留。"""
+        from unittest.mock import patch
+        digest = [
+            {"chat_id": "g1", "summary": "继续审查PR",
+             "created_at": "2026-09-14T09:00:00", "turn_id": "turn_old"},
+        ]
+        raw_new = [
+            {"user": "继续", "ai": "好的",
+             "created_at": "2026-09-14T10:00:00", "turn_id": "turn_new"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest), \
+             patch("raw_vault.get_recent_turns", return_value=raw_new):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "好的" in text, "new raw with different turn_id was falsely deduped"
+
+    def test_synonym_rewrite_same_turn_id_deduped(self, db_env):
+        """同义改写的摘要仍通过 turn_id 精确去重。"""
+        from unittest.mock import patch
+        tid = "turn_same_123"
+        digest = [
+            {"chat_id": "g1", "summary": "讨论晚餐选择并决定吃火锅",
+             "created_at": "2026-09-14T10:00:20", "turn_id": tid},
+        ]
+        raw_same = [
+            {"user": "今晚我们一起去吃海底捞怎么样呀", "ai": "好呀",
+             "created_at": "2026-09-14T10:00:00", "turn_id": tid},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest), \
+             patch("raw_vault.get_recent_turns", return_value=raw_same):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "讨论晚餐选择" in text
+        assert "海底捞" not in text
+
+    def test_legacy_empty_turn_id_not_deduped(self, db_env):
+        """Legacy rows with empty turn_id are conservatively kept (not deduped)."""
+        from unittest.mock import patch
+        digest = [
+            {"chat_id": "g1", "summary": "旧摘要",
+             "created_at": "2026-09-14T09:00:00", "turn_id": ""},
+        ]
+        raw = [
+            {"user": "旧原文", "ai": "旧回复",
+             "created_at": "2026-09-14T09:00:00", "turn_id": ""},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest), \
+             patch("raw_vault.get_recent_turns", return_value=raw):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        # Both should appear — empty turn_id means unknown, conservative keep
+        assert "旧摘要" in text
+        assert "旧原文" in text
+
+    def test_cross_section_dedup(self, db_env):
+        """M1: same summary shown in 【最近的对话】 must not repeat in 【其他窗口】."""
+        from unittest.mock import patch
+        shared_summary = "讨论了周末去爬山的计划"
+        mock_same_ai = [
+            {"chat_id": "g1", "summary": shared_summary, "created_at": "2026-09-14T10:00:00"},
+        ]
+        mock_cross_window = [
+            {"chat_id": "g2", "chat_type": "public_group", "summary": shared_summary, "created_at": "2026-09-14T09:00:00"},
+            {"chat_id": "g3", "chat_type": "public_group", "summary": "不同的摘要", "created_at": "2026-09-14T08:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_same_ai), \
+             patch("chat_digest.get_recent_digests", return_value=mock_cross_window):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert text.count(shared_summary) == 1, \
+            "same summary appeared in both 最近的对话 and 其他窗口"
+        assert "不同的摘要" in text
+
+
+# ════════════════════════════════════════════
 #  Corridor TODO section filtering
 # ════════════════════════════════════════════
 

@@ -312,6 +312,43 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
+    # 5.5. 最近的对话（digest 优先，raw 按 turn_id 去重补位）
+    recent_chat_lines: list[str] = []
+    _recent_chat_summaries: set[str] = set()
+    try:
+        from chat_digest import get_latest_same_ai
+        import raw_vault
+        latest_digests = get_latest_same_ai(ai_id, limit=5)
+        raw_turns = raw_vault.get_recent_turns(ai_id, limit=4)
+
+        merged: list[tuple[str, str]] = []
+        digest_turn_ids: set[str] = set()
+        for d in latest_digests:
+            merged.append((d.get("created_at", ""), d["summary"]))
+            tid = d.get("turn_id", "")
+            if tid:
+                digest_turn_ids.add(tid)
+
+        for t in raw_turns:
+            tid = t.get("turn_id", "")
+            if tid and tid in digest_turn_ids:
+                continue
+            merged.append((t.get("created_at", ""), f"用户: {t['user']} → 你: {t['ai']}"))
+
+        merged.sort(key=lambda x: x[0], reverse=True)
+        seen_text: set[str] = set()
+        for _, line in merged:
+            norm = "".join(line.split()).lower()
+            if norm in seen_text:
+                continue
+            seen_text.add(norm)
+            recent_chat_lines.append(line)
+            _recent_chat_summaries.add(norm)
+            if len(recent_chat_lines) >= 5:
+                break
+    except Exception:
+        log.warning("corridor: failed to load recent chat data", exc_info=True)
+
     # 6. 基建状态 — 3 条，recency-weighted
     infra_mems = [m for m in visible_mems.values()
                   if m.get("room") == "infra" and m.get("status") == "active"]
@@ -400,6 +437,10 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
+    # 0.8. 最近的对话（AI 醒来后第一眼看到"刚才聊了什么"）
+    if recent_chat_lines:
+        sections.append("【最近的对话】\n" + "\n".join(f"· {line}" for line in recent_chat_lines))
+
     if living:
         deduped_living = _dedup_texts(living, max_items=8)
         sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in deduped_living))
@@ -435,8 +476,11 @@ async def build_corridor(ai_id: str) -> str:
         sections.append("【近期重要事件】\n" + "\n".join(recent_lines))
 
     if cross_window_digests:
-        lines = [f"· {d['summary']}" for d in cross_window_digests]
-        sections.append("【你在其他聊天窗口最近聊了】\n" + "\n".join(lines))
+        deduped_cw = [d for d in cross_window_digests
+                      if "".join(d["summary"].split()).lower() not in _recent_chat_summaries]
+        if deduped_cw:
+            lines = [f"· {d['summary']}" for d in deduped_cw]
+            sections.append("【你在其他聊天窗口最近聊了】\n" + "\n".join(lines))
 
     if infra:
         sections.append("【当前基建状态】\n" + "\n".join(f"· {x[:150]}" for x in infra))

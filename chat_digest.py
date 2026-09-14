@@ -37,26 +37,36 @@ RETENTION_DEFAULT = 30
 
 def _init_table():
     conn = _connect()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_digests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ai_id TEXT NOT NULL,
-            chat_id TEXT NOT NULL DEFAULT '',
-            chat_type TEXT NOT NULL DEFAULT '',
-            summary TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
     try:
-        conn.execute("ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ai_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT '',
+                chat_type TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(chat_digests)").fetchall()}
+        for col_name, col_ddl in (
+            ("chat_type", "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''"),
+            ("turn_id", "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col_name not in existing:
+                conn.execute(col_ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
+            "ON chat_digests(ai_id, created_at DESC)"
+        )
+        conn.execute("COMMIT")
     except Exception:
-        pass
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
-        "ON chat_digests(ai_id, created_at DESC)"
-    )
-    conn.commit()
-    conn.close()
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 _init_table()
@@ -88,6 +98,7 @@ async def _call_llm(prompt: str) -> str:
 async def generate_and_save(
     user_message: str, ai_response: str, ai_id: str,
     chat_id: str = "", chat_type: str = "", reply_reason: str = "",
+    turn_id: str = "",
 ):
     """生成对话摘要并保存。
 
@@ -130,9 +141,9 @@ async def generate_and_save(
     now = datetime.now(timezone.utc).isoformat()
     conn = _connect()
     conn.execute(
-        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (ai_id, chat_id, chat_type, summary, now),
+        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at, turn_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (ai_id, chat_id, chat_type, summary, now, turn_id or ""),
     )
 
     limit = RETENTION_LIMITS.get(chat_type, RETENTION_DEFAULT)
@@ -183,6 +194,29 @@ def get_recent_digests(
         "  created_at DESC "
         "LIMIT ?",
         tuple(params),
+    )
+    results = [dict(r) for r in cur]
+    conn.close()
+    return results
+
+
+def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
+    """获取该 AI 最近的对话摘要（纯时间倒序，不排除任何窗口）。
+    自动展开别名组：cloudy/claude 视为同一 AI。"""
+    if not (ai_id or "").strip():
+        return []
+    limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 5, 50))
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    ai_ids = AI_ALIAS_GROUPS.get(canonical, [ai_id])
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in ai_ids)
+    cur = conn.execute(
+        f"SELECT chat_id, chat_type, summary, created_at, "
+        f"COALESCE(turn_id, '') AS turn_id FROM chat_digests "
+        f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
+        (*ai_ids, limit),
     )
     results = [dict(r) for r in cur]
     conn.close()

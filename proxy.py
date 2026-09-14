@@ -292,7 +292,8 @@ async def _extract_response_text(response_data: dict) -> str:
 
 
 async def _background_extract(user_message: str, ai_response: str, ai_id: str, platform: str,
-                               chat_id: str = "", chat_type: str = ""):
+                               chat_id: str = "", chat_type: str = "",
+                               turn_id: str = ""):
     """后台异步提取记忆"""
     try:
         await gateway_mod.post_process(
@@ -313,6 +314,7 @@ async def _background_extract(user_message: str, ai_response: str, ai_id: str, p
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type or "private",
+            turn_id=turn_id,
         )
     except Exception as e:
         logger.error(f"Proxy extract capture error: {e}")
@@ -387,6 +389,8 @@ async def handle_chat_completions(request: Request, body: dict):
             cleaned, cap_results = await capabilities.process(full_text, ai_id=config.ai_id)
             if cap_results:
                 logger.info(f"[Proxy] Stream capabilities executed: {[r['tag'] for r in cap_results]}")
+            import uuid
+            tid = uuid.uuid4().hex[:16]
             if config.extract_memory and user_message and cleaned:
                 await _background_extract(
                     user_message=user_message,
@@ -395,6 +399,7 @@ async def handle_chat_completions(request: Request, body: dict):
                     platform=config.platform,
                     chat_id=config.chat_id,
                     chat_type=config.chat_type,
+                    turn_id=tid,
                 )
             if config.chat_id and user_message and cleaned:
                 try:
@@ -403,6 +408,7 @@ async def handle_chat_completions(request: Request, body: dict):
                         user_message=user_message, ai_response=cleaned,
                         ai_id=config.ai_id, chat_id=config.chat_id,
                         chat_type=config.chat_type or "private",
+                        turn_id=tid,
                     )
                 except Exception as e:
                     logger.warning(f"[Proxy] Chat digest failed: {e}")
@@ -447,6 +453,8 @@ async def handle_chat_completions(request: Request, body: dict):
             if response_data.get("choices") and cleaned != ai_response:
                 response_data["choices"][0]["message"]["content"] = cleaned
             ai_response = cleaned
+    import uuid
+    tid = uuid.uuid4().hex[:16]
     if config.extract_memory and user_message and ai_response:
         asyncio.create_task(_background_extract(
             user_message=user_message,
@@ -455,6 +463,7 @@ async def handle_chat_completions(request: Request, body: dict):
             platform=config.platform,
             chat_id=config.chat_id,
             chat_type=config.chat_type,
+            turn_id=tid,
         ))
     if config.chat_id and user_message and ai_response:
         async def _bg_digest():
@@ -464,6 +473,7 @@ async def handle_chat_completions(request: Request, body: dict):
                     user_message=user_message, ai_response=ai_response,
                     ai_id=config.ai_id, chat_id=config.chat_id,
                     chat_type=config.chat_type or "private",
+                    turn_id=tid,
                 )
             except Exception as e:
                 logger.warning(f"[Proxy] Chat digest failed: {e}")
