@@ -51,7 +51,8 @@ def _init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
         conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
