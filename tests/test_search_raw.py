@@ -259,29 +259,113 @@ class TestLikeWildcardEscape:
             assert len(hits) == 1
 
 
+    def test_backslash_literal(self, tmp_path):
+        """Literal backslash in text can be found."""
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("a", "", "", "public_group", r"路径是C:\Users\test", "", "2026-09-01T00:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+            hits = raw_vault.search(r"C:\Users")
+            assert len(hits) == 1
+
+
+@pytest.fixture()
+def bulk_db(tmp_path):
+    """75 条同关键词公开记录 + 5 条私聊，用于 limit clamp 精确测试。"""
+    db_path = tmp_path / "raw_events.db"
+    with patch.object(raw_vault, "DB_PATH", db_path):
+        raw_vault._init_db()
+        conn = sqlite3.connect(db_path)
+        rows = []
+        for i in range(75):
+            rows.append(("bot", "tg", f"g{i}", "public_group",
+                         f"测试关键词第{i}条", "", f"2026-09-{1+i//28:02d}T{i%24:02d}:00:00+00:00"))
+        for i in range(5):
+            rows.append(("bot", "tg", f"dm{i}", "private",
+                         f"测试关键词私聊{i}", "", f"2026-09-10T{i:02d}:00:00+00:00"))
+        conn.executemany(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        yield db_path
+
+
 class TestLimitClamp:
-    """limit must be clamped to [1, 50]."""
+    """limit must be clamped to [1, 50] — uses 75-row fixture for precision."""
 
-    def test_negative_limit(self, test_db):
-        with patch.object(raw_vault, "DB_PATH", test_db):
-            hits = raw_vault.search("妈妈", ai_id="cloudy")
-            total_normal = len(hits)
-            hits_neg = raw_vault.search("妈妈", ai_id="cloudy", limit=-1)
-            assert len(hits_neg) <= total_normal
-            assert len(hits_neg) >= 0
+    def test_negative_limit_clamps_to_1(self, bulk_db):
+        with patch.object(raw_vault, "DB_PATH", bulk_db):
+            hits = raw_vault.search("测试关键词", ai_id="bot", limit=-1)
+            assert len(hits) == 1
 
-    def test_zero_limit(self, test_db):
-        with patch.object(raw_vault, "DB_PATH", test_db):
-            hits = raw_vault.search("妈妈", ai_id="cloudy", limit=0)
-            assert len(hits) <= 1
+    def test_zero_limit_clamps_to_1(self, bulk_db):
+        with patch.object(raw_vault, "DB_PATH", bulk_db):
+            hits = raw_vault.search("测试关键词", ai_id="bot", limit=0)
+            assert len(hits) == 1
 
-    def test_huge_limit_clamped(self, test_db):
-        with patch.object(raw_vault, "DB_PATH", test_db):
-            hits = raw_vault.search("妈妈", ai_id="cloudy", limit=999999)
-            assert len(hits) <= raw_vault._LIMIT_MAX
+    def test_huge_limit_clamps_to_50(self, bulk_db):
+        with patch.object(raw_vault, "DB_PATH", bulk_db):
+            hits = raw_vault.search("测试关键词", ai_id="bot", limit=999)
+            assert len(hits) == 50
+
+    def test_exact_limit_50(self, bulk_db):
+        with patch.object(raw_vault, "DB_PATH", bulk_db):
+            hits = raw_vault.search("测试关键词", ai_id="bot", limit=50)
+            assert len(hits) == 50
 
     def test_bulk_export_blocked(self, test_db):
         """query='%' + limit=-1 must not dump the entire table."""
         with patch.object(raw_vault, "DB_PATH", test_db):
             hits = raw_vault.search("%", limit=-1)
             assert len(hits) == 0
+
+
+class TestStatsPrivacy:
+    """stats(public_only=True) must exclude private chat metadata."""
+
+    def test_public_stats_excludes_private(self, test_db):
+        with patch.object(raw_vault, "DB_PATH", test_db):
+            all_stats = raw_vault.stats(public_only=False)
+            pub_stats = raw_vault.stats(public_only=True)
+            assert pub_stats["count"] < all_stats["count"]
+
+    def test_public_stats_count_matches_public_rows(self, test_db):
+        with patch.object(raw_vault, "DB_PATH", test_db):
+            pub_stats = raw_vault.stats(public_only=True)
+            assert pub_stats["count"] == 4
+
+    def test_public_stats_newest_is_public(self, test_db):
+        with patch.object(raw_vault, "DB_PATH", test_db):
+            pub_stats = raw_vault.stats(public_only=True)
+            assert "2026-09-06" in pub_stats["newest"]
+
+
+class TestMCPContract:
+    """MCP search_raw must not accept ai_id — checked via AST since mcp module not in test env."""
+
+    def test_mcp_search_raw_has_no_ai_id_param(self):
+        import ast
+        src = Path(__file__).parent.parent / "mcp_server.py"
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "search_raw":
+                param_names = [a.arg for a in node.args.args]
+                assert "ai_id" not in param_names, "MCP search_raw must not expose ai_id"
+                return
+        pytest.fail("search_raw function not found in mcp_server.py")
+
+    def test_mcp_search_raw_passes_empty_ai_id(self):
+        """Verify the wrapper always calls raw_vault.search with ai_id=''."""
+        src = Path(__file__).parent.parent / "mcp_server.py"
+        text = src.read_text(encoding="utf-8")
+        assert 'ai_id=""' in text or "ai_id=''" in text

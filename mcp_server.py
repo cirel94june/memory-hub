@@ -1022,7 +1022,7 @@ async def search_raw(query: str, limit: int = 5,
     """在原文保险箱里查当时的原始对话（未经加工的原话）。
     记忆内容存疑、或用户问"当时到底怎么说的"时用这个对照原文。
     支持同义词自动展开（如搜"妈妈"也能找到"母亲"）。
-    MCP 只能搜公开对话；私聊查询请用 operator CLI。
+    MCP 只能搜公开对话；当前不支持私聊查询。
 
     Args:
         query: 关键词（自动展开同义词）
@@ -1032,7 +1032,7 @@ async def search_raw(query: str, limit: int = 5,
     import raw_vault
     hits = raw_vault.search(query, ai_id="", limit=limit,
                             speaker_filter=speaker_filter)
-    return json.dumps({"results": hits, "stats": raw_vault.stats()}, ensure_ascii=False, indent=2)
+    return json.dumps({"results": hits, "stats": raw_vault.stats(public_only=True)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

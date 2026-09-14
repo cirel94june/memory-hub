@@ -137,9 +137,17 @@ def search(query: str, ai_id: str = "", limit: int = 10,
     return rows
 
 
-def stats() -> dict:
+def stats(public_only: bool = False) -> dict:
     conn = _connect()
-    cur = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events")
+    if public_only:
+        placeholders = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+        cur = conn.execute(
+            f"SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
+            f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({placeholders})",
+            _PUBLIC_CHAT_TYPES,
+        )
+    else:
+        cur = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events")
     count, oldest, newest = cur.fetchone()
     conn.close()
     return {"count": count or 0, "oldest": oldest or "", "newest": newest or ""}
