@@ -298,6 +298,7 @@ from async_remember import _idempotent_response  # noqa: E402,F401
 def _request_fingerprint(
     content: str, room: str, category: str, importance: float,
     event_date: str = "", subject_name: str = "", speaker_name: str = "",
+    force_create: bool = False,
 ) -> str:
     """Canonical fingerprint of the original request parameters.
 
@@ -309,6 +310,7 @@ def _request_fingerprint(
     canonical = (
         f"{content}\0{room}\0{category}\0{importance}"
         f"\0{event_date}\0{subject_name}\0{speaker_name}"
+        f"\0{force_create}"
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -393,7 +395,8 @@ async def remember(
     effective_crq = (f"{source_ai}::{client_request_id}"
                      if client_request_id else "")
     req_fp = _request_fingerprint(
-        content, room, category, importance, event_date, subject_name)
+        content, room, category, importance, event_date, subject_name,
+        force_create=force_create)
 
     # 1. Idempotency lookup — a pre-existing crq short-circuits everything.
     #    Compare against the persisted request_fingerprint (NOT re-hashed

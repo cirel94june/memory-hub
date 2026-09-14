@@ -1653,12 +1653,14 @@ class TestSafeRememberBehavioral:
     def _request_fingerprint(
         content: str, room: str, category: str, importance: float,
         event_date: str = "", subject_name: str = "", speaker_name: str = "",
+        force_create: bool = False,
     ) -> str:
         """Mirror of mcp_server._request_fingerprint (can't import
         mcp_server in tests due to FastMCP dependency)."""
         canonical = (
             f"{content}\0{room}\0{category}\0{importance}"
             f"\0{event_date}\0{subject_name}\0{speaker_name}"
+            f"\0{force_create}"
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
@@ -1712,7 +1714,8 @@ class TestSafeRememberBehavioral:
         """H1: changing any request param produces a different fingerprint,
         so genuinely different requests aren't falsely deduplicated."""
         base = dict(content="hello", room="r", category="c",
-                    importance=0.5, event_date="", subject_name="", speaker_name="")
+                    importance=0.5, event_date="", subject_name="",
+                    speaker_name="", force_create=False)
         fp_base = self._request_fingerprint(**base)
 
         for field, alt_value in [
@@ -1722,11 +1725,39 @@ class TestSafeRememberBehavioral:
             ("importance", 0.9),
             ("speaker_name", "Alice"),
             ("subject_name", "Bob"),
+            ("force_create", True),
         ]:
             altered = {**base, field: alt_value}
             fp_alt = self._request_fingerprint(**altered)
             assert fp_alt != fp_base, \
                 f"changing {field} must change the fingerprint"
+
+    def test_h1_force_create_changes_fingerprint_causes_conflict(self, db_env):
+        """M1-review: same CRQ + same content but different force_create
+        must produce different fingerprints — verifying that force_create
+        is part of the idempotency key."""
+        fp_no_force = self._request_fingerprint(
+            "test", "room", "cat", 0.5, force_create=False)
+        fp_force = self._request_fingerprint(
+            "test", "room", "cat", 0.5, force_create=True)
+        assert fp_no_force != fp_force, \
+            "force_create=True vs False must produce different fingerprints"
+
+        # Verify DB round-trip: skeleton with force_create=False fingerprint,
+        # lookup with force_create=True fingerprint should mismatch
+        crq = "claude::fc_conflict"
+        database.insert_pending_memory({
+            "id": "fc_skel", "content": "test",
+            "room": "room", "category": "cat",
+            "importance": 0.5,
+            "client_request_id": crq,
+            "status": "active",
+            "request_fingerprint": fp_no_force,
+        })
+        row = database.get_memory_by_client_request_id(crq)
+        assert row["request_fingerprint"] == fp_no_force
+        assert row["request_fingerprint"] != fp_force, \
+            "stored fp (force_create=False) must differ from fp (force_create=True)"
 
     def test_h2_speaker_name_persisted_in_skeleton(self, db_env):
         """H2: speaker_name stored in skeleton row survives for crash
@@ -1833,14 +1864,62 @@ class TestSafeRememberBehavioral:
             "source_platform must survive pipeline UPSERT"
 
     def test_sweep_recovery_passes_speaker_and_platform(self, db_env):
-        """Integration: pending_sweep's retry dispatch must read
-        speaker_name and source_platform from the skeleton and pass them
-        to the finalize call (verified via the dispatch kwargs in
-        pending_sweep.sweep_stuck_pending source)."""
-        import inspect
+        """Integration: sweep reads speaker_name and source_platform from
+        the skeleton row and passes them to finalize. Verified by inserting
+        a stale pending skeleton and running sweep with a fake finalize_fn
+        injected via the lazy import that sweep does internally."""
+        from datetime import timedelta
+        from types import ModuleType
         import pending_sweep
-        src = inspect.getsource(pending_sweep.sweep_stuck_pending)
-        assert 'speaker_name=skel.get("speaker_name"' in src, \
-            "sweep must read speaker_name from skeleton"
-        assert 'source_platform=skel.get("source_platform"' in src, \
-            "sweep must read source_platform from skeleton"
+
+        stale_time = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        database.insert_pending_memory({
+            "id": "sweep_int", "content": "sweep test",
+            "room": "living_room",
+            "client_request_id": "claude::sweep_int",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+            "speaker_name": "Diana",
+            "created_at": stale_time,
+        })
+
+        captured_kwargs = {}
+
+        async def fake_finalize(skeleton_id, **kwargs):
+            captured_kwargs.update(kwargs)
+            captured_kwargs["skeleton_id"] = skeleton_id
+            database.update_memory_status(skeleton_id, "active")
+
+        # Create a fake mcp_server module so the lazy import succeeds
+        fake_mcp = ModuleType("mcp_server")
+        fake_mcp._finalize_pending_memory = fake_finalize
+
+        with patch.dict("sys.modules", {"mcp_server": fake_mcp}):
+            with patch.object(pending_sweep, "_spawn_bg") as mock_bg:
+                mock_bg.side_effect = lambda coro: asyncio.ensure_future(coro)
+                asyncio.run(pending_sweep.sweep_stuck_pending())
+
+        assert captured_kwargs.get("speaker_name") == "Diana", \
+            "sweep must pass speaker_name from skeleton to finalize"
+        assert captured_kwargs.get("source_platform") == "mcp:safe", \
+            "sweep must pass source_platform from skeleton to finalize"
+
+    def test_migration_concurrent_startup_safe(self, db_env):
+        """M2: init_db can be called concurrently without duplicate-column
+        crashes — the migration block is wrapped in BEGIN IMMEDIATE."""
+        import threading
+        errors = []
+
+        def run_init():
+            try:
+                asyncio.run(database.init_db())
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run_init) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"concurrent init_db raised: {errors}"

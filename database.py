@@ -174,7 +174,17 @@ CREATE TABLE IF NOT EXISTS memories (
     resolved        INTEGER,
     anchored        INTEGER,
     provenance_type TEXT NOT NULL DEFAULT '',
-    fact_confidence REAL
+    fact_confidence REAL,
+    subject_id      TEXT NOT NULL DEFAULT '',
+    source_actor_id TEXT NOT NULL DEFAULT '',
+    info_type       TEXT NOT NULL DEFAULT 'fact',
+    client_request_id TEXT NOT NULL DEFAULT '',
+    link_to_real_id TEXT NOT NULL DEFAULT '',
+    finalize_claim_id TEXT NOT NULL DEFAULT '',
+    finalize_claim_at TEXT NOT NULL DEFAULT '',
+    subject_name    TEXT NOT NULL DEFAULT '',
+    speaker_name    TEXT NOT NULL DEFAULT '',
+    request_fingerprint TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_mem_status     ON memories(status);
@@ -378,54 +388,63 @@ async def init_db(db_path: str = None) -> None:
         )
 
         # ── Migrations for existing databases ──
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
-        if "anchored" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
-            logger.info("Migrated: added 'anchored' column")
-        if "provenance_type" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'provenance_type' column")
-        if "fact_confidence" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
-            logger.info("Migrated: added 'fact_confidence' column")
+        # Wrapped in BEGIN IMMEDIATE to prevent concurrent-startup TOCTOU:
+        # two processes reading PRAGMA table_info simultaneously could both
+        # see a column as missing and race on ALTER TABLE.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+            if "anchored" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN anchored INTEGER")
+                logger.info("Migrated: added 'anchored' column")
+            if "provenance_type" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN provenance_type TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'provenance_type' column")
+            if "fact_confidence" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN fact_confidence REAL")
+                logger.info("Migrated: added 'fact_confidence' column")
 
-        if "subject_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'subject_id' column")
-        if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'source_actor_id' column")
-        if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
-            logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
-        if "info_type" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
-            logger.info("Migrated: added 'info_type' column")
+            if "subject_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN subject_id TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'subject_id' column")
+            if "source_speaker_id" not in existing_cols and "source_actor_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN source_actor_id TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'source_actor_id' column")
+            if "source_speaker_id" in existing_cols and "source_actor_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories RENAME COLUMN source_speaker_id TO source_actor_id")
+                logger.info("Migrated: renamed 'source_speaker_id' → 'source_actor_id'")
+            if "info_type" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN info_type TEXT NOT NULL DEFAULT 'fact'")
+                logger.info("Migrated: added 'info_type' column")
 
-        # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
-        if "client_request_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'client_request_id' column")
-        if "link_to_real_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'link_to_real_id' column")
-        # PR C round-4 H1: real atomic claim for sweep retries. Without this,
-        # two concurrent sweeps can both spawn a finalize for the same skeleton.
-        if "finalize_claim_id" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'finalize_claim_id' column")
-        if "finalize_claim_at" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'finalize_claim_at' column")
-        if "subject_name" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN subject_name TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'subject_name' column")
-        if "speaker_name" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN speaker_name TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'speaker_name' column")
-        if "request_fingerprint" not in existing_cols:
-            conn.execute("ALTER TABLE memories ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''")
-            logger.info("Migrated: added 'request_fingerprint' column")
+            # PR C (块 8): async remember 支持——幂等 key + supersede 后骨架追踪
+            if "client_request_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN client_request_id TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'client_request_id' column")
+            if "link_to_real_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN link_to_real_id TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'link_to_real_id' column")
+            # PR C round-4 H1: real atomic claim for sweep retries.
+            if "finalize_claim_id" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_id TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'finalize_claim_id' column")
+            if "finalize_claim_at" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN finalize_claim_at TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'finalize_claim_at' column")
+            if "subject_name" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN subject_name TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'subject_name' column")
+            if "speaker_name" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN speaker_name TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'speaker_name' column")
+            if "request_fingerprint" not in existing_cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''")
+                logger.info("Migrated: added 'request_fingerprint' column")
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
