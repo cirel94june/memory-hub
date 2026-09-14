@@ -37,29 +37,35 @@ RETENTION_DEFAULT = 30
 
 def _init_table():
     conn = _connect()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_digests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ai_id TEXT NOT NULL,
-            chat_id TEXT NOT NULL DEFAULT '',
-            chat_type TEXT NOT NULL DEFAULT '',
-            summary TEXT NOT NULL,
-            created_at TEXT NOT NULL
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ai_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT '',
+                chat_type TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(chat_digests)").fetchall()}
+        for col_name, col_ddl in (
+            ("chat_type", "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''"),
+            ("turn_id", "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col_name not in existing:
+                conn.execute(col_ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
+            "ON chat_digests(ai_id, created_at DESC)"
         )
-    """)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(chat_digests)").fetchall()}
-    for col_name, col_ddl in (
-        ("chat_type", "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''"),
-        ("turn_id", "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"),
-    ):
-        if col_name not in existing:
-            conn.execute(col_ddl)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_digests_ai_time "
-        "ON chat_digests(ai_id, created_at DESC)"
-    )
-    conn.commit()
-    conn.close()
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 _init_table()

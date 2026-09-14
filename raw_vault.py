@@ -30,25 +30,31 @@ def _connect() -> sqlite3.Connection:
 
 def _init_db():
     conn = _connect()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS raw_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ai_id TEXT NOT NULL DEFAULT '',
-            platform TEXT NOT NULL DEFAULT '',
-            chat_id TEXT NOT NULL DEFAULT '',
-            chat_type TEXT NOT NULL DEFAULT '',
-            user_text TEXT NOT NULL DEFAULT '',
-            ai_text TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
-        )
-    """)
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
-    if "turn_id" not in existing:
-        conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS raw_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ai_id TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                chat_type TEXT NOT NULL DEFAULT '',
+                user_text TEXT NOT NULL DEFAULT '',
+                ai_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
+        if "turn_id" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 _init_db()
