@@ -312,7 +312,7 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
-    # 5.5. 最近的对话（digest + raw 合并取最新，不是二选一）
+    # 5.5. 最近的对话（digest 优先，raw 按内容去重补位）
     recent_chat_lines: list[str] = []
     _recent_chat_summaries: set[str] = set()
     try:
@@ -321,13 +321,17 @@ async def build_corridor(ai_id: str) -> str:
         latest_digests = get_latest_same_ai(ai_id, limit=5)
         raw_turns = raw_vault.get_recent_turns(ai_id, limit=4)
 
+        # digest 优先入列
         merged: list[tuple[str, str]] = []
+        digest_user_frags: set[str] = set()
         for d in latest_digests:
             merged.append((d.get("created_at", ""), d["summary"]))
-        # raw 只补充比最新 digest 更新的轮次，避免同一轮 digest+raw 双占位
-        newest_digest_ts = max((d.get("created_at", "") for d in latest_digests), default="")
+            digest_user_frags.add("".join(d["summary"].split()).lower())
+
+        # raw 补位：跳过用户原文前 30 字已被某条 digest 摘要包含的轮次
         for t in raw_turns:
-            if newest_digest_ts and t.get("created_at", "") <= newest_digest_ts:
+            user_norm = "".join((t["user"] or "").split()).lower()[:30]
+            if user_norm and any(user_norm in frag for frag in digest_user_frags):
                 continue
             merged.append((t.get("created_at", ""), f"用户: {t['user']} → 你: {t['ai']}"))
 

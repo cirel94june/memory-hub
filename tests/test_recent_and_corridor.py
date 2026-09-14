@@ -633,26 +633,40 @@ class TestCorridorRecentChat:
         assert lines_section.index("刚刚说的话") < lines_section.index("旧摘要")
 
     def test_same_turn_digest_and_raw_no_duplicate(self, db_env):
-        """M1-R2: when digest and raw cover the same time range, raw is excluded
-        to avoid one turn occupying two slots."""
+        """M1-R2: when digest covers the same turn as raw (user text appears
+        in digest summary), raw is excluded to avoid double-occupying slots."""
         from unittest.mock import patch
         digest = [
-            {"chat_id": "g1", "summary": "讨论了晚饭", "created_at": "2026-09-14T10:00:00"},
+            {"chat_id": "g1", "summary": "用户问今晚吃啥，AI建议火锅", "created_at": "2026-09-14T10:00:20"},
         ]
-        same_time_raw = [
+        covered_raw = [
             {"user": "今晚吃啥", "ai": "火锅吧", "created_at": "2026-09-14T10:00:00"},
         ]
-        older_raw = [
-            {"user": "更早的话", "ai": "更早回复", "created_at": "2026-09-14T09:00:00"},
-        ]
         with patch("chat_digest.get_latest_same_ai", return_value=digest), \
-             patch("raw_vault.get_recent_turns", return_value=same_time_raw + older_raw):
+             patch("raw_vault.get_recent_turns", return_value=covered_raw):
             text = asyncio.run(corridor.build_corridor("claude"))
         assert "【最近的对话】" in text
-        assert "讨论了晚饭" in text
-        # raw at same or older timestamp should NOT appear
-        assert "今晚吃啥" not in text
-        assert "更早的话" not in text
+        assert "用户问今晚吃啥" in text
+        # raw whose user text is covered by digest should NOT appear
+        assert text.count("今晚吃啥") == 1  # only in digest, not also as raw
+
+    def test_concurrent_digest_delay_preserves_newer_raw(self, db_env):
+        """H1-R3: digest saved late (10:00:20) must NOT suppress a genuinely
+        newer raw turn (B at 10:00:10) whose content differs from the digest."""
+        from unittest.mock import patch
+        digest_a = [
+            {"chat_id": "g1", "summary": "讨论了A轮的晚饭", "created_at": "2026-09-14T10:00:20"},
+        ]
+        raw_b = [
+            {"user": "B轮全新话题", "ai": "B轮回复", "created_at": "2026-09-14T10:00:10"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest_a), \
+             patch("raw_vault.get_recent_turns", return_value=raw_b):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "讨论了A轮的晚饭" in text
+        # B's raw must NOT be suppressed — its content differs from A's digest
+        assert "B轮全新话题" in text
 
     def test_cross_section_dedup(self, db_env):
         """M1: same summary shown in 【最近的对话】 must not repeat in 【其他窗口】."""
