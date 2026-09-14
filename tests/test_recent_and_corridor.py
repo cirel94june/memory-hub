@@ -520,6 +520,87 @@ class TestCorridorSnapshot:
 
 
 # ════════════════════════════════════════════
+#  Corridor 【最近的对话】 section
+# ════════════════════════════════════════════
+
+class TestCorridorRecentChat:
+    """The 【最近的对话】 section should show digest summaries if available,
+    fall back to raw_vault turns, and not appear when empty."""
+
+    def test_section_appears_with_digests(self, db_env):
+        """When chat_digest has data, section shows digest summaries."""
+        from unittest.mock import patch
+        mock_digests = [
+            {"chat_id": "g1", "chat_type": "public_group", "summary": "聊了晚饭吃什么", "created_at": "2026-09-14T10:00:00"},
+            {"chat_id": "dm1", "chat_type": "private", "summary": "讨论了周末计划", "created_at": "2026-09-14T09:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "聊了晚饭吃什么" in text
+        assert "讨论了周末计划" in text
+
+    def test_section_fallback_to_raw_vault(self, db_env):
+        """When no digest exists, fall back to raw_vault turns."""
+        from unittest.mock import patch
+        mock_turns = [
+            {"user": "今天好累", "ai": "辛苦了，要不要休息一下", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=[]), \
+             patch("raw_vault.get_recent_turns", return_value=mock_turns):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" in text
+        assert "今天好累" in text
+        assert "辛苦了" in text
+
+    def test_section_absent_when_no_data(self, db_env):
+        """When neither digest nor raw_vault has data, section is absent."""
+        from unittest.mock import patch
+        with patch("chat_digest.get_latest_same_ai", return_value=[]), \
+             patch("raw_vault.get_recent_turns", return_value=[]):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+
+    def test_section_placed_before_about_owner(self, db_env):
+        """最近的对话 should appear before 关于主人."""
+        from unittest.mock import patch
+        _insert_event("liv_test", "主人喜欢猫", room="living_room", importance=0.5)
+        mock_digests = [
+            {"chat_id": "g1", "chat_type": "public_group", "summary": "聊了天气", "created_at": "2026-09-14T10:00:00"},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=mock_digests):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        chat_pos = text.find("【最近的对话】")
+        owner_pos = text.find("【关于主人】")
+        assert chat_pos != -1
+        assert owner_pos != -1
+        assert chat_pos < owner_pos
+
+    def test_ai_isolation(self, db_env):
+        """Each AI's corridor should only get its own digests (via ai_id param)."""
+        from unittest.mock import patch, call
+        with patch("chat_digest.get_latest_same_ai", return_value=[]) as mock_fn:
+            asyncio.run(corridor.build_corridor("claude"))
+            mock_fn.assert_called_once_with("claude", limit=5)
+
+    def test_import_failure_graceful(self, db_env):
+        """If chat_digest import fails, section is absent, corridor still builds."""
+        from unittest.mock import patch
+        with patch.dict("sys.modules", {"chat_digest": None}):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+        assert "你是" in text
+
+    def test_digest_error_graceful(self, db_env):
+        """If get_latest_same_ai raises, section is absent, corridor still builds."""
+        from unittest.mock import patch
+        with patch("chat_digest.get_latest_same_ai", side_effect=RuntimeError("db locked")):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        assert "【最近的对话】" not in text
+        assert "你是" in text
+
+
+# ════════════════════════════════════════════
 #  Corridor TODO section filtering
 # ════════════════════════════════════════════
 

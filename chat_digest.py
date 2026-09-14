@@ -189,6 +189,20 @@ def get_recent_digests(
     return results
 
 
+def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
+    """获取该 AI 最近的对话摘要（纯时间倒序，不排除任何窗口）。"""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        "SELECT chat_id, chat_type, summary, created_at FROM chat_digests "
+        "WHERE ai_id = ? ORDER BY created_at DESC LIMIT ?",
+        (ai_id, limit),
+    )
+    results = [dict(r) for r in cur]
+    conn.close()
+    return results
+
+
 def get_recent_chat_activity(
     chat_id: str,
     exclude_ai_id: str = "",

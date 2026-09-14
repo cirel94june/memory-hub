@@ -137,6 +137,27 @@ def search(query: str, ai_id: str = "", limit: int = 10,
     return rows
 
 
+def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
+    """获取该 AI 最近几轮原始对话（用于走廊 fallback，截断到合理长度）。"""
+    if not ai_id:
+        return []
+    limit = max(1, min(limit, 10))
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        "SELECT user_text, ai_text, created_at FROM raw_events "
+        "WHERE ai_id = ? ORDER BY created_at DESC LIMIT ?",
+        (ai_id, limit),
+    )
+    rows = []
+    for r in cur:
+        user = (r["user_text"] or "")[:120]
+        ai = (r["ai_text"] or "")[:120]
+        rows.append({"user": user, "ai": ai, "created_at": r["created_at"]})
+    conn.close()
+    return rows
+
+
 def stats(public_only: bool = False) -> dict:
     conn = _connect()
     if public_only:

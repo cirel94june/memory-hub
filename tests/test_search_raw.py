@@ -350,6 +350,68 @@ class TestStatsPrivacy:
             assert "2026-09-06" in pub_stats["newest"]
 
 
+class TestGetRecentTurns:
+    """raw_vault.get_recent_turns() for corridor fallback."""
+
+    def test_returns_recent_turns(self, tmp_path):
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            for i in range(6):
+                conn.execute(
+                    "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                    "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                    ("claude", "", "", "public_group", f"用户说{i}", f"AI答{i}",
+                     f"2026-09-{10+i:02d}T12:00:00+00:00"),
+                )
+            conn.commit()
+            conn.close()
+            turns = raw_vault.get_recent_turns("claude", limit=4)
+            assert len(turns) == 4
+            assert "用户说5" in turns[0]["user"]
+            assert "AI答5" in turns[0]["ai"]
+
+    def test_empty_ai_id_returns_empty(self, tmp_path):
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            assert raw_vault.get_recent_turns("") == []
+
+    def test_truncates_text(self, tmp_path):
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("claude", "", "", "public_group", "x" * 500, "y" * 500,
+                 "2026-09-14T12:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+            turns = raw_vault.get_recent_turns("claude", limit=1)
+            assert len(turns[0]["user"]) <= 120
+            assert len(turns[0]["ai"]) <= 120
+
+    def test_ai_isolation(self, tmp_path):
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("lucien", "", "", "public_group", "lucien的对话", "lucien回复",
+                 "2026-09-14T12:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+            turns = raw_vault.get_recent_turns("claude", limit=4)
+            assert len(turns) == 0
+
+
 class TestMCPContract:
     """MCP search_raw must not accept ai_id — checked via AST since mcp module not in test env."""
 

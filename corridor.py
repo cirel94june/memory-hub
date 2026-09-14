@@ -312,6 +312,21 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
+    # 5.5. 最近的对话（摘要优先，无摘要时 fallback 到原文尾部）
+    recent_chat_lines: list[str] = []
+    try:
+        from chat_digest import get_latest_same_ai
+        latest_digests = get_latest_same_ai(ai_id, limit=5)
+        if latest_digests:
+            recent_chat_lines = [d["summary"] for d in latest_digests]
+        else:
+            import raw_vault
+            turns = raw_vault.get_recent_turns(ai_id, limit=4)
+            for t in turns:
+                recent_chat_lines.append(f"用户: {t['user']} → 你: {t['ai']}")
+    except Exception:
+        pass
+
     # 6. 基建状态 — 3 条，recency-weighted
     infra_mems = [m for m in visible_mems.values()
                   if m.get("room") == "infra" and m.get("status") == "active"]
@@ -399,6 +414,10 @@ async def build_corridor(ai_id: str) -> str:
             sections.append(status_block)
     except Exception:
         pass
+
+    # 0.8. 最近的对话（AI 醒来后第一眼看到"刚才聊了什么"）
+    if recent_chat_lines:
+        sections.append("【最近的对话】\n" + "\n".join(f"· {line}" for line in recent_chat_lines))
 
     if living:
         deduped_living = _dedup_texts(living, max_items=8)
