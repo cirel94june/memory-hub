@@ -2344,10 +2344,10 @@ class MCPGateway:
         try:
             await asyncio.wait_for(
                 _mcp_session_manager.handle_request(scope, receive, send),
-                timeout=30.0,
+                timeout=120.0,
             )
         except asyncio.TimeoutError:
-            logging.getLogger("mcp").error("MCP POST request timed out after 30s")
+            logging.getLogger("mcp").error("MCP POST request timed out after 120s")
             try:
                 await send({"type": "http.response.start", "status": 504,
                            "headers": [(b"content-type", b"text/plain")]})
