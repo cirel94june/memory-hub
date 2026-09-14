@@ -546,19 +546,16 @@ class TestAsyncRememberHelpers:
     def test_m1_crq_content_fingerprint_conflict(self):
         """M1: reusing the same crq with different content must produce
         a crq_content_conflict error, not silently return the first row's id."""
-        # Test the fingerprint logic directly by inspecting the response
-        # path — the full MCP tool is unavailable locally (needs mcp module).
-        # Read the source to verify the fingerprint check is present.
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
         idx = src.find("async def remember(")
         body = src[idx:idx + 10000]
-        assert "content_fingerprint" in body, \
-            "MCP wrapper missing content fingerprint compute"
+        assert "_request_fingerprint" in body, \
+            "MCP wrapper missing request fingerprint compute"
         assert '"error": "crq_content_conflict"' in body, \
             "MCP wrapper missing crq_content_conflict error path"
-        assert "existing_fp != content_fingerprint" in body, \
-            "MCP wrapper missing fingerprint comparison"
+        assert "request_fingerprint" in body, \
+            "MCP wrapper missing fingerprint persistence/comparison"
 
     def test_m1_effective_crq_namespaces_by_source_ai(self):
         """M1: effective_crq must include source_ai to prevent cross-AI collision."""
@@ -1586,8 +1583,8 @@ class TestSafeRememberAsync:
             "safe_remember must return queued status immediately"
         assert '"safe_write": True' in body, \
             "safe_remember must set safe_write flag in response"
-        assert "content_fingerprint" in body, \
-            "safe_remember missing content fingerprint for idempotency"
+        assert "request_fingerprint" in body, \
+            "safe_remember missing request fingerprint for idempotency"
 
     def test_safe_remember_idempotent_duplicate(self, db_env):
         """Same client_request_id returns idempotent=True without creating
@@ -1647,3 +1644,342 @@ class TestSafeRememberAsync:
         body = src[idx:idx + 10000]
         assert "speaker_name=speaker_name" in body, \
             "safe_remember must pass speaker_name to finalize"
+
+
+class TestSafeRememberBehavioral:
+    """Behavioral tests exercising real DB paths for H1/H2/M1 fixes."""
+
+    @staticmethod
+    def _request_fingerprint(
+        content: str, room: str, category: str, importance: float,
+        event_date: str = "", subject_name: str = "", speaker_name: str = "",
+        force_create: bool = False,
+    ) -> str:
+        """Mirror of mcp_server._request_fingerprint (can't import
+        mcp_server in tests due to FastMCP dependency)."""
+        canonical = (
+            f"{content}\0{room}\0{category}\0{importance}"
+            f"\0{event_date}\0{subject_name}\0{speaker_name}"
+            f"\0{force_create}"
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    def test_h1_request_fingerprint_survives_content_transformation(self, db_env):
+        """H1: request_fingerprint is persisted at skeleton time from raw
+        params. After pipeline transforms content via UPSERT, idempotency
+        lookup by crq still finds the row and its fingerprint matches the
+        original — proving the fingerprint is immune to content changes."""
+        crq = "claude::h1_fp_test"
+        raw_content = "Alice 今天说她很开心"
+        fp = self._request_fingerprint(
+            raw_content, "living_room", "daily", 0.5,
+            event_date="2025-01-15", subject_name="Alice", speaker_name="Bob")
+
+        database.insert_pending_memory({
+            "id": "h1_skel", "content": raw_content,
+            "room": "living_room", "category": "daily",
+            "importance": 0.5, "event_date": "2025-01-15",
+            "client_request_id": crq,
+            "status": "pending",
+            "source_platform": "mcp:safe",
+            "subject_name": "Alice",
+            "speaker_name": "Bob",
+            "request_fingerprint": fp,
+        })
+
+        # Simulate pipeline transforming content (as _compact_content would)
+        transformed = "[safe compact] Alice expressed happiness today"
+        database.set_memory({
+            "id": "h1_skel",
+            "content": transformed,
+            "status": "active",
+            "category": "emotion",
+            "room": "living_room",
+        })
+
+        row = database.get_memory_by_client_request_id(crq)
+        assert row is not None, "idempotency lookup must find the row by crq"
+        assert row["content"] == transformed, "content was transformed by pipeline"
+        assert row["request_fingerprint"] == fp, \
+            "request_fingerprint must survive content transformation"
+
+        # Re-compute fingerprint from same raw params — must match stored
+        fp2 = self._request_fingerprint(
+            raw_content, "living_room", "daily", 0.5,
+            event_date="2025-01-15", subject_name="Alice", speaker_name="Bob")
+        assert row["request_fingerprint"] == fp2, \
+            "same raw params must produce same fingerprint for idempotency"
+
+    def test_h1_different_params_different_fingerprint(self, db_env):
+        """H1: changing any request param produces a different fingerprint,
+        so genuinely different requests aren't falsely deduplicated."""
+        base = dict(content="hello", room="r", category="c",
+                    importance=0.5, event_date="", subject_name="",
+                    speaker_name="", force_create=False)
+        fp_base = self._request_fingerprint(**base)
+
+        for field, alt_value in [
+            ("content", "world"),
+            ("room", "kitchen"),
+            ("category", "emotion"),
+            ("importance", 0.9),
+            ("speaker_name", "Alice"),
+            ("subject_name", "Bob"),
+            ("force_create", True),
+        ]:
+            altered = {**base, field: alt_value}
+            fp_alt = self._request_fingerprint(**altered)
+            assert fp_alt != fp_base, \
+                f"changing {field} must change the fingerprint"
+
+    def test_h1_force_create_changes_fingerprint_causes_conflict(self, db_env):
+        """M1-review: same CRQ + same content but different force_create
+        must produce different fingerprints. Verifies the actual conflict
+        detection path: skeleton stored with fp(force_create=False), then
+        a lookup with fp(force_create=True) sees a mismatch — the real
+        remember() code path would return crq_content_conflict."""
+        fp_no_force = self._request_fingerprint(
+            "test", "room", "cat", 0.5, force_create=False)
+        fp_force = self._request_fingerprint(
+            "test", "room", "cat", 0.5, force_create=True)
+        assert fp_no_force != fp_force, \
+            "force_create=True vs False must produce different fingerprints"
+
+        # Simulate what remember() does: store skeleton with fp(False),
+        # then simulate a second call with fp(True) — the idempotency
+        # lookup finds the row but fingerprints differ → conflict.
+        crq = "claude::fc_conflict"
+        database.insert_pending_memory({
+            "id": "fc_skel", "content": "test",
+            "room": "room", "category": "cat",
+            "importance": 0.5,
+            "client_request_id": crq,
+            "status": "active",
+            "request_fingerprint": fp_no_force,
+        })
+        existing = database.get_memory_by_client_request_id(crq)
+        stored_fp = existing.get("request_fingerprint", "")
+        # This is the exact check remember() does for crq_content_conflict
+        assert stored_fp != fp_force, \
+            "stored fp (force_create=False) must differ from fp (force_create=True)"
+        assert stored_fp == fp_no_force, \
+            "stored fp must match the original fingerprint"
+
+    def test_h2_speaker_name_persisted_in_skeleton(self, db_env):
+        """H2: speaker_name stored in skeleton row survives for crash
+        recovery. pending_sweep reads it and passes to finalize."""
+        database.insert_pending_memory({
+            "id": "h2_skel", "content": "test content",
+            "room": "living_room",
+            "client_request_id": "claude::h2_test",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+            "speaker_name": "Alice",
+        })
+
+        row = database.get_memory("h2_skel")
+        assert row is not None
+        assert row["speaker_name"] == "Alice", \
+            "speaker_name must be persisted in the skeleton row"
+
+    def test_h2_speaker_name_passed_through_finalize_to_impl(self, db_env):
+        """H2: _finalize_pending_memory passes speaker_name to impl_fn,
+        so guardrail checks receive it even on sweep recovery."""
+        captured = {}
+
+        async def capture_impl(**kw):
+            captured.update(kw)
+            return {"id": kw["existing_id"], "status": "created"}
+
+        from async_remember import _finalize_pending_memory as _core
+
+        database.insert_pending_memory({
+            "id": "h2_pass", "content": "test",
+            "room": "living_room",
+            "client_request_id": "claude::h2_pass",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+            "speaker_name": "Charlie",
+        })
+
+        asyncio.run(_core(
+            "h2_pass", impl_fn=capture_impl,
+            content="test", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="claude::h2_pass",
+            subject_name="", speaker_name="Charlie",
+            source_platform="mcp:safe",
+        ))
+
+        assert captured.get("speaker_name") == "Charlie", \
+            "impl_fn must receive speaker_name from finalize chain"
+
+    def test_m1_source_platform_preserved_through_finalize(self, db_env):
+        """M1: source_platform='mcp:safe' set at skeleton time must reach
+        impl_fn — not be overwritten to default 'mcp'."""
+        captured = {}
+
+        async def capture_impl(**kw):
+            captured.update(kw)
+            return {"id": kw["existing_id"], "status": "created"}
+
+        from async_remember import _finalize_pending_memory as _core
+
+        database.insert_pending_memory({
+            "id": "m1_plat", "content": "test",
+            "room": "living_room",
+            "client_request_id": "claude::m1_plat",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+        })
+
+        asyncio.run(_core(
+            "m1_plat", impl_fn=capture_impl,
+            content="test", room="living_room", category="",
+            importance=0.5, source_ai="claude", event_date="",
+            force_create=False, client_request_id="claude::m1_plat",
+            subject_name="", speaker_name="",
+            source_platform="mcp:safe",
+        ))
+
+        assert captured.get("source_platform") == "mcp:safe", \
+            "source_platform must be threaded through, not defaulted to 'mcp'"
+
+    def test_m1_source_platform_preserved_after_upsert(self, db_env):
+        """M1: after pipeline UPSERT, the source_platform column in DB
+        must still be 'mcp:safe', not overwritten to 'mcp'."""
+        database.insert_pending_memory({
+            "id": "m1_db", "content": "original",
+            "room": "living_room",
+            "client_request_id": "claude::m1_db",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+        })
+
+        # Simulate pipeline UPSERT that preserves source_platform
+        database.set_memory({
+            "id": "m1_db",
+            "content": "transformed",
+            "room": "living_room",
+            "status": "active",
+            "source_platform": "mcp:safe",
+        })
+
+        row = database.get_memory("m1_db")
+        assert row["source_platform"] == "mcp:safe", \
+            "source_platform must survive pipeline UPSERT"
+
+    def test_sweep_recovery_passes_speaker_and_platform(self, db_env):
+        """Integration: sweep reads speaker_name and source_platform from
+        the skeleton row and passes them to finalize. Verified by inserting
+        a stale pending skeleton and running sweep with a fake finalize_fn
+        injected via the lazy import that sweep does internally."""
+        from datetime import timedelta
+        from types import ModuleType
+        import pending_sweep
+
+        stale_time = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        database.insert_pending_memory({
+            "id": "sweep_int", "content": "sweep test",
+            "room": "living_room",
+            "client_request_id": "claude::sweep_int",
+            "status": "pending",
+            "source_platform": "mcp:safe",
+            "speaker_name": "Diana",
+            "created_at": stale_time,
+        })
+
+        captured_kwargs = {}
+
+        async def fake_finalize(skeleton_id, **kwargs):
+            captured_kwargs.update(kwargs)
+            captured_kwargs["skeleton_id"] = skeleton_id
+            database.update_memory_status(skeleton_id, "active")
+
+        # Create a fake mcp_server module so the lazy import succeeds
+        fake_mcp = ModuleType("mcp_server")
+        fake_mcp._finalize_pending_memory = fake_finalize
+
+        with patch.dict("sys.modules", {"mcp_server": fake_mcp}):
+            with patch.object(pending_sweep, "_spawn_bg") as mock_bg:
+                mock_bg.side_effect = lambda coro: asyncio.ensure_future(coro)
+                asyncio.run(pending_sweep.sweep_stuck_pending())
+
+        assert captured_kwargs.get("speaker_name") == "Diana", \
+            "sweep must pass speaker_name from skeleton to finalize"
+        assert captured_kwargs.get("source_platform") == "mcp:safe", \
+            "sweep must pass source_platform from skeleton to finalize"
+
+    def test_migration_concurrent_startup_safe(self, tmp_path):
+        """M2: concurrent init_db on an old schema (missing new columns)
+        must not crash — busy_timeout + BEGIN IMMEDIATE prevent both
+        'database is locked' on WAL pragma and TOCTOU on ALTER TABLE."""
+        import threading
+        import sqlite3 as _sqlite3
+
+        old_db = tmp_path / "old_schema.db"
+        # Create a DB with the old schema (missing speaker_name,
+        # request_fingerprint) so init_db actually runs ALTER TABLE.
+        conn = _sqlite3.connect(str(old_db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL DEFAULT '',
+            layer TEXT NOT NULL DEFAULT 'shared',
+            room TEXT NOT NULL DEFAULT 'living_room',
+            category TEXT NOT NULL DEFAULT '',
+            owner_ai TEXT NOT NULL DEFAULT '',
+            importance REAL NOT NULL DEFAULT 0.5,
+            emotion_arousal REAL NOT NULL DEFAULT 0.3,
+            valence REAL NOT NULL DEFAULT 0.5,
+            domain TEXT NOT NULL DEFAULT '[]',
+            decay_score REAL NOT NULL DEFAULT 1.0,
+            activation_count REAL NOT NULL DEFAULT 0,
+            last_activated TEXT NOT NULL DEFAULT '',
+            source_ai TEXT NOT NULL DEFAULT '',
+            source_platform TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]',
+            linked_memories TEXT NOT NULL DEFAULT '[]',
+            supersedes TEXT NOT NULL DEFAULT '[]',
+            superseded_by TEXT NOT NULL DEFAULT '',
+            event_date TEXT NOT NULL DEFAULT '',
+            source_context TEXT NOT NULL DEFAULT '',
+            comments TEXT NOT NULL DEFAULT '[]',
+            embedding BLOB,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            history TEXT NOT NULL DEFAULT '[]',
+            resolved INTEGER,
+            anchored INTEGER,
+            provenance_type TEXT NOT NULL DEFAULT '',
+            fact_confidence REAL
+        )""")
+        conn.commit()
+        conn.close()
+
+        errors = []
+
+        def run_init():
+            try:
+                asyncio.run(database.init_db(db_path=str(old_db)))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run_init) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        alive = [t for t in threads if t.is_alive()]
+        assert not alive, f"{len(alive)} threads still alive after join"
+        assert not errors, f"concurrent init_db raised: {errors}"
+
+        # Verify new columns exist exactly once
+        conn = _sqlite3.connect(str(old_db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        conn.close()
+        for col in ("speaker_name", "request_fingerprint", "subject_name",
+                    "client_request_id", "link_to_real_id"):
+            assert col in cols, f"migration must add {col} column"

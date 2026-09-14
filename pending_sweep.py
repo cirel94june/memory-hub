@@ -260,6 +260,8 @@ async def sweep_stuck_pending() -> dict:
                 force_create=False,
                 client_request_id=crq,
                 subject_name=skel.get("subject_name", ""),
+                speaker_name=skel.get("speaker_name", ""),
+                source_platform=skel.get("source_platform", "mcp"),
             ))
             _write_audit(
                 skel["id"], "sweep_retry",

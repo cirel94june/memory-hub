@@ -295,12 +295,33 @@ def _spawn_background_task(coro):
 from async_remember import _idempotent_response  # noqa: E402,F401
 
 
+def _request_fingerprint(
+    content: str, room: str, category: str, importance: float,
+    event_date: str = "", subject_name: str = "", speaker_name: str = "",
+    force_create: bool = False,
+) -> str:
+    """Canonical fingerprint of the original request parameters.
+
+    Persisted at skeleton insert time and used for idempotency comparison.
+    Must NOT be recomputed from stored content — the pipeline transforms
+    content (_compact_content, _safe_summary), so stored content diverges
+    from the original request.
+    """
+    canonical = (
+        f"{content}\0{room}\0{category}\0{importance}"
+        f"\0{event_date}\0{subject_name}\0{speaker_name}"
+        f"\0{force_create}"
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 async def _finalize_pending_memory(
     skeleton_id: str, *, content: str, room: str, category: str,
     importance: float, source_ai: str, event_date: str, force_create: bool,
     client_request_id: str = "",
     subject_name: str = "",
     speaker_name: str = "",
+    source_platform: str = "mcp",
 ) -> None:
     """Thin wrapper that injects _safe_remember_impl into the shared finalizer.
     All reconciliation logic (real_id match / mark_replaced / mark failed)
@@ -314,6 +335,7 @@ async def _finalize_pending_memory(
         client_request_id=client_request_id,
         subject_name=subject_name,
         speaker_name=speaker_name,
+        source_platform=source_platform,
     )
 
 
@@ -372,18 +394,18 @@ async def remember(
     # instead of silently returning the first row's id.
     effective_crq = (f"{source_ai}::{client_request_id}"
                      if client_request_id else "")
-    content_fingerprint = hashlib.sha256(
-        (content or "").encode("utf-8")).hexdigest()[:16]
+    req_fp = _request_fingerprint(
+        content, room, category, importance, event_date, subject_name,
+        force_create=force_create)
 
     # 1. Idempotency lookup — a pre-existing crq short-circuits everything.
-    #    Verify the content fingerprint matches; else return a conflict so
-    #    the caller can tell they reused a key for a different payload.
+    #    Compare against the persisted request_fingerprint (NOT re-hashed
+    #    stored content, which may have been transformed by the pipeline).
     if effective_crq:
         existing = database.get_memory_by_client_request_id(effective_crq)
         if existing:
-            existing_fp = hashlib.sha256(
-                (existing.get("content") or "").encode("utf-8")).hexdigest()[:16]
-            if existing_fp != content_fingerprint:
+            stored_fp = existing.get("request_fingerprint") or ""
+            if stored_fp and stored_fp != req_fp:
                 return json.dumps({
                     "status": "error",
                     "error": "crq_content_conflict",
@@ -421,42 +443,26 @@ async def remember(
                 "client_request_id": effective_crq,
                 "created_at": now,
                 "subject_name": subject_name,
+                "request_fingerprint": req_fp,
             })
             inserted = True
             break
         except sqlite3.IntegrityError:
-            # Two possible causes:
-            #   (a) crq UNIQUE index collision — another request with the
-            #       same crq committed between our lookup and this INSERT.
-            #       Re-query and return the idempotent response.
-            #   (b) skeleton_id PK collision — extremely rare id-birthday.
-            #       Regenerate id and retry.
-            # NEVER let IntegrityError bubble to the MCP client — it would
-            # look like a failed write and trigger further retries.
             if effective_crq:
                 existing = database.get_memory_by_client_request_id(effective_crq)
                 if existing:
-                    # M1: same fingerprint check in the race path.
-                    existing_fp = hashlib.sha256(
-                        (existing.get("content") or "").encode("utf-8")
-                    ).hexdigest()[:16]
-                    if existing_fp != content_fingerprint:
+                    stored_fp = existing.get("request_fingerprint") or ""
+                    if stored_fp and stored_fp != req_fp:
                         return json.dumps({
                             "status": "error",
                             "error": "crq_content_conflict",
                             "memory_id": "",
                             "client_request_id": client_request_id,
-                            "hint": ("Reusing client_request_id with a "
-                                     "different content payload."),
                         }, ensure_ascii=False)
                     return _idempotent_response(existing)
-            # crq wasn't the cause → id collision. Regenerate and retry.
             if attempt < _MAX_ID_RETRIES:
                 skeleton_id = _new_skeleton_id()
                 continue
-            # Give up honoring the "never bubble IntegrityError" contract:
-            # return a structured error the MCP client can handle instead of
-            # re-raising and getting an opaque write failure.
             _LOG.error("skeleton_id collision after %d retries; returning error",
                        _MAX_ID_RETRIES)
     if not inserted:
@@ -465,24 +471,17 @@ async def remember(
             "error": "id_collision_max_retry",
             "memory_id": "",
             "client_request_id": client_request_id,
-            "hint": ("Failed to allocate a unique skeleton_id after "
-                     f"{_MAX_ID_RETRIES + 1} attempts. Retry the request "
-                     "with a slightly different content or wait a moment."),
         }, ensure_ascii=False)
 
-    # 3. Kick off background pipeline (fire-and-forget) — GC-safe reference.
-    # _finalize_pending_memory acquires the shared semaphore internally, so
-    # bursts of MCP requests + sweep retries share one bounded queue.
     _spawn_background_task(_finalize_pending_memory(
         skeleton_id,
         content=content, room=room, category=category, importance=importance,
         source_ai=source_ai, event_date=event_date, force_create=force_create,
         client_request_id=effective_crq,
         subject_name=subject_name,
+        source_platform="mcp",
     ))
 
-    # 4. Return immediately (<2s target). Return the original crq the caller
-    # sent (not the namespaced one) so the client sees what it sent.
     return json.dumps({
         "status": "queued",
         "memory_id": skeleton_id,
@@ -527,15 +526,15 @@ async def safe_remember(
     """
     effective_crq = (f"{source_ai}::{client_request_id}"
                      if client_request_id else "")
-    content_fingerprint = hashlib.sha256(
-        (content or "").encode("utf-8")).hexdigest()[:16]
+    req_fp = _request_fingerprint(
+        content, room, category, importance, event_date,
+        subject_name, speaker_name)
 
     if effective_crq:
         existing = database.get_memory_by_client_request_id(effective_crq)
         if existing:
-            existing_fp = hashlib.sha256(
-                (existing.get("content") or "").encode("utf-8")).hexdigest()[:16]
-            if existing_fp != content_fingerprint:
+            stored_fp = existing.get("request_fingerprint") or ""
+            if stored_fp and stored_fp != req_fp:
                 return json.dumps({
                     "status": "error",
                     "error": "crq_content_conflict",
@@ -570,6 +569,8 @@ async def safe_remember(
                 "client_request_id": effective_crq,
                 "created_at": now,
                 "subject_name": subject_name,
+                "speaker_name": speaker_name,
+                "request_fingerprint": req_fp,
             })
             inserted = True
             break
@@ -577,10 +578,8 @@ async def safe_remember(
             if effective_crq:
                 existing = database.get_memory_by_client_request_id(effective_crq)
                 if existing:
-                    existing_fp = hashlib.sha256(
-                        (existing.get("content") or "").encode("utf-8")
-                    ).hexdigest()[:16]
-                    if existing_fp != content_fingerprint:
+                    stored_fp = existing.get("request_fingerprint") or ""
+                    if stored_fp and stored_fp != req_fp:
                         return json.dumps({
                             "status": "error",
                             "error": "crq_content_conflict",
@@ -608,6 +607,7 @@ async def safe_remember(
         client_request_id=effective_crq,
         subject_name=subject_name,
         speaker_name=speaker_name,
+        source_platform="mcp:safe",
     ))
 
     return json.dumps({
