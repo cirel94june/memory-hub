@@ -420,6 +420,12 @@ async def init_db(db_path: str = None) -> None:
         if "subject_name" not in existing_cols:
             conn.execute("ALTER TABLE memories ADD COLUMN subject_name TEXT NOT NULL DEFAULT ''")
             logger.info("Migrated: added 'subject_name' column")
+        if "speaker_name" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN speaker_name TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'speaker_name' column")
+        if "request_fingerprint" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''")
+            logger.info("Migrated: added 'request_fingerprint' column")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_anchored ON memories(anchored)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject_id)")
@@ -707,6 +713,7 @@ _ALL_COLUMNS = [
     "subject_id", "source_actor_id", "info_type",
     "client_request_id", "link_to_real_id",
     "finalize_claim_id", "finalize_claim_at",
+    "subject_name", "speaker_name", "request_fingerprint",
 ]
 
 
@@ -759,8 +766,8 @@ def insert_pending_memory(mem: dict) -> None:
             "  id, content, layer, room, category, owner_ai, importance,"
             "  source_ai, source_platform, event_date, source_context,"
             "  status, client_request_id, created_at, updated_at, tags, domain,"
-            "  subject_name"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "  subject_name, speaker_name, request_fingerprint"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 mem["id"], mem.get("content", ""), mem.get("layer", "shared"),
                 mem.get("room", "living_room"), mem.get("category", ""),
@@ -772,6 +779,8 @@ def insert_pending_memory(mem: dict) -> None:
                 _as_json_list(mem.get("tags")),
                 _as_json_list(mem.get("domain")),
                 mem.get("subject_name", ""),
+                mem.get("speaker_name", ""),
+                mem.get("request_fingerprint", ""),
             ),
         )
 
@@ -1504,7 +1513,8 @@ def _set_memory_in_tx(conn: sqlite3.Connection, mem: dict) -> None:
     # release_finalize_claim / commit_finalize_atomic. If the caller-supplied
     # dict lacks the field, keep the DB's current value.
     _preserve_on_empty = {"client_request_id", "link_to_real_id",
-                          "finalize_claim_id", "finalize_claim_at"}
+                          "finalize_claim_id", "finalize_claim_at",
+                          "request_fingerprint", "subject_name", "speaker_name"}
     _preserve_always = {"created_at"}
     update_set_parts = []
     for c in _ALL_COLUMNS:
