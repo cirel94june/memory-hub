@@ -633,17 +633,16 @@ class TestCorridorRecentChat:
         assert lines_section.index("刚刚说的话") < lines_section.index("旧摘要")
 
     def test_same_turn_digest_and_raw_no_duplicate(self, db_env):
-        """Same source_fp in digest and raw → raw is excluded."""
+        """Same turn_id in digest and raw → raw is excluded."""
         from unittest.mock import patch
-        from chat_digest import source_fp
-        fp = source_fp("g1", "今晚吃啥好呢")
+        tid = "abc123def456"
         digest = [
             {"chat_id": "g1", "summary": "讨论晚餐选择并决定吃火锅",
-             "created_at": "2026-09-14T10:00:20", "source_fp": fp},
+             "created_at": "2026-09-14T10:00:20", "turn_id": tid},
         ]
         covered_raw = [
             {"user": "今晚吃啥好呢", "ai": "火锅吧",
-             "created_at": "2026-09-14T10:00:00", "source_fp": fp},
+             "created_at": "2026-09-14T10:00:00", "turn_id": tid},
         ]
         with patch("chat_digest.get_latest_same_ai", return_value=digest), \
              patch("raw_vault.get_recent_turns", return_value=covered_raw):
@@ -653,19 +652,16 @@ class TestCorridorRecentChat:
         assert "今晚吃啥好呢" not in text
 
     def test_concurrent_digest_delay_preserves_newer_raw(self, db_env):
-        """Different source_fp → raw is NOT suppressed even if digest timestamp
+        """Different turn_id → raw is NOT suppressed even if digest timestamp
         is later (delayed LLM generation)."""
         from unittest.mock import patch
-        from chat_digest import source_fp
-        fp_a = source_fp("g1", "A轮的原文")
-        fp_b = source_fp("g1", "B轮全新话题")
         digest_a = [
             {"chat_id": "g1", "summary": "讨论了A轮的晚饭",
-             "created_at": "2026-09-14T10:00:20", "source_fp": fp_a},
+             "created_at": "2026-09-14T10:00:20", "turn_id": "turn_aaa"},
         ]
         raw_b = [
             {"user": "B轮全新话题", "ai": "B轮回复",
-             "created_at": "2026-09-14T10:00:10", "source_fp": fp_b},
+             "created_at": "2026-09-14T10:00:10", "turn_id": "turn_bbb"},
         ]
         with patch("chat_digest.get_latest_same_ai", return_value=digest_a), \
              patch("raw_vault.get_recent_turns", return_value=raw_b):
@@ -674,44 +670,57 @@ class TestCorridorRecentChat:
         assert "讨论了A轮的晚饭" in text
         assert "B轮全新话题" in text
 
-    def test_short_msg_not_falsely_deduped(self, db_env):
-        """R4 反例：短消息"继续"不能因旧摘要包含该词而被误删。
-        fingerprint 不同 → raw 必须保留。"""
+    def test_same_content_different_turn_id_both_preserved(self, db_env):
+        """R5 反例：同一 chat 两次说"继续"，turn_id 不同，新 raw 必须保留。"""
         from unittest.mock import patch
-        from chat_digest import source_fp
-        fp_old = source_fp("g1", "继续审查PR的具体细节")
-        fp_new = source_fp("g1", "继续")
         digest = [
-            {"chat_id": "g1", "summary": "继续审查PR相关事项",
-             "created_at": "2026-09-14T09:00:00", "source_fp": fp_old},
+            {"chat_id": "g1", "summary": "继续审查PR",
+             "created_at": "2026-09-14T09:00:00", "turn_id": "turn_old"},
         ]
         raw_new = [
             {"user": "继续", "ai": "好的",
-             "created_at": "2026-09-14T10:00:00", "source_fp": fp_new},
+             "created_at": "2026-09-14T10:00:00", "turn_id": "turn_new"},
         ]
         with patch("chat_digest.get_latest_same_ai", return_value=digest), \
              patch("raw_vault.get_recent_turns", return_value=raw_new):
             text = asyncio.run(corridor.build_corridor("claude"))
-        assert "好的" in text, "short new raw was falsely deduped"
+        assert "好的" in text, "new raw with different turn_id was falsely deduped"
 
-    def test_synonym_rewrite_still_deduped(self, db_env):
-        """R4 反例：同义改写的摘要仍能通过 fingerprint 精确去重。"""
+    def test_synonym_rewrite_same_turn_id_deduped(self, db_env):
+        """同义改写的摘要仍通过 turn_id 精确去重。"""
         from unittest.mock import patch
-        from chat_digest import source_fp
-        fp = source_fp("g1", "今晚我们一起去吃海底捞怎么样呀")
+        tid = "turn_same_123"
         digest = [
             {"chat_id": "g1", "summary": "讨论晚餐选择并决定吃火锅",
-             "created_at": "2026-09-14T10:00:20", "source_fp": fp},
+             "created_at": "2026-09-14T10:00:20", "turn_id": tid},
         ]
         raw_same = [
             {"user": "今晚我们一起去吃海底捞怎么样呀", "ai": "好呀",
-             "created_at": "2026-09-14T10:00:00", "source_fp": fp},
+             "created_at": "2026-09-14T10:00:00", "turn_id": tid},
         ]
         with patch("chat_digest.get_latest_same_ai", return_value=digest), \
              patch("raw_vault.get_recent_turns", return_value=raw_same):
             text = asyncio.run(corridor.build_corridor("claude"))
         assert "讨论晚餐选择" in text
         assert "海底捞" not in text
+
+    def test_legacy_empty_turn_id_not_deduped(self, db_env):
+        """Legacy rows with empty turn_id are conservatively kept (not deduped)."""
+        from unittest.mock import patch
+        digest = [
+            {"chat_id": "g1", "summary": "旧摘要",
+             "created_at": "2026-09-14T09:00:00", "turn_id": ""},
+        ]
+        raw = [
+            {"user": "旧原文", "ai": "旧回复",
+             "created_at": "2026-09-14T09:00:00", "turn_id": ""},
+        ]
+        with patch("chat_digest.get_latest_same_ai", return_value=digest), \
+             patch("raw_vault.get_recent_turns", return_value=raw):
+            text = asyncio.run(corridor.build_corridor("claude"))
+        # Both should appear — empty turn_id means unknown, conservative keep
+        assert "旧摘要" in text
+        assert "旧原文" in text
 
     def test_cross_section_dedup(self, db_env):
         """M1: same summary shown in 【最近的对话】 must not repeat in 【其他窗口】."""

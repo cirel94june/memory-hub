@@ -4,7 +4,6 @@
 每次对话后生成一句话摘要，存入 chat_digests 表。
 下次在别的窗口开聊时，自动注入最近几条其他窗口的摘要。
 """
-import hashlib
 import sqlite3
 import logging
 from datetime import datetime, timezone
@@ -12,12 +11,6 @@ from pathlib import Path
 
 import httpx
 from config import LLM_API_KEY, LLM_MODEL, LLM_BASE_URL
-
-
-def source_fp(chat_id: str, user_text: str) -> str:
-    """Stable fingerprint tying a digest back to its source conversation turn."""
-    key = f"{chat_id}:{(user_text or '')[:100]}"
-    return hashlib.md5(key.encode()).hexdigest()[:12]
 
 logger = logging.getLogger("memory_hub.chat_digest")
 
@@ -57,6 +50,7 @@ def _init_table():
     for col_ddl in (
         "ALTER TABLE chat_digests ADD COLUMN chat_type TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE chat_digests ADD COLUMN source_fp TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE chat_digests ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''",
     ):
         try:
             conn.execute(col_ddl)
@@ -99,6 +93,7 @@ async def _call_llm(prompt: str) -> str:
 async def generate_and_save(
     user_message: str, ai_response: str, ai_id: str,
     chat_id: str = "", chat_type: str = "", reply_reason: str = "",
+    turn_id: str = "",
 ):
     """生成对话摘要并保存。
 
@@ -139,12 +134,11 @@ async def generate_and_save(
         summary = summary[:97] + "..."
 
     now = datetime.now(timezone.utc).isoformat()
-    fp = source_fp(chat_id, user_message)
     conn = _connect()
     conn.execute(
-        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at, source_fp) "
+        "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at, turn_id) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (ai_id, chat_id, chat_type, summary, now, fp),
+        (ai_id, chat_id, chat_type, summary, now, turn_id or ""),
     )
 
     limit = RETENTION_LIMITS.get(chat_type, RETENTION_DEFAULT)
@@ -215,7 +209,7 @@ def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
     placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
         f"SELECT chat_id, chat_type, summary, created_at, "
-        f"COALESCE(source_fp, '') AS source_fp FROM chat_digests "
+        f"COALESCE(turn_id, '') AS turn_id FROM chat_digests "
         f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
         (*ai_ids, limit),
     )

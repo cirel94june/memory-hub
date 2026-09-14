@@ -312,7 +312,7 @@ async def build_corridor(ai_id: str) -> str:
     except Exception:
         pass
 
-    # 5.5. 最近的对话（digest 优先，raw 按 source_fp 去重补位）
+    # 5.5. 最近的对话（digest 优先，raw 按 turn_id 去重补位）
     recent_chat_lines: list[str] = []
     _recent_chat_summaries: set[str] = set()
     try:
@@ -322,15 +322,16 @@ async def build_corridor(ai_id: str) -> str:
         raw_turns = raw_vault.get_recent_turns(ai_id, limit=4)
 
         merged: list[tuple[str, str]] = []
-        digest_fps: set[str] = set()
+        digest_turn_ids: set[str] = set()
         for d in latest_digests:
             merged.append((d.get("created_at", ""), d["summary"]))
-            fp = d.get("source_fp", "")
-            if fp:
-                digest_fps.add(fp)
+            tid = d.get("turn_id", "")
+            if tid:
+                digest_turn_ids.add(tid)
 
         for t in raw_turns:
-            if t.get("source_fp", "") in digest_fps:
+            tid = t.get("turn_id", "")
+            if tid and tid in digest_turn_ids:
                 continue
             merged.append((t.get("created_at", ""), f"用户: {t['user']} → 你: {t['ai']}"))
 

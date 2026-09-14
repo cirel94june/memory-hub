@@ -42,6 +42,10 @@ def _init_db():
             created_at TEXT NOT NULL
         )
     """)
+    try:
+        conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
     conn.commit()
@@ -52,18 +56,21 @@ _init_db()
 
 
 def log_turn(user_message: str, ai_response: str, ai_id: str = "",
-             platform: str = "", chat_id: str = "", chat_type: str = ""):
+             platform: str = "", chat_id: str = "", chat_type: str = "",
+             turn_id: str = ""):
     """记录一轮原始对话。任何失败都不往外抛——保险箱故障不能影响聊天。"""
     if not (user_message or "").strip() and not (ai_response or "").strip():
         return
     try:
         conn = _connect()
         conn.execute(
-            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, user_text, ai_text, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, turn_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (ai_id, platform, str(chat_id), chat_type,
              (user_message or "")[:4000], (ai_response or "")[:4000],
-             datetime.now(timezone.utc).isoformat(timespec="seconds")),
+             datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             turn_id or ""),
         )
         conn.commit()
         conn.close()
@@ -153,19 +160,17 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in ai_ids)
     cur = conn.execute(
-        f"SELECT chat_id, user_text, ai_text, created_at FROM raw_events "
+        f"SELECT user_text, ai_text, created_at, "
+        f"COALESCE(turn_id, '') AS turn_id FROM raw_events "
         f"WHERE ai_id IN ({placeholders}) ORDER BY created_at DESC LIMIT ?",
         (*ai_ids, limit),
     )
     rows = []
     for r in cur:
-        user_full = r["user_text"] or ""
-        user = user_full[:120]
+        user = (r["user_text"] or "")[:120]
         ai = (r["ai_text"] or "")[:120]
-        from chat_digest import source_fp
-        fp = source_fp(r["chat_id"] or "", user_full)
         rows.append({"user": user, "ai": ai, "created_at": r["created_at"],
-                      "source_fp": fp})
+                      "turn_id": r["turn_id"]})
     conn.close()
     return rows
 

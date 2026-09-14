@@ -718,12 +718,14 @@ async def api_post_process(body: PostProcessRequest, authorization: str = Header
         )
         if body.chat_id:
             try:
+                import uuid
                 from chat_digest import generate_and_save
                 await generate_and_save(
                     user_message=body.user_message, ai_response=body.ai_response,
                     ai_id=body.ai_id, chat_id=body.chat_id,
                     chat_type=body.chat_type or "private",
                     reply_reason=body.reply_reason,
+                    turn_id=uuid.uuid4().hex[:16],
                 )
             except Exception:
                 pass
@@ -749,6 +751,8 @@ class ConversationLogRequest(BaseModel):
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
     """记录一轮对话，缓冲区满时自动提取记忆"""
     verify_secret(authorization)
+    import uuid
+    turn_id = uuid.uuid4().hex[:16]
     result = await conversation_capture.log_conversation(
         user_message=body.user_message,
         ai_response=body.ai_response,
@@ -756,6 +760,7 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         platform=body.platform,
         chat_id=body.chat_id,
         chat_type=body.chat_type,
+        turn_id=turn_id,
     )
     if body.chat_id:
         try:
@@ -771,6 +776,7 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
                 chat_id=body.chat_id,
                 chat_type=digest_type,
                 reply_reason="capture_log",
+                turn_id=turn_id,
             )
         except Exception:
             pass

@@ -398,11 +398,13 @@ async def handle_chat_completions(request: Request, body: dict):
                 )
             if config.chat_id and user_message and cleaned:
                 try:
+                    import uuid
                     from chat_digest import generate_and_save
                     await generate_and_save(
                         user_message=user_message, ai_response=cleaned,
                         ai_id=config.ai_id, chat_id=config.chat_id,
                         chat_type=config.chat_type or "private",
+                        turn_id=uuid.uuid4().hex[:16],
                     )
                 except Exception as e:
                     logger.warning(f"[Proxy] Chat digest failed: {e}")
