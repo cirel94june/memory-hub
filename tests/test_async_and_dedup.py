@@ -1734,8 +1734,10 @@ class TestSafeRememberBehavioral:
 
     def test_h1_force_create_changes_fingerprint_causes_conflict(self, db_env):
         """M1-review: same CRQ + same content but different force_create
-        must produce different fingerprints — verifying that force_create
-        is part of the idempotency key."""
+        must produce different fingerprints. Verifies the actual conflict
+        detection path: skeleton stored with fp(force_create=False), then
+        a lookup with fp(force_create=True) sees a mismatch — the real
+        remember() code path would return crq_content_conflict."""
         fp_no_force = self._request_fingerprint(
             "test", "room", "cat", 0.5, force_create=False)
         fp_force = self._request_fingerprint(
@@ -1743,8 +1745,9 @@ class TestSafeRememberBehavioral:
         assert fp_no_force != fp_force, \
             "force_create=True vs False must produce different fingerprints"
 
-        # Verify DB round-trip: skeleton with force_create=False fingerprint,
-        # lookup with force_create=True fingerprint should mismatch
+        # Simulate what remember() does: store skeleton with fp(False),
+        # then simulate a second call with fp(True) — the idempotency
+        # lookup finds the row but fingerprints differ → conflict.
         crq = "claude::fc_conflict"
         database.insert_pending_memory({
             "id": "fc_skel", "content": "test",
@@ -1754,10 +1757,13 @@ class TestSafeRememberBehavioral:
             "status": "active",
             "request_fingerprint": fp_no_force,
         })
-        row = database.get_memory_by_client_request_id(crq)
-        assert row["request_fingerprint"] == fp_no_force
-        assert row["request_fingerprint"] != fp_force, \
+        existing = database.get_memory_by_client_request_id(crq)
+        stored_fp = existing.get("request_fingerprint", "")
+        # This is the exact check remember() does for crq_content_conflict
+        assert stored_fp != fp_force, \
             "stored fp (force_create=False) must differ from fp (force_create=True)"
+        assert stored_fp == fp_no_force, \
+            "stored fp must match the original fingerprint"
 
     def test_h2_speaker_name_persisted_in_skeleton(self, db_env):
         """H2: speaker_name stored in skeleton row survives for crash
@@ -1904,15 +1910,59 @@ class TestSafeRememberBehavioral:
         assert captured_kwargs.get("source_platform") == "mcp:safe", \
             "sweep must pass source_platform from skeleton to finalize"
 
-    def test_migration_concurrent_startup_safe(self, db_env):
-        """M2: init_db can be called concurrently without duplicate-column
-        crashes — the migration block is wrapped in BEGIN IMMEDIATE."""
+    def test_migration_concurrent_startup_safe(self, tmp_path):
+        """M2: concurrent init_db on an old schema (missing new columns)
+        must not crash — busy_timeout + BEGIN IMMEDIATE prevent both
+        'database is locked' on WAL pragma and TOCTOU on ALTER TABLE."""
         import threading
+        import sqlite3 as _sqlite3
+
+        old_db = tmp_path / "old_schema.db"
+        # Create a DB with the old schema (missing speaker_name,
+        # request_fingerprint) so init_db actually runs ALTER TABLE.
+        conn = _sqlite3.connect(str(old_db))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            content TEXT NOT NULL DEFAULT '',
+            layer TEXT NOT NULL DEFAULT 'shared',
+            room TEXT NOT NULL DEFAULT 'living_room',
+            category TEXT NOT NULL DEFAULT '',
+            owner_ai TEXT NOT NULL DEFAULT '',
+            importance REAL NOT NULL DEFAULT 0.5,
+            emotion_arousal REAL NOT NULL DEFAULT 0.3,
+            valence REAL NOT NULL DEFAULT 0.5,
+            domain TEXT NOT NULL DEFAULT '[]',
+            decay_score REAL NOT NULL DEFAULT 1.0,
+            activation_count REAL NOT NULL DEFAULT 0,
+            last_activated TEXT NOT NULL DEFAULT '',
+            source_ai TEXT NOT NULL DEFAULT '',
+            source_platform TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]',
+            linked_memories TEXT NOT NULL DEFAULT '[]',
+            supersedes TEXT NOT NULL DEFAULT '[]',
+            superseded_by TEXT NOT NULL DEFAULT '',
+            event_date TEXT NOT NULL DEFAULT '',
+            source_context TEXT NOT NULL DEFAULT '',
+            comments TEXT NOT NULL DEFAULT '[]',
+            embedding BLOB,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            history TEXT NOT NULL DEFAULT '[]',
+            resolved INTEGER,
+            anchored INTEGER,
+            provenance_type TEXT NOT NULL DEFAULT '',
+            fact_confidence REAL
+        )""")
+        conn.commit()
+        conn.close()
+
         errors = []
 
         def run_init():
             try:
-                asyncio.run(database.init_db())
+                asyncio.run(database.init_db(db_path=str(old_db)))
             except Exception as e:
                 errors.append(e)
 
@@ -1920,6 +1970,16 @@ class TestSafeRememberBehavioral:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=10)
+            t.join(timeout=30)
 
+        alive = [t for t in threads if t.is_alive()]
+        assert not alive, f"{len(alive)} threads still alive after join"
         assert not errors, f"concurrent init_db raised: {errors}"
+
+        # Verify new columns exist exactly once
+        conn = _sqlite3.connect(str(old_db))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        conn.close()
+        for col in ("speaker_name", "request_fingerprint", "subject_name",
+                    "client_request_id", "link_to_real_id"):
+            assert col in cols, f"migration must add {col} column"

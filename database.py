@@ -350,15 +350,17 @@ async def init_db(db_path: str = None) -> None:
     path = str(new_db_path)
     logger.info(f"Initialising SQLite database at {path}")
 
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
 
-        # Pragmas
+        # busy_timeout MUST come before journal_mode=WAL — without it,
+        # concurrent init_db calls fail with "database is locked" on the
+        # WAL pragma instead of waiting for the other connection.
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
 
         # Load sqlite-vec extension
         try:
