@@ -195,8 +195,9 @@ def get_latest_same_ai(ai_id: str, limit: int = 5) -> list[dict]:
     if not (ai_id or "").strip():
         return []
     limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 5, 50))
-    from config import AI_ALIAS_GROUPS
-    ai_ids = AI_ALIAS_GROUPS.get(ai_id, [ai_id])
+    from config import AI_ALIASES, AI_ALIAS_GROUPS
+    canonical = AI_ALIASES.get(ai_id, ai_id)
+    ai_ids = AI_ALIAS_GROUPS.get(canonical, [ai_id])
     conn = _connect()
     conn.row_factory = sqlite3.Row
     placeholders = ",".join("?" for _ in ai_ids)

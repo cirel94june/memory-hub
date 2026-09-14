@@ -144,8 +144,9 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
         return []
     limit = max(1, min(limit, 10))
     try:
-        from config import AI_ALIAS_GROUPS
-        ai_ids = AI_ALIAS_GROUPS.get(ai_id, [ai_id])
+        from config import AI_ALIASES, AI_ALIAS_GROUPS
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        ai_ids = AI_ALIAS_GROUPS.get(canonical, [ai_id])
     except Exception:
         ai_ids = [ai_id]
     conn = _connect()

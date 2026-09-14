@@ -324,7 +324,11 @@ async def build_corridor(ai_id: str) -> str:
         merged: list[tuple[str, str]] = []
         for d in latest_digests:
             merged.append((d.get("created_at", ""), d["summary"]))
+        # raw 只补充比最新 digest 更新的轮次，避免同一轮 digest+raw 双占位
+        newest_digest_ts = max((d.get("created_at", "") for d in latest_digests), default="")
         for t in raw_turns:
+            if newest_digest_ts and t.get("created_at", "") <= newest_digest_ts:
+                continue
             merged.append((t.get("created_at", ""), f"用户: {t['user']} → 你: {t['ai']}"))
 
         merged.sort(key=lambda x: x[0], reverse=True)

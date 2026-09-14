@@ -429,6 +429,24 @@ class TestGetRecentTurns:
             assert len(turns) == 1
             assert "cloudy存的对话" in turns[0]["user"]
 
+    def test_reverse_alias_cloudy_finds_claude(self, tmp_path):
+        """L1: querying 'cloudy' (non-canonical) must also find 'claude' data."""
+        db_path = tmp_path / "raw_events.db"
+        with patch.object(raw_vault, "DB_PATH", db_path):
+            raw_vault._init_db()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES (?,?,?,?,?,?,?)",
+                ("claude", "", "", "public_group", "claude存的对话", "claude回复",
+                 "2026-09-14T12:00:00+00:00"),
+            )
+            conn.commit()
+            conn.close()
+            turns = raw_vault.get_recent_turns("cloudy", limit=4)
+            assert len(turns) == 1
+            assert "claude存的对话" in turns[0]["user"]
+
 
 class TestGetLatestSameAiAlias:
     """chat_digest.get_latest_same_ai() alias expansion via real SQLite."""
@@ -452,20 +470,50 @@ class TestGetLatestSameAiAlias:
             assert len(results) == 1
             assert results[0]["summary"] == "cloudy存的摘要"
 
+    def test_reverse_alias_cloudy_finds_claude(self, tmp_path):
+        """L1: querying 'cloudy' (non-canonical) must also find 'claude' data."""
+        import chat_digest
+        db_path = tmp_path / "memories.db"
+        with patch.object(chat_digest, "DB_PATH", db_path):
+            chat_digest._init_table()
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
+                "VALUES (?,?,?,?,?)",
+                ("claude", "g1", "public_group", "claude存的摘要",
+                 "2026-09-14T10:00:00"),
+            )
+            conn.commit()
+            conn.close()
+            results = chat_digest.get_latest_same_ai("cloudy", limit=5)
+            assert len(results) == 1
+            assert results[0]["summary"] == "claude存的摘要"
+
     def test_empty_ai_id_returns_empty(self):
         import chat_digest
         assert chat_digest.get_latest_same_ai("") == []
         assert chat_digest.get_latest_same_ai("   ") == []
 
     def test_limit_clamped(self, tmp_path):
+        """Limit must clamp: -5→1 (returns ≤1), 999→50 (returns ≤50)."""
         import chat_digest
         db_path = tmp_path / "memories.db"
         with patch.object(chat_digest, "DB_PATH", db_path):
             chat_digest._init_table()
-            results = chat_digest.get_latest_same_ai("claude", limit=-5)
-            assert isinstance(results, list)
-            results2 = chat_digest.get_latest_same_ai("claude", limit=999)
-            assert isinstance(results2, list)
+            conn = sqlite3.connect(db_path)
+            for i in range(60):
+                conn.execute(
+                    "INSERT INTO chat_digests (ai_id, chat_id, chat_type, summary, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    ("claude", f"g{i}", "public_group", f"摘要{i}",
+                     f"2026-09-{10 + (i % 20):02d}T{i % 24:02d}:00:00"),
+                )
+            conn.commit()
+            conn.close()
+            results_neg = chat_digest.get_latest_same_ai("claude", limit=-5)
+            assert len(results_neg) == 1  # clamped to 1
+            results_big = chat_digest.get_latest_same_ai("claude", limit=999)
+            assert len(results_big) == 50  # clamped to 50
 
 
 class TestMCPContract:
