@@ -257,17 +257,19 @@ class TestStats:
             s = raw_vault.stats()
             assert s["count"] == 7
 
-    def test_stats_ai_id_empty_matches_public_only(self, tmp_db):
-        """ai_id="" 和 public_only=True 应该返回相同口径（Medium fix）。"""
+    def test_stats_no_ai_id_no_public_only_counts_all(self, tmp_db):
+        """ai_id="" + public_only=False → doctor_report 路径，统计全库。"""
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
-            s_empty = raw_vault.stats(ai_id="")
-            s_public = raw_vault.stats(public_only=True)
-            # ai_id="" → falls to public_only=False → counts all (doctor_report)
-            # But search(ai_id="") only returns public groups
-            # So stats(ai_id="") should match stats() for backwards compat
-            # The MCP tool calls stats(public_only=True) explicitly
-            assert s_empty["count"] == 7  # doctor_report path
+            s = raw_vault.stats(ai_id="", public_only=False)
+            assert s["count"] == 7
+
+    def test_stats_public_only_overrides_ai_id(self, tmp_db):
+        """public_only=True 优先于 ai_id，不含私聊/小群（Low fix）。"""
+        with patch("raw_vault.DB_PATH", tmp_db):
+            import raw_vault
+            s = raw_vault.stats(public_only=True, ai_id="cloudy")
+            assert s["count"] == 3  # only public_group + supergroup + group
 
     def test_stats_alias_canonicalization(self, tmp_db):
         """claude 和 cloudy 是别名，stats 口径一致（M4 fix）。"""

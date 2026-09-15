@@ -254,13 +254,20 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
 def stats(public_only: bool = False, ai_id: str = "") -> dict:
     """统计原文条数。隔离口径与 search() 一致：
 
-    - ai_id 非空：大群 + 小群 + 该 AI（含别名）的私聊
-    - ai_id 为空 或 public_only=True：只统计大群（不含小群/私聊）
-    - 两者都为空且 public_only=False：统计全部（doctor_report 用）
+    - public_only=True：只统计大群（优先于 ai_id）
+    - ai_id 非空且 public_only=False：大群 + 小群 + 该 AI（含别名）的私聊
+    - 两者都为空：统计全部（doctor_report 用）
     """
     conn = _connect()
     try:
-        if ai_id:
+        if public_only:
+            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+            cur = conn.execute(
+                "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
+                f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({gp})",
+                _PUBLIC_CHAT_TYPES,
+            )
+        elif ai_id:
             ai_ids = _resolve_ai_ids(ai_id)
             all_group = _ALL_GROUP_TYPES
             gp = ",".join("?" for _ in all_group)
@@ -270,13 +277,6 @@ def stats(public_only: bool = False, ai_id: str = "") -> dict:
                 f"WHERE (LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp})"
                 f" OR (LOWER(TRIM(COALESCE(chat_type,''))) = 'private' AND ai_id IN ({ai_ph})))",
                 (*all_group, *ai_ids),
-            )
-        elif public_only:
-            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
-            cur = conn.execute(
-                "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
-                f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({gp})",
-                _PUBLIC_CHAT_TYPES,
             )
         else:
             cur = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events")
