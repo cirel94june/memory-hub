@@ -286,11 +286,20 @@ async def build_corridor(ai_id: str) -> str:
         reverse=True,
     )[:3]
 
-    # 3.5. 该 AI 最近的梦（room=dreams，最多 1 条，独立于日记）
+    # 3.5. 该 AI 最近的梦（room=dreams，排除消化条目，最多 1 条）
     dreams = sorted(
         [m for m in visible_mems.values()
          if m.get("room") == "dreams" and m.get("owner_ai") == ai_id
-         and m.get("status") == "active"],
+         and m.get("status") == "active" and m.get("category") != "digest"],
+        key=lambda x: x.get("created_at", ""),
+        reverse=True,
+    )[:1]
+
+    # 3.6. 最近一次消化摘要（room=dreams, category=digest）
+    digests = sorted(
+        [m for m in visible_mems.values()
+         if m.get("room") == "dreams" and m.get("owner_ai") == ai_id
+         and m.get("status") == "active" and m.get("category") == "digest"],
         key=lambda x: x.get("created_at", ""),
         reverse=True,
     )[:1]
@@ -468,6 +477,9 @@ async def build_corridor(ai_id: str) -> str:
 
     if dreams:
         sections.append("【最近的梦】\n" + "\n".join(f"· {d['content'][:300]}" for d in dreams))
+
+    if digests:
+        sections.append("【昨晚消化】\n" + "\n".join(f"· {d['content'][:400]}" for d in digests))
 
     # 6.5 (render) 近期重要事件 — 放在日记之后，跨房间兜底
     # dedup 已在候选筛选阶段完成，这里直接渲染。

@@ -96,6 +96,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logging.getLogger("main").exception(
                 "proposal_sweep failed to start (continuing without it): %s", e)
+        idle_flush_task = asyncio.create_task(_idle_flush_loop())
+        print("[Memory Hub] Idle flush loop started (every 5min, timeout 15min)")
+
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -110,7 +113,7 @@ async def lifespan(app: FastAPI):
             # L: cancel + await so tasks fully unwind. Without the await,
             # asyncio can print "task was destroyed but it is pending" and
             # in-flight DB writes may not commit before shutdown.
-            cancel_list = [daemon_task, lag_task, bg_worker_task]
+            cancel_list = [daemon_task, lag_task, bg_worker_task, idle_flush_task]
             if sweep_task is not None:
                 cancel_list.append(sweep_task)
             # v5.1 S7: cooperative shutdown for proposal_sweep.
@@ -172,6 +175,24 @@ def _seconds_until_next_run() -> int:
     nxt = future[0]
     delta = int((nxt - now).total_seconds())
     return max(delta, 60)
+
+
+_IDLE_FLUSH_INTERVAL = 300  # 每 5 分钟扫一次
+
+
+async def _idle_flush_loop():
+    """定期扫描 conversation_capture 缓冲区，对超时闲置的 buffer 自动提取。"""
+    log = logging.getLogger("idle_flush")
+    await asyncio.sleep(60)
+    while True:
+        try:
+            from conversation_capture import idle_flush
+            result = await idle_flush()
+            if result:
+                log.info(f"Idle flush: {len(result)} buffers extracted")
+        except Exception as e:
+            log.warning(f"Idle flush failed: {e}")
+        await asyncio.sleep(_IDLE_FLUSH_INTERVAL)
 
 
 async def _daemon_loop():

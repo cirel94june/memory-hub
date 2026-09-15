@@ -88,6 +88,8 @@ _buffer_chat_types: dict[str, str] = {}
 _last_extract_time: dict[str, float] = {}
 # 防止同一 buffer 并发提取的锁
 _extract_locks: dict[str, asyncio.Lock] = {}
+# 每个 buffer 最近一条消息的时间戳（用于 idle flush）
+_buffer_last_active: dict[str, float] = {}
 
 # 按聊天类型的触发阈值
 CHUNK_SIZES = {
@@ -97,6 +99,7 @@ CHUNK_SIZES = {
 }
 MAX_BUFFER_SIZE = 150
 EXTRACT_COOLDOWN = 600  # 同一个 chat 提取后冷却10分钟
+IDLE_FLUSH_SECONDS = 900  # 15分钟无新消息自动提取
 
 
 def _touch_pulse(user_message: str, ai_response: str, ai_id: str):
@@ -303,6 +306,7 @@ async def log_conversation(
         "chat_type": chat_type,
         "timestamp": now,
     })
+    _buffer_last_active[key] = time.time()
     _touch_pulse(user_message, ai_response, ai_id)
 
     # 原文保险箱：不加工的原始对话留档，记忆漂移时可以找回原话
@@ -670,4 +674,33 @@ async def extract_from_messages(
         memories.append(result)
 
     return memories
+
+
+async def idle_flush() -> dict:
+    """扫描所有缓冲区，对超过 IDLE_FLUSH_SECONDS 无新消息的 buffer 自动提取。
+
+    由 main.py 的 _idle_flush_loop 每 5 分钟调用一次。
+    """
+    now = time.time()
+    flushed = {}
+    for key in list(_conversation_buffers.keys()):
+        buf = _conversation_buffers.get(key)
+        if not buf:
+            continue
+        last_active = _buffer_last_active.get(key, 0)
+        if not last_active:
+            continue
+        idle_seconds = now - last_active
+        if idle_seconds < IDLE_FLUSH_SECONDS:
+            continue
+        last_extract = _last_extract_time.get(key, 0)
+        if last_active <= last_extract:
+            continue
+        try:
+            logger.info(f"[IdleFlush] {key}: {len(buf)} msgs, idle {idle_seconds:.0f}s")
+            extracted = await _extract_and_remember(key)
+            flushed[key] = extracted
+        except Exception as e:
+            logger.warning(f"[IdleFlush] {key} failed: {e}")
+    return flushed
 

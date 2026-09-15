@@ -1188,6 +1188,13 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Dreams failed: {e}")
 
+    # 10.85 消化：对每个 AI 的近期零散记忆做关联归纳
+    try:
+        from digest import run_digest
+        await run_step("digest", "Digest recent memories", run_digest)
+    except Exception as e:
+        log.warning(f"  Digest failed: {e}")
+
     # 10.9 Memory Safety Kit：可读 Markdown + 安全报告导出到 GitHub/Obsidian
     try:
         from safety_export import export_obsidian
