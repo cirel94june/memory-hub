@@ -1114,21 +1114,26 @@ async def doctor_report() -> str:
 
 @mcp.tool()
 async def search_raw(query: str, limit: int = 5,
-                     speaker_filter: str = "") -> str:
+                     speaker_filter: str = "",
+                     source_ai: str = "claude") -> str:
     """在原文保险箱里查当时的原始对话（未经加工的原话）。
     记忆内容存疑、或用户问"当时到底怎么说的"时用这个对照原文。
     支持同义词自动展开（如搜"妈妈"也能找到"母亲"）。
-    MCP 只能搜公开对话；当前不支持私聊查询。
+    长查询会自动拆词，多词命中的结果排在前面。
+
+    隔离策略：传了 source_ai 可搜自己的私聊 + 所有群聊；
+    不传则只搜群聊。
 
     Args:
-        query: 关键词（自动展开同义词）
+        query: 关键词（自动拆词 + 展开同义词）
         limit: 最多返回条数（上限 50）
         speaker_filter: 留空=搜全部发言人, "user"=只搜用户说的, "ai"=只搜 AI 说的
+        source_ai: 来源AI（cloudy/lucien/jasper/claude）
     """
     import raw_vault
-    hits = raw_vault.search(query, ai_id="", limit=limit,
+    hits = raw_vault.search(query, ai_id=source_ai, limit=limit,
                             speaker_filter=speaker_filter)
-    return json.dumps({"results": hits, "stats": raw_vault.stats(public_only=True)}, ensure_ascii=False, indent=2)
+    return json.dumps({"results": hits, "stats": raw_vault.stats(ai_id=source_ai)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
