@@ -85,14 +85,37 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
 
 
 _LIKE_ESCAPE_TABLE = str.maketrans({"%": "\\%", "_": "\\_", "\\": "\\\\"})
-_GROUP_CHAT_TYPES = ("public_group", "group", "supergroup", "private_group")
+_PUBLIC_CHAT_TYPES = ("public_group", "group", "supergroup")
+_HOUSEHOLD_CHAT_TYPES = ("private_group",)
+_ALL_GROUP_TYPES = _PUBLIC_CHAT_TYPES + _HOUSEHOLD_CHAT_TYPES
 _VALID_SPEAKER_FILTERS = {"", "user", "ai"}
 _LIMIT_MAX = 50
+_MAX_SEARCH_WORDS = 16
+
+_SELECT_COLS = "id, ai_id, platform, chat_id, chat_type, user_text, ai_text, created_at"
+
+
+def _resolve_ai_ids(ai_id: str) -> list[str]:
+    """别名归一化：cloudy/claude 等视为同一 AI。"""
+    if not ai_id:
+        return []
+    try:
+        from config import AI_ALIASES, AI_ALIAS_GROUPS
+        canonical = AI_ALIASES.get(ai_id, ai_id)
+        return AI_ALIAS_GROUPS.get(canonical, [ai_id])
+    except Exception:
+        return [ai_id]
 
 
 def _split_words(query: str) -> list[str]:
     parts = query.strip().split()
-    return [p for p in parts if p]
+    seen: set[str] = set()
+    result: list[str] = []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result[:_MAX_SEARCH_WORDS]
 
 
 def _like_clauses_for_keyword(kw: str, speaker_filter: str,
@@ -114,10 +137,11 @@ def search(query: str, ai_id: str = "", limit: int = 10,
            speaker_filter: str = "") -> list[dict]:
     """按关键词查原话（自动拆词 + 同义词展开 + 多词命中排序）。
 
-    隔离策略：
-    - 私聊 (chat_type='private')：按 ai_id 过滤，每个 AI 只看自己的
-    - 群聊 (private_group/public_group/group/supergroup)：所有 AI 都能搜
-    - ai_id 为空时：只搜群聊（不含私聊）
+    隔离策略（三层）：
+    - 私聊 (chat_type='private')：按 ai_id（含别名）过滤
+    - 小群 (private_group)：需要 ai_id 非空才可见，但不过滤具体 ai_id
+    - 大群 (public_group/group/supergroup)：任何人可搜
+    - ai_id 为空时：只搜大群（不含小群、不含私聊）
     """
     if not (query or "").strip():
         return []
@@ -137,60 +161,63 @@ def search(query: str, ai_id: str = "", limit: int = 10,
 
     conn = _connect()
     conn.row_factory = sqlite3.Row
-
-    where_params: list = []
-    word_clauses = []
-    for kw_group in word_synonym_groups:
-        syn_clauses = [_like_clauses_for_keyword(kw, speaker_filter, where_params)
-                       for kw in kw_group]
-        word_clauses.append("(" + " OR ".join(syn_clauses) + ")")
-
-    any_word_where = "(" + " OR ".join(word_clauses) + ")"
-
-    if ai_id:
-        gp = ",".join("?" for _ in _GROUP_CHAT_TYPES)
-        isolation = (
-            f" AND (LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp})"
-            " OR (LOWER(TRIM(COALESCE(chat_type,''))) = 'private' AND ai_id = ?))"
-        )
-        where_params.extend(_GROUP_CHAT_TYPES)
-        where_params.append(ai_id)
-    else:
-        gp = ",".join("?" for _ in _GROUP_CHAT_TYPES)
-        isolation = f" AND LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp}) "
-        where_params.extend(_GROUP_CHAT_TYPES)
-
-    if len(word_synonym_groups) > 1:
-        score_params: list = []
-        score_parts = []
+    try:
+        where_params: list = []
+        word_clauses = []
         for kw_group in word_synonym_groups:
-            syn_parts = [_like_clauses_for_keyword(kw, speaker_filter, score_params)
-                         for kw in kw_group]
-            score_parts.append("CASE WHEN " + " OR ".join(syn_parts) + " THEN 1 ELSE 0 END")
-        score_expr = " + ".join(score_parts)
-        all_params = score_params + where_params + [limit]
-        sql = (
-            f"SELECT *, ({score_expr}) AS _match_score "
-            f"FROM raw_events WHERE {any_word_where}{isolation} "
-            "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
-        )
-    else:
-        all_params = where_params + [limit]
-        sql = (
-            "SELECT id, ai_id, platform, chat_id, chat_type, "
-            "user_text, ai_text, created_at "
-            f"FROM raw_events WHERE {any_word_where}{isolation} "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
+            syn_clauses = [_like_clauses_for_keyword(kw, speaker_filter, where_params)
+                           for kw in kw_group]
+            word_clauses.append("(" + " OR ".join(syn_clauses) + ")")
 
-    cur = conn.execute(sql, tuple(all_params))
-    rows = []
-    for r in cur:
-        d = dict(r)
-        d.pop("_match_score", None)
-        rows.append(d)
-    conn.close()
-    return rows
+        any_word_where = "(" + " OR ".join(word_clauses) + ")"
+
+        if ai_id:
+            ai_ids = _resolve_ai_ids(ai_id)
+            all_group = _ALL_GROUP_TYPES
+            gp = ",".join("?" for _ in all_group)
+            ai_ph = ",".join("?" for _ in ai_ids)
+            isolation = (
+                f" AND (LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp})"
+                f" OR (LOWER(TRIM(COALESCE(chat_type,''))) = 'private' AND ai_id IN ({ai_ph})))"
+            )
+            where_params.extend(all_group)
+            where_params.extend(ai_ids)
+        else:
+            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+            isolation = f" AND LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp}) "
+            where_params.extend(_PUBLIC_CHAT_TYPES)
+
+        if len(word_synonym_groups) > 1:
+            score_params: list = []
+            score_parts = []
+            for kw_group in word_synonym_groups:
+                syn_parts = [_like_clauses_for_keyword(kw, speaker_filter, score_params)
+                             for kw in kw_group]
+                score_parts.append("CASE WHEN " + " OR ".join(syn_parts) + " THEN 1 ELSE 0 END")
+            score_expr = " + ".join(score_parts)
+            all_params = score_params + where_params + [limit]
+            sql = (
+                f"SELECT {_SELECT_COLS}, ({score_expr}) AS _match_score "
+                f"FROM raw_events WHERE {any_word_where}{isolation} "
+                "ORDER BY _match_score DESC, created_at DESC LIMIT ?"
+            )
+        else:
+            all_params = where_params + [limit]
+            sql = (
+                f"SELECT {_SELECT_COLS} "
+                f"FROM raw_events WHERE {any_word_where}{isolation} "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+
+        cur = conn.execute(sql, tuple(all_params))
+        rows = []
+        for r in cur:
+            d = dict(r)
+            d.pop("_match_score", None)
+            rows.append(d)
+        return rows
+    finally:
+        conn.close()
 
 
 def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
@@ -225,34 +252,38 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
 
 
 def stats(public_only: bool = False, ai_id: str = "") -> dict:
-    """统计原文条数。
+    """统计原文条数。隔离口径与 search() 一致：
 
-    隔离口径与 search() 一致：
-    - ai_id 非空：群聊全部 + 该 AI 的私聊
-    - ai_id 为空 / public_only=True：只统计群聊
+    - ai_id 非空：大群 + 小群 + 该 AI（含别名）的私聊
+    - ai_id 为空 或 public_only=True：只统计大群（不含小群/私聊）
     - 两者都为空且 public_only=False：统计全部（doctor_report 用）
     """
     conn = _connect()
-    if ai_id:
-        gp = ",".join("?" for _ in _GROUP_CHAT_TYPES)
-        cur = conn.execute(
-            "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
-            f"WHERE (LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp})"
-            " OR (LOWER(TRIM(COALESCE(chat_type,'')) ) = 'private' AND ai_id = ?))",
-            (*_GROUP_CHAT_TYPES, ai_id),
-        )
-    elif public_only:
-        gp = ",".join("?" for _ in _GROUP_CHAT_TYPES)
-        cur = conn.execute(
-            "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
-            f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({gp})",
-            _GROUP_CHAT_TYPES,
-        )
-    else:
-        cur = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events")
-    count, oldest, newest = cur.fetchone()
-    conn.close()
-    return {"count": count or 0, "oldest": oldest or "", "newest": newest or ""}
+    try:
+        if ai_id:
+            ai_ids = _resolve_ai_ids(ai_id)
+            all_group = _ALL_GROUP_TYPES
+            gp = ",".join("?" for _ in all_group)
+            ai_ph = ",".join("?" for _ in ai_ids)
+            cur = conn.execute(
+                "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
+                f"WHERE (LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp})"
+                f" OR (LOWER(TRIM(COALESCE(chat_type,''))) = 'private' AND ai_id IN ({ai_ph})))",
+                (*all_group, *ai_ids),
+            )
+        elif public_only:
+            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+            cur = conn.execute(
+                "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
+                f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({gp})",
+                _PUBLIC_CHAT_TYPES,
+            )
+        else:
+            cur = conn.execute("SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events")
+        count, oldest, newest = cur.fetchone()
+        return {"count": count or 0, "oldest": oldest or "", "newest": newest or ""}
+    finally:
+        conn.close()
 
 
 def prune(keep_days: int = 120) -> int:
