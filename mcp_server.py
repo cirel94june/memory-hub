@@ -88,6 +88,74 @@ MCP_INSTRUCTIONS = """\
 - diary/dreams/relationship/personality: AI 私有空间
 - game_room: 游戏/角色扮演（隔离，不混入正经对话）
 
+## 工具速查表（38 个工具，按用途分组）
+
+### 醒来 / 上下文
+| 工具 | 一句话说明 |
+|------|-----------|
+| pulse | 醒来第一件事：走廊 + 相关记忆一次拿全 |
+| get_corridor | 只拿走廊快照（pulse 的子集） |
+| living_room | 只拿客厅（核心身份 + 当前状态） |
+| smart_context | 智能上下文：按前端能力自动适配返回量 |
+
+### 存记忆
+| 工具 | 一句话说明 |
+|------|-----------|
+| remember | 存一条记忆（异步，<2秒返回，建议传 client_request_id 去重） |
+| safe_remember | 同 remember，额外做安全降敏（心理/创伤/敏感内容用这个） |
+| batch_remember | 一次存多条记忆 |
+| grow | 把一大段混合文本自动拆分成多条独立记忆 |
+| capture_conversation | 记录一轮对话到缓冲区（攒 20 轮自动提取） |
+| flush_capture | 手动触发缓冲区提取，不等攒满 |
+| extract_from_messages | 把整段对话消息数组交给系统提取记忆 |
+
+### 搜记忆
+| 工具 | 一句话说明 |
+|------|-----------|
+| recall | 语义搜索（向量相似度），找"相关的"记忆 |
+| search_by_tags | 按标签精确搜索，比 recall 更精准 |
+| search_raw | 搜原文保险箱（未加工原话），支持同义词 + 自动拆词 |
+| recent_interaction | 按人名 + 时间窗查最近互动（纯 SQL，<200ms） |
+| dream_recall | 专搜梦境（梦境不会出现在普通 recall 里） |
+| list_memories | 按房间/状态分页列出记忆 |
+| get_memory_detail | 查一条记忆的完整详情（含原始对话、年轮评论） |
+
+### 维护 / 修改
+| 工具 | 一句话说明 |
+|------|-----------|
+| update_memory | 改内容/重要度/房间/标签 |
+| add_comment | 追加年轮评论（不改原文，记录认知变化） |
+| resolve_memory | 标记已解决 / 未解决（待办事项用） |
+| apply_correction | 用户纠错：一步完成纠正+标记旧记忆+清走廊缓存 |
+| archive_memory | 归档一条记忆 |
+| unarchive_memory | 恢复已归档/衰减的记忆 |
+| delete_memory | 永久删除 |
+| anchor | 锚定为永不衰减的"坐标系"记忆（最多 20 条） |
+| release_anchor | 解除锚点，恢复正常衰减 |
+| batch_ops | 批量操作（重置 activation / 归档 / 解决等） |
+
+### 写日记
+| 工具 | 一句话说明 |
+|------|-----------|
+| dream | 写梦境/自省（私人空间，只有自己能看） |
+
+### 画像 / 提案
+| 工具 | 一句话说明 |
+|------|-----------|
+| get_profile | 查看画像（用户/AI/关系） |
+| approve_profile | 审批 pending_review 的画像 |
+| list_proposals | 列出待审记忆提案 |
+| review_proposal | 审核提案（approve / reject） |
+
+### 管理 / 诊断
+| 工具 | 一句话说明 |
+|------|-----------|
+| maintain | 执行记忆整理（合并 / 衰减 / 重建走廊） |
+| doctor_report | 查看体检报告（自动修复了什么、存疑记忆、池子大小） |
+| hub_info | 查看角色 + 房间配置 |
+| mcp_health | MCP 健康检查（身份 + schema hash + 审计日志） |
+| mcp_debug_log | 读取 MCP 工具到达日志 |
+
 ## 重要原则
 - 不需要用户提醒你"去用记忆工具"，你应该主动判断
 - 记忆要精炼：一条 = 一个事实/洞察，不要塞整段对话

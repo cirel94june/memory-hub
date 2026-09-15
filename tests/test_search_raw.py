@@ -221,10 +221,11 @@ class TestPrivacyAllowlist:
             hits = raw_vault.search("未知类型秘密")
             assert len(hits) == 0
 
-    def test_private_group_excluded(self, test_db):
+    def test_private_group_visible_without_ai_id(self, test_db):
         with patch.object(raw_vault, "DB_PATH", test_db):
             hits = raw_vault.search("private_group秘密")
-            assert len(hits) == 0
+            assert len(hits) == 1
+            assert hits[0]["chat_type"] == "private_group"
 
 
 class TestLikeWildcardEscape:
@@ -342,12 +343,12 @@ class TestStatsPrivacy:
     def test_public_stats_count_matches_public_rows(self, test_db):
         with patch.object(raw_vault, "DB_PATH", test_db):
             pub_stats = raw_vault.stats(public_only=True)
-            assert pub_stats["count"] == 4
+            assert pub_stats["count"] == 5
 
-    def test_public_stats_newest_is_public(self, test_db):
+    def test_public_stats_newest_is_group(self, test_db):
         with patch.object(raw_vault, "DB_PATH", test_db):
             pub_stats = raw_vault.stats(public_only=True)
-            assert "2026-09-06" in pub_stats["newest"]
+            assert "2026-09-11" in pub_stats["newest"]
 
 
 class TestGetRecentTurns:
