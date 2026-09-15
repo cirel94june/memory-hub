@@ -80,7 +80,7 @@ class TestIsolationPrivateChat:
 
 
 class TestIsolationSmallGroup:
-    """小群 (private_group)：需要 ai_id 非空才可见，但不过滤具体 ai_id。"""
+    """小群 (private_group)：所有人可搜，包括 ai_id=""。"""
 
     def test_small_group_visible_to_any_identified_ai(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
@@ -90,11 +90,11 @@ class TestIsolationSmallGroup:
                 pg_hits = [h for h in hits if h["chat_type"] == "private_group"]
                 assert len(pg_hits) == 2, f"ai_id={ai} should see both private_group records"
 
-    def test_small_group_invisible_without_ai_id(self, tmp_db):
+    def test_small_group_visible_without_ai_id(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             hits = raw_vault.search("小群", ai_id="")
-            assert not any(h["chat_type"] == "private_group" for h in hits)
+            assert any(h["chat_type"] == "private_group" for h in hits)
 
 
 class TestIsolationPublicGroup:
@@ -106,19 +106,19 @@ class TestIsolationPublicGroup:
             hits = raw_vault.search("大群", ai_id="jasper")
             assert any(h["chat_type"] == "public_group" for h in hits)
 
-    def test_public_group_visible_without_ai_id(self, tmp_db):
+    def test_all_groups_visible_without_ai_id(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             hits = raw_vault.search("开心", ai_id="")
             chat_types = {h["chat_type"] for h in hits}
-            assert chat_types <= {"public_group", "group", "supergroup"}
+            assert chat_types <= {"public_group", "group", "supergroup", "private_group"}
 
-    def test_no_ai_id_sees_only_public_groups(self, tmp_db):
+    def test_no_ai_id_sees_only_groups_not_private(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             hits = raw_vault.search("开心", ai_id="")
             for h in hits:
-                assert h["chat_type"] in ("public_group", "group", "supergroup"), \
+                assert h["chat_type"] in ("public_group", "group", "supergroup", "private_group"), \
                     f"ai_id='' should not see {h['chat_type']}"
 
 
@@ -132,12 +132,12 @@ class TestSecurityRegression:
             hits = raw_vault.search("妈妈", ai_id="")
             assert not any(h["chat_type"] == "private" for h in hits)
 
-    def test_mcp_cannot_query_private_groups(self, tmp_db):
-        """MCP 传 ai_id="" 不能看到小群（High fix）。"""
+    def test_mcp_can_query_small_groups(self, tmp_db):
+        """MCP 传 ai_id="" 可以搜小群（household 群聊无隐私边界）。"""
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             hits = raw_vault.search("小群", ai_id="")
-            assert not any(h["chat_type"] == "private_group" for h in hits)
+            assert any(h["chat_type"] == "private_group" for h in hits)
 
     def test_spoofed_ai_id_cannot_read_others_private(self, tmp_db):
         """伪造 source_ai 无法读到其他 AI 的私聊。"""
@@ -244,12 +244,12 @@ class TestStats:
             s_all = raw_vault.stats()
             assert s_cloudy["count"] < s_all["count"]
 
-    def test_stats_public_only_excludes_private_group(self, tmp_db):
+    def test_stats_public_only_includes_all_groups(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             s = raw_vault.stats(public_only=True)
-            # public: 1 public_group + 1 supergroup + 1 group = 3
-            assert s["count"] == 3
+            # all groups: 2 private_group + 1 public_group + 1 supergroup + 1 group = 5
+            assert s["count"] == 5
 
     def test_stats_no_filter_counts_all(self, tmp_db):
         with patch("raw_vault.DB_PATH", tmp_db):
@@ -265,11 +265,12 @@ class TestStats:
             assert s["count"] == 7
 
     def test_stats_public_only_overrides_ai_id(self, tmp_db):
-        """public_only=True 优先于 ai_id，不含私聊/小群（Low fix）。"""
+        """public_only=True 优先于 ai_id，不含私聊（Low fix）。"""
         with patch("raw_vault.DB_PATH", tmp_db):
             import raw_vault
             s = raw_vault.stats(public_only=True, ai_id="cloudy")
-            assert s["count"] == 3  # only public_group + supergroup + group
+            # all groups: 2 private_group + 1 public_group + 1 supergroup + 1 group = 5
+            assert s["count"] == 5
 
     def test_stats_alias_canonicalization(self, tmp_db):
         """claude 和 cloudy 是别名，stats 口径一致（M4 fix）。"""

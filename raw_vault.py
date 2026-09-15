@@ -137,11 +137,10 @@ def search(query: str, ai_id: str = "", limit: int = 10,
            speaker_filter: str = "") -> list[dict]:
     """按关键词查原话（自动拆词 + 同义词展开 + 多词命中排序）。
 
-    隔离策略（三层）：
+    隔离策略：
     - 私聊 (chat_type='private')：按 ai_id（含别名）过滤
-    - 小群 (private_group)：需要 ai_id 非空才可见，但不过滤具体 ai_id
-    - 大群 (public_group/group/supergroup)：任何人可搜
-    - ai_id 为空时：只搜大群（不含小群、不含私聊）
+    - 群聊 (private_group/public_group/group/supergroup)：任何人可搜
+    - ai_id 为空时：搜所有群聊（不含私聊）
     """
     if not (query or "").strip():
         return []
@@ -183,9 +182,9 @@ def search(query: str, ai_id: str = "", limit: int = 10,
             where_params.extend(all_group)
             where_params.extend(ai_ids)
         else:
-            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+            gp = ",".join("?" for _ in _ALL_GROUP_TYPES)
             isolation = f" AND LOWER(TRIM(COALESCE(chat_type,''))) IN ({gp}) "
-            where_params.extend(_PUBLIC_CHAT_TYPES)
+            where_params.extend(_ALL_GROUP_TYPES)
 
         if len(word_synonym_groups) > 1:
             score_params: list = []
@@ -254,18 +253,18 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
 def stats(public_only: bool = False, ai_id: str = "") -> dict:
     """统计原文条数。隔离口径与 search() 一致：
 
-    - public_only=True：只统计大群（优先于 ai_id）
-    - ai_id 非空且 public_only=False：大群 + 小群 + 该 AI（含别名）的私聊
+    - public_only=True：只统计群聊（优先于 ai_id，不含私聊）
+    - ai_id 非空且 public_only=False：群聊 + 该 AI（含别名）的私聊
     - 两者都为空：统计全部（doctor_report 用）
     """
     conn = _connect()
     try:
         if public_only:
-            gp = ",".join("?" for _ in _PUBLIC_CHAT_TYPES)
+            gp = ",".join("?" for _ in _ALL_GROUP_TYPES)
             cur = conn.execute(
                 "SELECT COUNT(*), MIN(created_at), MAX(created_at) FROM raw_events "
                 f"WHERE LOWER(TRIM(COALESCE(chat_type, ''))) IN ({gp})",
-                _PUBLIC_CHAT_TYPES,
+                _ALL_GROUP_TYPES,
             )
         elif ai_id:
             ai_ids = _resolve_ai_ids(ai_id)
