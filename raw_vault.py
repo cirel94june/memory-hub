@@ -104,13 +104,14 @@ def _embed_text(user_text: str, ai_text: str) -> str:
     return f"{u} {a}".strip()
 
 
-def _store_embedding(event_id: int, embedding: list[float]):
-    """把 embedding 写入 raw_events + vec 索引。"""
+def _store_embedding(event_id: int, embedding: list[float]) -> bool:
+    """把 embedding 写入 raw_events + vec 索引。三步在同一事务内完成。"""
     blob = struct.pack(f"{len(embedding)}f", *embedding)
+    conn = _connect(load_vec=True)
     try:
-        conn = _connect(load_vec=True)
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE raw_events SET embedding = ? WHERE id = ?", (blob, event_id))
-        row = conn.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,)
         )
         vec_rowid = conn.execute(
@@ -127,9 +128,14 @@ def _store_embedding(event_id: int, embedding: list[float]):
                 (blob, vec_rowid),
             )
         conn.commit()
-        conn.close()
+        return True
     except Exception as e:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         log.warning(f"raw_vault store_embedding failed: {e}")
+        return False
+    finally:
+        conn.close()
 
 
 async def _async_embed_and_store(event_id: int, text: str):
@@ -417,82 +423,105 @@ def semantic_search(
 ) -> list[dict]:
     """在最近 N 天的 raw_events 里做向量语义搜索。
 
-    返回按 cosine_sim × recency_weight 排序的结果。
+    返回按 真实cosine × 0.7 + recency × 0.3 排序的结果。
     隔离策略与 search() 一致。
+    逐步扩容 KNN 候选池直到凑够 limit 条合格结果或耗尽。
     """
-    expected_bytes = EMBEDDING_DIM * 4
     query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     now_ts = datetime.now(timezone.utc)
     decay_hours = days * 24.0
 
-    fetch_k = limit * 6
-
     conn = _connect(load_vec=True)
     conn.row_factory = sqlite3.Row
-    try:
-        vec_rows = conn.execute(
-            "SELECT rowid, distance FROM raw_events_vec "
-            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, fetch_k),
-        ).fetchall()
-    except Exception as e:
-        log.warning(f"raw_vault semantic_search vec query failed: {e}")
-        conn.close()
-        return []
 
     ai_ids = _resolve_ai_ids(ai_id) if ai_id else []
 
     results = []
-    for vr in vec_rows:
-        vec_rowid = vr["rowid"]
-        distance = vr["distance"]
+    fetch_k = limit * 6
+    max_fetch = 500
 
-        map_row = conn.execute(
-            "SELECT event_id FROM raw_vec_id_map WHERE vec_rowid = ?",
-            (vec_rowid,),
-        ).fetchone()
-        if not map_row:
-            continue
-        event_id = map_row["event_id"]
+    try:
+        while len(results) < limit and fetch_k <= max_fetch:
+            try:
+                vec_rows = conn.execute(
+                    "SELECT rowid, distance FROM raw_events_vec "
+                    "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                    (query_blob, fetch_k),
+                ).fetchall()
+            except Exception as e:
+                log.warning(f"raw_vault semantic_search vec query failed: {e}")
+                return []
 
-        event = conn.execute(
-            f"SELECT {_SELECT_COLS} FROM raw_events WHERE id = ? AND created_at >= ?",
-            (event_id, cutoff),
-        ).fetchone()
-        if not event:
-            continue
+            if not vec_rows:
+                break
 
-        ev = dict(event)
+            vec_rowids = [vr["rowid"] for vr in vec_rows]
+            distances = {vr["rowid"]: vr["distance"] for vr in vec_rows}
 
-        if ai_ids:
-            ct = (ev.get("chat_type") or "").strip().lower()
-            if ct == "private" and ev.get("ai_id") not in ai_ids:
-                continue
-        elif not ai_id:
-            ct = (ev.get("chat_type") or "").strip().lower()
-            if ct == "private":
-                continue
+            ph = ",".join("?" * len(vec_rowids))
+            map_rows = conn.execute(
+                f"SELECT vec_rowid, event_id FROM raw_vec_id_map WHERE vec_rowid IN ({ph})",
+                vec_rowids,
+            ).fetchall()
+            event_map = {mr["vec_rowid"]: mr["event_id"] for mr in map_rows}
 
-        cos_sim = max(0.0, 1.0 - distance / 2.0)
+            event_ids = list(event_map.values())
+            if not event_ids:
+                break
+            eph = ",".join("?" * len(event_ids))
+            events = conn.execute(
+                f"SELECT {_SELECT_COLS}, embedding FROM raw_events "
+                f"WHERE id IN ({eph}) AND created_at >= ?",
+                (*event_ids, cutoff),
+            ).fetchall()
+            event_dict = {e["id"]: dict(e) for e in events}
 
-        try:
-            evt = datetime.fromisoformat(ev["created_at"])
-            if evt.tzinfo is None:
-                evt = evt.replace(tzinfo=timezone.utc)
-            hours_ago = max(0, (now_ts - evt).total_seconds() / 3600)
-        except Exception:
-            hours_ago = decay_hours
+            seen_ids = {r["id"] for r in results}
+            for vec_rowid in vec_rowids:
+                eid = event_map.get(vec_rowid)
+                if eid is None or eid in seen_ids:
+                    continue
+                ev = event_dict.get(eid)
+                if ev is None:
+                    continue
 
-        recency = math.exp(-hours_ago / decay_hours)
+                ct = (ev.get("chat_type") or "").strip().lower()
+                if ai_ids:
+                    if ct == "private" and ev.get("ai_id") not in ai_ids:
+                        continue
+                elif not ai_id:
+                    if ct == "private":
+                        continue
 
-        ev["_score"] = round(cos_sim * 0.7 + recency * 0.3, 4)
-        ev["_cosine"] = round(cos_sim, 4)
-        ev["_recency"] = round(recency, 4)
-        results.append(ev)
+                raw_emb = ev.pop("embedding", None)
+                if raw_emb and len(raw_emb) == EMBEDDING_DIM * 4:
+                    cos_sim = _cosine_sim(query_blob, raw_emb)
+                else:
+                    cos_sim = max(0.0, 1.0 - distances[vec_rowid] / 2.0)
 
-    conn.close()
+                try:
+                    evt = datetime.fromisoformat(ev["created_at"])
+                    if evt.tzinfo is None:
+                        evt = evt.replace(tzinfo=timezone.utc)
+                    hours_ago = max(0, (now_ts - evt).total_seconds() / 3600)
+                except Exception:
+                    hours_ago = decay_hours
+
+                recency = math.exp(-hours_ago / decay_hours)
+
+                ev["_score"] = round(cos_sim * 0.7 + recency * 0.3, 4)
+                ev["_cosine"] = round(cos_sim, 4)
+                ev["_recency"] = round(recency, 4)
+                results.append(ev)
+                seen_ids.add(eid)
+
+            if len(results) >= limit or len(vec_rows) < fetch_k:
+                break
+            fetch_k *= 2
+    finally:
+        conn.close()
 
     results.sort(key=lambda x: x["_score"], reverse=True)
     return results[:limit]
@@ -503,30 +532,37 @@ async def backfill_raw_embeddings(batch: int = 100) -> dict:
     from embedding import get_embedding
 
     conn = _connect()
-    rows = conn.execute(
-        "SELECT id, user_text, ai_text FROM raw_events "
-        "WHERE embedding IS NULL ORDER BY id DESC LIMIT ?",
-        (batch,),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT id, user_text, ai_text FROM raw_events "
+            "WHERE embedding IS NULL ORDER BY id DESC LIMIT ?",
+            (batch,),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
-        return {"backfilled": 0, "total_missing": 0}
+        return {"backfilled": 0, "failed": 0, "total_missing": 0}
 
     done = 0
+    failed = 0
     for row_id, user_text, ai_text in rows:
         text = _embed_text(user_text, ai_text)
         if not text:
             continue
         vec = await get_embedding(text)
         if vec and len(vec) == EMBEDDING_DIM:
-            _store_embedding(row_id, vec)
-            done += 1
+            if _store_embedding(row_id, vec):
+                done += 1
+            else:
+                failed += 1
 
     conn2 = _connect()
-    missing = conn2.execute("SELECT COUNT(*) FROM raw_events WHERE embedding IS NULL").fetchone()[0]
-    conn2.close()
+    try:
+        missing = conn2.execute("SELECT COUNT(*) FROM raw_events WHERE embedding IS NULL").fetchone()[0]
+    finally:
+        conn2.close()
 
     if done:
-        log.info(f"raw_vault backfilled {done} embeddings, {missing} still missing")
-    return {"backfilled": done, "total_missing": missing}
+        log.info(f"raw_vault backfilled {done} embeddings ({failed} failed), {missing} still missing")
+    return {"backfilled": done, "failed": failed, "total_missing": missing}
