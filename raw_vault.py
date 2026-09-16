@@ -10,21 +10,36 @@
 存储：data/raw_events.db（独立 SQLite，不进 git，不参与记忆召回）
 保留：默认 120 天，daemon 定期清理
 """
+import math
+import struct
 import sqlite3
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from config import EMBEDDING_DIM
+
 log = logging.getLogger("raw_vault")
+
+_EMBED_TEXT_LIMIT = 500
 
 DB_PATH = Path(__file__).parent / "data" / "raw_events.db"
 
 
-def _connect() -> sqlite3.Connection:
+def _connect(load_vec: bool = False) -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
+    if load_vec:
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
     return conn
 
 
@@ -47,9 +62,30 @@ def _init_db():
         existing = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
         if "turn_id" not in existing:
             conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
+        if "embedding" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN embedding BLOB")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS raw_vec_id_map (
+                vec_rowid  INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id   INTEGER NOT NULL UNIQUE
+            )
+        """)
         conn.execute("COMMIT")
+
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS raw_events_vec "
+                f"USING vec0(embedding float[{EMBEDDING_DIM}])"
+            )
+        except Exception:
+            pass
     except Exception:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -61,6 +97,55 @@ def _init_db():
 _init_db()
 
 
+def _embed_text(user_text: str, ai_text: str) -> str:
+    """拼接用于 embedding 的文本（各截 500 字）。"""
+    u = (user_text or "")[:_EMBED_TEXT_LIMIT].strip()
+    a = (ai_text or "")[:_EMBED_TEXT_LIMIT].strip()
+    return f"{u} {a}".strip()
+
+
+def _store_embedding(event_id: int, embedding: list[float]):
+    """把 embedding 写入 raw_events + vec 索引。"""
+    blob = struct.pack(f"{len(embedding)}f", *embedding)
+    try:
+        conn = _connect(load_vec=True)
+        conn.execute("UPDATE raw_events SET embedding = ? WHERE id = ?", (blob, event_id))
+        row = conn.execute(
+            "INSERT OR IGNORE INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,)
+        )
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            conn.execute(
+                "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+                (vec_rowid, blob),
+            )
+        except sqlite3.Error:
+            conn.execute(
+                "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
+                (blob, vec_rowid),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning(f"raw_vault store_embedding failed: {e}")
+
+
+async def _async_embed_and_store(event_id: int, text: str):
+    """后台异步：算 embedding 并存储。"""
+    try:
+        from embedding import get_embedding
+        vec = await get_embedding(text)
+        if vec and len(vec) == EMBEDDING_DIM:
+            _store_embedding(event_id, vec)
+    except Exception as e:
+        log.debug(f"raw_vault async embed failed for event {event_id}: {e}")
+
+
+_bg_tasks: set[asyncio.Task] = set()
+
+
 def log_turn(user_message: str, ai_response: str, ai_id: str = "",
              platform: str = "", chat_id: str = "", chat_type: str = "",
              turn_id: str = ""):
@@ -69,7 +154,7 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
         return
     try:
         conn = _connect()
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
             "user_text, ai_text, created_at, turn_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -78,8 +163,19 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
              datetime.now(timezone.utc).isoformat(timespec="seconds"),
              turn_id or ""),
         )
+        event_id = cur.lastrowid
         conn.commit()
         conn.close()
+
+        embed_text = _embed_text(user_message, ai_response)
+        if embed_text:
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(_async_embed_and_store(event_id, embed_text))
+                _bg_tasks.add(task)
+                task.add_done_callback(_bg_tasks.discard)
+            except RuntimeError:
+                pass
     except Exception as e:
         log.warning(f"raw_vault log failed: {e}")
 
@@ -296,3 +392,141 @@ def prune(keep_days: int = 120) -> int:
     if deleted:
         log.info(f"raw_vault pruned {deleted} events older than {keep_days}d")
     return deleted
+
+
+# ── 语义搜索 ──
+
+def _cosine_sim(a: bytes, b: bytes) -> float:
+    """从 packed bytes 算余弦相似度。"""
+    n = len(a) // 4
+    va = struct.unpack(f"{n}f", a)
+    vb = struct.unpack(f"{n}f", b)
+    dot = sum(x * y for x, y in zip(va, vb))
+    na = math.sqrt(sum(x * x for x in va))
+    nb = math.sqrt(sum(x * x for x in vb))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def semantic_search(
+    query_vec: list[float],
+    ai_id: str = "",
+    days: int = 7,
+    limit: int = 8,
+) -> list[dict]:
+    """在最近 N 天的 raw_events 里做向量语义搜索。
+
+    返回按 cosine_sim × recency_weight 排序的结果。
+    隔离策略与 search() 一致。
+    """
+    expected_bytes = EMBEDDING_DIM * 4
+    query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    now_ts = datetime.now(timezone.utc)
+    decay_hours = days * 24.0
+
+    fetch_k = limit * 6
+
+    conn = _connect(load_vec=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        vec_rows = conn.execute(
+            "SELECT rowid, distance FROM raw_events_vec "
+            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (query_blob, fetch_k),
+        ).fetchall()
+    except Exception as e:
+        log.warning(f"raw_vault semantic_search vec query failed: {e}")
+        conn.close()
+        return []
+
+    ai_ids = _resolve_ai_ids(ai_id) if ai_id else []
+
+    results = []
+    for vr in vec_rows:
+        vec_rowid = vr["rowid"]
+        distance = vr["distance"]
+
+        map_row = conn.execute(
+            "SELECT event_id FROM raw_vec_id_map WHERE vec_rowid = ?",
+            (vec_rowid,),
+        ).fetchone()
+        if not map_row:
+            continue
+        event_id = map_row["event_id"]
+
+        event = conn.execute(
+            f"SELECT {_SELECT_COLS} FROM raw_events WHERE id = ? AND created_at >= ?",
+            (event_id, cutoff),
+        ).fetchone()
+        if not event:
+            continue
+
+        ev = dict(event)
+
+        if ai_ids:
+            ct = (ev.get("chat_type") or "").strip().lower()
+            if ct == "private" and ev.get("ai_id") not in ai_ids:
+                continue
+        elif not ai_id:
+            ct = (ev.get("chat_type") or "").strip().lower()
+            if ct == "private":
+                continue
+
+        cos_sim = max(0.0, 1.0 - distance / 2.0)
+
+        try:
+            evt = datetime.fromisoformat(ev["created_at"])
+            if evt.tzinfo is None:
+                evt = evt.replace(tzinfo=timezone.utc)
+            hours_ago = max(0, (now_ts - evt).total_seconds() / 3600)
+        except Exception:
+            hours_ago = decay_hours
+
+        recency = math.exp(-hours_ago / decay_hours)
+
+        ev["_score"] = round(cos_sim * 0.7 + recency * 0.3, 4)
+        ev["_cosine"] = round(cos_sim, 4)
+        ev["_recency"] = round(recency, 4)
+        results.append(ev)
+
+    conn.close()
+
+    results.sort(key=lambda x: x["_score"], reverse=True)
+    return results[:limit]
+
+
+async def backfill_raw_embeddings(batch: int = 100) -> dict:
+    """给缺失 embedding 的 raw_events 补算向量。daemon 调用。"""
+    from embedding import get_embedding
+
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, user_text, ai_text FROM raw_events "
+        "WHERE embedding IS NULL ORDER BY id DESC LIMIT ?",
+        (batch,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return {"backfilled": 0, "total_missing": 0}
+
+    done = 0
+    for row_id, user_text, ai_text in rows:
+        text = _embed_text(user_text, ai_text)
+        if not text:
+            continue
+        vec = await get_embedding(text)
+        if vec and len(vec) == EMBEDDING_DIM:
+            _store_embedding(row_id, vec)
+            done += 1
+
+    conn2 = _connect()
+    missing = conn2.execute("SELECT COUNT(*) FROM raw_events WHERE embedding IS NULL").fetchone()[0]
+    conn2.close()
+
+    if done:
+        log.info(f"raw_vault backfilled {done} embeddings, {missing} still missing")
+    return {"backfilled": done, "total_missing": missing}
