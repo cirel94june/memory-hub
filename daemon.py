@@ -1168,10 +1168,17 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Raw vault prune failed: {e}")
 
-    # （embedding 自愈由上面 10.55 的 backfill_embeddings 负责——
+    # （memory embedding 自愈由上面 10.55 的 backfill_embeddings 负责——
     #  不要在这里再 from memory_ops import backfill_embeddings：
     #  函数内 import 会把该名字变成整个函数的局部变量，
     #  导致 10.55 处 UnboundLocalError、整个维护中途崩掉。2026-07-18 事故。）
+
+    # 10.75 raw_events embedding 补漏
+    try:
+        from raw_vault import backfill_raw_embeddings
+        await run_step("backfill_raw_embeddings", "Backfill raw event embeddings", backfill_raw_embeddings)
+    except Exception as e:
+        log.warning(f"  Raw embedding backfill failed: {e}")
 
     # 10.76 正文完整性审计：标记存库前就残缺的内容（半句梦等），
     # 召回降权 + 不进最近动态，不自动补写

@@ -95,7 +95,7 @@ MCP_INSTRUCTIONS = """\
 
 不调的后果：这段对话在记忆系统里完全不存在，就像没发生过。
 
-## 工具速查表（38 个工具，按用途分组）
+## 工具速查表（39 个工具，按用途分组）
 
 ### 醒来 / 上下文
 | 工具 | 一句话说明 |
@@ -119,9 +119,10 @@ MCP_INSTRUCTIONS = """\
 ### 搜记忆
 | 工具 | 一句话说明 |
 |------|-----------|
-| recall | 语义搜索（向量相似度），找"相关的"记忆 |
+| recall | 语义搜索已提取的记忆（向量相似度） |
+| recent_raw_context | 语义搜最近 N 天原文（模糊描述找原话用这个） |
 | search_by_tags | 按标签精确搜索，比 recall 更精准 |
-| search_raw | 搜原文保险箱（未加工原话），支持同义词 + 自动拆词 |
+| search_raw | 搜原文保险箱（精确关键词匹配），支持同义词 + 自动拆词 |
 | recent_interaction | 按人名 + 时间窗查最近互动（纯 SQL，<200ms） |
 | dream_recall | 专搜梦境（梦境不会出现在普通 recall 里） |
 | list_memories | 按房间/状态分页列出记忆 |
@@ -1207,6 +1208,55 @@ async def search_raw(query: str, limit: int = 5,
     hits = raw_vault.search(query, ai_id="", limit=limit,
                             speaker_filter=speaker_filter)
     return json.dumps({"results": hits, "stats": raw_vault.stats(public_only=True)}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def recent_raw_context(
+    query: str,
+    ai_id: str = "",
+    days: int = 7,
+    limit: int = 8,
+) -> str:
+    """在最近 N 天的原始对话里做语义搜索——找"意思相近"的原文。
+
+    三个搜索工具怎么选：
+    - 语义模糊 + 想找最近原话 → recent_raw_context（本工具）
+    - 精确关键词 + 查特定原话 → search_raw
+    - 找已提取/整理过的记忆 → recall
+
+    典型场景：用户说"咪肚子痛"，你想找之前聊过的相关原文
+    （比如"姨妈又犯了腰酸"），关键词对不上但语义相关。
+
+    隔离策略：传 ai_id 按私聊隔离，不传搜群聊全员。
+
+    Args:
+        query: 当前用户说的话或关键描述
+        ai_id: 你的身份（私聊传自己 ai_id，群聊留空）
+        days: 搜索范围（天），默认 7
+        limit: 返回条数，默认 8
+    """
+    from embedding import get_embedding
+    import raw_vault
+
+    days = max(1, min(days, 120))
+    limit = max(1, min(limit, 30))
+
+    query_vec = await get_embedding(query)
+    if not query_vec:
+        return json.dumps({"error": "embedding_failed", "hint": "无法计算查询向量，请改用 search_raw 关键词搜索"}, ensure_ascii=False)
+
+    hits = raw_vault.semantic_search(
+        query_vec=query_vec, ai_id=ai_id, days=days, limit=limit,
+    )
+    for h in hits:
+        h.pop("embedding", None)
+
+    return json.dumps({
+        "results": hits,
+        "query": query,
+        "days": days,
+        "stats": raw_vault.stats(ai_id=ai_id),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
