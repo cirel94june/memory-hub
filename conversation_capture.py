@@ -341,8 +341,7 @@ async def log_conversation(
 
         async def _bg_extract():
             try:
-                async with _extract_locks[key]:
-                    await _extract_and_remember(key)
+                await _extract_and_remember(key)
             except Exception as e:
                 logger.warning(f"background extraction failed for {key}: {e}")
 
@@ -394,14 +393,25 @@ async def get_buffer_status() -> dict:
 
 
 async def _extract_and_remember(buffer_key: str) -> list[dict]:
-    """从对话缓冲区提取记忆，走 remember 流程"""
+    """从对话缓冲区提取记忆，走 remember 流程。
+
+    H1 fix: 先 swap buffer 再 await LLM，防止提取期间新消息到达后被清空丢失。
+    失败时把 snapshot prepend 回 buffer。
+    """
     import memory_ops
 
-    buffer = _conversation_buffers.get(buffer_key, [])
-    if not buffer:
-        return []
+    if buffer_key not in _extract_locks:
+        _extract_locks[buffer_key] = asyncio.Lock()
+
+    async with _extract_locks[buffer_key]:
+        buffer = _conversation_buffers.get(buffer_key, [])
+        if not buffer:
+            return []
+        snapshot = list(buffer)
+        _conversation_buffers[buffer_key] = []
 
     chat_type = _buffer_chat_types.get(buffer_key, "private")
+    buffer = snapshot
 
     # 把对话格式化给小模型
     lines = []
@@ -434,9 +444,14 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     prompt = f"今天日期：{today}\n来源：{context_label}，共{len(buffer)}条消息（展示了{len(lines)}条）：\n\n{conversation_text}"
 
     extract_prompt = _get_extract_prompt(chat_type)
+    def _restore_snapshot():
+        _conversation_buffers[buffer_key] = snapshot + _conversation_buffers.get(buffer_key, [])
+        _last_extract_time.pop(buffer_key, None)
+
     raw = await _call_llm(extract_prompt + "\n\n" + prompt)
     if not raw:
-        logger.warning(f"Extract LLM returned empty for {buffer_key}, keeping buffer for retry")
+        logger.warning(f"Extract LLM returned empty for {buffer_key}, restoring snapshot")
+        _restore_snapshot()
         return []
 
     # 解析结果
@@ -446,9 +461,12 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
         items = json.loads(raw)
         if not isinstance(items, list):
-            items = []
+            logger.warning(f"Extract returned non-list JSON for {buffer_key}, restoring snapshot")
+            _restore_snapshot()
+            return []
     except Exception as e:
-        logger.warning(f"Extract parse failed for {buffer_key}: {e}, keeping buffer for retry")
+        logger.warning(f"Extract parse failed for {buffer_key}: {e}, restoring snapshot")
+        _restore_snapshot()
         return []
 
     # 提取的记忆走 remember 流程
@@ -552,8 +570,6 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             if mem_id:
                 await memory_ops.resolve_memory(mem_id, resolved=False)
 
-    # 清空缓冲区
-    _conversation_buffers[buffer_key] = []
     if memories:
         logger.info(f"Auto-captured {len(memories)} memories from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
     else:

@@ -1771,7 +1771,7 @@ async def recall(
         db_kwargs["include_rooms"] = include_rooms
     elif exclude_isolated and isolated_rooms:
         db_kwargs["exclude_rooms"] = list(isolated_rooms)
-    db_kwargs["exclude_provenance"] = ["dream"]
+    db_kwargs["exclude_provenance"] = ["dream", "digest"]
     db_kwargs["exclude_resolved"] = True
     db_kwargs["exclude_superseded"] = True
 
