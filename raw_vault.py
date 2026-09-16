@@ -73,6 +73,12 @@ def _init_db():
                 event_id   INTEGER NOT NULL UNIQUE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS _migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+        """)
         conn.execute("COMMIT")
 
         try:
@@ -104,17 +110,20 @@ def _embed_text(user_text: str, ai_text: str) -> str:
     return f"{u} {a}".strip()
 
 
-def _l2_normalize(vec: list[float]) -> list[float]:
+def _l2_normalize(vec: list[float]) -> list[float] | None:
+    """L2 归一化。零向量返回 None（调用方应拒绝）。"""
     norm = math.sqrt(sum(x * x for x in vec))
     if norm == 0:
-        return vec
+        return None
     return [x / norm for x in vec]
 
 
 def _store_embedding(event_id: int, embedding: list[float]) -> bool:
     """把 embedding L2 归一化后写入 raw_events + vec 索引。单事务，失败回滚。"""
-    embedding = _l2_normalize(embedding)
-    blob = struct.pack(f"{len(embedding)}f", *embedding)
+    normalized = _l2_normalize(embedding)
+    if normalized is None:
+        return False
+    blob = struct.pack(f"{len(normalized)}f", *normalized)
     conn = None
     try:
         conn = _connect(load_vec=True)
@@ -444,6 +453,8 @@ def semantic_search(
         return []
 
     query_vec = _l2_normalize(query_vec)
+    if query_vec is None:
+        return []
     query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
@@ -508,7 +519,7 @@ def semantic_search(
                     vec_rowid = ev.pop("vec_rowid")
                     distance = dist_map[vec_rowid]
 
-                    cos_sim = max(0.0, 1.0 - distance / 2.0)
+                    cos_sim = max(0.0, min(1.0, 1.0 - distance * distance / 2.0))
 
                     try:
                         evt = datetime.fromisoformat(ev["created_at"])
@@ -586,23 +597,89 @@ async def backfill_raw_embeddings(batch: int = 100) -> dict:
     return {"backfilled": done, "failed": failed, "total_missing": missing}
 
 
-def renormalize_all_embeddings() -> dict:
-    """一次性重新归一化所有已存 embedding。部署 L2 归一化后运行一次。"""
+_MIGRATION_NAME = "l2_normalize_embeddings_v1"
+
+
+def _migration_applied(name: str) -> bool:
     conn = _connect()
     try:
-        rows = conn.execute(
-            "SELECT id, embedding FROM raw_events WHERE embedding IS NOT NULL"
-        ).fetchall()
+        row = conn.execute(
+            "SELECT 1 FROM _migrations WHERE name = ?", (name,)
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def _mark_migration(name: str):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (name, applied_at) VALUES (?, ?)",
+            (name, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def renormalize_all_embeddings(batch: int = 500) -> dict:
+    """一次性重新归一化所有已存 embedding。幂等，可中断后重跑。
+
+    逐行读取当前 blob → 归一化 → 仅在范数偏离 1.0 时才写回。
+    已归一化的行跳过（幂等）。写入走 _store_embedding（BEGIN IMMEDIATE
+    序列化），不会覆盖并发产生的新归一化 embedding。
+    """
+    if _migration_applied(_MIGRATION_NAME):
+        return {"status": "already_applied", "renormalized": 0, "skipped": 0}
+
+    conn = _connect()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM raw_events WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        if total == 0:
+            _mark_migration(_MIGRATION_NAME)
+            return {"status": "done", "renormalized": 0, "skipped": 0, "total": 0}
     finally:
         conn.close()
 
     updated = 0
-    for event_id, blob in rows:
-        if not blob or len(blob) % 4 != 0:
-            continue
-        n = len(blob) // 4
-        vec = list(struct.unpack(f"{n}f", blob))
-        if _store_embedding(event_id, vec):
-            updated += 1
+    skipped = 0
+    offset = 0
+    while offset < total:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, embedding FROM raw_events "
+                "WHERE embedding IS NOT NULL ORDER BY id LIMIT ? OFFSET ?",
+                (batch, offset),
+            ).fetchall()
+        finally:
+            conn.close()
 
-    return {"renormalized": updated, "total": len(rows)}
+        if not rows:
+            break
+
+        for event_id, blob in rows:
+            if not blob or len(blob) % 4 != 0:
+                skipped += 1
+                continue
+            n = len(blob) // 4
+            vec = list(struct.unpack(f"{n}f", blob))
+            norm = math.sqrt(sum(x * x for x in vec))
+            if abs(norm - 1.0) < 1e-6:
+                skipped += 1
+                continue
+            if _store_embedding(event_id, vec):
+                updated += 1
+            else:
+                skipped += 1
+
+        offset += len(rows)
+
+    _mark_migration(_MIGRATION_NAME)
+    log.info(f"renormalize_all_embeddings: {updated} updated, {skipped} skipped, {total} total")
+    return {"status": "done", "renormalized": updated, "skipped": skipped, "total": total}
