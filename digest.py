@@ -196,4 +196,7 @@ async def run_digest() -> dict:
 
     succeeded = sum(1 for r in results.values() if r.get("status") == "success")
     failed = sum(1 for r in results.values() if r.get("status") == "failed")
-    return {"digested": succeeded, "failed": failed, "details": results}
+    summary = {"digested": succeeded, "failed": failed, "details": results}
+    if failed and not succeeded:
+        raise RuntimeError(f"All digests failed ({failed}/{len(results)}): {summary}")
+    return summary

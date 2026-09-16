@@ -444,10 +444,14 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     prompt = f"今天日期：{today}\n来源：{context_label}，共{len(buffer)}条消息（展示了{len(lines)}条）：\n\n{conversation_text}"
 
     extract_prompt = _get_extract_prompt(chat_type)
+    def _restore_snapshot():
+        _conversation_buffers[buffer_key] = snapshot + _conversation_buffers.get(buffer_key, [])
+        _last_extract_time.pop(buffer_key, None)
+
     raw = await _call_llm(extract_prompt + "\n\n" + prompt)
     if not raw:
-        logger.warning(f"Extract LLM returned empty for {buffer_key}, prepending snapshot back")
-        _conversation_buffers[buffer_key] = snapshot + _conversation_buffers.get(buffer_key, [])
+        logger.warning(f"Extract LLM returned empty for {buffer_key}, restoring snapshot")
+        _restore_snapshot()
         return []
 
     # 解析结果
@@ -457,10 +461,12 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
         items = json.loads(raw)
         if not isinstance(items, list):
-            items = []
+            logger.warning(f"Extract returned non-list JSON for {buffer_key}, restoring snapshot")
+            _restore_snapshot()
+            return []
     except Exception as e:
-        logger.warning(f"Extract parse failed for {buffer_key}: {e}, prepending snapshot back")
-        _conversation_buffers[buffer_key] = snapshot + _conversation_buffers.get(buffer_key, [])
+        logger.warning(f"Extract parse failed for {buffer_key}: {e}, restoring snapshot")
+        _restore_snapshot()
         return []
 
     # 提取的记忆走 remember 流程

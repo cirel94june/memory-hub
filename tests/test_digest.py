@@ -196,6 +196,62 @@ class TestDigestForAi:
         assert "connection timeout" in result["error"]
 
 
+    @pytest.mark.asyncio
+    async def test_all_failed_raises(self, digest_db):
+        """run_digest raises RuntimeError when all AIs fail."""
+        _insert_memories(digest_db, "claude", 35)
+
+        with patch("digest._call_llm", new_callable=AsyncMock,
+                   return_value=("", "timeout")):
+            from digest import run_digest
+            with pytest.raises(RuntimeError, match="All digests failed"):
+                await run_digest()
+
+
+class TestBufferRecovery:
+    """Tests for _extract_and_remember failure recovery."""
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_clears_last_extract_time(self):
+        """On LLM failure, _last_extract_time should be cleared so retry can happen."""
+        import conversation_capture as cc
+        key = "test_recovery_buf"
+        cc._conversation_buffers[key] = [{"role": "user", "content": "test",
+                                           "user": "hi", "ai": "hello",
+                                           "ai_id": "claude", "platform": "test",
+                                           "chat_type": "private", "timestamp": "2025-01-01T00:00"}]
+        cc._last_extract_time[key] = 99999.0
+
+        with patch.object(cc, "_call_llm", new_callable=AsyncMock, return_value=""):
+            result = await cc._extract_and_remember(key)
+
+        assert result == []
+        assert key not in cc._last_extract_time
+        assert len(cc._conversation_buffers.get(key, [])) == 1
+        cc._conversation_buffers.pop(key, None)
+        cc._last_extract_time.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_nonlist_json_restores_buffer(self):
+        """Non-list JSON response should restore buffer, not consume it."""
+        import conversation_capture as cc
+        key = "test_nonlist_buf"
+        cc._conversation_buffers[key] = [{"role": "user", "content": "test",
+                                           "user": "hi", "ai": "hello",
+                                           "ai_id": "claude", "platform": "test",
+                                           "chat_type": "private", "timestamp": "2025-01-01T00:00"}]
+        cc._last_extract_time[key] = 99999.0
+
+        with patch.object(cc, "_call_llm", new_callable=AsyncMock, return_value='{"not": "a list"}'):
+            result = await cc._extract_and_remember(key)
+
+        assert result == []
+        assert key not in cc._last_extract_time
+        assert len(cc._conversation_buffers.get(key, [])) == 1
+        cc._conversation_buffers.pop(key, None)
+        cc._last_extract_time.pop(key, None)
+
+
 class TestIdleFlush:
     """Tests for conversation_capture.idle_flush() — A1 idle flush."""
 
