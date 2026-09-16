@@ -125,9 +125,9 @@ class TestSemanticSearch:
     def test_finds_similar(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "咪肚子痛", "心疼",
-                      hours_ago=2, vec_seed=seed)
+                      chat_type="private_group", hours_ago=2, vec_seed=seed)
         _insert_event(raw_db, "claude", "天气很好", "是啊",
-                      hours_ago=3, vec_seed=0.9)
+                      chat_type="private_group", hours_ago=3, vec_seed=0.9)
 
         query_vec = _fake_vec(seed)
 
@@ -142,7 +142,7 @@ class TestSemanticSearch:
     def test_date_filter(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "很久以前的事", "嗯",
-                      hours_ago=24 * 30, vec_seed=seed)
+                      chat_type="public_group", hours_ago=24 * 30, vec_seed=seed)
 
         query_vec = _fake_vec(seed)
 
@@ -187,9 +187,9 @@ class TestSemanticSearch:
     def test_recency_affects_score(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "最近的话", "嗯",
-                      hours_ago=1, vec_seed=seed)
+                      chat_type="public_group", hours_ago=1, vec_seed=seed)
         _insert_event(raw_db, "claude", "较旧的话", "嗯",
-                      hours_ago=150, vec_seed=seed)
+                      chat_type="public_group", hours_ago=150, vec_seed=seed)
 
         query_vec = _fake_vec(seed)
 
@@ -199,6 +199,73 @@ class TestSemanticSearch:
 
         if len(results) >= 2:
             assert results[0]["_score"] >= results[1]["_score"]
+
+    def test_empty_chat_type_excluded(self, raw_db):
+        """chat_type="" 必须被排除（allowlist 而非 denylist）。"""
+        seed = 0.5
+        _insert_event(raw_db, "claude", "无类型消息", "回复",
+                      chat_type="", hours_ago=1, vec_seed=seed)
+        _insert_event(raw_db, "claude", "群聊消息", "回复",
+                      chat_type="public_group", hours_ago=1, vec_seed=0.51)
+
+        query_vec = _fake_vec(seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results_anon = semantic_search(query_vec, ai_id="", days=7, limit=10)
+            results_ai = semantic_search(query_vec, ai_id="claude", days=7, limit=10)
+
+        for r in results_anon:
+            assert r["chat_type"] != "", "empty chat_type leaked through anonymous search"
+        for r in results_ai:
+            assert r["chat_type"] in ("private", "public_group", "group",
+                                       "supergroup", "private_group"), \
+                f"unexpected chat_type '{r['chat_type']}' in ai_id search"
+
+    def test_unknown_chat_type_excluded(self, raw_db):
+        """chat_type="unknown" / "channel" 等非法值必须被排除。"""
+        seed = 0.5
+        _insert_event(raw_db, "claude", "未知类型", "回复",
+                      chat_type="unknown", hours_ago=1, vec_seed=seed)
+        _insert_event(raw_db, "claude", "频道消息", "回复",
+                      chat_type="channel", hours_ago=1, vec_seed=0.52)
+
+        query_vec = _fake_vec(seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(query_vec, ai_id="", days=7, limit=10)
+
+        for r in results:
+            assert r["chat_type"] not in ("unknown", "channel"), \
+                f"chat_type '{r['chat_type']}' should be excluded"
+
+    def test_candidate_starvation_expansion(self, raw_db):
+        """501+ 不可见候选中仍能找到那 1 条可见记录（动态 max_fetch）。"""
+        visible_seed = 0.5
+        _insert_event(raw_db, "claude", "唯一可见的群聊", "找到了",
+                      chat_type="public_group", hours_ago=1, vec_seed=visible_seed)
+
+        for i in range(510):
+            _insert_event(raw_db, "claude", f"私聊噪声{i}", f"回复{i}",
+                          chat_type="private", hours_ago=1,
+                          vec_seed=visible_seed + 0.001 * (i + 1))
+
+        query_vec = _fake_vec(visible_seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(query_vec, ai_id="", days=7, limit=5)
+
+        assert len(results) >= 1, "should find the visible event despite 510 invisible candidates"
+        assert results[0]["user_text"] == "唯一可见的群聊"
+
+    def test_empty_query_vec_returns_empty(self, raw_db):
+        """空查询向量应返回空列表。"""
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            assert semantic_search([], ai_id="claude") == []
+            assert semantic_search(None, ai_id="claude") == []
 
 
 class TestBackfillRawEmbeddings:
@@ -223,6 +290,31 @@ class TestBackfillRawEmbeddings:
             result = await backfill_raw_embeddings(batch=10)
 
         assert result["backfilled"] >= 0
+        assert "failed" in result
+
+    @pytest.mark.asyncio
+    async def test_backfill_counts_failures(self, raw_db):
+        """embedding 失败应计入 failed 计数。"""
+        conn = sqlite3.connect(str(raw_db))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES ('claude', '', '', 'private', "
+                "?, 'reply', ?)", (f"msg{i}", ts),
+            )
+        conn.commit()
+        conn.close()
+
+        with (
+            patch("raw_vault.DB_PATH", raw_db),
+            patch("embedding.get_embedding", new_callable=AsyncMock, return_value=None),
+        ):
+            from raw_vault import backfill_raw_embeddings
+            result = await backfill_raw_embeddings(batch=10)
+
+        assert result["failed"] == 3
+        assert result["backfilled"] == 0
 
 
 class TestMCPToolRegistration:
@@ -259,10 +351,50 @@ class TestStoreEmbedding:
         vec = _fake_vec(0.42)
         with patch("raw_vault.DB_PATH", raw_db):
             from raw_vault import _store_embedding
-            _store_embedding(1, vec)
+            ok = _store_embedding(1, vec)
 
+        assert ok is True
         conn = sqlite3.connect(str(raw_db))
         row = conn.execute("SELECT embedding FROM raw_events WHERE id = 1").fetchone()
         assert row[0] is not None
         assert len(row[0]) == EMBEDDING_DIM * 4
         conn.close()
+
+    def test_store_failure_returns_false(self, raw_db):
+        """_store_embedding 对不存在的 event_id 仍返回 bool，不抛异常。"""
+        conn = sqlite3.connect(str(raw_db))
+        conn.execute("DROP TABLE raw_vec_id_map")
+        conn.commit()
+        conn.close()
+
+        vec = _fake_vec(0.1)
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import _store_embedding
+            ok = _store_embedding(999, vec)
+
+        assert ok is False
+
+    def test_store_normalizes_vector(self, raw_db):
+        """_store_embedding 应 L2 归一化向量后再存储。"""
+        conn = sqlite3.connect(str(raw_db))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES ('claude', '', '', 'private', "
+            "'test', 'test', ?)", (ts,),
+        )
+        conn.commit()
+        conn.close()
+
+        unnorm = [3.0] * EMBEDDING_DIM
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import _store_embedding
+            _store_embedding(1, unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        blob = conn.execute("SELECT embedding FROM raw_events WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        stored = struct.unpack(f"{EMBEDDING_DIM}f", blob)
+        norm = math.sqrt(sum(x * x for x in stored))
+        assert abs(norm - 1.0) < 1e-5, f"stored vector norm {norm} != 1.0"
