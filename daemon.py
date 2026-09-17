@@ -1180,7 +1180,16 @@ async def _run_full_maintenance_inner() -> dict:
     except Exception as e:
         log.warning(f"  Raw embedding backfill failed: {e}")
 
-    # 10.76 正文完整性审计：标记存库前就残缺的内容（半句梦等），
+    # 10.76 raw_events embedding L2 归一化迁移（一次性，幂等）
+    try:
+        from raw_vault import renormalize_all_embeddings
+        result = renormalize_all_embeddings()
+        if result.get("status") != "already_applied":
+            log.info(f"  L2 normalize migration: {result}")
+    except Exception as e:
+        log.warning(f"  L2 normalize migration failed: {e}")
+
+    # 10.77 正文完整性审计：标记存库前就残缺的内容（半句梦等），
     # 召回降权 + 不进最近动态，不自动补写
     try:
         from memory_ops import audit_content_integrity

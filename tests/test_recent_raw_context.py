@@ -49,6 +49,13 @@ def raw_db(tmp_path):
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """)
+
     try:
         import sqlite_vec
         conn.enable_load_extension(True)
@@ -125,9 +132,9 @@ class TestSemanticSearch:
     def test_finds_similar(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "咪肚子痛", "心疼",
-                      hours_ago=2, vec_seed=seed)
+                      chat_type="private_group", hours_ago=2, vec_seed=seed)
         _insert_event(raw_db, "claude", "天气很好", "是啊",
-                      hours_ago=3, vec_seed=0.9)
+                      chat_type="private_group", hours_ago=3, vec_seed=0.9)
 
         query_vec = _fake_vec(seed)
 
@@ -142,7 +149,7 @@ class TestSemanticSearch:
     def test_date_filter(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "很久以前的事", "嗯",
-                      hours_ago=24 * 30, vec_seed=seed)
+                      chat_type="public_group", hours_ago=24 * 30, vec_seed=seed)
 
         query_vec = _fake_vec(seed)
 
@@ -187,9 +194,9 @@ class TestSemanticSearch:
     def test_recency_affects_score(self, raw_db):
         seed = 0.5
         _insert_event(raw_db, "claude", "最近的话", "嗯",
-                      hours_ago=1, vec_seed=seed)
+                      chat_type="public_group", hours_ago=1, vec_seed=seed)
         _insert_event(raw_db, "claude", "较旧的话", "嗯",
-                      hours_ago=150, vec_seed=seed)
+                      chat_type="public_group", hours_ago=150, vec_seed=seed)
 
         query_vec = _fake_vec(seed)
 
@@ -199,6 +206,184 @@ class TestSemanticSearch:
 
         if len(results) >= 2:
             assert results[0]["_score"] >= results[1]["_score"]
+
+    def test_empty_chat_type_excluded(self, raw_db):
+        """chat_type="" 必须被排除（allowlist 而非 denylist）。"""
+        seed = 0.5
+        _insert_event(raw_db, "claude", "无类型消息", "回复",
+                      chat_type="", hours_ago=1, vec_seed=seed)
+        _insert_event(raw_db, "claude", "群聊消息", "回复",
+                      chat_type="public_group", hours_ago=1, vec_seed=0.51)
+
+        query_vec = _fake_vec(seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results_anon = semantic_search(query_vec, ai_id="", days=7, limit=10)
+            results_ai = semantic_search(query_vec, ai_id="claude", days=7, limit=10)
+
+        for r in results_anon:
+            assert r["chat_type"] != "", "empty chat_type leaked through anonymous search"
+        for r in results_ai:
+            assert r["chat_type"] in ("private", "public_group", "group",
+                                       "supergroup", "private_group"), \
+                f"unexpected chat_type '{r['chat_type']}' in ai_id search"
+
+    def test_unknown_chat_type_excluded(self, raw_db):
+        """chat_type="unknown" / "channel" 等非法值必须被排除。"""
+        seed = 0.5
+        _insert_event(raw_db, "claude", "未知类型", "回复",
+                      chat_type="unknown", hours_ago=1, vec_seed=seed)
+        _insert_event(raw_db, "claude", "频道消息", "回复",
+                      chat_type="channel", hours_ago=1, vec_seed=0.52)
+
+        query_vec = _fake_vec(seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(query_vec, ai_id="", days=7, limit=10)
+
+        for r in results:
+            assert r["chat_type"] not in ("unknown", "channel"), \
+                f"chat_type '{r['chat_type']}' should be excluded"
+
+    def test_candidate_starvation_expansion(self, raw_db):
+        """901 条更近似的私聊 + 1 条公开记录 → 扩容到全表才能找到。
+        同时覆盖 900 参数分块边界。"""
+        visible_seed = 0.5
+        _insert_event(raw_db, "claude", "唯一可见的群聊", "找到了",
+                      chat_type="public_group", hours_ago=1, vec_seed=visible_seed)
+
+        for i in range(901):
+            _insert_event(raw_db, "claude", f"私聊噪声{i}", f"回复{i}",
+                          chat_type="private", hours_ago=1,
+                          vec_seed=visible_seed + 0.0001 * (i + 1))
+
+        query_vec = _fake_vec(visible_seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(query_vec, ai_id="", days=7, limit=5)
+
+        assert len(results) >= 1, "should find visible event despite 901 invisible closer candidates"
+        assert results[0]["user_text"] == "唯一可见的群聊"
+
+    def test_empty_query_vec_returns_empty(self, raw_db):
+        """空查询向量应返回空列表。"""
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            assert semantic_search([], ai_id="claude") == []
+            assert semantic_search(None, ai_id="claude") == []
+
+    def test_zero_query_vec_returns_empty(self, raw_db):
+        """全零查询向量（范数=0）应返回空列表。"""
+        _insert_event(raw_db, "claude", "群聊", "回复",
+                      chat_type="public_group", hours_ago=1, vec_seed=0.5)
+
+        zero_vec = [0.0] * EMBEDDING_DIM
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            assert semantic_search(zero_vec, ai_id="") == []
+
+    def test_cosine_identical_vectors(self, raw_db):
+        """相同向量 cosine ≈ 1.0。"""
+        seed = 0.42
+        _insert_event(raw_db, "claude", "相同向量测试", "回复",
+                      chat_type="public_group", hours_ago=1, vec_seed=seed)
+
+        query_vec = _fake_vec(seed)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(query_vec, ai_id="", days=7, limit=5)
+
+        assert len(results) == 1
+        assert results[0]["_cosine"] > 0.99
+
+    def test_cosine_orthogonal_vectors(self, raw_db):
+        """正交向量 cosine ≈ 0。"""
+        orth_a = [0.0] * EMBEDDING_DIM
+        orth_b = [0.0] * EMBEDDING_DIM
+        orth_a[0] = 1.0
+        orth_b[1] = 1.0
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES ('claude', '', '', 'public_group', "
+            "'正交测试', '回复', ?)", (ts,),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *orth_b)
+        conn.execute("UPDATE raw_events SET embedding = ? WHERE id = ?", (blob, event_id))
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(orth_a, ai_id="", days=7, limit=5)
+
+        assert len(results) == 1
+        assert results[0]["_cosine"] < 0.01
+
+    def test_cosine_60_degree_vectors(self, raw_db):
+        """夹角 60° 的向量 cosine ≈ 0.5。"""
+        vec_a = [0.0] * EMBEDDING_DIM
+        vec_b = [0.0] * EMBEDDING_DIM
+        vec_a[0] = 1.0
+        vec_b[0] = 0.5
+        vec_b[1] = math.sqrt(3) / 2
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES ('claude', '', '', 'public_group', "
+            "'60度测试', '回复', ?)", (ts,),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *vec_b)
+        conn.execute("UPDATE raw_events SET embedding = ? WHERE id = ?", (blob, event_id))
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import semantic_search
+            results = semantic_search(vec_a, ai_id="", days=7, limit=5)
+
+        assert len(results) == 1
+        assert abs(results[0]["_cosine"] - 0.5) < 0.05
 
 
 class TestBackfillRawEmbeddings:
@@ -223,6 +408,31 @@ class TestBackfillRawEmbeddings:
             result = await backfill_raw_embeddings(batch=10)
 
         assert result["backfilled"] >= 0
+        assert "failed" in result
+
+    @pytest.mark.asyncio
+    async def test_backfill_counts_failures(self, raw_db):
+        """embedding 失败应计入 failed 计数。"""
+        conn = sqlite3.connect(str(raw_db))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at) VALUES ('claude', '', '', 'private', "
+                "?, 'reply', ?)", (f"msg{i}", ts),
+            )
+        conn.commit()
+        conn.close()
+
+        with (
+            patch("raw_vault.DB_PATH", raw_db),
+            patch("embedding.get_embedding", new_callable=AsyncMock, return_value=None),
+        ):
+            from raw_vault import backfill_raw_embeddings
+            result = await backfill_raw_embeddings(batch=10)
+
+        assert result["failed"] == 3
+        assert result["backfilled"] == 0
 
 
 class TestMCPToolRegistration:
@@ -259,10 +469,505 @@ class TestStoreEmbedding:
         vec = _fake_vec(0.42)
         with patch("raw_vault.DB_PATH", raw_db):
             from raw_vault import _store_embedding
-            _store_embedding(1, vec)
+            ok = _store_embedding(1, vec)
 
+        assert ok is True
         conn = sqlite3.connect(str(raw_db))
         row = conn.execute("SELECT embedding FROM raw_events WHERE id = 1").fetchone()
         assert row[0] is not None
         assert len(row[0]) == EMBEDDING_DIM * 4
         conn.close()
+
+    def test_store_failure_returns_false(self, raw_db):
+        """_store_embedding 对不存在的 event_id 仍返回 bool，不抛异常。"""
+        conn = sqlite3.connect(str(raw_db))
+        conn.execute("DROP TABLE raw_vec_id_map")
+        conn.commit()
+        conn.close()
+
+        vec = _fake_vec(0.1)
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import _store_embedding
+            ok = _store_embedding(999, vec)
+
+        assert ok is False
+
+    def test_store_normalizes_vector(self, raw_db):
+        """_store_embedding 应 L2 归一化向量后再存储。"""
+        conn = sqlite3.connect(str(raw_db))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES ('claude', '', '', 'private', "
+            "'test', 'test', ?)", (ts,),
+        )
+        conn.commit()
+        conn.close()
+
+        unnorm = [3.0] * EMBEDDING_DIM
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import _store_embedding
+            _store_embedding(1, unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        blob = conn.execute("SELECT embedding FROM raw_events WHERE id = 1").fetchone()[0]
+        conn.close()
+
+        stored = struct.unpack(f"{EMBEDDING_DIM}f", blob)
+        norm = math.sqrt(sum(x * x for x in stored))
+        assert abs(norm - 1.0) < 1e-5, f"stored vector norm {norm} != 1.0"
+
+    def test_store_zero_vector_returns_false(self, raw_db):
+        """全零向量存储应被拒绝。"""
+        conn = sqlite3.connect(str(raw_db))
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at) VALUES ('claude', '', '', 'private', "
+            "'test', 'test', ?)", (ts,),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import _store_embedding
+            ok = _store_embedding(1, [0.0] * EMBEDDING_DIM)
+
+        assert ok is False
+
+
+class TestRenormalizeMigration:
+    def test_unnormalized_vectors_get_normalized(self, raw_db):
+        """预置未归一化旧向量 → 迁移后 raw blob 和 vec 索引都变成 norm≈1。"""
+        unnorm = [3.0] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import renormalize_all_embeddings
+            result = renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1
+
+        conn = sqlite3.connect(str(raw_db))
+        raw_blob = conn.execute(
+            "SELECT embedding FROM raw_events WHERE id = ?", (event_id,)
+        ).fetchone()[0]
+        conn.close()
+
+        stored = struct.unpack(f"{EMBEDDING_DIM}f", raw_blob)
+        norm = math.sqrt(sum(x * x for x in stored))
+        assert abs(norm - 1.0) < 1e-5
+
+    def test_idempotent_second_run(self, raw_db):
+        """第二次执行应直接跳过（already_applied）。"""
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import renormalize_all_embeddings
+            r1 = renormalize_all_embeddings()
+            r2 = renormalize_all_embeddings()
+
+        assert r1["status"] == "done"
+        assert r2["status"] == "already_applied"
+
+    def test_already_normalized_skipped(self, raw_db):
+        """已归一化且 map+vec 完整的向量应被跳过（不重写）。"""
+        vec = _fake_vec(0.7)
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *vec)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            from raw_vault import renormalize_all_embeddings
+            result = renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["skipped"] == 1
+        assert result["renormalized"] == 0
+
+    def test_store_failure_prevents_marker(self, raw_db):
+        """_renormalize_one_atomic 返回 failed → 不写完成 marker。"""
+        unnorm = [5.0] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        import raw_vault
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            with patch.object(raw_vault, "_renormalize_one_atomic", return_value="failed"):
+                result = raw_vault.renormalize_all_embeddings()
+
+            assert result["status"] == "incomplete"
+            assert result["failed"] == 1
+            assert not raw_vault._migration_applied(raw_vault._MIGRATION_NAME), \
+                "marker must NOT be written when failed > 0"
+
+            result2 = raw_vault.renormalize_all_embeddings()
+
+        assert result2["status"] == "done"
+        assert result2["renormalized"] == 1
+
+    def test_resumable_after_crash(self, raw_db):
+        """中途异常后可继续：下次重跑处理剩余行。"""
+        unnorm = [5.0] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at, embedding) VALUES "
+                "('claude', '', '', 'private', ?, 'reply', ?, ?)",
+                (f"test{i}", ts, blob),
+            )
+            event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+            vec_rowid = conn.execute(
+                "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+            ).fetchone()[0]
+            try:
+                import sqlite_vec
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            except Exception:
+                pass
+            conn.execute(
+                "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+                (vec_rowid, blob),
+            )
+        conn.commit()
+        conn.close()
+
+        import raw_vault
+        call_count = [0]
+        original_fn = raw_vault._renormalize_one_atomic
+
+        def _failing_on_second(event_id):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise RuntimeError("simulated crash")
+            return original_fn(event_id)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            with patch.object(raw_vault, "_renormalize_one_atomic",
+                              side_effect=_failing_on_second):
+                result = raw_vault.renormalize_all_embeddings()
+
+            assert result["status"] == "incomplete"
+            assert not raw_vault._migration_applied(raw_vault._MIGRATION_NAME)
+
+            r2 = raw_vault.renormalize_all_embeddings()
+
+        assert r2["status"] == "done"
+        assert r2["renormalized"] >= 1
+
+    def test_concurrent_write_not_overwritten(self, raw_db):
+        """迁移原子读写不会覆盖并发产生的新 embedding。"""
+        old_vec = [3.0] * EMBEDDING_DIM
+        old_blob = struct.pack(f"{EMBEDDING_DIM}f", *old_vec)
+
+        new_vec = _fake_vec(0.99)
+        new_blob = struct.pack(f"{EMBEDDING_DIM}f", *new_vec)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, old_blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, old_blob),
+        )
+        conn.commit()
+        conn.close()
+
+        import raw_vault
+
+        original_fn = raw_vault._renormalize_one_atomic
+
+        def _intercept_and_write_new(eid):
+            conn2 = sqlite3.connect(str(raw_db))
+            conn2.execute(
+                "UPDATE raw_events SET embedding = ? WHERE id = ?",
+                (new_blob, eid),
+            )
+            conn2.commit()
+            conn2.close()
+            return original_fn(eid)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            with patch.object(raw_vault, "_renormalize_one_atomic",
+                              side_effect=_intercept_and_write_new):
+                raw_vault.renormalize_all_embeddings()
+
+        conn3 = sqlite3.connect(str(raw_db))
+        final_blob = conn3.execute(
+            "SELECT embedding FROM raw_events WHERE id = ?", (event_id,)
+        ).fetchone()[0]
+        conn3.close()
+
+        final_vec = struct.unpack(f"{EMBEDDING_DIM}f", final_blob)
+        norm = math.sqrt(sum(x * x for x in final_vec))
+        assert abs(norm - 1.0) < 1e-5, "final vector should be normalized"
+
+    def _insert_raw_only(self, raw_db, vec_val=3.0, normalized=False):
+        """Helper: insert raw_events row with embedding but NO map/vec rows."""
+        if normalized:
+            vec = _fake_vec(0.42)
+        else:
+            vec = [vec_val] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *vec)
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'public_group', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        return event_id
+
+    def test_missing_map_repaired(self, raw_db):
+        """raw embedding 存在但 map 缺失 → 迁移应创建 map + vec。"""
+        event_id = self._insert_raw_only(raw_db)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1
+
+        conn = sqlite3.connect(str(raw_db))
+        map_row = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        assert map_row is not None, "map row should be created"
+
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (map_row[0],)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec row should be created"
+
+    def test_missing_vec_row_repaired(self, raw_db):
+        """map 存在但 vec 行缺失 → 迁移应创建 vec 行。"""
+        event_id = self._insert_raw_only(raw_db)
+
+        conn = sqlite3.connect(str(raw_db))
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1
+
+        conn = sqlite3.connect(str(raw_db))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (vec_rowid,)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec row should be created"
+
+    def test_normalized_but_missing_index_repaired(self, raw_db):
+        """embedding 已归一化但 vec 索引缺失 → 不能 skip，必须修复索引。"""
+        event_id = self._insert_raw_only(raw_db, normalized=True)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1, "should be 'updated' not 'skipped' when index missing"
+
+        conn = sqlite3.connect(str(raw_db))
+        map_row = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        assert map_row is not None
+
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (map_row[0],)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec index must be created even for normalized vectors"
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            query_vec = _fake_vec(0.42)
+            results = raw_vault.semantic_search(query_vec, ai_id="", days=7, limit=5)
+        assert any(r["id"] == event_id for r in results), \
+            "repaired record should be findable via semantic_search"
+
+    def test_stale_vec_content_repaired(self, raw_db):
+        """raw 已归一化但 vec 索引存的是旧 embedding → 迁移应同步 vec 内容。"""
+        correct_vec = _fake_vec(0.42)
+        correct_blob = struct.pack(f"{EMBEDDING_DIM}f", *correct_vec)
+        stale_vec = _fake_vec(0.91)
+        stale_blob = struct.pack(f"{EMBEDDING_DIM}f", *stale_vec)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'public_group', 'test', 'reply', ?, ?)",
+            (ts, correct_blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, stale_blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            query_vec = _fake_vec(0.42)
+            results = raw_vault.semantic_search(query_vec, ai_id="", days=7, limit=5)
+
+        assert len(results) == 1
+        assert results[0]["id"] == event_id
+        assert results[0]["_cosine"] > 0.99, \
+            f"vec should match raw after migration, got cosine={results[0]['_cosine']}"

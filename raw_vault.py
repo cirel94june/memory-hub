@@ -73,6 +73,12 @@ def _init_db():
                 event_id   INTEGER NOT NULL UNIQUE
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS _migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+        """)
         conn.execute("COMMIT")
 
         try:
@@ -104,13 +110,26 @@ def _embed_text(user_text: str, ai_text: str) -> str:
     return f"{u} {a}".strip()
 
 
-def _store_embedding(event_id: int, embedding: list[float]):
-    """把 embedding 写入 raw_events + vec 索引。"""
-    blob = struct.pack(f"{len(embedding)}f", *embedding)
+def _l2_normalize(vec: list[float]) -> list[float] | None:
+    """L2 归一化。零向量返回 None（调用方应拒绝）。"""
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0:
+        return None
+    return [x / norm for x in vec]
+
+
+def _store_embedding(event_id: int, embedding: list[float]) -> bool:
+    """把 embedding L2 归一化后写入 raw_events + vec 索引。单事务，失败回滚。"""
+    normalized = _l2_normalize(embedding)
+    if normalized is None:
+        return False
+    blob = struct.pack(f"{len(normalized)}f", *normalized)
+    conn = None
     try:
         conn = _connect(load_vec=True)
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("UPDATE raw_events SET embedding = ? WHERE id = ?", (blob, event_id))
-        row = conn.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,)
         )
         vec_rowid = conn.execute(
@@ -126,10 +145,16 @@ def _store_embedding(event_id: int, embedding: list[float]):
                 "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
                 (blob, vec_rowid),
             )
-        conn.commit()
-        conn.close()
+        conn.execute("COMMIT")
+        return True
     except Exception as e:
+        if conn and conn.in_transaction:
+            conn.execute("ROLLBACK")
         log.warning(f"raw_vault store_embedding failed: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 async def _async_embed_and_store(event_id: int, text: str):
@@ -409,6 +434,9 @@ def _cosine_sim(a: bytes, b: bytes) -> float:
     return dot / (na * nb)
 
 
+_SQLITE_PARAM_LIMIT = 900
+
+
 def semantic_search(
     query_vec: list[float],
     ai_id: str = "",
@@ -418,84 +446,107 @@ def semantic_search(
     """在最近 N 天的 raw_events 里做向量语义搜索。
 
     返回按 cosine_sim × recency_weight 排序的结果。
-    隔离策略与 search() 一致。
+    隔离策略与 search() / stats() 一致（allowlist _ALL_GROUP_TYPES）。
+    查询向量自动 L2 归一化。候选池按 vec 表实际行数动态扩展。
     """
-    expected_bytes = EMBEDDING_DIM * 4
+    if not query_vec:
+        return []
+
+    query_vec = _l2_normalize(query_vec)
+    if query_vec is None:
+        return []
     query_blob = struct.pack(f"{EMBEDDING_DIM}f", *query_vec)
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
     now_ts = datetime.now(timezone.utc)
     decay_hours = days * 24.0
 
-    fetch_k = limit * 6
-
     conn = _connect(load_vec=True)
     conn.row_factory = sqlite3.Row
     try:
-        vec_rows = conn.execute(
-            "SELECT rowid, distance FROM raw_events_vec "
-            "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (query_blob, fetch_k),
-        ).fetchall()
-    except Exception as e:
-        log.warning(f"raw_vault semantic_search vec query failed: {e}")
-        conn.close()
-        return []
+        total_count = conn.execute(
+            "SELECT COUNT(*) FROM raw_events_vec"
+        ).fetchone()[0]
+        if total_count == 0:
+            return []
 
-    ai_ids = _resolve_ai_ids(ai_id) if ai_id else []
-
-    results = []
-    for vr in vec_rows:
-        vec_rowid = vr["rowid"]
-        distance = vr["distance"]
-
-        map_row = conn.execute(
-            "SELECT event_id FROM raw_vec_id_map WHERE vec_rowid = ?",
-            (vec_rowid,),
-        ).fetchone()
-        if not map_row:
-            continue
-        event_id = map_row["event_id"]
-
-        event = conn.execute(
-            f"SELECT {_SELECT_COLS} FROM raw_events WHERE id = ? AND created_at >= ?",
-            (event_id, cutoff),
-        ).fetchone()
-        if not event:
-            continue
-
-        ev = dict(event)
-
+        ai_ids = _resolve_ai_ids(ai_id) if ai_id else []
         if ai_ids:
-            ct = (ev.get("chat_type") or "").strip().lower()
-            if ct == "private" and ev.get("ai_id") not in ai_ids:
-                continue
-        elif not ai_id:
-            ct = (ev.get("chat_type") or "").strip().lower()
-            if ct == "private":
-                continue
+            gp = ",".join("?" for _ in _ALL_GROUP_TYPES)
+            ai_ph = ",".join("?" for _ in ai_ids)
+            vis_where = (
+                f"(LOWER(TRIM(COALESCE(e.chat_type,''))) IN ({gp})"
+                f" OR (LOWER(TRIM(COALESCE(e.chat_type,''))) = 'private'"
+                f" AND e.ai_id IN ({ai_ph})))"
+            )
+            vis_params = list(_ALL_GROUP_TYPES) + list(ai_ids)
+        else:
+            gp = ",".join("?" for _ in _ALL_GROUP_TYPES)
+            vis_where = f"LOWER(TRIM(COALESCE(e.chat_type,''))) IN ({gp})"
+            vis_params = list(_ALL_GROUP_TYPES)
 
-        cos_sim = max(0.0, 1.0 - distance / 2.0)
+        fetch_k = min(limit * 4, total_count)
+        results: list[dict] = []
 
-        try:
-            evt = datetime.fromisoformat(ev["created_at"])
-            if evt.tzinfo is None:
-                evt = evt.replace(tzinfo=timezone.utc)
-            hours_ago = max(0, (now_ts - evt).total_seconds() / 3600)
-        except Exception:
-            hours_ago = decay_hours
+        while True:
+            vec_rows = conn.execute(
+                "SELECT rowid, distance FROM raw_events_vec "
+                "WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                (query_blob, fetch_k),
+            ).fetchall()
 
-        recency = math.exp(-hours_ago / decay_hours)
+            if not vec_rows:
+                break
 
-        ev["_score"] = round(cos_sim * 0.7 + recency * 0.3, 4)
-        ev["_cosine"] = round(cos_sim, 4)
-        ev["_recency"] = round(recency, 4)
-        results.append(ev)
+            dist_map = {vr["rowid"]: vr["distance"] for vr in vec_rows}
+            vec_rowids = list(dist_map.keys())
 
-    conn.close()
+            results = []
+            for chunk_start in range(0, len(vec_rowids), _SQLITE_PARAM_LIMIT):
+                chunk = vec_rowids[chunk_start:chunk_start + _SQLITE_PARAM_LIMIT]
+                ph = ",".join("?" for _ in chunk)
+                sql = (
+                    f"SELECT e.id, e.ai_id, e.platform, e.chat_id, e.chat_type, "
+                    f"e.user_text, e.ai_text, e.created_at, m.vec_rowid "
+                    f"FROM raw_vec_id_map m "
+                    f"JOIN raw_events e ON e.id = m.event_id "
+                    f"WHERE m.vec_rowid IN ({ph}) "
+                    f"AND e.created_at >= ? AND {vis_where}"
+                )
+                params = list(chunk) + [cutoff] + vis_params
+                for row in conn.execute(sql, params):
+                    ev = dict(row)
+                    vec_rowid = ev.pop("vec_rowid")
+                    distance = dist_map[vec_rowid]
 
-    results.sort(key=lambda x: x["_score"], reverse=True)
-    return results[:limit]
+                    cos_sim = max(0.0, min(1.0, 1.0 - distance * distance / 2.0))
+
+                    try:
+                        evt = datetime.fromisoformat(ev["created_at"])
+                        if evt.tzinfo is None:
+                            evt = evt.replace(tzinfo=timezone.utc)
+                        hours_ago = max(0, (now_ts - evt).total_seconds() / 3600)
+                    except Exception:
+                        hours_ago = decay_hours
+
+                    recency = math.exp(-hours_ago / decay_hours)
+
+                    ev["_score"] = round(cos_sim * 0.7 + recency * 0.3, 4)
+                    ev["_cosine"] = round(cos_sim, 4)
+                    ev["_recency"] = round(recency, 4)
+                    results.append(ev)
+
+            if len(results) >= limit or fetch_k >= total_count:
+                break
+            fetch_k = min(fetch_k * 2, total_count)
+
+        results.sort(key=lambda x: x["_score"], reverse=True)
+        return results[:limit]
+    except Exception as e:
+        log.warning(f"raw_vault semantic_search failed: {e}")
+        return []
+    finally:
+        conn.close()
 
 
 async def backfill_raw_embeddings(batch: int = 100) -> dict:
@@ -503,30 +554,224 @@ async def backfill_raw_embeddings(batch: int = 100) -> dict:
     from embedding import get_embedding
 
     conn = _connect()
-    rows = conn.execute(
-        "SELECT id, user_text, ai_text FROM raw_events "
-        "WHERE embedding IS NULL ORDER BY id DESC LIMIT ?",
-        (batch,),
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT id, user_text, ai_text FROM raw_events "
+            "WHERE embedding IS NULL ORDER BY id DESC LIMIT ?",
+            (batch,),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
-        return {"backfilled": 0, "total_missing": 0}
+        return {"backfilled": 0, "failed": 0, "total_missing": 0}
 
     done = 0
+    failed = 0
     for row_id, user_text, ai_text in rows:
         text = _embed_text(user_text, ai_text)
         if not text:
             continue
-        vec = await get_embedding(text)
-        if vec and len(vec) == EMBEDDING_DIM:
-            _store_embedding(row_id, vec)
-            done += 1
+        try:
+            vec = await get_embedding(text)
+            if vec and len(vec) == EMBEDDING_DIM:
+                if _store_embedding(row_id, vec):
+                    done += 1
+                else:
+                    failed += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
 
     conn2 = _connect()
-    missing = conn2.execute("SELECT COUNT(*) FROM raw_events WHERE embedding IS NULL").fetchone()[0]
-    conn2.close()
+    try:
+        missing = conn2.execute(
+            "SELECT COUNT(*) FROM raw_events WHERE embedding IS NULL"
+        ).fetchone()[0]
+    finally:
+        conn2.close()
 
     if done:
-        log.info(f"raw_vault backfilled {done} embeddings, {missing} still missing")
-    return {"backfilled": done, "total_missing": missing}
+        log.info(f"raw_vault backfilled {done} embeddings ({failed} failed), {missing} still missing")
+    return {"backfilled": done, "failed": failed, "total_missing": missing}
+
+
+_MIGRATION_NAME = "l2_normalize_embeddings_v1"
+
+
+def _migration_applied(name: str) -> bool:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM _migrations WHERE name = ?", (name,)
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def _mark_migration(name: str):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO _migrations (name, applied_at) VALUES (?, ?)",
+            (name, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _renormalize_one_atomic(event_id: int) -> str:
+    """在同一事务内确保 raw→map→vec 三者一致且已归一化。
+
+    返回 "updated" / "skipped" / "failed"。
+    即使 raw embedding 已归一化，也必须检查并修复缺失的 map/vec 行。
+    只有三者都一致时才返回 "skipped"。
+    """
+    conn = None
+    try:
+        conn = _connect(load_vec=True)
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT embedding FROM raw_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            conn.execute("ROLLBACK")
+            return "skipped"
+
+        blob = row[0]
+        if len(blob) % 4 != 0:
+            conn.execute("ROLLBACK")
+            return "failed"
+
+        n = len(blob) // 4
+        vec = list(struct.unpack(f"{n}f", blob))
+        norm = math.sqrt(sum(x * x for x in vec))
+
+        if norm == 0:
+            conn.execute("ROLLBACK")
+            return "failed"
+
+        already_normalized = abs(norm - 1.0) < 1e-6
+
+        if already_normalized:
+            final_blob = blob
+        else:
+            normalized = [x / norm for x in vec]
+            final_blob = struct.pack(f"{n}f", *normalized)
+            conn.execute(
+                "UPDATE raw_events SET embedding = ? WHERE id = ?",
+                (final_blob, event_id),
+            )
+
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_vec_id_map (event_id) VALUES (?)",
+            (event_id,),
+        )
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()[0]
+
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (vec_rowid,)
+        ).fetchone()
+        if vec_row:
+            conn.execute(
+                "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
+                (final_blob, vec_rowid),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+                (vec_rowid, final_blob),
+            )
+
+        needs_write = not already_normalized or not vec_row
+        conn.execute("COMMIT")
+        return "updated" if needs_write else "skipped"
+    except Exception as e:
+        if conn and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        log.warning(f"renormalize_one_atomic failed for event {event_id}: {e}")
+        return "failed"
+    finally:
+        if conn:
+            conn.close()
+
+
+def renormalize_all_embeddings(batch: int = 500) -> dict:
+    """一次性重新归一化所有已存 embedding。幂等，可中断后重跑。
+
+    每行在同一事务内读取当前 blob → 归一化 → 写回（原子操作，
+    不会覆盖并发产生的新 embedding）。
+    failed > 0 时不写完成 marker，下次调用会重试。
+    """
+    if _migration_applied(_MIGRATION_NAME):
+        return {"status": "already_applied", "renormalized": 0, "skipped": 0, "failed": 0}
+
+    conn = _connect()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM raw_events WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        if total == 0:
+            _mark_migration(_MIGRATION_NAME)
+            return {"status": "done", "renormalized": 0, "skipped": 0, "failed": 0, "total": 0}
+    finally:
+        conn.close()
+
+    updated = 0
+    skipped = 0
+    failed = 0
+    offset = 0
+    while offset < total:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                "SELECT id FROM raw_events "
+                "WHERE embedding IS NOT NULL ORDER BY id LIMIT ? OFFSET ?",
+                (batch, offset),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            break
+
+        for (event_id,) in rows:
+            try:
+                result = _renormalize_one_atomic(event_id)
+            except Exception as e:
+                log.warning(f"renormalize event {event_id} crashed: {e}")
+                result = "failed"
+            if result == "updated":
+                updated += 1
+            elif result == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+
+        offset += len(rows)
+
+    if failed > 0:
+        log.warning(
+            f"renormalize_all_embeddings incomplete: {updated} updated, "
+            f"{failed} failed, {skipped} skipped — marker NOT written"
+        )
+        return {
+            "status": "incomplete", "renormalized": updated,
+            "skipped": skipped, "failed": failed, "total": total,
+        }
+
+    _mark_migration(_MIGRATION_NAME)
+    log.info(f"renormalize_all_embeddings: {updated} updated, {skipped} skipped, {total} total")
+    return {
+        "status": "done", "renormalized": updated,
+        "skipped": skipped, "failed": 0, "total": total,
+    }

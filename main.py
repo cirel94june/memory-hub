@@ -61,6 +61,15 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"[Memory Hub] MCP server ready at /mcp (identity unavailable: {exc})")
 
+        # 一次性迁移：L2 归一化存量 embedding（幂等，已完成则跳过）
+        try:
+            from raw_vault import renormalize_all_embeddings
+            mig = renormalize_all_embeddings()
+            if mig.get("status") != "already_applied":
+                print(f"[Memory Hub] L2 normalize migration: {mig}")
+        except Exception as e:
+            print(f"[Memory Hub] L2 normalize migration failed: {e}")
+
         # 启动后台 daemon 定时任务
         daemon_task = asyncio.create_task(_daemon_loop())
         lag_task = asyncio.create_task(_event_loop_lag_monitor())

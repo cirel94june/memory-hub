@@ -1213,7 +1213,6 @@ async def search_raw(query: str, limit: int = 5,
 @mcp.tool()
 async def recent_raw_context(
     query: str,
-    ai_id: str = "",
     days: int = 7,
     limit: int = 8,
 ) -> str:
@@ -1227,16 +1226,18 @@ async def recent_raw_context(
     典型场景：用户说"咪肚子痛"，你想找之前聊过的相关原文
     （比如"姨妈又犯了腰酸"），关键词对不上但语义相关。
 
-    隔离策略：传 ai_id 按私聊隔离，不传搜群聊全员。
+    只搜群聊，不含私聊（保护隐私）。
 
     Args:
         query: 当前用户说的话或关键描述
-        ai_id: 你的身份（私聊传自己 ai_id，群聊留空）
         days: 搜索范围（天），默认 7
         limit: 返回条数，默认 8
     """
     from embedding import get_embedding
     import raw_vault
+
+    if not (query or "").strip():
+        return json.dumps({"error": "empty_query", "hint": "请提供搜索内容"}, ensure_ascii=False)
 
     days = max(1, min(days, 120))
     limit = max(1, min(limit, 30))
@@ -1246,7 +1247,7 @@ async def recent_raw_context(
         return json.dumps({"error": "embedding_failed", "hint": "无法计算查询向量，请改用 search_raw 关键词搜索"}, ensure_ascii=False)
 
     hits = raw_vault.semantic_search(
-        query_vec=query_vec, ai_id=ai_id, days=days, limit=limit,
+        query_vec=query_vec, ai_id="", days=days, limit=limit,
     )
     for h in hits:
         h.pop("embedding", None)
@@ -1255,7 +1256,7 @@ async def recent_raw_context(
         "results": hits,
         "query": query,
         "days": days,
-        "stats": raw_vault.stats(ai_id=ai_id),
+        "stats": raw_vault.stats(public_only=True),
     }, ensure_ascii=False, indent=2)
 
 
