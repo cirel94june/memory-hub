@@ -682,20 +682,19 @@ def _renormalize_one_atomic(event_id: int) -> str:
             "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (vec_rowid,)
         ).fetchone()
         if vec_row:
-            if not already_normalized:
-                conn.execute(
-                    "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
-                    (final_blob, vec_rowid),
-                )
+            conn.execute(
+                "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
+                (final_blob, vec_rowid),
+            )
         else:
             conn.execute(
                 "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
                 (vec_rowid, final_blob),
             )
-            already_normalized = False
 
+        needs_write = not already_normalized or not vec_row
         conn.execute("COMMIT")
-        return "skipped" if already_normalized else "updated"
+        return "updated" if needs_write else "skipped"
     except Exception as e:
         if conn and conn.in_transaction:
             conn.execute("ROLLBACK")

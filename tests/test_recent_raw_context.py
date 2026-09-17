@@ -922,3 +922,52 @@ class TestRenormalizeMigration:
             results = raw_vault.semantic_search(query_vec, ai_id="", days=7, limit=5)
         assert any(r["id"] == event_id for r in results), \
             "repaired record should be findable via semantic_search"
+
+    def test_stale_vec_content_repaired(self, raw_db):
+        """raw 已归一化但 vec 索引存的是旧 embedding → 迁移应同步 vec 内容。"""
+        correct_vec = _fake_vec(0.42)
+        correct_blob = struct.pack(f"{EMBEDDING_DIM}f", *correct_vec)
+        stale_vec = _fake_vec(0.91)
+        stale_blob = struct.pack(f"{EMBEDDING_DIM}f", *stale_vec)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'public_group', 'test', 'reply', ?, ?)",
+            (ts, correct_blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, stale_blob),
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            query_vec = _fake_vec(0.42)
+            results = raw_vault.semantic_search(query_vec, ai_id="", days=7, limit=5)
+
+        assert len(results) == 1
+        assert results[0]["id"] == event_id
+        assert results[0]["_cosine"] > 0.99, \
+            f"vec should match raw after migration, got cosine={results[0]['_cosine']}"
