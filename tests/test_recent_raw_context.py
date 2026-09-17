@@ -620,8 +620,56 @@ class TestRenormalizeMigration:
         assert result["skipped"] == 1
         assert result["renormalized"] == 0
 
-    def test_resumable_after_partial_failure(self, raw_db):
-        """中途失败后可继续：不标记 migration，下次重跑处理剩余。"""
+    def test_store_failure_prevents_marker(self, raw_db):
+        """_renormalize_one_atomic 返回 failed → 不写完成 marker。"""
+        unnorm = [5.0] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *unnorm)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
+        )
+        conn.commit()
+        conn.close()
+
+        import raw_vault
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            with patch.object(raw_vault, "_renormalize_one_atomic", return_value="failed"):
+                result = raw_vault.renormalize_all_embeddings()
+
+            assert result["status"] == "incomplete"
+            assert result["failed"] == 1
+            assert not raw_vault._migration_applied(raw_vault._MIGRATION_NAME), \
+                "marker must NOT be written when failed > 0"
+
+            result2 = raw_vault.renormalize_all_embeddings()
+
+        assert result2["status"] == "done"
+        assert result2["renormalized"] == 1
+
+    def test_resumable_after_crash(self, raw_db):
+        """中途异常后可继续：下次重跑处理剩余行。"""
         unnorm = [5.0] * EMBEDDING_DIM
         blob = struct.pack(f"{EMBEDDING_DIM}f", *unnorm)
 
@@ -653,29 +701,89 @@ class TestRenormalizeMigration:
         conn.commit()
         conn.close()
 
+        import raw_vault
         call_count = [0]
-        original_store = None
+        original_fn = raw_vault._renormalize_one_atomic
 
-        def _failing_store(event_id, embedding):
+        def _failing_on_second(event_id):
             call_count[0] += 1
             if call_count[0] == 2:
-                raise RuntimeError("simulated failure")
-            return original_store(event_id, embedding)
-
-        import raw_vault
-        original_store = raw_vault._store_embedding
+                raise RuntimeError("simulated crash")
+            return original_fn(event_id)
 
         with patch("raw_vault.DB_PATH", raw_db):
-            with patch("raw_vault._store_embedding", side_effect=_failing_store):
-                try:
-                    raw_vault.renormalize_all_embeddings()
-                except RuntimeError:
-                    pass
+            with patch.object(raw_vault, "_renormalize_one_atomic",
+                              side_effect=_failing_on_second):
+                result = raw_vault.renormalize_all_embeddings()
 
-            assert not raw_vault._migration_applied(raw_vault._MIGRATION_NAME), \
-                "migration should NOT be marked on failure"
+            assert result["status"] == "incomplete"
+            assert not raw_vault._migration_applied(raw_vault._MIGRATION_NAME)
 
             r2 = raw_vault.renormalize_all_embeddings()
 
         assert r2["status"] == "done"
         assert r2["renormalized"] >= 1
+
+    def test_concurrent_write_not_overwritten(self, raw_db):
+        """迁移原子读写不会覆盖并发产生的新 embedding。"""
+        old_vec = [3.0] * EMBEDDING_DIM
+        old_blob = struct.pack(f"{EMBEDDING_DIM}f", *old_vec)
+
+        new_vec = _fake_vec(0.99)
+        new_blob = struct.pack(f"{EMBEDDING_DIM}f", *new_vec)
+
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
+            (ts, old_blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, old_blob),
+        )
+        conn.commit()
+        conn.close()
+
+        import raw_vault
+
+        original_fn = raw_vault._renormalize_one_atomic
+
+        def _intercept_and_write_new(eid):
+            conn2 = sqlite3.connect(str(raw_db))
+            conn2.execute(
+                "UPDATE raw_events SET embedding = ? WHERE id = ?",
+                (new_blob, eid),
+            )
+            conn2.commit()
+            conn2.close()
+            return original_fn(eid)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            with patch.object(raw_vault, "_renormalize_one_atomic",
+                              side_effect=_intercept_and_write_new):
+                raw_vault.renormalize_all_embeddings()
+
+        conn3 = sqlite3.connect(str(raw_db))
+        final_blob = conn3.execute(
+            "SELECT embedding FROM raw_events WHERE id = ?", (event_id,)
+        ).fetchone()[0]
+        conn3.close()
+
+        final_vec = struct.unpack(f"{EMBEDDING_DIM}f", final_blob)
+        norm = math.sqrt(sum(x * x for x in final_vec))
+        assert abs(norm - 1.0) < 1e-5, "final vector should be normalized"

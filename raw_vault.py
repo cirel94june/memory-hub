@@ -625,15 +625,78 @@ def _mark_migration(name: str):
         conn.close()
 
 
+def _renormalize_one_atomic(event_id: int) -> str:
+    """在同一事务内读取当前 blob → 归一化 → 写回 raw + vec。
+
+    返回 "updated" / "skipped" / "failed"。
+    BEGIN IMMEDIATE 保证读写之间无并发覆盖。
+    """
+    conn = None
+    try:
+        conn = _connect(load_vec=True)
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT embedding FROM raw_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            conn.execute("ROLLBACK")
+            return "skipped"
+
+        blob = row[0]
+        if len(blob) % 4 != 0:
+            conn.execute("ROLLBACK")
+            return "failed"
+
+        n = len(blob) // 4
+        vec = list(struct.unpack(f"{n}f", blob))
+        norm = math.sqrt(sum(x * x for x in vec))
+
+        if abs(norm - 1.0) < 1e-6:
+            conn.execute("ROLLBACK")
+            return "skipped"
+
+        if norm == 0:
+            conn.execute("ROLLBACK")
+            return "failed"
+
+        normalized = [x / norm for x in vec]
+        new_blob = struct.pack(f"{n}f", *normalized)
+
+        conn.execute(
+            "UPDATE raw_events SET embedding = ? WHERE id = ?", (new_blob, event_id)
+        )
+
+        map_row = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if map_row:
+            conn.execute(
+                "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
+                (new_blob, map_row[0]),
+            )
+
+        conn.execute("COMMIT")
+        return "updated"
+    except Exception as e:
+        if conn and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        log.warning(f"renormalize_one_atomic failed for event {event_id}: {e}")
+        return "failed"
+    finally:
+        if conn:
+            conn.close()
+
+
 def renormalize_all_embeddings(batch: int = 500) -> dict:
     """一次性重新归一化所有已存 embedding。幂等，可中断后重跑。
 
-    逐行读取当前 blob → 归一化 → 仅在范数偏离 1.0 时才写回。
-    已归一化的行跳过（幂等）。写入走 _store_embedding（BEGIN IMMEDIATE
-    序列化），不会覆盖并发产生的新归一化 embedding。
+    每行在同一事务内读取当前 blob → 归一化 → 写回（原子操作，
+    不会覆盖并发产生的新 embedding）。
+    failed > 0 时不写完成 marker，下次调用会重试。
     """
     if _migration_applied(_MIGRATION_NAME):
-        return {"status": "already_applied", "renormalized": 0, "skipped": 0}
+        return {"status": "already_applied", "renormalized": 0, "skipped": 0, "failed": 0}
 
     conn = _connect()
     try:
@@ -642,18 +705,19 @@ def renormalize_all_embeddings(batch: int = 500) -> dict:
         ).fetchone()[0]
         if total == 0:
             _mark_migration(_MIGRATION_NAME)
-            return {"status": "done", "renormalized": 0, "skipped": 0, "total": 0}
+            return {"status": "done", "renormalized": 0, "skipped": 0, "failed": 0, "total": 0}
     finally:
         conn.close()
 
     updated = 0
     skipped = 0
+    failed = 0
     offset = 0
     while offset < total:
         conn = _connect()
         try:
             rows = conn.execute(
-                "SELECT id, embedding FROM raw_events "
+                "SELECT id FROM raw_events "
                 "WHERE embedding IS NOT NULL ORDER BY id LIMIT ? OFFSET ?",
                 (batch, offset),
             ).fetchall()
@@ -663,23 +727,34 @@ def renormalize_all_embeddings(batch: int = 500) -> dict:
         if not rows:
             break
 
-        for event_id, blob in rows:
-            if not blob or len(blob) % 4 != 0:
-                skipped += 1
-                continue
-            n = len(blob) // 4
-            vec = list(struct.unpack(f"{n}f", blob))
-            norm = math.sqrt(sum(x * x for x in vec))
-            if abs(norm - 1.0) < 1e-6:
-                skipped += 1
-                continue
-            if _store_embedding(event_id, vec):
+        for (event_id,) in rows:
+            try:
+                result = _renormalize_one_atomic(event_id)
+            except Exception as e:
+                log.warning(f"renormalize event {event_id} crashed: {e}")
+                result = "failed"
+            if result == "updated":
                 updated += 1
-            else:
+            elif result == "skipped":
                 skipped += 1
+            else:
+                failed += 1
 
         offset += len(rows)
 
+    if failed > 0:
+        log.warning(
+            f"renormalize_all_embeddings incomplete: {updated} updated, "
+            f"{failed} failed, {skipped} skipped — marker NOT written"
+        )
+        return {
+            "status": "incomplete", "renormalized": updated,
+            "skipped": skipped, "failed": failed, "total": total,
+        }
+
     _mark_migration(_MIGRATION_NAME)
     log.info(f"renormalize_all_embeddings: {updated} updated, {skipped} skipped, {total} total")
-    return {"status": "done", "renormalized": updated, "skipped": skipped, "total": total}
+    return {
+        "status": "done", "renormalized": updated,
+        "skipped": skipped, "failed": 0, "total": total,
+    }
