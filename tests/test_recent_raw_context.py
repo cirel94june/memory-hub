@@ -597,7 +597,7 @@ class TestRenormalizeMigration:
         assert r2["status"] == "already_applied"
 
     def test_already_normalized_skipped(self, raw_db):
-        """已归一化的向量应被跳过（不重写）。"""
+        """已归一化且 map+vec 完整的向量应被跳过（不重写）。"""
         vec = _fake_vec(0.7)
         blob = struct.pack(f"{EMBEDDING_DIM}f", *vec)
 
@@ -608,6 +608,22 @@ class TestRenormalizeMigration:
             "user_text, ai_text, created_at, embedding) VALUES "
             "('claude', '', '', 'private', 'test', 'reply', ?, ?)",
             (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+            (vec_rowid, blob),
         )
         conn.commit()
         conn.close()
@@ -787,3 +803,122 @@ class TestRenormalizeMigration:
         final_vec = struct.unpack(f"{EMBEDDING_DIM}f", final_blob)
         norm = math.sqrt(sum(x * x for x in final_vec))
         assert abs(norm - 1.0) < 1e-5, "final vector should be normalized"
+
+    def _insert_raw_only(self, raw_db, vec_val=3.0, normalized=False):
+        """Helper: insert raw_events row with embedding but NO map/vec rows."""
+        if normalized:
+            vec = _fake_vec(0.42)
+        else:
+            vec = [vec_val] * EMBEDDING_DIM
+        blob = struct.pack(f"{EMBEDDING_DIM}f", *vec)
+        conn = sqlite3.connect(str(raw_db))
+        ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+            "user_text, ai_text, created_at, embedding) VALUES "
+            "('claude', '', '', 'public_group', 'test', 'reply', ?, ?)",
+            (ts, blob),
+        )
+        event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        return event_id
+
+    def test_missing_map_repaired(self, raw_db):
+        """raw embedding 存在但 map 缺失 → 迁移应创建 map + vec。"""
+        event_id = self._insert_raw_only(raw_db)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1
+
+        conn = sqlite3.connect(str(raw_db))
+        map_row = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        assert map_row is not None, "map row should be created"
+
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (map_row[0],)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec row should be created"
+
+    def test_missing_vec_row_repaired(self, raw_db):
+        """map 存在但 vec 行缺失 → 迁移应创建 vec 行。"""
+        event_id = self._insert_raw_only(raw_db)
+
+        conn = sqlite3.connect(str(raw_db))
+        conn.execute("INSERT INTO raw_vec_id_map (event_id) VALUES (?)", (event_id,))
+        conn.commit()
+        conn.close()
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1
+
+        conn = sqlite3.connect(str(raw_db))
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()[0]
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (vec_rowid,)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec row should be created"
+
+    def test_normalized_but_missing_index_repaired(self, raw_db):
+        """embedding 已归一化但 vec 索引缺失 → 不能 skip，必须修复索引。"""
+        event_id = self._insert_raw_only(raw_db, normalized=True)
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            import raw_vault
+            result = raw_vault.renormalize_all_embeddings()
+
+        assert result["status"] == "done"
+        assert result["renormalized"] == 1, "should be 'updated' not 'skipped' when index missing"
+
+        conn = sqlite3.connect(str(raw_db))
+        map_row = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        assert map_row is not None
+
+        try:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception:
+            pass
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (map_row[0],)
+        ).fetchone()
+        conn.close()
+        assert vec_row is not None, "vec index must be created even for normalized vectors"
+
+        with patch("raw_vault.DB_PATH", raw_db):
+            query_vec = _fake_vec(0.42)
+            results = raw_vault.semantic_search(query_vec, ai_id="", days=7, limit=5)
+        assert any(r["id"] == event_id for r in results), \
+            "repaired record should be findable via semantic_search"

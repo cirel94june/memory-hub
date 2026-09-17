@@ -626,10 +626,11 @@ def _mark_migration(name: str):
 
 
 def _renormalize_one_atomic(event_id: int) -> str:
-    """在同一事务内读取当前 blob → 归一化 → 写回 raw + vec。
+    """在同一事务内确保 raw→map→vec 三者一致且已归一化。
 
     返回 "updated" / "skipped" / "failed"。
-    BEGIN IMMEDIATE 保证读写之间无并发覆盖。
+    即使 raw embedding 已归一化，也必须检查并修复缺失的 map/vec 行。
+    只有三者都一致时才返回 "skipped"。
     """
     conn = None
     try:
@@ -652,32 +653,49 @@ def _renormalize_one_atomic(event_id: int) -> str:
         vec = list(struct.unpack(f"{n}f", blob))
         norm = math.sqrt(sum(x * x for x in vec))
 
-        if abs(norm - 1.0) < 1e-6:
-            conn.execute("ROLLBACK")
-            return "skipped"
-
         if norm == 0:
             conn.execute("ROLLBACK")
             return "failed"
 
-        normalized = [x / norm for x in vec]
-        new_blob = struct.pack(f"{n}f", *normalized)
+        already_normalized = abs(norm - 1.0) < 1e-6
 
-        conn.execute(
-            "UPDATE raw_events SET embedding = ? WHERE id = ?", (new_blob, event_id)
-        )
-
-        map_row = conn.execute(
-            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        if map_row:
+        if already_normalized:
+            final_blob = blob
+        else:
+            normalized = [x / norm for x in vec]
+            final_blob = struct.pack(f"{n}f", *normalized)
             conn.execute(
-                "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
-                (new_blob, map_row[0]),
+                "UPDATE raw_events SET embedding = ? WHERE id = ?",
+                (final_blob, event_id),
             )
 
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_vec_id_map (event_id) VALUES (?)",
+            (event_id,),
+        )
+        vec_rowid = conn.execute(
+            "SELECT vec_rowid FROM raw_vec_id_map WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()[0]
+
+        vec_row = conn.execute(
+            "SELECT rowid FROM raw_events_vec WHERE rowid = ?", (vec_rowid,)
+        ).fetchone()
+        if vec_row:
+            if not already_normalized:
+                conn.execute(
+                    "UPDATE raw_events_vec SET embedding = ? WHERE rowid = ?",
+                    (final_blob, vec_rowid),
+                )
+        else:
+            conn.execute(
+                "INSERT INTO raw_events_vec (rowid, embedding) VALUES (?, ?)",
+                (vec_rowid, final_blob),
+            )
+            already_normalized = False
+
         conn.execute("COMMIT")
-        return "updated"
+        return "skipped" if already_normalized else "updated"
     except Exception as e:
         if conn and conn.in_transaction:
             conn.execute("ROLLBACK")
