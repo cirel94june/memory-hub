@@ -606,3 +606,84 @@ def test_import_skips_missing_subject(db, monkeypatch):
     assert len(remember_called) == 0
     assert len(result) == 1
     assert result[0]["status"] == "skipped_no_subject"
+
+
+# ── Layer 10: update_memory guardrail ──────────────────────────────────
+
+async def _fake_embed(*a, **kw):
+    return None
+
+
+def test_update_memory_blocks_hijacked_content(db, monkeypatch):
+    """update_memory(content=...) must run subject guardrail when the
+    memory has a stored subject_name. Outsider content → blocked."""
+    import memory_ops
+    import database as _db
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    # Create a memory with subject_name="cloudy"
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 喜欢画画",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+    ))
+    assert result["status"] == "created"
+    mem_id = result["id"]
+
+    # Try to update content to mention an outsider → should be blocked
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="师兄说他是 Gemini",
+        changed_by="jasper",
+    ))
+    assert update_result["status"] == "guardrail_blocked"
+
+    # Verify original content is preserved
+    mem = _db.get_memory(mem_id)
+    assert "Cloudy 喜欢画画" in mem["content"]
+
+
+def test_update_memory_allows_valid_content(db, monkeypatch):
+    """update_memory(content=...) must allow legitimate content updates
+    when the guardrail passes."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 喜欢画画",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="Cloudy 喜欢画画和弹钢琴",
+        changed_by="jasper",
+    ))
+    assert update_result["status"] == "updated"
+
+
+def test_update_memory_no_subject_skips_guardrail(db, monkeypatch):
+    """When the stored memory has no subject_name, update_memory should
+    skip the guardrail (backwards compat with old memories)."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="随便记点什么",
+        room="living_room",
+        source_ai="jasper",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="更新后的内容",
+        changed_by="jasper",
+    ))
+    assert update_result["status"] == "updated"

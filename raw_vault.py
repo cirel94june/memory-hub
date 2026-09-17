@@ -158,17 +158,26 @@ def _store_embedding(event_id: int, embedding: list[float]) -> bool:
 
 
 async def _async_embed_and_store(event_id: int, text: str):
-    """后台异步：算 embedding 并存储。"""
-    try:
-        from embedding import get_embedding
-        vec = await get_embedding(text)
-        if vec and len(vec) == EMBEDDING_DIM:
-            _store_embedding(event_id, vec)
-    except Exception as e:
-        log.debug(f"raw_vault async embed failed for event {event_id}: {e}")
+    """后台异步：算 embedding 并存储。受 Semaphore 限制最多 4 个并发。"""
+    async with _get_embed_semaphore():
+        try:
+            from embedding import get_embedding
+            vec = await get_embedding(text)
+            if vec and len(vec) == EMBEDDING_DIM:
+                _store_embedding(event_id, vec)
+        except Exception as e:
+            log.debug(f"raw_vault async embed failed for event {event_id}: {e}")
 
 
 _bg_tasks: set[asyncio.Task] = set()
+_embed_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_embed_semaphore() -> asyncio.Semaphore:
+    global _embed_semaphore
+    if _embed_semaphore is None:
+        _embed_semaphore = asyncio.Semaphore(4)
+    return _embed_semaphore
 
 
 def log_turn(user_message: str, ai_response: str, ai_id: str = "",

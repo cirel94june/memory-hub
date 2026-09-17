@@ -452,6 +452,8 @@ async def remember(
                     client_request_id=client_request_id,
                     override_id=mem_id, override_now=now,
                     origin="normal_create",
+                    subject_name=subject_name,
+                    speaker_name=speaker_name,
                 )
 
                 store.set_memory(mem)
@@ -495,6 +497,8 @@ async def remember(
         client_request_id=client_request_id,
         override_id=mem_id, override_now=now,
         origin="normal_create",
+        subject_name=subject_name,
+        speaker_name=speaker_name,
     )
 
     store.set_memory(mem)
@@ -1655,6 +1659,29 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
     mem["updated_at"] = now
 
     if content is not None and content != mem.get("content"):
+        stored_subject = mem.get("subject_name", "")
+        if stored_subject:
+            try:
+                import subject_guardrail
+                verdict = subject_guardrail.verify_subject_provenance(
+                    subject_name=stored_subject,
+                    speaker_name="",
+                    content=content,
+                )
+                if verdict.blocked:
+                    logger.info(
+                        "subject-guardrail blocked update_memory: reason=%s subject=%r id=%s",
+                        verdict.drop_reason, stored_subject, memory_id,
+                    )
+                    return {"id": memory_id, "status": "guardrail_blocked",
+                            "reason": verdict.drop_reason}
+            except ImportError:
+                logger.warning("subject_guardrail module not available — fail-closed")
+                return {"id": memory_id, "status": "guardrail_unavailable"}
+            except Exception:
+                logger.warning("subject_guardrail check failed — fail-closed", exc_info=True)
+                return {"id": memory_id, "status": "guardrail_unavailable"}
+
         mem["content"] = content
         vec = await get_embedding(content)
         if vec:

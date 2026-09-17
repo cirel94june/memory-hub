@@ -190,6 +190,9 @@ def build_new_memory_payload(
     supersedes=None,
     # embedding (opaque bytes; None ok)
     embedding=None,
+    # guardrail identity fields
+    subject_name: str = "",
+    speaker_name: str = "",
     # async / idempotency
     client_request_id: str = "",
     # injection hooks — pass override_id / override_now for full determinism
@@ -265,6 +268,9 @@ def build_new_memory_payload(
         "subject_id": subject_id,
         "source_actor_id": source_actor_id,
         "info_type": resolved_info_type,
+        # guardrail identity
+        "subject_name": subject_name,
+        "speaker_name": speaker_name,
         # async
         "client_request_id": client_request_id,
     }
