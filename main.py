@@ -2359,40 +2359,62 @@ async def spa_catchall(path: str = ""):
 
 # ── 启动 ──
 
+_CORS_HEADERS = [
+    (b"access-control-allow-origin", b"*"),
+    (b"access-control-allow-methods", b"POST, DELETE, OPTIONS"),
+    (b"access-control-allow-headers", b"content-type, authorization, mcp-session-id, accept"),
+    (b"access-control-expose-headers", b"mcp-session-id"),
+    (b"access-control-max-age", b"86400"),
+]
+
+
 class MCPGateway:
     """顶层 ASGI 应用：/mcp 走 MCP session manager，其他走 FastAPI。"""
     def __init__(self, fastapi_app):
         self.fastapi_app = fastapi_app
 
     async def _handle_mcp(self, scope, receive, send):
-        if _mcp_session_manager is None:
-            await send({"type": "http.response.start", "status": 503,
-                       "headers": [(b"content-type", b"text/plain")]})
-            await send({"type": "http.response.body", "body": b"MCP not initialized"})
+        method = scope.get("method", "GET").upper()
+
+        if method == "OPTIONS":
+            await send({"type": "http.response.start", "status": 204,
+                       "headers": _CORS_HEADERS})
+            await send({"type": "http.response.body", "body": b""})
             return
 
-        method = scope.get("method", "GET").upper()
+        if _mcp_session_manager is None:
+            await send({"type": "http.response.start", "status": 503,
+                       "headers": [(b"content-type", b"text/plain")] + _CORS_HEADERS})
+            await send({"type": "http.response.body", "body": b"MCP not initialized"})
+            return
 
         # stateless_http + json_response 模式下不需要 SSE 长连接
         # GET /mcp 是 SSE 端点，会无限阻塞事件循环，必须拒绝
         if method == "GET":
             await send({"type": "http.response.start", "status": 405,
                        "headers": [(b"content-type", b"text/plain"),
-                                   (b"allow", b"POST, DELETE")]})
+                                   (b"allow", b"POST, DELETE")] + _CORS_HEADERS})
             await send({"type": "http.response.body",
                        "body": b"SSE not supported. This server uses stateless HTTP (json_response)."})
             return
 
+        async def send_with_cors(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.extend(_CORS_HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)
+
         try:
             await asyncio.wait_for(
-                _mcp_session_manager.handle_request(scope, receive, send),
+                _mcp_session_manager.handle_request(scope, receive, send_with_cors),
                 timeout=120.0,
             )
         except asyncio.TimeoutError:
             logging.getLogger("mcp").error("MCP POST request timed out after 120s")
             try:
                 await send({"type": "http.response.start", "status": 504,
-                           "headers": [(b"content-type", b"text/plain")]})
+                           "headers": [(b"content-type", b"text/plain")] + _CORS_HEADERS})
                 await send({"type": "http.response.body", "body": b"MCP request timed out"})
             except Exception:
                 pass
@@ -2401,7 +2423,7 @@ class MCPGateway:
             traceback.print_exc()
             try:
                 await send({"type": "http.response.start", "status": 500,
-                           "headers": [(b"content-type", b"text/plain")]})
+                           "headers": [(b"content-type", b"text/plain")] + _CORS_HEADERS})
                 await send({"type": "http.response.body", "body": f"MCP Error: {e}".encode()})
             except Exception:
                 pass
