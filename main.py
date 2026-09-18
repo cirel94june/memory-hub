@@ -343,6 +343,12 @@ _mcp_session_manager = None
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# ── IB Mobile 前端 (/ib/) ──
+import os as _ib_os
+_IB_DIR = _ib_os.path.join(_ib_os.path.dirname(__file__), "ib")
+if _ib_os.path.isdir(_IB_DIR):
+    app.mount("/ib", StaticFiles(directory=_IB_DIR, html=True), name="ib")
+
 import os as _os
 _uploads_dir = _os.path.join(_os.path.dirname(__file__), "uploads")
 _os.makedirs(_uploads_dir, exist_ok=True)
@@ -2355,6 +2361,66 @@ async def spa_catchall(path: str = ""):
     if os.path.exists(spa_index):
         return FileResponse(spa_index, headers={"Cache-Control": "no-cache"})
     return JSONResponse({"error": "Frontend not built. Run: cd frontend && npm run build"}, status_code=404)
+
+
+# ── CORS 代理 (/cors-proxy/) ──
+# IB Mobile 浏览器前端连外部 MCP 时需要跨域中转
+# 用法：在 IB「跨域中转」栏填 http://172.245.180.158:8888/cors-proxy/?u=
+
+_PROXY_ALLOWED_SCHEMES = {"http", "https"}
+_PROXY_HOP_HEADERS = frozenset({
+    "host", "connection", "keep-alive", "transfer-encoding",
+    "te", "trailer", "upgrade", "proxy-authorization", "proxy-connection",
+})
+
+@app.api_route("/cors-proxy/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def cors_proxy(request: Request, u: str = Query(..., description="Target URL")):
+    from urllib.parse import urlparse
+    parsed = urlparse(u)
+    if parsed.scheme not in _PROXY_ALLOWED_SCHEMES or not parsed.hostname:
+        return JSONResponse({"error": "invalid target URL"}, status_code=400,
+                           headers={"access-control-allow-origin": "*"})
+    if parsed.hostname in ("127.0.0.1", "localhost", "0.0.0.0"):
+        return JSONResponse({"error": "localhost proxy forbidden"}, status_code=403,
+                           headers={"access-control-allow-origin": "*"})
+
+    if request.method == "OPTIONS":
+        return JSONResponse(None, status_code=204, headers={
+            "access-control-allow-origin": "*",
+            "access-control-allow-methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+            "access-control-allow-headers": "content-type, authorization, mcp-session-id, accept",
+            "access-control-expose-headers": "mcp-session-id",
+            "access-control-max-age": "86400",
+        })
+
+    fwd_headers = {}
+    for k, v in request.headers.items():
+        if k.lower() not in _PROXY_HOP_HEADERS and k.lower() != "origin":
+            fwd_headers[k] = v
+    fwd_headers["host"] = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+
+    body = await request.body()
+    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        try:
+            resp = await client.request(
+                method=request.method, url=u,
+                headers=fwd_headers, content=body,
+            )
+        except httpx.RequestError as exc:
+            return JSONResponse({"error": f"proxy upstream error: {exc}"}, status_code=502,
+                               headers={"access-control-allow-origin": "*"})
+
+    resp_headers = {
+        "access-control-allow-origin": "*",
+        "access-control-expose-headers": "mcp-session-id",
+    }
+    for k, v in resp.headers.items():
+        if k.lower() not in ("access-control-allow-origin", "access-control-expose-headers",
+                              "transfer-encoding", "connection", "content-encoding", "content-length"):
+            resp_headers[k] = v
+
+    from starlette.responses import Response
+    return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers)
 
 
 # ── 启动 ──
