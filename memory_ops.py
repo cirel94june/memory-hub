@@ -1654,7 +1654,8 @@ async def grow(
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
                         owner_ai: str = None, source_ai: str = None,
-                        layer: str = None, changed_by: str = "") -> dict:
+                        layer: str = None, changed_by: str = "",
+                        update_provenance: str = "") -> dict:
     mem = store.get_memory(memory_id)
     if not mem:
         return {"id": memory_id, "status": "not_found"}
@@ -1667,11 +1668,12 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
         if stored_subject:
             try:
                 import subject_guardrail
+                effective_provenance = update_provenance or mem.get("provenance_type", "")
                 verdict = subject_guardrail.verify_subject_provenance(
                     subject_name=stored_subject,
                     speaker_name=mem.get("speaker_name", ""),
                     content=content,
-                    provenance_type=mem.get("provenance_type", ""),
+                    provenance_type=effective_provenance,
                 )
                 if verdict.blocked:
                     logger.info(

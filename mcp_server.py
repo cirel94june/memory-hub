@@ -871,6 +871,7 @@ async def update_memory(
         room=room or None,
         tags=tags or None,
         changed_by="claude",
+        update_provenance="ai_summary",
     )
     return json.dumps(result, ensure_ascii=False)
 

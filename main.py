@@ -544,6 +544,7 @@ class UpdateRequest(BaseModel):
     source_ai: Optional[str] = None
     layer: Optional[str] = None
     changed_by: str = ""
+    update_provenance: str = ""
 
 @app.put("/api/memory/{memory_id}")
 async def api_update(memory_id: str, body: UpdateRequest, authorization: str = Header(default="")):
@@ -553,6 +554,7 @@ async def api_update(memory_id: str, body: UpdateRequest, authorization: str = H
         room=body.room, category=body.category, tags=body.tags,
         owner_ai=body.owner_ai, source_ai=body.source_ai,
         layer=body.layer, changed_by=body.changed_by,
+        update_provenance=body.update_provenance,
     )
     if not result.get("error"):
         asyncio.create_task(corridor.rebuild_all_corridors())

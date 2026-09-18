@@ -714,6 +714,56 @@ def test_update_memory_user_correction_allows_outsider_mention(db, monkeypatch):
     assert update_result["status"] == "updated"
 
 
+def test_update_ai_summary_with_user_correction_provenance_allows(db, monkeypatch):
+    """Codex反例: 原记忆是 ai_summary，用户通过 update_provenance=user_correction
+    纠正内容提到 outsider → 必须允许。"""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 的模型信息",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+        provenance_type="ai_summary",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="Cloudy 澄清：师兄是 Gemini，不是 Cloudy",
+        changed_by="ceci",
+        update_provenance="user_correction",
+    ))
+    assert update_result["status"] == "updated"
+
+
+def test_update_ai_summary_by_ai_still_blocked(db, monkeypatch):
+    """Codex反例: 原记忆是 ai_summary，AI 发起的更新（ai_summary provenance）
+    提到 outsider → 仍应拦截。"""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 的模型信息",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+        provenance_type="ai_summary",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="师兄说他是 Gemini",
+        changed_by="claude",
+        update_provenance="ai_summary",
+    ))
+    assert update_result["status"] == "guardrail_blocked"
+
+
 def test_quick_remember_persists_subject_name(db, monkeypatch):
     """H1: quick=True path must persist subject_name/speaker_name
     through the proposal system."""
