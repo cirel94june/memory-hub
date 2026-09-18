@@ -806,3 +806,69 @@ def test_promotion_preserves_subject_name(db, monkeypatch):
     mem = memory_payload.promotion_payload_from_proposal(proposal)
     assert mem["subject_name"] == "cloudy"
     assert mem["speaker_name"] == "ceci"
+
+
+def test_update_memory_rejects_unknown_provenance(db, monkeypatch):
+    """Codex H1 PR#39: unknown update_provenance values must be
+    rejected (fail-closed allowlist)."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 的日常",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+        provenance_type="ai_summary",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="师兄说他是 Gemini",
+        changed_by="claude",
+        update_provenance="admin_override",
+    ))
+    assert update_result["status"] == "invalid_provenance"
+
+
+def test_update_memory_accepts_valid_provenance_values(db, monkeypatch):
+    """Allowlist accepts all legitimate provenance values."""
+    import memory_ops
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    for prov in ("", "ai_summary", "user_correction"):
+        result = asyncio.run(memory_ops.remember(
+            content=f"Cloudy note {prov}",
+            room="living_room",
+            source_ai="jasper",
+            subject_name="cloudy",
+            speaker_name="ceci",
+            provenance_type="user_statement",
+        ))
+        update_result = asyncio.run(memory_ops.update_memory(
+            memory_id=result["id"],
+            content="Cloudy 今天吃了冰淇淋",
+            changed_by="claude",
+            update_provenance=prov,
+        ))
+        assert update_result["status"] != "invalid_provenance", f"prov={prov!r} rejected"
+
+
+def test_rest_update_request_has_no_provenance_field():
+    """Codex H1 PR#39: UpdateRequest must NOT expose
+    update_provenance to REST callers."""
+    import ast
+    main_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+    with open(main_path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "UpdateRequest":
+            field_names = [
+                stmt.target.id for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
+            assert "update_provenance" not in field_names
+            return
+    raise AssertionError("UpdateRequest class not found in main.py")

@@ -1651,11 +1651,19 @@ async def grow(
 
 # ── 更新记忆 ──
 
+_VALID_UPDATE_PROVENANCE = frozenset({
+    "", "ai_summary", "ai_speculation", "user_statement", "user_correction",
+})
+
 async def update_memory(memory_id: str, content: str = None, importance: float = None,
                         room: str = None, category: str = None, tags: list[str] = None,
                         owner_ai: str = None, source_ai: str = None,
                         layer: str = None, changed_by: str = "",
                         update_provenance: str = "") -> dict:
+    if update_provenance not in _VALID_UPDATE_PROVENANCE:
+        return {"id": memory_id, "status": "invalid_provenance",
+                "reason": f"unknown update_provenance: {update_provenance!r}"}
+
     mem = store.get_memory(memory_id)
     if not mem:
         return {"id": memory_id, "status": "not_found"}
