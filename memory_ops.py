@@ -332,6 +332,7 @@ async def remember(
             conversation_kind=conversation_kind, evidence_excerpt=evidence_excerpt,
             subject_id=subject_id, source_actor_id=source_actor_id,
             info_type=info_type,
+            subject_name=subject_name, speaker_name=speaker_name,
         )
 
     # Step 1: 自动打标
@@ -962,6 +963,7 @@ async def _create_proposal(
     evidence_excerpt: str,
     subject_id: str = "", source_actor_id: str = "",
     info_type: str = "",
+    subject_name: str = "", speaker_name: str = "",
 ) -> dict:
     if not provenance_type and "auto_capture" in (source_platform or ""):
         provenance_type = "ai_summary"
@@ -1001,6 +1003,8 @@ async def _create_proposal(
         "info_type": info_type or "fact",
         "maintenance_action": "",
         "maintenance_target_id": "",
+        "subject_name": subject_name,
+        "speaker_name": speaker_name,
         "created_at": now,
         "reviewed_at": "",
         "reviewed_by": "",
@@ -1665,8 +1669,9 @@ async def update_memory(memory_id: str, content: str = None, importance: float =
                 import subject_guardrail
                 verdict = subject_guardrail.verify_subject_provenance(
                     subject_name=stored_subject,
-                    speaker_name="",
+                    speaker_name=mem.get("speaker_name", ""),
                     content=content,
+                    provenance_type=mem.get("provenance_type", ""),
                 )
                 if verdict.blocked:
                     logger.info(

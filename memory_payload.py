@@ -335,6 +335,8 @@ def promotion_payload_from_proposal(
         override_now=proposal.get("created_at") or override_now,
         origin=origin,
         proposal_id=proposal["id"],
+        subject_name=proposal.get("subject_name", ""),
+        speaker_name=proposal.get("speaker_name", ""),
     )
 
 

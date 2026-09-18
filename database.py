@@ -540,6 +540,15 @@ async def init_db(db_path: str = None) -> None:
             conn.execute("ALTER TABLE proposals RENAME COLUMN source_speaker_id TO source_actor_id")
             logger.info("Migrated proposals: renamed 'source_speaker_id' → 'source_actor_id'")
 
+        # PR #38: subject_name / speaker_name for guardrail continuity
+        existing_after_v51 = {
+            row[1] for row in conn.execute("PRAGMA table_info(proposals)").fetchall()
+        }
+        for col in ("subject_name", "speaker_name"):
+            if col not in existing_after_v51:
+                conn.execute(f"ALTER TABLE proposals ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+                logger.info(f"Migrated proposals: added '{col}' column")
+
         # ── Maintenance Audit table ──
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS maintenance_audit (
@@ -1978,6 +1987,7 @@ _PROPOSAL_COLUMNS = [
     # new inserts explicitly write 2 via _prepare_new_proposal below.
     "promotion_claim_id", "promotion_claim_at",
     "promotion_protocol_version", "target_snapshot_json",
+    "subject_name", "speaker_name",
 ]
 
 # v5.1 protocol version for new proposals. Old rows stay at column default 0
