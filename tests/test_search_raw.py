@@ -238,10 +238,11 @@ class TestLikeWildcardEscape:
             assert len(hits) == 0
 
     def test_underscore_not_wildcard(self, test_db):
-        """query='_' must not match single-char patterns."""
+        """query='_' must match only literal underscores, not act as
+        a single-char wildcard."""
         with patch.object(raw_vault, "DB_PATH", test_db):
             hits = raw_vault.search("_")
-            assert len(hits) == 0
+            assert all("_" in (h["user_text"] + h["ai_text"]) for h in hits)
 
     def test_percent_in_real_text(self, tmp_path):
         """A row containing literal '%' can be found by searching '%'."""
