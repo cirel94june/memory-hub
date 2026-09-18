@@ -170,14 +170,21 @@ async def _async_embed_and_store(event_id: int, text: str):
 
 
 _bg_tasks: set[asyncio.Task] = set()
-_embed_semaphore: asyncio.Semaphore | None = None
+_embed_semaphores: dict[int, asyncio.Semaphore] = {}
 
 
 def _get_embed_semaphore() -> asyncio.Semaphore:
-    global _embed_semaphore
-    if _embed_semaphore is None:
-        _embed_semaphore = asyncio.Semaphore(4)
-    return _embed_semaphore
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _embed_semaphores.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(4)
+        _embed_semaphores[key] = sem
+    return sem
+
+
+def clear_embed_semaphores() -> None:
+    _embed_semaphores.clear()
 
 
 def log_turn(user_message: str, ai_response: str, ai_id: str = "",

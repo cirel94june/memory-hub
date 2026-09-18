@@ -687,3 +687,72 @@ def test_update_memory_no_subject_skips_guardrail(db, monkeypatch):
         changed_by="jasper",
     ))
     assert update_result["status"] == "updated"
+
+
+def test_update_memory_user_correction_allows_outsider_mention(db, monkeypatch):
+    """M2: update_memory with user_statement provenance must NOT block
+    content that mentions an outsider — it's a legitimate correction."""
+    import memory_ops
+    import database as _db
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 是 Claude 不是 Gemini",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+        provenance_type="user_statement",
+    ))
+    mem_id = result["id"]
+
+    update_result = asyncio.run(memory_ops.update_memory(
+        memory_id=mem_id,
+        content="Cloudy 澄清：师兄是 Gemini，不是 Cloudy",
+        changed_by="ceci",
+    ))
+    assert update_result["status"] == "updated"
+
+
+def test_quick_remember_persists_subject_name(db, monkeypatch):
+    """H1: quick=True path must persist subject_name/speaker_name
+    through the proposal system."""
+    import memory_ops
+    import database as _db
+    monkeypatch.setattr(memory_ops, "get_embedding", _fake_embed)
+
+    result = asyncio.run(memory_ops.remember(
+        content="Cloudy 今天很开心",
+        room="living_room",
+        source_ai="jasper",
+        subject_name="cloudy",
+        speaker_name="ceci",
+        quick=True,
+        source_platform="auto_capture:telegram:public_group",
+    ))
+    prop_id = result.get("id", "")
+    assert prop_id.startswith("prop_")
+
+    prop = _db.get_proposal(prop_id)
+    assert prop is not None
+    assert prop["subject_name"] == "cloudy"
+    assert prop["speaker_name"] == "ceci"
+
+
+def test_promotion_preserves_subject_name(db, monkeypatch):
+    """H1: promotion_payload_from_proposal must carry subject_name
+    into the final memory."""
+    import memory_payload
+    proposal = {
+        "id": "prop_test_123",
+        "content": "Cloudy 喜欢猫",
+        "subject_name": "cloudy",
+        "speaker_name": "ceci",
+        "proposed_room": "living_room",
+        "proposer_ai_id": "jasper",
+        "provenance_type": "user_statement",
+        "created_at": "2026-09-18T00:00:00",
+    }
+    mem = memory_payload.promotion_payload_from_proposal(proposal)
+    assert mem["subject_name"] == "cloudy"
+    assert mem["speaker_name"] == "ceci"
