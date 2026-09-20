@@ -315,16 +315,20 @@ async def log_conversation(
     _touch_pulse(user_message, ai_response, ai_id)
 
     # 原文保险箱：不加工的原始对话留档，记忆漂移时可以找回原话
+    raw_event_id = None
     try:
         import raw_vault
-        raw_vault.log_turn(user_message, ai_response, ai_id=ai_id,
-                           platform=platform, chat_id=chat_id, chat_type=chat_type,
-                           turn_id=turn_id,
-                           thread_id=thread_id, message_id=message_id,
-                           sender_id=sender_id, sender_type=sender_type,
-                           reply_to_id=reply_to_id)
+        raw_event_id = raw_vault.log_turn(
+            user_message, ai_response, ai_id=ai_id,
+            platform=platform, chat_id=chat_id, chat_type=chat_type,
+            turn_id=turn_id,
+            thread_id=thread_id, message_id=message_id,
+            sender_id=sender_id, sender_type=sender_type,
+            reply_to_id=reply_to_id)
     except Exception:
         pass
+    if raw_event_id is not None:
+        _conversation_buffers[key][-1]["raw_event_id"] = raw_event_id
 
     # 防止内存爆
     if len(_conversation_buffers[key]) > MAX_BUFFER_SIZE:
@@ -583,42 +587,16 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     else:
         logger.info(f"No memories worth keeping from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
 
-    # Mark corresponding raw_events as extracted — by ai_id+chat_id+timestamp
+    # Mark specific raw_events rows as extracted by ID
     try:
         import raw_vault
-        parts = buffer_key.split(":", 3)
-        bk_ai_id = parts[0] if len(parts) > 0 else ""
-        bk_chat_id = parts[2] if len(parts) > 2 else ""
-        if bk_chat_id and bk_ai_id:
-            last_ts = buffer[-1]["timestamp"] if buffer else ""
-            _mark_raw_events_done(bk_ai_id, bk_chat_id, last_ts)
+        raw_event_ids = [e.get("raw_event_id") for e in buffer if e.get("raw_event_id")]
+        if raw_event_ids:
+            raw_vault.mark_rows(raw_event_ids, raw_vault.EXTRACT_DONE)
     except Exception as e:
         logger.warning(f"Failed to mark raw_events as extracted: {e}")
 
     return memories
-
-
-def _mark_raw_events_done(ai_id: str, chat_id: str, up_to_timestamp: str):
-    """Mark pending raw_events for a specific ai_id+chat_id as extracted."""
-    import raw_vault
-    conn = raw_vault._connect()
-    try:
-        if up_to_timestamp:
-            conn.execute(
-                "UPDATE raw_events SET extract_status = ? "
-                "WHERE ai_id = ? AND chat_id = ? AND extract_status IN (0, 1) "
-                "AND created_at <= ?",
-                (raw_vault.EXTRACT_DONE, ai_id, chat_id, up_to_timestamp),
-            )
-        else:
-            conn.execute(
-                "UPDATE raw_events SET extract_status = ? "
-                "WHERE ai_id = ? AND chat_id = ? AND extract_status IN (0, 1)",
-                (raw_vault.EXTRACT_DONE, ai_id, chat_id),
-            )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 async def extract_from_messages(
@@ -775,31 +753,19 @@ def _get_recovery_lock():
     return _RECOVERY_LOCK
 
 
-def _check_batch_already_extracted(batch_id: str) -> bool:
-    """Check if memories with this batch_id already exist (idempotency guard)."""
-    try:
-        import database as _db
-        all_mems = _db.store.get_all_memories()
-        for mem in all_mems.values():
-            sp = mem.get("source_platform", "")
-            if batch_id in sp:
-                return True
-    except Exception:
-        pass
-    return False
-
-
 async def recover_unprocessed() -> dict:
     """Scan raw_events for unprocessed conversations and extract memories.
 
     Called on startup and periodically by the idle flush loop.
     Processes at most _RECOVERY_MAX_CHUNKS groups per call to avoid blocking.
 
-    Fixes applied:
-    - Empty LLM response (API failure) → failed, not done
-    - Only rows within char budget are marked done; overflow stays pending
-    - Groups by ai_id+chat_id+thread_id (private chat isolation)
-    - Idempotency: interrupted batches checked for existing memories
+    Both normal extraction and recovery share the same row-ID-based mechanism:
+    - Claim specific row IDs (mark processing)
+    - Only mark those exact IDs as done after success
+    - Overflow beyond char budget stays pending
+    - Failed rows retry with backoff (max 3 attempts)
+    - Idempotency for interrupted batches: re-extract safely because
+      remember() has built-in content dedup (vector similarity merge)
     """
     import raw_vault
     import memory_ops
@@ -823,19 +789,6 @@ async def recover_unprocessed() -> dict:
             chat_type = chunk["chat_type"] or "private"
             ai_id = chunk["ai_id"]
             platform = chunk["platform"]
-
-            # Idempotency: if interrupted rows have a batch_id and memories
-            # with that batch already exist, just mark done and skip
-            for old_batch in chunk.get("interrupted_batches", []):
-                if _check_batch_already_extracted(old_batch):
-                    raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, old_batch)
-                    results[chunk["key"]] = {
-                        "status": "already_extracted",
-                        "batch_id": old_batch,
-                    }
-                    break
-            if chunk["key"] in results:
-                continue
 
             batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
             raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_PROCESSING, batch_id)

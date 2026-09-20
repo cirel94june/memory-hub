@@ -47,7 +47,8 @@ def _make_db(tmp_path):
             sender_type TEXT NOT NULL DEFAULT '',
             reply_to_id TEXT NOT NULL DEFAULT '',
             extract_status INTEGER NOT NULL DEFAULT 0,
-            extract_batch TEXT NOT NULL DEFAULT ''
+            extract_batch TEXT NOT NULL DEFAULT '',
+            extract_retries INTEGER NOT NULL DEFAULT 0
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_extract ON raw_events(extract_status, created_at DESC)")
@@ -293,12 +294,11 @@ def test_count_by_status():
         assert counts["legacy"] == 3
 
 
-# ── 10. _mark_raw_events_done isolates by ai_id ──
+# ── 10. mark_rows only affects specified row IDs ──
 
-def test_extract_marks_raw_done_with_ai_isolation():
-    """_mark_raw_events_done must only mark rows for the specific ai_id."""
+def test_mark_rows_only_affects_specified_ids():
+    """mark_rows must only change the status of the given row IDs."""
     import raw_vault
-    from conversation_capture import _mark_raw_events_done
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_db(tmp)
         _seed(db, [
@@ -309,20 +309,22 @@ def test_extract_marks_raw_done_with_ai_isolation():
             {"ai_id": "cloudy", "chat_id": "200", "extract_status": 0,
              "created_at": "2026-09-20T01:00:00+00:00"},
         ])
+        conn = sqlite3.connect(db)
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        # Mark only the first row as done
         with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
-            _mark_raw_events_done("cloudy", "100", "2026-09-20T02:00:00+00:00")
+            raw_vault.mark_rows([all_ids[0]], raw_vault.EXTRACT_DONE)
 
         conn = sqlite3.connect(db)
         rows = conn.execute(
-            "SELECT ai_id, chat_id, extract_status FROM raw_events ORDER BY ai_id, chat_id"
+            "SELECT id, extract_status FROM raw_events ORDER BY id"
         ).fetchall()
         conn.close()
-        # cloudy:100 → done (2)
-        assert rows[0] == ("cloudy", "100", 2)
-        # cloudy:200 → still pending (0)
-        assert rows[1] == ("cloudy", "200", 0)
-        # lucien:100 → still pending (0) — not swept by cloudy's mark
-        assert rows[2] == ("lucien", "100", 0)
+        assert rows[0][1] == 2   # first row → done
+        assert rows[1][1] == 0   # second row → still pending
+        assert rows[2][1] == 0   # third row → still pending
 
 
 # ── 11a. LLM returns valid [] → done (nothing worth keeping) ──
@@ -425,10 +427,10 @@ def test_recovery_extracts_memories():
         assert counts.get(2, 0) == 1  # done
 
 
-# ── 13. recover_unprocessed is idempotent (no rows left after first run) ──
+# ── 13. recover_unprocessed is idempotent (done rows not re-processed) ──
 
-def test_recovery_idempotent():
-    """Running recovery twice doesn't reprocess already-done rows."""
+def test_recovery_idempotent_done_rows():
+    """Running recovery twice: first run marks done, second finds nothing."""
     import raw_vault
     from conversation_capture import recover_unprocessed
 
@@ -456,7 +458,37 @@ def test_recovery_idempotent():
         assert result2["status"] == "nothing_to_recover"
 
 
-# ── 14. Failed LLM marks rows as failed, not stuck ──
+# ── 13b. Interrupted rows are re-extracted (remember() handles dedup) ──
+
+def test_interrupted_rows_re_extracted():
+    """Rows stuck at status=1 must be re-extracted, not skipped."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    llm_called = []
+
+    async def mock_llm(*args, **kwargs):
+        llm_called.append(True)
+        return "[]"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "interrupted msg",
+             "extract_status": 1,  # was processing, got interrupted
+             "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm):
+            result = asyncio.run(recover_unprocessed())
+
+        assert len(llm_called) == 1, "interrupted rows must be re-extracted"
+        counts = _status_counts(db)
+        assert counts.get(2, 0) == 1  # now done
+
+
+# ── 14. Failed LLM marks rows as failed with retry increment ──
 
 def test_recovery_llm_failure_marks_failed():
     import raw_vault
@@ -480,6 +512,58 @@ def test_recovery_llm_failure_marks_failed():
         assert result["status"] == "recovered"
         counts = _status_counts(db)
         assert counts.get(3, 0) == 1  # failed
+
+        # Verify retry count incremented
+        conn = sqlite3.connect(db)
+        retries = conn.execute("SELECT extract_retries FROM raw_events").fetchone()[0]
+        conn.close()
+        assert retries == 1
+
+
+# ── 14b. Failed rows are retried (with backoff) ──
+
+def test_failed_rows_retried_after_backoff():
+    """Failed rows with retries < 3 should be picked up again."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Failed row from 1 hour ago (past 30min backoff)
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        _seed(db, [
+            {"chat_id": "100", "user_text": "retry me",
+             "extract_status": 3, "created_at": old_ts},
+        ])
+        # Set retries = 1 (under limit of 3)
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET extract_retries = 1")
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            chunks = raw_vault.get_unprocessed_chunks()
+        assert len(chunks) == 1, "failed row should be picked up for retry"
+
+
+# ── 14c. Failed rows exhausted retries are not picked up ──
+
+def test_exhausted_retries_excluded():
+    """Failed rows with retries >= 3 should NOT be picked up."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        _seed(db, [
+            {"chat_id": "100", "user_text": "give up",
+             "extract_status": 3, "created_at": old_ts},
+        ])
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET extract_retries = 3")
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            chunks = raw_vault.get_unprocessed_chunks()
+        assert len(chunks) == 0
 
 
 # ── 15. chunk_size limits rows per group ──
@@ -535,46 +619,9 @@ def test_overflow_rows_stay_pending():
         assert done + pending == 20
 
 
-# ── 17. Idempotency: crash after writing memory but before marking done ──
-
-def test_idempotency_crash_after_write():
-    """If memories were written with batch_id but rows still at status=1,
-    recovery must detect them and skip re-extraction."""
-    import raw_vault
-    from conversation_capture import recover_unprocessed, _check_batch_already_extracted
-
-    existing_batch = "recovery-abc123"
-
-    with tempfile.TemporaryDirectory() as tmp:
-        db = _make_db(tmp)
-        _seed(db, [
-            {"chat_id": "100", "user_text": "test msg", "ai_text": "reply",
-             "extract_status": 1,  # interrupted (processing)
-             "created_at": "2026-09-20T01:00:00+00:00"},
-        ])
-        # Set the batch_id on the interrupted row
-        conn = sqlite3.connect(db)
-        conn.execute("UPDATE raw_events SET extract_batch = ?", (existing_batch,))
-        conn.commit()
-        conn.close()
-
-        llm_called = []
-
-        async def mock_llm(*args, **kwargs):
-            llm_called.append(True)
-            return "[]"
-
-        # Mock _check_batch_already_extracted to return True (memory exists)
-        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
-             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
-             mock.patch("conversation_capture._check_batch_already_extracted",
-                        return_value=True):
-            result = asyncio.run(recover_unprocessed())
-
-        assert len(llm_called) == 0, "LLM should NOT be called for already-extracted batch"
-        counts = _status_counts(db)
-        assert counts.get(2, 0) == 1  # marked done
-        assert counts.get(1, 0) == 0  # no more processing
+# ── 17. (removed — old mock-based idempotency test) ──
+# Idempotency is now handled by remember()'s built-in vector similarity dedup.
+# Tests 13, 13b cover the row-level status tracking that prevents reprocessing.
 
 
 # ── 18. Recovery preserves original timestamps ──
@@ -622,3 +669,93 @@ def test_recovery_preserves_original_timestamps():
     assert len(remembered) == 1
     assert "2026-09-15" in remembered[0]["source_context"]
     assert remembered[0]["event_date"] == "2026-09-15"
+
+
+# ── 19. Normal extraction marks rows by specific IDs ──
+
+def test_normal_extraction_marks_by_row_id():
+    """_extract_and_remember must mark only the buffer's raw_event_ids as done,
+    not do a broad timestamp sweep."""
+    import raw_vault
+    from conversation_capture import (
+        _extract_and_remember,
+        _conversation_buffers,
+        _buffer_chat_types,
+    )
+
+    async def mock_llm(*args, **kwargs):
+        return "[]"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Seed two pending rows from same chat
+        _seed(db, [
+            {"chat_id": "100", "user_text": "msg1",
+             "extract_status": 0,
+             "created_at": "2026-09-20T01:00:00+00:00"},
+            {"chat_id": "100", "user_text": "msg2",
+             "extract_status": 0,
+             "created_at": "2026-09-20T01:01:00+00:00"},
+        ])
+
+        conn = sqlite3.connect(db)
+        row_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        # Build buffer with only first row's raw_event_id
+        key = "cloudy:100"
+        _conversation_buffers[key] = [
+            {"user": "msg1", "ai": "", "timestamp": "2026-09-20T01:00:00",
+             "ai_id": "cloudy", "raw_event_id": row_ids[0]},
+        ]
+        _buffer_chat_types[key] = "private"
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm):
+            asyncio.run(_extract_and_remember(key))
+
+        counts = _status_counts(db)
+        assert counts.get(2, 0) == 1, "only buffer row should be marked done"
+        assert counts.get(0, 0) == 1, "other row should stay pending"
+
+        # Clean up
+        _conversation_buffers.pop(key, None)
+        _buffer_chat_types.pop(key, None)
+
+
+# ── 20. Normal extraction and recovery don't conflict ──
+
+def test_normal_and_recovery_independent():
+    """If one chat is being normal-extracted, recovery should still pick up
+    a different chat's pending rows (they don't block each other)."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    recovered_chunks = []
+
+    async def mock_llm(*args, **kwargs):
+        return "[]"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Chat 100: already being processed (status=1) by normal extraction
+        # Chat 200: pending (status=0), should be picked up by recovery
+        _seed(db, [
+            {"chat_id": "100", "user_text": "normal path",
+             "extract_status": 1,
+             "created_at": "2026-09-20T01:00:00+00:00"},
+            {"chat_id": "200", "user_text": "recovery needed",
+             "extract_status": 0,
+             "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", return_value={"id": "x", "status": "created"}), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        counts = _status_counts(db)
+        # Both should end up as done (recovery processes both status=0 and status=1)
+        assert counts.get(2, 0) == 2

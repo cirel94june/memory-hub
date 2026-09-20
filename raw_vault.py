@@ -71,6 +71,8 @@ def _init_db():
             conn.execute("ALTER TABLE raw_events ADD COLUMN extract_status INTEGER NOT NULL DEFAULT 0")
         if "extract_batch" not in existing:
             conn.execute("ALTER TABLE raw_events ADD COLUMN extract_batch TEXT NOT NULL DEFAULT ''")
+        if "extract_retries" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_retries INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_window ON raw_events(chat_id, thread_id, created_at DESC)")
@@ -210,13 +212,14 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
              turn_id: str = "", *,
              thread_id: str = "", message_id: str = "",
              sender_id: str = "", sender_type: str = "",
-             reply_to_id: str = ""):
+             reply_to_id: str = "") -> int | None:
     """记录一轮原始对话。任何失败都不往外抛——保险箱故障不能影响聊天。
 
     去重：当 ai_id + chat_id + message_id 三元组重复时跳过插入（message_id 非空时）。
+    返回 event_id（成功）或 None（失败/去重跳过）。
     """
     if not (user_message or "").strip() and not (ai_response or "").strip():
-        return
+        return None
     try:
         conn = _connect()
         try:
@@ -235,7 +238,7 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
             )
         except sqlite3.IntegrityError:
             conn.close()
-            return
+            return None
         event_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -249,8 +252,10 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
                 task.add_done_callback(_bg_tasks.discard)
             except RuntimeError:
                 pass
+        return event_id
     except Exception as e:
         log.warning(f"raw_vault log failed: {e}")
+        return None
 
 
 _LIKE_ESCAPE_TABLE = str.maketrans({"%": "\\%", "_": "\\_", "\\": "\\\\"})
@@ -929,13 +934,21 @@ EXTRACT_FAILED = 3
 EXTRACT_LEGACY = -1
 
 
+_MAX_EXTRACT_RETRIES = 3
+_RETRY_BACKOFF_SECONDS = 1800  # 30 minutes
+
+
 def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[dict]:
     """Find unprocessed raw_events grouped by ai_id+chat_id+thread_id.
 
     Returns up to max_chunks groups, each with row IDs, chat metadata,
-    and formatted conversation text. Only status 0 (pending) and 1 (processing,
-    i.e. interrupted) are included. Private chats are isolated per ai_id.
+    and formatted conversation text. Includes:
+    - status 0 (pending)
+    - status 1 (processing/interrupted)
+    - status 3 (failed) with retries < 3 and 30min backoff
+    Private chats are isolated per ai_id.
     """
+    retry_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_RETRY_BACKOFF_SECONDS)).isoformat(timespec="seconds")
     conn = _connect()
     try:
         rows = conn.execute(
@@ -944,9 +957,10 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
             "extract_batch "
             "FROM raw_events "
             "WHERE extract_status IN (0, 1) "
+            "   OR (extract_status = 3 AND extract_retries < ? AND created_at < ?) "
             "ORDER BY created_at ASC "
             "LIMIT ?",
-            (max_chunks * chunk_size * 2,),
+            (_MAX_EXTRACT_RETRIES, retry_cutoff, max_chunks * chunk_size * 2),
         ).fetchall()
     finally:
         conn.close()
@@ -992,13 +1006,22 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
 
 
 def mark_rows(row_ids: list[int], status: int, batch_id: str = ""):
-    """Set extract_status (and optionally batch_id) on specific rows."""
+    """Set extract_status (and optionally batch_id) on specific rows.
+    Increments extract_retries when marking as failed (status=3).
+    """
     if not row_ids:
         return
     conn = _connect()
     try:
         placeholders = ",".join("?" for _ in row_ids)
-        if batch_id:
+        if status == EXTRACT_FAILED:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
+                f"extract_retries = extract_retries + 1 "
+                f"WHERE id IN ({placeholders})",
+                [status, batch_id or ""] + row_ids,
+            )
+        elif batch_id:
             conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ? "
                 f"WHERE id IN ({placeholders})",
