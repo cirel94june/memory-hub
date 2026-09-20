@@ -621,16 +621,17 @@ from resolve_patterns import (
 )
 
 
-# Recency boost coefficient (Phase 1.7 块 12).
-# 0.3 pushed irrelevant new memories to the front of recall; 0.15 preserves
-# a small recency signal without overwhelming semantic relevance.
-# New curve: 1 day → 1.145×, 30 days → 1.055×, 90 days → 1.007×.
+# Recency boost coefficient (Phase 1.7 块 12, tuned v2).
+# Old: coef=0.15, tau=30 — too weak, 1-day-old only 8.5% ahead of 30-day-old.
+# New: coef=0.25, tau=7 — strong for ≤7 days, negligible after 14 days.
+# Curve: 1 day → 1.217×, 3 days → 1.163×, 7 days → 1.092×, 30 days → 1.003×.
 # Adjust here and update test_recency_* thresholds if tuning further.
-_RECENCY_BOOST_COEF = 0.15
+_RECENCY_BOOST_COEF = 0.25
+_RECENCY_DECAY_DAYS = 7
 
 
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
-    """In-place: multiply score by (1 + _RECENCY_BOOST_COEF * exp(-days/30))
+    """In-place: multiply score by (1 + _RECENCY_BOOST_COEF * exp(-days/_RECENCY_DECAY_DAYS))
     using created_at.
 
     Future timestamps are clamped to days=0 to avoid runaway boosts.
@@ -643,7 +644,7 @@ def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
             days = max(0.0, (now_utc - created).total_seconds() / 86400)
-            boost = 1 + _RECENCY_BOOST_COEF * math.exp(-days / 30)
+            boost = 1 + _RECENCY_BOOST_COEF * math.exp(-days / _RECENCY_DECAY_DAYS)
         except Exception:
             boost = 1.0
         item["score"] = round(item.get("score", 0) * boost, 6)
