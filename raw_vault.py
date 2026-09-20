@@ -465,9 +465,10 @@ def get_window_context(
     finally:
         conn.close()
 
-    rows_desc.reverse()
-
-    turns = []
+    # rows_desc is newest-first from the query; iterate newest→oldest to
+    # keep the most recent turns within the char budget, then reverse to
+    # chronological order for the caller.
+    selected = []
     used_chars = 0
     result_truncated = False
     for row in rows_desc:
@@ -477,17 +478,20 @@ def get_window_context(
         turn_chars = user_len + ai_len
 
         if used_chars + turn_chars > max_chars:
-            if not turns:
+            if not selected:
                 row["user_text"] = (row.get("user_text") or "")[:max_chars // 2]
                 row["ai_text"] = (row.get("ai_text") or "")[:max_chars // 2]
                 row["truncated"] = True
-                turns.append(row)
+                selected.append(row)
                 result_truncated = True
             else:
                 result_truncated = True
             break
-        turns.append(row)
+        selected.append(row)
         used_chars += turn_chars
+
+    selected.reverse()
+    turns = selected
 
     return {
         "turns": turns,

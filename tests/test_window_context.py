@@ -164,13 +164,13 @@ def test_group_chat_no_ai_filter():
         assert result["count"] == 2
 
 
-# ── 7. 字符预算 ──
+# ── 7. 字符预算（优先保留最新） ──
 
-def test_char_budget_truncates():
+def test_char_budget_keeps_newest():
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_vault(tmp)
         _seed(db, [
-            {"chat_id": "100", "user_text": "a" * 500, "ai_text": "b" * 500,
+            {"chat_id": "100", "user_text": f"msg{i}", "ai_text": "a" * 500,
              "created_at": f"2026-09-20T0{i}:00:00+00:00"}
             for i in range(8)
         ])
@@ -179,6 +179,8 @@ def test_char_budget_truncates():
         assert result["count"] < 8
         total = sum(len(t["user_text"]) + len(t["ai_text"]) for t in result["turns"])
         assert total <= 2000
+        assert result["turns"][-1]["user_text"] == "msg7"
+        assert result["turns"][0]["created_at"] < result["turns"][-1]["created_at"]
 
 
 # ── 8. 单条超预算截断 ──
