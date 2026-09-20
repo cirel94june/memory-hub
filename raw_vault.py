@@ -64,8 +64,13 @@ def _init_db():
             conn.execute("ALTER TABLE raw_events ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
         if "embedding" not in existing:
             conn.execute("ALTER TABLE raw_events ADD COLUMN embedding BLOB")
+        for col in ("thread_id", "message_id", "sender_id", "sender_type", "reply_to_id"):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE raw_events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_window ON raw_events(chat_id, thread_id, created_at DESC)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_dedup ON raw_events(ai_id, chat_id, message_id) WHERE message_id != ''")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS raw_vec_id_map (
@@ -189,21 +194,35 @@ def clear_embed_semaphores() -> None:
 
 def log_turn(user_message: str, ai_response: str, ai_id: str = "",
              platform: str = "", chat_id: str = "", chat_type: str = "",
-             turn_id: str = ""):
-    """记录一轮原始对话。任何失败都不往外抛——保险箱故障不能影响聊天。"""
+             turn_id: str = "", *,
+             thread_id: str = "", message_id: str = "",
+             sender_id: str = "", sender_type: str = "",
+             reply_to_id: str = ""):
+    """记录一轮原始对话。任何失败都不往外抛——保险箱故障不能影响聊天。
+
+    去重：当 ai_id + chat_id + message_id 三元组重复时跳过插入（message_id 非空时）。
+    """
     if not (user_message or "").strip() and not (ai_response or "").strip():
         return
     try:
         conn = _connect()
-        cur = conn.execute(
-            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
-            "user_text, ai_text, created_at, turn_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ai_id, platform, str(chat_id), chat_type,
-             (user_message or "")[:4000], (ai_response or "")[:4000],
-             datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             turn_id or ""),
-        )
+        try:
+            cur = conn.execute(
+                "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, "
+                "user_text, ai_text, created_at, turn_id, "
+                "thread_id, message_id, sender_id, sender_type, reply_to_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ai_id, platform, str(chat_id), chat_type,
+                 (user_message or "")[:4000], (ai_response or "")[:4000],
+                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 turn_id or "",
+                 str(thread_id or ""), str(message_id or ""),
+                 str(sender_id or ""), str(sender_type or ""),
+                 str(reply_to_id or "")),
+            )
+        except sqlite3.IntegrityError:
+            conn.close()
+            return
         event_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -385,6 +404,99 @@ def get_recent_turns(ai_id: str, limit: int = 4) -> list[dict]:
                       "turn_id": r["turn_id"]})
     conn.close()
     return rows
+
+
+_WINDOW_SELECT = (
+    "id, ai_id, platform, chat_id, chat_type, user_text, ai_text, "
+    "created_at, turn_id, thread_id, message_id, sender_id, sender_type, reply_to_id"
+)
+
+
+def get_window_context(
+    ai_id: str,
+    chat_id: str,
+    thread_id: str = "",
+    max_turns: int = 10,
+    max_chars: int = 6000,
+) -> dict:
+    """按窗口恢复最近原始对话，用于 bot 重启后续聊。
+
+    隔离策略：
+    - 必须提供 chat_id（不允许退化为全窗口读取）
+    - 私聊额外按 ai_id 过滤
+    - thread_id 非空时精确匹配，空值只返回无话题的消息
+
+    返回 turns 按时间正序，每条包含完整消息内容。
+    总字符预算 max_chars：按完整轮次装入，装不下则停止。
+    单条超预算时截断并标记 truncated=true。
+    """
+    if not chat_id:
+        return {"error": "chat_id_required", "turns": [], "truncated": False}
+
+    max_turns = max(1, min(max_turns, 30))
+    max_chars = max(500, min(max_chars, 20000))
+
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        where = "chat_id = ? AND thread_id = ?"
+        params: list = [str(chat_id), str(thread_id or "")]
+
+        chat_type_row = conn.execute(
+            "SELECT chat_type FROM raw_events WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+            (str(chat_id),),
+        ).fetchone()
+        is_private = chat_type_row and (chat_type_row["chat_type"] or "") == "private"
+
+        if is_private:
+            if not ai_id:
+                return {"error": "ai_id_required_for_private", "turns": [], "truncated": False}
+            ai_ids = _resolve_ai_ids(ai_id)
+            ph = ",".join("?" for _ in ai_ids)
+            where += f" AND ai_id IN ({ph})"
+            params.extend(ai_ids)
+
+        cur = conn.execute(
+            f"SELECT {_WINDOW_SELECT} FROM raw_events "
+            f"WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            (*params, max_turns),
+        )
+        rows_desc = [dict(r) for r in cur]
+    finally:
+        conn.close()
+
+    rows_desc.reverse()
+
+    turns = []
+    used_chars = 0
+    result_truncated = False
+    for row in rows_desc:
+        row.pop("embedding", None)
+        user_len = len(row.get("user_text") or "")
+        ai_len = len(row.get("ai_text") or "")
+        turn_chars = user_len + ai_len
+
+        if used_chars + turn_chars > max_chars:
+            if not turns:
+                row["user_text"] = (row.get("user_text") or "")[:max_chars // 2]
+                row["ai_text"] = (row.get("ai_text") or "")[:max_chars // 2]
+                row["truncated"] = True
+                turns.append(row)
+                result_truncated = True
+            else:
+                result_truncated = True
+            break
+        turns.append(row)
+        used_chars += turn_chars
+
+    return {
+        "turns": turns,
+        "count": len(turns),
+        "total_available": len(rows_desc),
+        "truncated": result_truncated,
+        "chat_id": str(chat_id),
+        "thread_id": str(thread_id or ""),
+    }
 
 
 def stats(public_only: bool = False, ai_id: str = "") -> dict:

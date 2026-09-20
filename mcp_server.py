@@ -1212,6 +1212,42 @@ async def search_raw(query: str, limit: int = 5,
 
 
 @mcp.tool()
+async def window_context(
+    ai_id: str,
+    chat_id: str,
+    thread_id: str = "",
+    max_turns: int = 10,
+    max_chars: int = 6000,
+) -> str:
+    """恢复当前聊天窗口的最近原始对话——用于续聊。
+
+    bot 重启或本地历史丢失后，调用此工具恢复"刚才在聊什么"。
+    返回按时间正序的完整消息，包含发言人、消息 ID、引用关系。
+
+    隔离：私聊按 ai_id 过滤，群聊按 chat_id + thread_id 隔离。
+    不传 chat_id 会报错，不会退化为全窗口读取。
+
+    Args:
+        ai_id: 当前 bot 身份（cloudy / lucien / jasper）
+        chat_id: Telegram chat_id（必须）
+        thread_id: 话题 ID（有话题群时传，无话题留空）
+        max_turns: 最多返回轮数（默认 10，上限 30）
+        max_chars: 总字符预算（默认 6000，上限 20000）
+    """
+    import raw_vault
+    if not chat_id:
+        return json.dumps({"error": "chat_id_required"}, ensure_ascii=False)
+    result = raw_vault.get_window_context(
+        ai_id=ai_id,
+        chat_id=str(chat_id),
+        thread_id=str(thread_id or ""),
+        max_turns=max_turns,
+        max_chars=max_chars,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def recent_raw_context(
     query: str,
     days: int = 7,

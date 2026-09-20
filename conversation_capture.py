@@ -280,6 +280,11 @@ async def log_conversation(
     chat_id: str = "",
     chat_type: str = "private",
     turn_id: str = "",
+    thread_id: str = "",
+    message_id: str = "",
+    sender_id: str = "",
+    sender_type: str = "",
+    reply_to_id: str = "",
 ) -> dict:
     """记录一轮对话到缓冲区。如果缓冲区满了，自动触发总结。
 
@@ -314,7 +319,10 @@ async def log_conversation(
         import raw_vault
         raw_vault.log_turn(user_message, ai_response, ai_id=ai_id,
                            platform=platform, chat_id=chat_id, chat_type=chat_type,
-                           turn_id=turn_id)
+                           turn_id=turn_id,
+                           thread_id=thread_id, message_id=message_id,
+                           sender_id=sender_id, sender_type=sender_type,
+                           reply_to_id=reply_to_id)
     except Exception:
         pass
 
