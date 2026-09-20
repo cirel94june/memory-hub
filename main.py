@@ -788,6 +788,11 @@ class ConversationLogRequest(BaseModel):
     platform: str = ""
     chat_id: str = ""
     chat_type: str = "private"
+    thread_id: str = ""
+    message_id: str = ""
+    sender_id: str = ""
+    sender_type: str = ""
+    reply_to_id: str = ""
 
 @app.post("/api/capture/log")
 async def api_log_conversation(body: ConversationLogRequest, authorization: str = Header(default="")):
@@ -803,6 +808,11 @@ async def api_log_conversation(body: ConversationLogRequest, authorization: str 
         chat_id=body.chat_id,
         chat_type=body.chat_type,
         turn_id=turn_id,
+        thread_id=body.thread_id,
+        message_id=body.message_id,
+        sender_id=body.sender_id,
+        sender_type=body.sender_type,
+        reply_to_id=body.reply_to_id,
     )
     if body.chat_id:
         try:
@@ -862,6 +872,35 @@ async def api_capture_status(authorization: str = Header(default="")):
     """查看对话缓冲区状态"""
     verify_secret(authorization)
     return await conversation_capture.get_buffer_status()
+
+
+# ── 窗口续聊 ──
+
+class WindowContextRequest(BaseModel):
+    ai_id: str
+    chat_id: str
+    thread_id: str = ""
+    max_turns: int = 10
+    max_chars: int = 6000
+
+@app.post("/api/window/context")
+async def api_window_context(body: WindowContextRequest, authorization: str = Header(default="")):
+    """按窗口恢复最近原始对话，用于 bot 重启后续聊。
+
+    必须传 chat_id，否则返回 400。
+    私聊额外按 ai_id 隔离，群聊按 chat_id + thread_id 隔离。
+    """
+    verify_secret(authorization)
+    if not body.chat_id:
+        return JSONResponse({"error": "chat_id_required"}, status_code=400)
+    import raw_vault
+    return raw_vault.get_window_context(
+        ai_id=body.ai_id,
+        chat_id=body.chat_id,
+        thread_id=body.thread_id,
+        max_turns=body.max_turns,
+        max_chars=body.max_chars,
+    )
 
 
 # ── Daemon 操作 ──
