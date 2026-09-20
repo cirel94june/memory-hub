@@ -108,6 +108,9 @@ async def lifespan(app: FastAPI):
         idle_flush_task = asyncio.create_task(_idle_flush_loop())
         print("[Memory Hub] Idle flush loop started (every 5min, timeout 15min)")
 
+        asyncio.create_task(_startup_recovery())
+        print("[Memory Hub] Extraction recovery scheduled")
+
         from ai_profiles import load_profiles
         await load_profiles()
         from image_gen import load_config as load_image_config
@@ -194,10 +197,23 @@ def _seconds_until_next_run() -> int:
 _IDLE_FLUSH_INTERVAL = 300  # 每 5 分钟扫一次
 
 
+async def _startup_recovery():
+    """On startup, recover unprocessed raw_events that were lost when Hub restarted."""
+    log = logging.getLogger("recovery")
+    await asyncio.sleep(30)
+    try:
+        from conversation_capture import recover_unprocessed
+        result = await recover_unprocessed()
+        log.info(f"Startup recovery: {result}")
+    except Exception as e:
+        log.warning(f"Startup recovery failed: {e}")
+
+
 async def _idle_flush_loop():
     """定期扫描 conversation_capture 缓冲区，对超时闲置的 buffer 自动提取。"""
     log = logging.getLogger("idle_flush")
     await asyncio.sleep(60)
+    cycle = 0
     while True:
         try:
             from conversation_capture import idle_flush
@@ -206,6 +222,15 @@ async def _idle_flush_loop():
                 log.info(f"Idle flush: {len(result)} buffers extracted")
         except Exception as e:
             log.warning(f"Idle flush failed: {e}")
+        cycle += 1
+        if cycle % 3 == 0:
+            try:
+                from conversation_capture import recover_unprocessed
+                result = await recover_unprocessed()
+                if result.get("chunks", 0) > 0:
+                    log.info(f"Periodic recovery: {result}")
+            except Exception as e:
+                log.warning(f"Periodic recovery failed: {e}")
         await asyncio.sleep(_IDLE_FLUSH_INTERVAL)
 
 

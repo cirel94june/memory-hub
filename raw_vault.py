@@ -67,10 +67,15 @@ def _init_db():
         for col in ("thread_id", "message_id", "sender_id", "sender_type", "reply_to_id"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE raw_events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        if "extract_status" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_status INTEGER NOT NULL DEFAULT 0")
+        if "extract_batch" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_batch TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_window ON raw_events(chat_id, thread_id, created_at DESC)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_dedup ON raw_events(ai_id, chat_id, message_id) WHERE message_id != ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_extract ON raw_events(extract_status, created_at DESC)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS raw_vec_id_map (
@@ -84,6 +89,14 @@ def _init_db():
                 applied_at TEXT NOT NULL
             )
         """)
+
+        # Migration: mark old rows as legacy (-1) so recovery only processes recent ones
+        applied = {r[0] for r in conn.execute("SELECT name FROM _migrations").fetchall()}
+        if "extract_status_backfill" not in applied:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
+            conn.execute("UPDATE raw_events SET extract_status = -1 WHERE extract_status = 0 AND created_at < ?", (cutoff,))
+            conn.execute("INSERT OR IGNORE INTO _migrations (name, applied_at) VALUES ('extract_status_backfill', ?)",
+                         (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
         conn.execute("COMMIT")
 
         try:
@@ -903,3 +916,105 @@ def renormalize_all_embeddings(batch: int = 500) -> dict:
         "status": "done", "renormalized": updated,
         "skipped": skipped, "failed": 0, "total": total,
     }
+
+
+# ════════════════════════════════════════════
+#  Extraction status tracking
+# ════════════════════════════════════════════
+# extract_status: -1=legacy(skip), 0=pending, 1=processing, 2=done, 3=failed
+EXTRACT_PENDING = 0
+EXTRACT_PROCESSING = 1
+EXTRACT_DONE = 2
+EXTRACT_FAILED = 3
+EXTRACT_LEGACY = -1
+
+
+def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[dict]:
+    """Find unprocessed raw_events grouped by chat_id+thread_id.
+
+    Returns up to max_chunks groups, each with row IDs, chat metadata,
+    and formatted conversation text. Only status 0 (pending) and 1 (processing,
+    i.e. interrupted) are included.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, ai_id, platform, chat_id, chat_type, user_text, ai_text, "
+            "created_at, thread_id, sender_id, sender_type, extract_status "
+            "FROM raw_events "
+            "WHERE extract_status IN (0, 1) "
+            "ORDER BY created_at ASC "
+            "LIMIT ?",
+            (max_chunks * chunk_size * 2,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        key = f"{row[3]}:{row[8]}"  # chat_id:thread_id
+        if key not in groups:
+            groups[key] = []
+        groups[key].append({
+            "id": row[0], "ai_id": row[1], "platform": row[2],
+            "chat_id": row[3], "chat_type": row[4],
+            "user_text": row[5], "ai_text": row[6],
+            "created_at": row[7], "thread_id": row[8],
+            "sender_id": row[9], "sender_type": row[10],
+            "extract_status": row[11],
+        })
+
+    chunks = []
+    for key, events in list(groups.items())[:max_chunks]:
+        events_to_process = events[:chunk_size]
+        remaining = events[chunk_size:]
+        ai_id = events_to_process[0]["ai_id"] or "claude"
+        chunks.append({
+            "key": key,
+            "chat_id": events_to_process[0]["chat_id"],
+            "thread_id": events_to_process[0]["thread_id"],
+            "chat_type": events_to_process[0]["chat_type"],
+            "ai_id": ai_id,
+            "platform": events_to_process[0]["platform"],
+            "row_ids": [e["id"] for e in events_to_process],
+            "events": events_to_process,
+            "remaining_count": len(remaining),
+        })
+    return chunks
+
+
+def mark_rows(row_ids: list[int], status: int, batch_id: str = ""):
+    """Set extract_status (and optionally batch_id) on specific rows."""
+    if not row_ids:
+        return
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" for _ in row_ids)
+        if batch_id:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ?, extract_batch = ? "
+                f"WHERE id IN ({placeholders})",
+                [status, batch_id] + row_ids,
+            )
+        else:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ? "
+                f"WHERE id IN ({placeholders})",
+                [status] + row_ids,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_by_status() -> dict[str, int]:
+    """Return counts of rows per extract_status for diagnostics."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT extract_status, COUNT(*) FROM raw_events GROUP BY extract_status"
+        ).fetchall()
+    finally:
+        conn.close()
+    labels = {-1: "legacy", 0: "pending", 1: "processing", 2: "done", 3: "failed"}
+    return {labels.get(s, f"unknown_{s}"): c for s, c in rows}

@@ -583,7 +583,41 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     else:
         logger.info(f"No memories worth keeping from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
 
+    # Mark corresponding raw_events as extracted
+    try:
+        import raw_vault
+        parts = buffer_key.split(":", 3)
+        bk_ai_id = parts[0] if len(parts) > 0 else ""
+        bk_chat_id = parts[2] if len(parts) > 2 else ""
+        if bk_chat_id:
+            last_ts = buffer[-1]["timestamp"] if buffer else ""
+            _mark_raw_events_done(bk_chat_id, last_ts)
+    except Exception as e:
+        logger.warning(f"Failed to mark raw_events as extracted: {e}")
+
     return memories
+
+
+def _mark_raw_events_done(chat_id: str, up_to_timestamp: str):
+    """Mark pending raw_events for a chat as extracted (status=2)."""
+    import raw_vault
+    conn = raw_vault._connect()
+    try:
+        if up_to_timestamp:
+            conn.execute(
+                "UPDATE raw_events SET extract_status = ? "
+                "WHERE chat_id = ? AND extract_status IN (0, 1) AND created_at <= ?",
+                (raw_vault.EXTRACT_DONE, chat_id, up_to_timestamp),
+            )
+        else:
+            conn.execute(
+                "UPDATE raw_events SET extract_status = ? "
+                "WHERE chat_id = ? AND extract_status IN (0, 1)",
+                (raw_vault.EXTRACT_DONE, chat_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def extract_from_messages(
@@ -727,4 +761,216 @@ async def idle_flush() -> dict:
         except Exception as e:
             logger.warning(f"[IdleFlush] {key} failed: {e}")
     return flushed
+
+
+_RECOVERY_MAX_CHUNKS = 2
+_RECOVERY_LOCK = None
+
+
+def _get_recovery_lock():
+    global _RECOVERY_LOCK
+    if _RECOVERY_LOCK is None:
+        _RECOVERY_LOCK = asyncio.Lock()
+    return _RECOVERY_LOCK
+
+
+async def recover_unprocessed() -> dict:
+    """Scan raw_events for unprocessed conversations and extract memories.
+
+    Called on startup and periodically by the idle flush loop.
+    Processes at most _RECOVERY_MAX_CHUNKS groups per call to avoid blocking.
+    Idempotent: uses batch_id to detect already-processed chunks.
+    """
+    import raw_vault
+    import memory_ops
+    import uuid
+
+    lock = _get_recovery_lock()
+    if lock.locked():
+        return {"status": "already_running"}
+
+    async with lock:
+        chunks = raw_vault.get_unprocessed_chunks(
+            max_chunks=_RECOVERY_MAX_CHUNKS,
+            chunk_size=CHUNK_SIZES.get("private", 30),
+        )
+        if not chunks:
+            return {"status": "nothing_to_recover", "chunks": 0}
+
+        results = {}
+        for chunk in chunks:
+            batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
+            row_ids = chunk["row_ids"]
+            chat_type = chunk["chat_type"] or "private"
+            ai_id = chunk["ai_id"]
+            platform = chunk["platform"]
+
+            raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_PROCESSING, batch_id)
+
+            # Build conversation text from raw_events (same format as _extract_and_remember)
+            lines = []
+            char_budget = 5500
+            is_group = chat_type in ("private_group", "public_group")
+            for event in chunk["events"]:
+                user_short = (event["user_text"] or "")[:200]
+                ai_short = (event["ai_text"] or "")[:200]
+                ts = (event["created_at"] or "")[:16]
+                entry_ai = event.get("ai_id", "AI")
+                if not user_short and not ai_short:
+                    continue
+                if is_group:
+                    if ai_short:
+                        line = f"[{ts}] {user_short}\n  → {entry_ai}: {ai_short}"
+                    else:
+                        line = f"[{ts}] {user_short}"
+                else:
+                    if ai_short:
+                        line = f"[{ts}] ceci: {user_short} | {entry_ai}: {ai_short}"
+                    else:
+                        line = f"[{ts}] ceci: {user_short}"
+                if sum(len(l) for l in lines) + len(line) > char_budget:
+                    break
+                lines.append(line)
+
+            if not lines:
+                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
+                results[chunk["key"]] = {"status": "empty", "batch_id": batch_id}
+                continue
+
+            conversation_text = "\n".join(lines)
+            today = local_today()
+            context_label = {"private": "私聊", "private_group": "私密小群",
+                             "public_group": "公开大群"}.get(chat_type, "对话")
+            prompt = (f"今天日期：{today}\n来源：{context_label}（补提取），"
+                      f"共{len(chunk['events'])}条消息（展示了{len(lines)}条）：\n\n{conversation_text}")
+
+            extract_prompt = _get_extract_prompt(chat_type)
+
+            try:
+                raw = await _call_llm(extract_prompt + "\n\n" + prompt)
+            except Exception as e:
+                logger.warning(f"[Recovery] LLM call failed for {chunk['key']}: {e}")
+                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                results[chunk["key"]] = {"status": "llm_failed", "batch_id": batch_id}
+                continue
+
+            if not raw:
+                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
+                results[chunk["key"]] = {"status": "no_content", "batch_id": batch_id}
+                continue
+
+            try:
+                raw = raw.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+                items = json.loads(raw)
+                if not isinstance(items, list):
+                    items = []
+            except Exception:
+                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                results[chunk["key"]] = {"status": "parse_failed", "batch_id": batch_id}
+                continue
+
+            max_items = {"private": 5, "private_group": 6, "public_group": 2}.get(chat_type, 8)
+            memories = []
+            valid_about = {"user", "interaction", "ai"}
+            source_ctx = conversation_text[:1500]
+            is_private_memory = chat_type == "private"
+
+            for item in items[:max_items]:
+                content = str(item.get("content", "")).strip()
+                if not content or len(content) < 10:
+                    continue
+                raw_importance = float(item.get("importance", 0.5))
+                if raw_importance < 0.5:
+                    continue
+
+                about = item.get("about", "user")
+                if about not in valid_about:
+                    about = "user"
+                if about == "user" and not content.startswith("[用户]"):
+                    content = f"[用户] {content}"
+                elif about == "interaction" and not content.startswith("[互动]"):
+                    content = f"[互动] {content}"
+                elif about == "ai" and not content.startswith("[AI]"):
+                    content = f"[AI] {content}"
+
+                valid_prov = {"user_statement", "user_correction", "user_quote",
+                              "ai_summary", "ai_speculation", "roleplay_meme"}
+                provenance = item.get("provenance", "")
+                if provenance not in valid_prov:
+                    provenance = ""
+                if provenance == "roleplay_meme":
+                    raw_importance = min(raw_importance, 0.55)
+
+                subj_name = item.get("subject_name", "")
+                spkr_name = item.get("speaker_name", "")
+                subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
+                source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+
+                verdict = _guardrail_check_and_audit(
+                    item=item, subj_name=subj_name, subject_id=subject_id,
+                    spkr_name=spkr_name, content=content, provenance=provenance,
+                    source_ctx=source_ctx,
+                    source_platform=f"recovery:{platform}:{chat_type}",
+                    proposer_ai_id=ai_id,
+                )
+                if verdict is not None and verdict.blocked:
+                    continue
+
+                if provenance == "user_correction":
+                    result = await memory_ops.apply_user_correction(
+                        corrected_value=content,
+                        old_value=str(item.get("corrects_old_value", "")).strip(),
+                        source_ai=ai_id,
+                        room=item.get("room", "living_room"),
+                        source_context=source_ctx,
+                        layer="private" if is_private_memory else "shared",
+                        owner_ai=ai_id if is_private_memory else "",
+                    )
+                    memories.append(result)
+                    continue
+
+                result = await memory_ops.remember(
+                    content=content,
+                    layer="private" if is_private_memory else "shared",
+                    room=item.get("room", "living_room"),
+                    owner_ai=ai_id if is_private_memory else "",
+                    importance=max(0.4, min(1.0, raw_importance)),
+                    event_date=item.get("event_date", ""),
+                    source_ai=ai_id,
+                    source_platform=f"recovery:{platform}:{chat_type}",
+                    source_context=source_ctx,
+                    auto_analyze=False,
+                    quick=True,
+                    provenance_type=provenance,
+                    claim_type=item.get("claim_type", ""),
+                    speech_mode=item.get("speech_mode", ""),
+                    subject_id=subject_id,
+                    source_actor_id=source_actor_id,
+                    info_type=item.get("info_type", ""),
+                    subject_name=subj_name,
+                    speaker_name=spkr_name,
+                )
+                memories.append(result)
+
+                if item.get("resolved") == False:
+                    mem_id = result.get("id")
+                    if mem_id:
+                        await memory_ops.resolve_memory(mem_id, resolved=False)
+
+            raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
+
+            if memories:
+                logger.info(f"[Recovery] Extracted {len(memories)} memories from {chunk['key']} (batch={batch_id})")
+            else:
+                logger.info(f"[Recovery] No memories from {chunk['key']} (batch={batch_id})")
+
+            results[chunk["key"]] = {
+                "status": "extracted",
+                "batch_id": batch_id,
+                "memory_count": len(memories),
+            }
+
+        return {"status": "recovered", "chunks": len(results), "details": results}
 
