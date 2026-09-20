@@ -196,18 +196,17 @@ class TestBlock2RecencyBoost:
         _apply_recency_boost([item], now_utc=now)
         return item["score"]
 
-    # PR C 块 12: coefficient tightened from 0.3 → 0.15 to stop irrelevant new
-    # memories from dominating recall. New curve: 1 day ≈ 1.145, 30 days ≈ 1.055,
-    # 90 days ≈ 1.007.
+    # Recency boost v2: coef=0.25, tau=7.
+    # Curve: 1 day ≈ 1.217, 3 days ≈ 1.163, 7 days ≈ 1.092, 30 days ≈ 1.003.
 
     def test_recency_1_day(self):
-        assert 1.14 < self._boost(1) < 1.15
+        assert 1.21 < self._boost(1) < 1.23
 
     def test_recency_30_days(self):
-        assert 1.05 < self._boost(30) < 1.06
+        assert 1.00 < self._boost(30) < 1.01
 
     def test_recency_90_days(self):
-        assert 1.005 < self._boost(90) < 1.010
+        assert 1.000 < self._boost(90) < 1.001
 
     def test_recency_future_timestamp_clamped(self):
         """Future timestamps must not exceed the max boost (days clamped to 0)."""
@@ -229,12 +228,13 @@ class TestBlock2RecencyBoost:
         now = datetime(2026, 8, 11, tzinfo=timezone.utc)
         item = {"score": 1.0, "created_at": "2026-07-11T00:00:00"}
         _apply_recency_boost([item], now_utc=now)
-        assert 1.05 < item["score"] < 1.06
+        assert 1.00 < item["score"] < 1.01
 
     def test_recency_coefficient_is_module_constant(self):
-        """块 12 抽出的常量必须存在且为 0.15；改动它前请更新上面的曲线断言。"""
-        from memory_ops import _RECENCY_BOOST_COEF
-        assert _RECENCY_BOOST_COEF == 0.15
+        """v2 常量：coef=0.25, tau=7；改动前请更新上面的曲线断言。"""
+        from memory_ops import _RECENCY_BOOST_COEF, _RECENCY_DECAY_DAYS
+        assert _RECENCY_BOOST_COEF == 0.25
+        assert _RECENCY_DECAY_DAYS == 7
 
 
 # ════════════════════════════════════════════
