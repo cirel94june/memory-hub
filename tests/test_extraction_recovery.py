@@ -48,7 +48,8 @@ def _make_db(tmp_path):
             reply_to_id TEXT NOT NULL DEFAULT '',
             extract_status INTEGER NOT NULL DEFAULT 0,
             extract_batch TEXT NOT NULL DEFAULT '',
-            extract_retries INTEGER NOT NULL DEFAULT 0
+            extract_retries INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT NOT NULL DEFAULT ''
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_extract ON raw_events(extract_status, created_at DESC)")
@@ -56,6 +57,16 @@ def _make_db(tmp_path):
         CREATE TABLE IF NOT EXISTS _migrations (
             name TEXT PRIMARY KEY,
             applied_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS extract_batches (
+            batch_id TEXT PRIMARY KEY,
+            row_ids TEXT NOT NULL DEFAULT '[]',
+            llm_result TEXT,
+            items_written INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'processing'
         )
     """)
     conn.commit()
@@ -221,15 +232,43 @@ def test_legacy_rows_excluded():
 # ── 7. Processing (interrupted) rows are included ──
 
 def test_interrupted_processing_rows_included():
+    """Status=1 rows with stale last_attempt_at are picked up by recovery."""
     import raw_vault
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_db(tmp)
         _seed(db, [
             {"chat_id": "100", "user_text": "interrupted", "extract_status": 1},
         ])
+        # Set stale last_attempt_at (>5min ago)
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?", (stale,))
+        conn.commit()
+        conn.close()
+
         with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
             chunks = raw_vault.get_unprocessed_chunks()
         assert len(chunks) == 1
+
+
+def test_recent_processing_rows_excluded():
+    """Status=1 rows with recent last_attempt_at (active claim) are NOT picked up."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "being processed now", "extract_status": 1},
+        ])
+        # last_attempt_at is recent (1 min ago, within 5min claim window)
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?", (recent,))
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            chunks = raw_vault.get_unprocessed_chunks()
+        assert len(chunks) == 0, "actively processing rows should not be picked up"
 
 
 # ── 8. Migration marks old rows as legacy ──
@@ -461,7 +500,7 @@ def test_recovery_idempotent_done_rows():
 # ── 13b. Interrupted rows are re-extracted (remember() handles dedup) ──
 
 def test_interrupted_rows_re_extracted():
-    """Rows stuck at status=1 must be re-extracted, not skipped."""
+    """Rows stuck at status=1 with stale claim must be re-extracted."""
     import raw_vault
     from conversation_capture import recover_unprocessed
 
@@ -475,9 +514,15 @@ def test_interrupted_rows_re_extracted():
         db = _make_db(tmp)
         _seed(db, [
             {"chat_id": "100", "user_text": "interrupted msg",
-             "extract_status": 1,  # was processing, got interrupted
+             "extract_status": 1,
              "created_at": "2026-09-20T01:00:00+00:00"},
         ])
+        # last_attempt_at was 10 min ago (past 5min stale claim timeout)
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?", (stale,))
+        conn.commit()
+        conn.close()
 
         with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
              mock.patch("conversation_capture._call_llm", side_effect=mock_llm):
@@ -523,19 +568,18 @@ def test_recovery_llm_failure_marks_failed():
 # ── 14b. Failed rows are retried (with backoff) ──
 
 def test_failed_rows_retried_after_backoff():
-    """Failed rows with retries < 3 should be picked up again."""
+    """Failed rows with retries < 3 should be picked up after 30min backoff from last_attempt_at."""
     import raw_vault
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_db(tmp)
-        # Failed row from 1 hour ago (past 30min backoff)
-        old_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
         _seed(db, [
             {"chat_id": "100", "user_text": "retry me",
-             "extract_status": 3, "created_at": old_ts},
+             "extract_status": 3, "created_at": "2026-09-19T01:00:00+00:00"},
         ])
-        # Set retries = 1 (under limit of 3)
+        # last_attempt_at was 1 hour ago (past 30min backoff)
+        old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
         conn = sqlite3.connect(db)
-        conn.execute("UPDATE raw_events SET extract_retries = 1")
+        conn.execute("UPDATE raw_events SET extract_retries = 1, last_attempt_at = ?", (old_attempt,))
         conn.commit()
         conn.close()
 
@@ -551,19 +595,41 @@ def test_exhausted_retries_excluded():
     import raw_vault
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_db(tmp)
-        old_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
+        old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds")
         _seed(db, [
             {"chat_id": "100", "user_text": "give up",
-             "extract_status": 3, "created_at": old_ts},
+             "extract_status": 3, "created_at": "2026-09-19T01:00:00+00:00"},
         ])
         conn = sqlite3.connect(db)
-        conn.execute("UPDATE raw_events SET extract_retries = 3")
+        conn.execute("UPDATE raw_events SET extract_retries = 3, last_attempt_at = ?", (old_attempt,))
         conn.commit()
         conn.close()
 
         with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
             chunks = raw_vault.get_unprocessed_chunks()
         assert len(chunks) == 0
+
+
+# ── 14d. Backoff uses last_attempt_at, not created_at ──
+
+def test_backoff_uses_last_attempt_at():
+    """A row that failed just now should NOT be retried, even if created_at is old."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "just failed",
+             "extract_status": 3, "created_at": "2026-09-15T01:00:00+00:00"},
+        ])
+        recent_attempt = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET extract_retries = 1, last_attempt_at = ?", (recent_attempt,))
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            chunks = raw_vault.get_unprocessed_chunks()
+        assert len(chunks) == 0, "recently failed row should respect backoff"
 
 
 # ── 15. chunk_size limits rows per group ──
@@ -725,29 +791,59 @@ def test_normal_extraction_marks_by_row_id():
 
 # ── 20. Normal extraction and recovery don't conflict ──
 
-def test_normal_and_recovery_independent():
-    """If one chat is being normal-extracted, recovery should still pick up
-    a different chat's pending rows (they don't block each other)."""
+def test_normal_claim_prevents_recovery():
+    """Normal extraction claims rows (status=1, recent last_attempt_at).
+    Recovery should NOT pick up those rows (active claim)."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "being extracted by normal path",
+             "extract_status": 1,
+             "created_at": "2026-09-20T01:00:00+00:00"},
+            {"chat_id": "200", "user_text": "pending for recovery",
+             "extract_status": 0,
+             "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        # Chat 100: recently claimed by normal extraction
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ? WHERE chat_id = '100'", (recent,))
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            chunks = raw_vault.get_unprocessed_chunks()
+
+        # Only chat 200 should be picked up
+        assert len(chunks) == 1
+        assert chunks[0]["chat_id"] == "200"
+
+
+def test_recovery_picks_up_stale_and_pending():
+    """Recovery processes stale claims AND pending rows from different chats."""
     import raw_vault
     from conversation_capture import recover_unprocessed
-
-    recovered_chunks = []
 
     async def mock_llm(*args, **kwargs):
         return "[]"
 
     with tempfile.TemporaryDirectory() as tmp:
         db = _make_db(tmp)
-        # Chat 100: already being processed (status=1) by normal extraction
-        # Chat 200: pending (status=0), should be picked up by recovery
         _seed(db, [
-            {"chat_id": "100", "user_text": "normal path",
+            {"chat_id": "100", "user_text": "stale claim",
              "extract_status": 1,
              "created_at": "2026-09-20T01:00:00+00:00"},
-            {"chat_id": "200", "user_text": "recovery needed",
+            {"chat_id": "200", "user_text": "pending",
              "extract_status": 0,
              "created_at": "2026-09-20T01:00:00+00:00"},
         ])
+        # Chat 100: stale claim (>5min)
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ? WHERE chat_id = '100'", (stale,))
+        conn.commit()
+        conn.close()
 
         with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
              mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
@@ -757,5 +853,128 @@ def test_normal_and_recovery_independent():
 
         assert result["status"] == "recovered"
         counts = _status_counts(db)
-        # Both should end up as done (recovery processes both status=0 and status=1)
-        assert counts.get(2, 0) == 2
+        assert counts.get(2, 0) == 2  # both done
+
+
+# ── 22. Batch persistence: partial write + crash + resume ──
+
+def test_batch_resume_skips_already_written():
+    """If 2 of 3 items were written before crash, resume writes only the 3rd."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    batch_id = "recovery-test123abc"
+
+    remembered = []
+
+    async def mock_llm(*args, **kwargs):
+        raise AssertionError("LLM should NOT be called — result is saved")
+
+    async def mock_remember(**kwargs):
+        remembered.append(kwargs.get("content", ""))
+        return {"id": f"mem-{len(remembered)}", "status": "created"}
+
+    llm_result = json.dumps([
+        {"content": "[用户] first memory item here", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+        {"content": "[用户] second memory item here", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+        {"content": "[用户] third memory item here", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "msg1", "ai_text": "reply1",
+             "extract_status": 1, "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+
+        # Set stale claim and saved batch with 2 items already written
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = ?",
+                     (stale, batch_id))
+        conn.execute(
+            "INSERT INTO extract_batches (batch_id, row_ids, llm_result, items_written, created_at, status) "
+            "VALUES (?, ?, ?, 2, ?, 'processing')",
+            (batch_id, json.dumps([row_id]), llm_result, stale),
+        )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        # Only 1 new item written (3rd), first 2 were skipped
+        assert len(remembered) == 1
+        assert "third" in remembered[0]
+        counts = _status_counts(db)
+        assert counts.get(2, 0) == 1  # done
+
+
+# ── 23. Normal extraction overflow goes back to buffer ──
+
+def test_normal_extraction_overflow_returns_to_buffer():
+    """Entries that exceed char_budget must go back to the buffer."""
+    import raw_vault
+    from conversation_capture import (
+        _extract_and_remember,
+        _conversation_buffers,
+        _buffer_chat_types,
+    )
+
+    async def mock_llm(*args, **kwargs):
+        return "[]"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Create many rows
+        rows_data = []
+        for i in range(30):
+            rows_data.append({
+                "chat_id": "100", "user_text": f"message number {i} " + "x" * 200,
+                "extract_status": 0,
+                "created_at": f"2026-09-20T01:{i:02d}:00+00:00",
+            })
+        _seed(db, rows_data)
+
+        conn = sqlite3.connect(db)
+        row_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        key = "cloudy:100"
+        buffer_entries = []
+        for i, rid in enumerate(row_ids):
+            buffer_entries.append({
+                "user": f"message number {i} " + "x" * 200,
+                "ai": "reply",
+                "timestamp": f"2026-09-20T01:{i:02d}:00",
+                "ai_id": "cloudy",
+                "raw_event_id": rid,
+            })
+        _conversation_buffers[key] = buffer_entries
+        _buffer_chat_types[key] = "private"
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm):
+            asyncio.run(_extract_and_remember(key))
+
+        counts = _status_counts(db)
+        done_count = counts.get(2, 0)
+        pending_count = counts.get(0, 0)
+        assert done_count > 0, "some rows should be marked done"
+        assert done_count < 30, "not all rows should be done (overflow)"
+        # Overflow entries should be back in buffer
+        remaining = _conversation_buffers.get(key, [])
+        assert len(remaining) > 0, "overflow entries should return to buffer"
+        assert len(remaining) + done_count == 30
+
+        # Clean up
+        _conversation_buffers.pop(key, None)
+        _buffer_chat_types.pop(key, None)
