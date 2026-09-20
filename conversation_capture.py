@@ -583,37 +583,38 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     else:
         logger.info(f"No memories worth keeping from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
 
-    # Mark corresponding raw_events as extracted
+    # Mark corresponding raw_events as extracted — by ai_id+chat_id+timestamp
     try:
         import raw_vault
         parts = buffer_key.split(":", 3)
         bk_ai_id = parts[0] if len(parts) > 0 else ""
         bk_chat_id = parts[2] if len(parts) > 2 else ""
-        if bk_chat_id:
+        if bk_chat_id and bk_ai_id:
             last_ts = buffer[-1]["timestamp"] if buffer else ""
-            _mark_raw_events_done(bk_chat_id, last_ts)
+            _mark_raw_events_done(bk_ai_id, bk_chat_id, last_ts)
     except Exception as e:
         logger.warning(f"Failed to mark raw_events as extracted: {e}")
 
     return memories
 
 
-def _mark_raw_events_done(chat_id: str, up_to_timestamp: str):
-    """Mark pending raw_events for a chat as extracted (status=2)."""
+def _mark_raw_events_done(ai_id: str, chat_id: str, up_to_timestamp: str):
+    """Mark pending raw_events for a specific ai_id+chat_id as extracted."""
     import raw_vault
     conn = raw_vault._connect()
     try:
         if up_to_timestamp:
             conn.execute(
                 "UPDATE raw_events SET extract_status = ? "
-                "WHERE chat_id = ? AND extract_status IN (0, 1) AND created_at <= ?",
-                (raw_vault.EXTRACT_DONE, chat_id, up_to_timestamp),
+                "WHERE ai_id = ? AND chat_id = ? AND extract_status IN (0, 1) "
+                "AND created_at <= ?",
+                (raw_vault.EXTRACT_DONE, ai_id, chat_id, up_to_timestamp),
             )
         else:
             conn.execute(
                 "UPDATE raw_events SET extract_status = ? "
-                "WHERE chat_id = ? AND extract_status IN (0, 1)",
-                (raw_vault.EXTRACT_DONE, chat_id),
+                "WHERE ai_id = ? AND chat_id = ? AND extract_status IN (0, 1)",
+                (raw_vault.EXTRACT_DONE, ai_id, chat_id),
             )
         conn.commit()
     finally:
@@ -774,12 +775,31 @@ def _get_recovery_lock():
     return _RECOVERY_LOCK
 
 
+def _check_batch_already_extracted(batch_id: str) -> bool:
+    """Check if memories with this batch_id already exist (idempotency guard)."""
+    try:
+        import database as _db
+        all_mems = _db.store.get_all_memories()
+        for mem in all_mems.values():
+            sp = mem.get("source_platform", "")
+            if batch_id in sp:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 async def recover_unprocessed() -> dict:
     """Scan raw_events for unprocessed conversations and extract memories.
 
     Called on startup and periodically by the idle flush loop.
     Processes at most _RECOVERY_MAX_CHUNKS groups per call to avoid blocking.
-    Idempotent: uses batch_id to detect already-processed chunks.
+
+    Fixes applied:
+    - Empty LLM response (API failure) → failed, not done
+    - Only rows within char budget are marked done; overflow stays pending
+    - Groups by ai_id+chat_id+thread_id (private chat isolation)
+    - Idempotency: interrupted batches checked for existing memories
     """
     import raw_vault
     import memory_ops
@@ -799,16 +819,30 @@ async def recover_unprocessed() -> dict:
 
         results = {}
         for chunk in chunks:
-            batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
             row_ids = chunk["row_ids"]
             chat_type = chunk["chat_type"] or "private"
             ai_id = chunk["ai_id"]
             platform = chunk["platform"]
 
+            # Idempotency: if interrupted rows have a batch_id and memories
+            # with that batch already exist, just mark done and skip
+            for old_batch in chunk.get("interrupted_batches", []):
+                if _check_batch_already_extracted(old_batch):
+                    raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, old_batch)
+                    results[chunk["key"]] = {
+                        "status": "already_extracted",
+                        "batch_id": old_batch,
+                    }
+                    break
+            if chunk["key"] in results:
+                continue
+
+            batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
             raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_PROCESSING, batch_id)
 
-            # Build conversation text from raw_events (same format as _extract_and_remember)
+            # Build conversation text; track which rows fit in budget
             lines = []
+            included_row_ids = []
             char_budget = 5500
             is_group = chat_type in ("private_group", "public_group")
             for event in chunk["events"]:
@@ -817,6 +851,7 @@ async def recover_unprocessed() -> dict:
                 ts = (event["created_at"] or "")[:16]
                 entry_ai = event.get("ai_id", "AI")
                 if not user_short and not ai_short:
+                    included_row_ids.append(event["id"])
                     continue
                 if is_group:
                     if ai_short:
@@ -831,9 +866,15 @@ async def recover_unprocessed() -> dict:
                 if sum(len(l) for l in lines) + len(line) > char_budget:
                     break
                 lines.append(line)
+                included_row_ids.append(event["id"])
+
+            # Rows beyond budget: reset to pending so they're picked up next cycle
+            overflow_ids = [rid for rid in row_ids if rid not in included_row_ids]
+            if overflow_ids:
+                raw_vault.mark_rows(overflow_ids, raw_vault.EXTRACT_PENDING)
 
             if not lines:
-                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
+                raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_DONE, batch_id)
                 results[chunk["key"]] = {"status": "empty", "batch_id": batch_id}
                 continue
 
@@ -850,13 +891,15 @@ async def recover_unprocessed() -> dict:
                 raw = await _call_llm(extract_prompt + "\n\n" + prompt)
             except Exception as e:
                 logger.warning(f"[Recovery] LLM call failed for {chunk['key']}: {e}")
-                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
                 results[chunk["key"]] = {"status": "llm_failed", "batch_id": batch_id}
                 continue
 
+            # Fix P1: empty string = API failure → failed, not done
             if not raw:
-                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
-                results[chunk["key"]] = {"status": "no_content", "batch_id": batch_id}
+                logger.warning(f"[Recovery] LLM returned empty for {chunk['key']}, marking failed")
+                raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                results[chunk["key"]] = {"status": "llm_empty", "batch_id": batch_id}
                 continue
 
             try:
@@ -865,10 +908,18 @@ async def recover_unprocessed() -> dict:
                     raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
                 items = json.loads(raw)
                 if not isinstance(items, list):
-                    items = []
+                    raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                    results[chunk["key"]] = {"status": "parse_failed", "batch_id": batch_id}
+                    continue
             except Exception:
-                raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
                 results[chunk["key"]] = {"status": "parse_failed", "batch_id": batch_id}
+                continue
+
+            # Valid [] = "nothing worth keeping" → done (not failed)
+            if not items:
+                raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_DONE, batch_id)
+                results[chunk["key"]] = {"status": "no_content", "batch_id": batch_id}
                 continue
 
             max_items = {"private": 5, "private_group": 6, "public_group": 2}.get(chat_type, 8)
@@ -912,7 +963,7 @@ async def recover_unprocessed() -> dict:
                     item=item, subj_name=subj_name, subject_id=subject_id,
                     spkr_name=spkr_name, content=content, provenance=provenance,
                     source_ctx=source_ctx,
-                    source_platform=f"recovery:{platform}:{chat_type}",
+                    source_platform=f"recovery:{batch_id}:{platform}:{chat_type}",
                     proposer_ai_id=ai_id,
                 )
                 if verdict is not None and verdict.blocked:
@@ -939,7 +990,7 @@ async def recover_unprocessed() -> dict:
                     importance=max(0.4, min(1.0, raw_importance)),
                     event_date=item.get("event_date", ""),
                     source_ai=ai_id,
-                    source_platform=f"recovery:{platform}:{chat_type}",
+                    source_platform=f"recovery:{batch_id}:{platform}:{chat_type}",
                     source_context=source_ctx,
                     auto_analyze=False,
                     quick=True,
@@ -959,7 +1010,7 @@ async def recover_unprocessed() -> dict:
                     if mem_id:
                         await memory_ops.resolve_memory(mem_id, resolved=False)
 
-            raw_vault.mark_rows(row_ids, raw_vault.EXTRACT_DONE, batch_id)
+            raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_DONE, batch_id)
 
             if memories:
                 logger.info(f"[Recovery] Extracted {len(memories)} memories from {chunk['key']} (batch={batch_id})")

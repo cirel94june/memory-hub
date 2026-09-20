@@ -930,17 +930,18 @@ EXTRACT_LEGACY = -1
 
 
 def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[dict]:
-    """Find unprocessed raw_events grouped by chat_id+thread_id.
+    """Find unprocessed raw_events grouped by ai_id+chat_id+thread_id.
 
     Returns up to max_chunks groups, each with row IDs, chat metadata,
     and formatted conversation text. Only status 0 (pending) and 1 (processing,
-    i.e. interrupted) are included.
+    i.e. interrupted) are included. Private chats are isolated per ai_id.
     """
     conn = _connect()
     try:
         rows = conn.execute(
             "SELECT id, ai_id, platform, chat_id, chat_type, user_text, ai_text, "
-            "created_at, thread_id, sender_id, sender_type, extract_status "
+            "created_at, thread_id, sender_id, sender_type, extract_status, "
+            "extract_batch "
             "FROM raw_events "
             "WHERE extract_status IN (0, 1) "
             "ORDER BY created_at ASC "
@@ -952,7 +953,7 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
 
     groups: dict[str, list[dict]] = {}
     for row in rows:
-        key = f"{row[3]}:{row[8]}"  # chat_id:thread_id
+        key = f"{row[1]}:{row[3]}:{row[8]}"  # ai_id:chat_id:thread_id
         if key not in groups:
             groups[key] = []
         groups[key].append({
@@ -962,6 +963,7 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
             "created_at": row[7], "thread_id": row[8],
             "sender_id": row[9], "sender_type": row[10],
             "extract_status": row[11],
+            "extract_batch": row[12],
         })
 
     chunks = []
@@ -969,6 +971,11 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
         events_to_process = events[:chunk_size]
         remaining = events[chunk_size:]
         ai_id = events_to_process[0]["ai_id"] or "claude"
+        # Collect batch_ids from interrupted (status=1) rows for idempotency check
+        interrupted_batches = list({
+            e["extract_batch"] for e in events_to_process
+            if e["extract_status"] == 1 and e["extract_batch"]
+        })
         chunks.append({
             "key": key,
             "chat_id": events_to_process[0]["chat_id"],
@@ -979,6 +986,7 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
             "row_ids": [e["id"] for e in events_to_process],
             "events": events_to_process,
             "remaining_count": len(remaining),
+            "interrupted_batches": interrupted_batches,
         })
     return chunks
 
