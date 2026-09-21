@@ -459,15 +459,18 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     # Claim included rows in DB — only rows still PENDING (conditional, atomic)
     import raw_vault
     import uuid
-    included_row_ids = [e.get("raw_event_id") for e in included_entries if e.get("raw_event_id")]
+    all_row_ids = [e.get("raw_event_id") for e in included_entries if e.get("raw_event_id")]
     batch_id = f"normal-{uuid.uuid4().hex[:12]}"
-    if included_row_ids:
-        claimed = raw_vault.mark_rows(
-            included_row_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
+    included_row_ids: list[int] = []
+    if all_row_ids:
+        claimed_ids = raw_vault.mark_rows(
+            all_row_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
             expected_status=[raw_vault.EXTRACT_PENDING],
         )
-        if claimed == 0:
+        if not claimed_ids:
             logger.info(f"No rows claimed for {buffer_key} (already processed by recovery)")
+            return []
+        included_row_ids = claimed_ids
         raw_vault.save_batch(batch_id, included_row_ids)
 
     today = local_today()
@@ -551,7 +554,7 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
 
         source_ctx = conversation_text[:1500]
         is_private_memory = chat_type == "private"
-        item_source = f"auto_capture:{batch_id}:item{item_idx}:{platform}:{chat_type}"
+        item_source = f"extract:{batch_id}:item{item_idx}:{platform}:{chat_type}"
 
         # Idempotency: skip if a proposal with this exact source already exists
         if raw_vault.proposal_exists_by_source(item_source):
@@ -627,12 +630,13 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
     else:
         logger.info(f"No memories worth keeping from {buffer_key} [{chat_type}] ({len(buffer)} messages)")
 
-    # Mark only the included rows as done (conditional: only our claimed rows)
+    # Mark only our claimed rows as done (verify both status and batch ownership)
     try:
         if included_row_ids:
             raw_vault.mark_rows(
                 included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                 expected_status=[raw_vault.EXTRACT_PROCESSING],
+                expected_batch=batch_id,
             )
             raw_vault.update_batch_progress(batch_id, len(processable_items), "done")
     except Exception as e:
@@ -844,15 +848,15 @@ async def recover_unprocessed() -> dict:
                 batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
 
             # Conditional claim: only take rows in PENDING or stale PROCESSING
-            claimed = raw_vault.mark_rows(
+            claimed_ids = raw_vault.mark_rows(
                 row_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
                 expected_status=[raw_vault.EXTRACT_PENDING, raw_vault.EXTRACT_PROCESSING,
                                  raw_vault.EXTRACT_FAILED],
             )
-            if claimed == 0:
+            if not claimed_ids:
                 results[chunk["key"]] = {"status": "no_rows_claimed", "batch_id": batch_id}
                 continue
-            raw_vault.save_batch(batch_id, row_ids)
+            row_ids = claimed_ids
 
             # For a resumed batch with saved LLM result, use the batch's stored row_ids
             items = None
@@ -916,10 +920,14 @@ async def recover_unprocessed() -> dict:
                 if overflow_ids:
                     raw_vault.mark_rows(overflow_ids, raw_vault.EXTRACT_PENDING)
 
+                # Save batch with actual included set (after budget filtering)
+                raw_vault.save_batch(batch_id, included_row_ids)
+
                 if not lines:
                     raw_vault.mark_rows(
                         included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                         expected_status=[raw_vault.EXTRACT_PROCESSING],
+                        expected_batch=batch_id,
                     )
                     raw_vault.update_batch_progress(batch_id, 0, "done")
                     results[chunk["key"]] = {"status": "empty", "batch_id": batch_id}
@@ -973,6 +981,7 @@ async def recover_unprocessed() -> dict:
                 raw_vault.mark_rows(
                     included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                     expected_status=[raw_vault.EXTRACT_PROCESSING],
+                    expected_batch=batch_id,
                 )
                 raw_vault.update_batch_progress(batch_id, 0, "done")
                 results[chunk["key"]] = {"status": "no_content", "batch_id": batch_id}
@@ -1022,7 +1031,7 @@ async def recover_unprocessed() -> dict:
                 subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
                 source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
 
-                item_source = f"recovery:{batch_id}:item{item_idx}:{platform}:{chat_type}"
+                item_source = f"extract:{batch_id}:item{item_idx}:{platform}:{chat_type}"
 
                 # Idempotency: skip if proposal with this source already exists
                 if raw_vault.proposal_exists_by_source(item_source):
@@ -1087,6 +1096,7 @@ async def recover_unprocessed() -> dict:
             raw_vault.mark_rows(
                 included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                 expected_status=[raw_vault.EXTRACT_PROCESSING],
+                expected_batch=batch_id,
             )
             raw_vault.update_batch_progress(batch_id, len(processable_items), "done")
 

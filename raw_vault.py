@@ -1025,16 +1025,18 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
 def mark_rows(
     row_ids: list[int], status: int, batch_id: str = "",
     expected_status: list[int] | None = None,
-) -> int:
-    """Set extract_status on specific rows. Returns count of rows actually updated.
+    expected_batch: str | None = None,
+) -> list[int]:
+    """Set extract_status on specific rows. Returns list of row IDs actually updated.
 
     expected_status: if provided, only update rows currently in one of these states.
-    This makes the claim atomic — rows already claimed by another task are skipped.
+    expected_batch: if provided, only update rows whose extract_batch matches.
+    Together these make claims and done-marking atomic and owner-verified.
     Increments extract_retries when marking as failed (status=3).
     Updates last_attempt_at when marking as processing (1) or failed (3).
     """
     if not row_ids:
-        return 0
+        return []
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn = _connect()
     try:
@@ -1045,35 +1047,52 @@ def mark_rows(
             s_placeholders = ",".join("?" for _ in expected_status)
             status_filter = f" AND extract_status IN ({s_placeholders})"
             filter_params = list(expected_status)
+        if expected_batch is not None:
+            status_filter += " AND extract_batch = ?"
+            filter_params.append(expected_batch)
+
+        where = f"id IN ({placeholders}){status_filter}"
 
         if status == EXTRACT_FAILED:
-            cur = conn.execute(
+            conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
                 f"extract_retries = extract_retries + 1, last_attempt_at = ? "
-                f"WHERE id IN ({placeholders}){status_filter}",
+                f"WHERE {where}",
                 [status, batch_id or "", now] + row_ids + filter_params,
             )
         elif status == EXTRACT_PROCESSING:
-            cur = conn.execute(
+            conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
                 f"last_attempt_at = ? "
-                f"WHERE id IN ({placeholders}){status_filter}",
+                f"WHERE {where}",
                 [status, batch_id or "", now] + row_ids + filter_params,
             )
         elif batch_id:
-            cur = conn.execute(
+            conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ? "
-                f"WHERE id IN ({placeholders}){status_filter}",
+                f"WHERE {where}",
                 [status, batch_id] + row_ids + filter_params,
             )
         else:
-            cur = conn.execute(
+            conn.execute(
                 f"UPDATE raw_events SET extract_status = ? "
-                f"WHERE id IN ({placeholders}){status_filter}",
+                f"WHERE {where}",
                 [status] + row_ids + filter_params,
             )
+        if batch_id:
+            updated = conn.execute(
+                f"SELECT id FROM raw_events WHERE id IN ({placeholders}) "
+                f"AND extract_status = ? AND extract_batch = ?",
+                row_ids + [status, batch_id],
+            ).fetchall()
+        else:
+            updated = conn.execute(
+                f"SELECT id FROM raw_events WHERE id IN ({placeholders}) "
+                f"AND extract_status = ?",
+                row_ids + [status],
+            ).fetchall()
         conn.commit()
-        return cur.rowcount
+        return [r[0] for r in updated]
     finally:
         conn.close()
 
@@ -1090,7 +1109,8 @@ def save_batch(batch_id: str, row_ids: list[int], llm_result: str | None = None)
             conn.execute(
                 "INSERT INTO extract_batches (batch_id, row_ids, llm_result, created_at, status) "
                 "VALUES (?, ?, ?, ?, 'processing') "
-                "ON CONFLICT(batch_id) DO UPDATE SET llm_result = excluded.llm_result",
+                "ON CONFLICT(batch_id) DO UPDATE SET llm_result = excluded.llm_result, "
+                "row_ids = excluded.row_ids",
                 (batch_id, _json.dumps(row_ids), llm_result, now),
             )
         else:

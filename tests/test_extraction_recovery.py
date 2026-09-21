@@ -460,7 +460,7 @@ def test_recovery_extracts_memories():
         assert result["status"] == "recovered"
         assert len(remembered) == 1
         assert "臭袜子" in remembered[0]["source_context"]
-        assert remembered[0]["source_platform"].startswith("recovery:")
+        assert remembered[0]["source_platform"].startswith("extract:")
 
         counts = _status_counts(db)
         assert counts.get(2, 0) == 1  # done
@@ -1003,7 +1003,7 @@ def test_conditional_claim_skips_done_rows():
                 expected_status=[raw_vault.EXTRACT_PENDING],
             )
 
-        assert claimed == 1, "only the pending row should be claimed"
+        assert len(claimed) == 1, "only the pending row should be claimed"
         conn = sqlite3.connect(db)
         rows = conn.execute("SELECT id, extract_status FROM raw_events ORDER BY id").fetchall()
         conn.close()
@@ -1033,7 +1033,7 @@ def test_conditional_claim_skips_processing_rows():
                 expected_status=[raw_vault.EXTRACT_PENDING],
             )
 
-        assert claimed == 0, "actively processing row must not be re-claimed"
+        assert len(claimed) == 0, "actively processing row must not be re-claimed"
         conn = sqlite3.connect(db)
         batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
         conn.close()
@@ -1168,3 +1168,203 @@ def test_per_item_idempotency_skips_existing_proposal():
         # Only item1 should be written (item0 was skipped as duplicate)
         assert len(remembered_contents) == 1
         assert "second" in remembered_contents[0]
+
+
+# ── 28. Claim 0 rows → must NOT call LLM ──
+
+def test_claim_zero_rows_aborts_extraction():
+    """If all rows are already claimed by another task, LLM must NOT be called."""
+    import raw_vault
+    from conversation_capture import _extract_and_remember, _conversation_buffers, _buffer_chat_types
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Seed a row already in PROCESSING by another batch
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "hello",
+             "extract_status": 1, "created_at": "2026-09-20T12:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = 'other-task'", (recent,))
+        conn.commit()
+        conn.close()
+
+        buf_key = "cloudy:100"
+        _conversation_buffers[buf_key] = [
+            {"user": "hello", "ai": "hi", "timestamp": "2026-09-20T12:00:00+00:00",
+             "ai_id": "cloudy", "platform": "telegram", "raw_event_id": row_id},
+        ]
+        _buffer_chat_types[buf_key] = "private"
+        llm_called = []
+
+        async def mock_llm(prompt):
+            llm_called.append(prompt)
+            return '[]'
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(_extract_and_remember(buf_key))
+
+        assert result == [], "should return empty when no rows claimed"
+        assert len(llm_called) == 0, "LLM must NOT be called when claim returns 0 rows"
+
+        # Row must still belong to the other task
+        conn = sqlite3.connect(db)
+        batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
+        conn.close()
+        assert batch == "other-task"
+
+
+# ── 29. Overflow rows must NOT be marked done on recovery restart ──
+
+def test_recovery_overflow_rows_stay_pending():
+    """When budget filtering reduces the row set, overflow rows must stay pending
+    and the batch record must contain only the actually-processed row IDs."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Seed 15 rows with 200-char user text each; ~400 chars/line × 15 = 6000 > 5500 budget
+        # So some rows will overflow
+        rows_data = []
+        for i in range(15):
+            rows_data.append({
+                "ai_id": "cloudy", "chat_id": "100",
+                "user_text": f"msg{i} " + "a" * 190,
+                "ai_text": "reply " + "b" * 190,
+                "extract_status": 0,
+                "created_at": f"2026-09-20T12:{i:02d}:00+00:00",
+            })
+        _seed(db, rows_data)
+        conn = sqlite3.connect(db)
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        async def mock_remember(**kw):
+            return {"id": "mem-1"}
+
+        async def mock_llm(prompt):
+            return json.dumps([{"content": "test memory", "importance": 0.8,
+                                "about": "user", "room": "living_room"}])
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            asyncio.run(recover_unprocessed())
+
+        conn = sqlite3.connect(db)
+        rows = conn.execute("SELECT id, extract_status FROM raw_events ORDER BY id").fetchall()
+        conn.close()
+        done_ids = [r[0] for r in rows if r[1] == 2]
+        pending_ids = [r[0] for r in rows if r[1] == 0]
+        assert len(done_ids) > 0, "some rows must be done"
+        assert len(pending_ids) > 0, "overflow rows must stay pending"
+        assert len(done_ids) + len(pending_ids) == 15, "all rows accounted for"
+
+        # Batch record must contain only the included (done) rows
+        conn = sqlite3.connect(db)
+        batch_row = conn.execute("SELECT row_ids FROM extract_batches").fetchone()
+        conn.close()
+        assert batch_row is not None
+        batch_row_ids = json.loads(batch_row[0])
+        for pid in pending_ids:
+            assert pid not in batch_row_ids, f"overflow row {pid} must not be in batch record"
+
+
+# ── 30. Unified idempotency key: normal write + crash → recovery finds existing proposal ──
+
+def test_cross_path_idempotency():
+    """If normal extraction writes item0 then crashes before marking done,
+    recovery must find the existing proposal and skip it (same key prefix)."""
+    import raw_vault
+    from conversation_capture import _extract_and_remember, recover_unprocessed, _conversation_buffers, _buffer_chat_types
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "臭袜子",
+             "extract_status": 0, "created_at": "2026-09-20T12:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        conn.close()
+
+        # --- Phase 1: Normal extraction writes item0, then "crashes" before done ---
+        remembered_sources = []
+
+        async def mock_remember(**kw):
+            remembered_sources.append(kw.get("source_platform", ""))
+            return {"id": "mem-1"}
+
+        async def mock_llm(prompt):
+            return json.dumps([{"content": "[用户] Ceci说她的臭袜子放在床头柜上面了", "importance": 0.8,
+                                "about": "user", "room": "living_room"}])
+
+        buf_key = "cloudy:100"
+        _conversation_buffers[buf_key] = [
+            {"user": "我的臭袜子放在床头柜上面了", "ai": "好的我记住了", "timestamp": "2026-09-20T12:00:00+00:00",
+             "ai_id": "cloudy", "platform": "telegram", "raw_event_id": row_id},
+        ]
+        _buffer_chat_types[buf_key] = "private"
+
+        # Let normal extraction run but crash right before done-marking:
+        # replace the final mark_rows(DONE) with a no-op to simulate crash
+        original_mark_rows = raw_vault.mark_rows.__wrapped__ if hasattr(raw_vault.mark_rows, '__wrapped__') else raw_vault.mark_rows
+
+        def crash_on_done(row_ids, status, batch_id="", **kw):
+            if status == raw_vault.EXTRACT_DONE:
+                raise RuntimeError("simulated crash before done-marking")
+            return original_mark_rows(row_ids, status, batch_id, **kw)
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            # The crash_on_done will cause done-marking to fail, but remember() ran
+            with mock.patch("raw_vault.mark_rows", side_effect=crash_on_done):
+                try:
+                    asyncio.run(_extract_and_remember(buf_key))
+                except RuntimeError:
+                    pass
+
+        assert len(remembered_sources) == 1, "remember() must have been called once"
+        normal_source = remembered_sources[0]
+        assert normal_source.startswith("extract:"), f"source must use unified prefix, got {normal_source}"
+
+        # Row should still be in PROCESSING (done-marking crashed)
+        conn = sqlite3.connect(db)
+        status = conn.execute("SELECT extract_status FROM raw_events").fetchone()[0]
+        batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
+        conn.close()
+        assert status == 1, "row must be stuck in PROCESSING (crash before done)"
+
+        # Make last_attempt_at stale so recovery picks it up
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?", (stale,))
+        conn.commit()
+        conn.close()
+
+        # --- Phase 2: Recovery picks up the stale PROCESSING row ---
+        recovery_remembered = []
+
+        async def mock_remember2(**kw):
+            recovery_remembered.append(kw.get("source_platform", ""))
+            return {"id": "mem-2"}
+
+        # Mock proposal_exists: return True for the normal-path source key
+        def mock_proposal_exists(source):
+            return source == normal_source
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember2), \
+             mock.patch("raw_vault.proposal_exists_by_source", side_effect=mock_proposal_exists), \
+             mock.patch("database.resolve_alias", return_value=""):
+            asyncio.run(recover_unprocessed())
+
+        # Recovery must NOT create a duplicate — same batch_id means same source key
+        assert len(recovery_remembered) == 0, \
+            "recovery must skip items already written by normal path (same idempotency key)"
