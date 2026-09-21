@@ -978,3 +978,193 @@ def test_normal_extraction_overflow_returns_to_buffer():
         # Clean up
         _conversation_buffers.pop(key, None)
         _buffer_chat_types.pop(key, None)
+
+
+# ── 24. Conditional claim: mark_rows with expected_status ──
+
+def test_conditional_claim_skips_done_rows():
+    """mark_rows with expected_status=[0] must NOT overwrite status=2 (done) rows."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "already done",
+             "extract_status": 2, "created_at": "2026-09-20T01:00:00+00:00"},
+            {"chat_id": "100", "user_text": "pending",
+             "extract_status": 0, "created_at": "2026-09-20T01:01:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            claimed = raw_vault.mark_rows(
+                all_ids, raw_vault.EXTRACT_PROCESSING, "test-batch",
+                expected_status=[raw_vault.EXTRACT_PENDING],
+            )
+
+        assert claimed == 1, "only the pending row should be claimed"
+        conn = sqlite3.connect(db)
+        rows = conn.execute("SELECT id, extract_status FROM raw_events ORDER BY id").fetchall()
+        conn.close()
+        assert rows[0][1] == 2, "done row must NOT be overwritten"
+        assert rows[1][1] == 1, "pending row should now be processing"
+
+
+def test_conditional_claim_skips_processing_rows():
+    """mark_rows with expected_status=[0] must NOT overwrite status=1 (processing) rows."""
+    import raw_vault
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "being processed",
+             "extract_status": 1, "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds")
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = 'other-batch'", (recent,))
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            claimed = raw_vault.mark_rows(
+                [row_id], raw_vault.EXTRACT_PROCESSING, "my-batch",
+                expected_status=[raw_vault.EXTRACT_PENDING],
+            )
+
+        assert claimed == 0, "actively processing row must not be re-claimed"
+        conn = sqlite3.connect(db)
+        batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
+        conn.close()
+        assert batch == "other-batch", "batch_id must not change"
+
+
+# ── 25. Batch resume uses saved row_ids, not chunk's mixed set ──
+
+def test_batch_resume_uses_saved_row_ids():
+    """When resuming a saved batch, new rows in the same chat must NOT be
+    included in the batch — they must stay pending."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    batch_id = "recovery-saved123"
+
+    async def mock_llm(*args, **kwargs):
+        raise AssertionError("LLM should NOT be called — saved result exists")
+
+    async def mock_remember(**kwargs):
+        return {"id": "mem-1", "status": "created"}
+
+    llm_result = json.dumps([
+        {"content": "[用户] saved memory content here", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Row 1: old interrupted batch row
+        _seed(db, [
+            {"chat_id": "100", "user_text": "old msg", "ai_text": "old reply",
+             "extract_status": 1, "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        old_row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = ?",
+                     (stale, batch_id))
+        # Row 2: new message in same chat (arrived after crash)
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, user_text, ai_text, "
+            "created_at, thread_id, extract_status) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("cloudy", "telegram", "100", "private", "new msg", "new reply",
+             "2026-09-20T02:00:00+00:00", "", 0),
+        )
+        new_row_id = conn.execute("SELECT id FROM raw_events ORDER BY id DESC LIMIT 1").fetchone()[0]
+        # Save batch with only the old row
+        conn.execute(
+            "INSERT INTO extract_batches (batch_id, row_ids, llm_result, items_written, created_at, status) "
+            "VALUES (?, ?, ?, 0, ?, 'processing')",
+            (batch_id, json.dumps([old_row_id]), llm_result, stale),
+        )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        conn = sqlite3.connect(db)
+        rows = conn.execute(
+            "SELECT id, extract_status FROM raw_events ORDER BY id"
+        ).fetchall()
+        conn.close()
+        # Old row should be done
+        assert rows[0][1] == 2, "old batch row should be marked done"
+        # New row should remain pending (not swept into old batch)
+        assert rows[1][1] == 0, "new row must NOT be marked done by old batch"
+
+
+# ── 26. Per-item idempotency: duplicate proposal check ──
+
+def test_per_item_idempotency_skips_existing_proposal():
+    """If a proposal with the same per-item source_platform already exists,
+    remember() should NOT be called for that item."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    batch_id = "recovery-idem456"
+
+    remembered_contents = []
+
+    async def mock_llm(*args, **kwargs):
+        raise AssertionError("LLM should NOT be called — saved result exists")
+
+    async def mock_remember(**kwargs):
+        remembered_contents.append(kwargs.get("content", ""))
+        return {"id": f"mem-{len(remembered_contents)}", "status": "created"}
+
+    llm_result = json.dumps([
+        {"content": "[用户] first item already written", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+        {"content": "[用户] second item not yet written", "about": "user",
+         "importance": 0.7, "room": "living_room", "provenance": "ai_summary"},
+    ])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"chat_id": "100", "user_text": "test msg", "ai_text": "reply",
+             "extract_status": 1, "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = ?",
+                     (stale, batch_id))
+        conn.execute(
+            "INSERT INTO extract_batches (batch_id, row_ids, llm_result, items_written, created_at, status) "
+            "VALUES (?, ?, ?, 0, ?, 'processing')",
+            (batch_id, json.dumps([row_id]), llm_result, stale),
+        )
+        conn.commit()
+        conn.close()
+
+        # Mock proposal_exists_by_source: item0 exists, item1 doesn't
+        def mock_proposal_exists(source_platform):
+            return "item0" in source_platform
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("raw_vault.proposal_exists_by_source", side_effect=mock_proposal_exists), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        # Only item1 should be written (item0 was skipped as duplicate)
+        assert len(remembered_contents) == 1
+        assert "second" in remembered_contents[0]

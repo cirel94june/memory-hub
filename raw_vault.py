@@ -1022,44 +1022,58 @@ def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[di
     return chunks
 
 
-def mark_rows(row_ids: list[int], status: int, batch_id: str = ""):
-    """Set extract_status (and optionally batch_id) on specific rows.
+def mark_rows(
+    row_ids: list[int], status: int, batch_id: str = "",
+    expected_status: list[int] | None = None,
+) -> int:
+    """Set extract_status on specific rows. Returns count of rows actually updated.
+
+    expected_status: if provided, only update rows currently in one of these states.
+    This makes the claim atomic — rows already claimed by another task are skipped.
     Increments extract_retries when marking as failed (status=3).
     Updates last_attempt_at when marking as processing (1) or failed (3).
     """
     if not row_ids:
-        return
+        return 0
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     conn = _connect()
     try:
         placeholders = ",".join("?" for _ in row_ids)
+        status_filter = ""
+        filter_params: list = []
+        if expected_status is not None:
+            s_placeholders = ",".join("?" for _ in expected_status)
+            status_filter = f" AND extract_status IN ({s_placeholders})"
+            filter_params = list(expected_status)
+
         if status == EXTRACT_FAILED:
-            conn.execute(
+            cur = conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
                 f"extract_retries = extract_retries + 1, last_attempt_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [status, batch_id or "", now] + row_ids,
+                f"WHERE id IN ({placeholders}){status_filter}",
+                [status, batch_id or "", now] + row_ids + filter_params,
             )
         elif status == EXTRACT_PROCESSING:
-            conn.execute(
+            cur = conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
                 f"last_attempt_at = ? "
-                f"WHERE id IN ({placeholders})",
-                [status, batch_id or "", now] + row_ids,
+                f"WHERE id IN ({placeholders}){status_filter}",
+                [status, batch_id or "", now] + row_ids + filter_params,
             )
         elif batch_id:
-            conn.execute(
+            cur = conn.execute(
                 f"UPDATE raw_events SET extract_status = ?, extract_batch = ? "
-                f"WHERE id IN ({placeholders})",
-                [status, batch_id] + row_ids,
+                f"WHERE id IN ({placeholders}){status_filter}",
+                [status, batch_id] + row_ids + filter_params,
             )
         else:
-            conn.execute(
+            cur = conn.execute(
                 f"UPDATE raw_events SET extract_status = ? "
-                f"WHERE id IN ({placeholders})",
-                [status] + row_ids,
+                f"WHERE id IN ({placeholders}){status_filter}",
+                [status] + row_ids + filter_params,
             )
         conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 
@@ -1124,6 +1138,20 @@ def update_batch_progress(batch_id: str, items_written: int, status: str = "proc
         conn.commit()
     finally:
         conn.close()
+
+
+def proposal_exists_by_source(source_platform: str) -> bool:
+    """Check if a proposal with this exact source_platform already exists."""
+    try:
+        import database
+        conn = database._get_read_conn()
+        row = conn.execute(
+            "SELECT 1 FROM proposals WHERE source_platform = ? LIMIT 1",
+            (source_platform,),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
 
 
 def count_by_status() -> dict[str, int]:
