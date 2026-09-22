@@ -1051,8 +1051,11 @@ def test_batch_resume_uses_saved_row_ids():
     stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
     batch_id = "recovery-saved123"
 
-    async def mock_llm(*args, **kwargs):
-        raise AssertionError("LLM should NOT be called — saved result exists")
+    llm_calls = []
+
+    async def mock_llm(prompt):
+        llm_calls.append(prompt)
+        return '[]'
 
     async def mock_remember(**kwargs):
         return {"id": "mem-1", "status": "created"}
@@ -1099,13 +1102,17 @@ def test_batch_resume_uses_saved_row_ids():
         assert result["status"] == "recovered"
         conn = sqlite3.connect(db)
         rows = conn.execute(
-            "SELECT id, extract_status FROM raw_events ORDER BY id"
+            "SELECT id, extract_status, extract_batch FROM raw_events ORDER BY id"
         ).fetchall()
         conn.close()
-        # Old row should be done
+        # Old row should be done with its original batch
         assert rows[0][1] == 2, "old batch row should be marked done"
-        # New row should remain pending (not swept into old batch)
-        assert rows[1][1] == 0, "new row must NOT be marked done by old batch"
+        assert rows[0][2] == batch_id, "old row must keep its batch_id"
+        # New row must NOT be marked done by the old batch — it gets its own batch
+        assert rows[1][2] != batch_id, "new row must NOT belong to old batch"
+        # LLM should only be called for the new row's batch, not the saved one
+        for prompt in llm_calls:
+            assert "old msg" not in prompt, "saved batch must NOT re-call LLM with old row's text"
 
 
 # ── 26. Per-item idempotency: duplicate proposal check ──
@@ -1527,3 +1534,96 @@ def test_recovery_partial_claim_filters_events():
             batch_row_ids = json.loads(batch_row[0])
             assert all_ids[0] not in batch_row_ids, \
                 "unclaimed row must not be in batch record"
+
+
+# ── 34. Two interrupted batches in same chunk: each resumes independently ──
+
+def test_two_interrupted_batches_resume_independently():
+    """When A and B both have saved LLM results in the same chat,
+    recovery must resume each from its saved result without re-calling LLM."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+
+    stale = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+
+    batch_a = "normal-aaa111"
+    batch_b = "normal-bbb222"
+    llm_a = json.dumps([{"content": "[用户] Ceci说她喜欢吃芒果而且每天都要吃一个", "about": "user",
+                          "importance": 0.8, "room": "living_room"}])
+    llm_b = json.dumps([{"content": "[用户] Ceci觉得臭袜子的味道让人上头很好闻", "about": "user",
+                          "importance": 0.7, "room": "living_room"}])
+
+    llm_calls = []
+
+    async def mock_llm(prompt):
+        llm_calls.append(prompt)
+        return '[]'
+
+    remembered_sources = []
+
+    async def mock_remember(**kw):
+        remembered_sources.append(kw.get("source_platform", ""))
+        return {"id": f"mem-{len(remembered_sources)}"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Row 1: batch A's row (stale PROCESSING)
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "mango talk",
+             "extract_status": 1, "created_at": "2026-09-20T01:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_a = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        conn.execute("UPDATE raw_events SET last_attempt_at = ?, extract_batch = ?", (stale, batch_a))
+
+        # Row 2: batch B's row (stale PROCESSING)
+        conn.execute(
+            "INSERT INTO raw_events (ai_id, platform, chat_id, chat_type, user_text, ai_text, "
+            "created_at, thread_id, extract_status, extract_batch, last_attempt_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            ("cloudy", "telegram", "100", "private", "sock talk", "haha",
+             "2026-09-20T01:05:00+00:00", "", 1, batch_b, stale),
+        )
+        row_b = conn.execute("SELECT id FROM raw_events ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+        # Save batch records with LLM results
+        conn.execute(
+            "INSERT INTO extract_batches (batch_id, row_ids, llm_result, items_written, created_at, status) "
+            "VALUES (?, ?, ?, 0, ?, 'processing')",
+            (batch_a, json.dumps([row_a]), llm_a, stale),
+        )
+        conn.execute(
+            "INSERT INTO extract_batches (batch_id, row_ids, llm_result, items_written, created_at, status) "
+            "VALUES (?, ?, ?, 0, ?, 'processing')",
+            (batch_b, json.dumps([row_b]), llm_b, stale),
+        )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+
+        # LLM must NOT be called — both batches have saved results
+        assert len(llm_calls) == 0, \
+            f"LLM should not be called for saved batches, but was called {len(llm_calls)} time(s)"
+
+        # Both rows should be done
+        conn = sqlite3.connect(db)
+        rows = conn.execute("SELECT id, extract_status, extract_batch FROM raw_events ORDER BY id").fetchall()
+        conn.close()
+        assert rows[0][1] == 2, "batch A row must be done"
+        assert rows[1][1] == 2, "batch B row must be done"
+        assert rows[0][2] == batch_a, "batch A row must keep batch A's id"
+        assert rows[1][2] == batch_b, "batch B row must keep batch B's id"
+
+        # Both batches should have produced memories (from their saved LLM results)
+        assert len(remembered_sources) == 2, f"expected 2 memories, got {len(remembered_sources)}"
+        a_sources = [s for s in remembered_sources if batch_a in s]
+        b_sources = [s for s in remembered_sources if batch_b in s]
+        assert len(a_sources) == 1, "batch A should produce 1 memory"
+        assert len(b_sources) == 1, "batch B should produce 1 memory"

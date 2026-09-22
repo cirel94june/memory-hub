@@ -865,286 +865,301 @@ async def recover_unprocessed() -> dict:
             ai_id = chunk["ai_id"]
             platform = chunk["platform"]
 
-            # Check for saved batch from interrupted run
+            # Build recovery jobs: one per interrupted batch, plus one for remaining rows
             interrupted_batches = chunk.get("interrupted_batches", [])
-            saved = None
-            batch_id = None
-            if interrupted_batches:
-                batch_id = interrupted_batches[0]
-                saved = raw_vault.get_batch(batch_id)
+            recovery_jobs: list[dict] = []
+            handled_row_ids: set[int] = set()
 
-            if not batch_id:
-                batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
+            for int_batch_id in interrupted_batches:
+                saved = raw_vault.get_batch(int_batch_id)
+                if saved and saved["llm_result"]:
+                    recovery_jobs.append({
+                        "batch_id": int_batch_id,
+                        "saved": saved,
+                        "target_row_ids": list(saved["row_ids"]),
+                    })
+                    handled_row_ids.update(saved["row_ids"])
 
-            # Conditional claim: PENDING/FAILED unconditionally, PROCESSING only if stale
+            remaining_ids = [rid for rid in row_ids if rid not in handled_row_ids]
+            if remaining_ids:
+                recovery_jobs.append({
+                    "batch_id": f"recovery-{uuid.uuid4().hex[:12]}",
+                    "saved": None,
+                    "target_row_ids": remaining_ids,
+                })
+
+            if not recovery_jobs:
+                recovery_jobs.append({
+                    "batch_id": f"recovery-{uuid.uuid4().hex[:12]}",
+                    "saved": None,
+                    "target_row_ids": row_ids,
+                })
+
             from datetime import timedelta
             stale_cutoff = (
                 datetime.now(timezone.utc) - timedelta(seconds=raw_vault._CLAIM_STALE_SECONDS)
             ).isoformat(timespec="seconds")
-            claimed_ids = raw_vault.mark_rows(
-                row_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
-                expected_status=[raw_vault.EXTRACT_PENDING, raw_vault.EXTRACT_PROCESSING,
-                                 raw_vault.EXTRACT_FAILED],
-                stale_before=stale_cutoff,
-            )
-            if not claimed_ids:
-                results[chunk["key"]] = {"status": "no_rows_claimed", "batch_id": batch_id}
-                continue
-            row_ids = claimed_ids
 
-            # For a resumed batch with saved LLM result, use the batch's stored row_ids
-            items = None
-            items_already_written = 0
-            if saved and saved["llm_result"]:
-                try:
-                    items = json.loads(saved["llm_result"])
-                    items_already_written = saved["items_written"]
-                    # Use the saved batch's row_ids, not the chunk's mixed set
-                    included_row_ids = saved["row_ids"]
-                    # Reset new rows that weren't part of this batch back to pending
-                    new_row_ids = [rid for rid in row_ids if rid not in included_row_ids]
-                    if new_row_ids:
-                        raw_vault.mark_rows(new_row_ids, raw_vault.EXTRACT_PENDING)
-                    # Build conversation_text from chunk events for source_ctx
-                    resume_lines = []
-                    for event in chunk["events"]:
-                        if event["id"] not in included_row_ids:
-                            continue
-                        u = (event["user_text"] or "")[:200]
-                        a = (event["ai_text"] or "")[:200]
+            chunk_memories = []
+            for job in recovery_jobs:
+                batch_id = job["batch_id"]
+                saved = job["saved"]
+                target_ids = job["target_row_ids"]
+
+                # Conditional claim: only target rows, PROCESSING only if stale
+                claimed_ids = raw_vault.mark_rows(
+                    target_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
+                    expected_status=[raw_vault.EXTRACT_PENDING, raw_vault.EXTRACT_PROCESSING,
+                                     raw_vault.EXTRACT_FAILED],
+                    stale_before=stale_cutoff,
+                )
+                if not claimed_ids:
+                    continue
+
+                items = None
+                items_already_written = 0
+                included_row_ids = claimed_ids
+
+                if saved and saved["llm_result"]:
+                    try:
+                        items = json.loads(saved["llm_result"])
+                        items_already_written = saved["items_written"]
+                        included_row_ids = list(saved["row_ids"])
+                        # Build conversation_text from saved batch's events
+                        saved_set = set(included_row_ids)
+                        resume_lines = []
+                        for event in chunk["events"]:
+                            if event["id"] not in saved_set:
+                                continue
+                            u = (event["user_text"] or "")[:200]
+                            a = (event["ai_text"] or "")[:200]
+                            ts = (event["created_at"] or "")[:16]
+                            if u or a:
+                                resume_lines.append(f"[{ts}] {u} | {a}" if a else f"[{ts}] {u}")
+                        conversation_text = "\n".join(resume_lines) if resume_lines else ""
+                        logger.info(f"[Recovery] Resuming batch {batch_id}: {items_already_written} items already written")
+                    except Exception:
+                        items = None
+
+                if items is None:
+                    # No saved result — build conversation text from claimed events only
+                    claimed_set = set(claimed_ids)
+                    claimed_events = [e for e in chunk["events"] if e["id"] in claimed_set]
+                    lines = []
+                    included_row_ids = []
+                    char_budget = 5500
+                    is_group = chat_type in ("private_group", "public_group")
+                    for event in claimed_events:
+                        user_short = (event["user_text"] or "")[:200]
+                        ai_short = (event["ai_text"] or "")[:200]
                         ts = (event["created_at"] or "")[:16]
-                        if u or a:
-                            resume_lines.append(f"[{ts}] {u} | {a}" if a else f"[{ts}] {u}")
-                    conversation_text = "\n".join(resume_lines) if resume_lines else ""
-                    logger.info(f"[Recovery] Resuming batch {batch_id}: {items_already_written} items already written")
-                except Exception:
-                    items = None
-
-            if items is None:
-                # No saved result — build conversation text from claimed events only
-                claimed_set = set(row_ids)
-                claimed_events = [e for e in chunk["events"] if e["id"] in claimed_set]
-                lines = []
-                included_row_ids = []
-                char_budget = 5500
-                is_group = chat_type in ("private_group", "public_group")
-                for event in claimed_events:
-                    user_short = (event["user_text"] or "")[:200]
-                    ai_short = (event["ai_text"] or "")[:200]
-                    ts = (event["created_at"] or "")[:16]
-                    entry_ai = event.get("ai_id", "AI")
-                    if not user_short and not ai_short:
+                        entry_ai = event.get("ai_id", "AI")
+                        if not user_short and not ai_short:
+                            included_row_ids.append(event["id"])
+                            continue
+                        if is_group:
+                            if ai_short:
+                                line = f"[{ts}] {user_short}\n  → {entry_ai}: {ai_short}"
+                            else:
+                                line = f"[{ts}] {user_short}"
+                        else:
+                            if ai_short:
+                                line = f"[{ts}] ceci: {user_short} | {entry_ai}: {ai_short}"
+                            else:
+                                line = f"[{ts}] ceci: {user_short}"
+                        if sum(len(l) for l in lines) + len(line) > char_budget:
+                            break
+                        lines.append(line)
                         included_row_ids.append(event["id"])
+
+                    # Rows beyond budget: reset to pending
+                    overflow_ids = [rid for rid in claimed_ids if rid not in included_row_ids]
+                    if overflow_ids:
+                        raw_vault.mark_rows(overflow_ids, raw_vault.EXTRACT_PENDING)
+
+                    # Save batch with actual included set (after budget filtering)
+                    raw_vault.save_batch(batch_id, included_row_ids)
+
+                    if not lines:
+                        raw_vault.mark_rows(
+                            included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
+                            expected_status=[raw_vault.EXTRACT_PROCESSING],
+                            expected_batch=batch_id,
+                        )
+                        raw_vault.update_batch_progress(batch_id, 0, "done")
                         continue
-                    if is_group:
-                        if ai_short:
-                            line = f"[{ts}] {user_short}\n  → {entry_ai}: {ai_short}"
-                        else:
-                            line = f"[{ts}] {user_short}"
-                    else:
-                        if ai_short:
-                            line = f"[{ts}] ceci: {user_short} | {entry_ai}: {ai_short}"
-                        else:
-                            line = f"[{ts}] ceci: {user_short}"
-                    if sum(len(l) for l in lines) + len(line) > char_budget:
-                        break
-                    lines.append(line)
-                    included_row_ids.append(event["id"])
 
-                # Rows beyond budget: reset to pending
-                overflow_ids = [rid for rid in row_ids if rid not in included_row_ids]
-                if overflow_ids:
-                    raw_vault.mark_rows(overflow_ids, raw_vault.EXTRACT_PENDING)
+                    conversation_text = "\n".join(lines)
 
-                # Save batch with actual included set (after budget filtering)
-                raw_vault.save_batch(batch_id, included_row_ids)
+                if items is None:
+                    # No saved result — call LLM
+                    today = local_today()
+                    context_label = {"private": "私聊", "private_group": "私密小群",
+                                     "public_group": "公开大群"}.get(chat_type, "对话")
+                    prompt = (f"今天日期：{today}\n来源：{context_label}（补提取），"
+                              f"共{len(included_row_ids)}条消息（展示了{len(lines)}条）：\n\n{conversation_text}")
 
-                if not lines:
+                    extract_prompt = _get_extract_prompt(chat_type)
+
+                    try:
+                        raw = await _call_llm(extract_prompt + "\n\n" + prompt)
+                    except Exception as e:
+                        logger.warning(f"[Recovery] LLM call failed for {chunk['key']}: {e}")
+                        raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        continue
+
+                    if not raw:
+                        logger.warning(f"[Recovery] LLM returned empty for {chunk['key']}, marking failed")
+                        raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        continue
+
+                    try:
+                        raw = raw.strip()
+                        if raw.startswith("```"):
+                            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+                        items = json.loads(raw)
+                        if not isinstance(items, list):
+                            raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                            continue
+                    except Exception:
+                        raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        continue
+
+                    # Persist LLM result so interrupted retries can resume
+                    raw_vault.save_batch(batch_id, included_row_ids, json.dumps(items))
+
+                # Valid [] = "nothing worth keeping" → done (not failed)
+                if not items:
                     raw_vault.mark_rows(
                         included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                         expected_status=[raw_vault.EXTRACT_PROCESSING],
                         expected_batch=batch_id,
                     )
                     raw_vault.update_batch_progress(batch_id, 0, "done")
-                    results[chunk["key"]] = {"status": "empty", "batch_id": batch_id}
                     continue
 
-                conversation_text = "\n".join(lines)
+                max_items = {"private": 5, "private_group": 6, "public_group": 2}.get(chat_type, 8)
+                memories = []
+                valid_about = {"user", "interaction", "ai"}
+                source_ctx = conversation_text[:1500]
+                is_private_memory = chat_type == "private"
 
-            if items is None:
-                # No saved result — call LLM
-                today = local_today()
-                context_label = {"private": "私聊", "private_group": "私密小群",
-                                 "public_group": "公开大群"}.get(chat_type, "对话")
-                prompt = (f"今天日期：{today}\n来源：{context_label}（补提取），"
-                          f"共{len(chunk['events'])}条消息（展示了{len(lines)}条）：\n\n{conversation_text}")
-
-                extract_prompt = _get_extract_prompt(chat_type)
-
-                try:
-                    raw = await _call_llm(extract_prompt + "\n\n" + prompt)
-                except Exception as e:
-                    logger.warning(f"[Recovery] LLM call failed for {chunk['key']}: {e}")
-                    raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
-                    results[chunk["key"]] = {"status": "llm_failed", "batch_id": batch_id}
-                    continue
-
-                if not raw:
-                    logger.warning(f"[Recovery] LLM returned empty for {chunk['key']}, marking failed")
-                    raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
-                    results[chunk["key"]] = {"status": "llm_empty", "batch_id": batch_id}
-                    continue
-
-                try:
-                    raw = raw.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
-                    items = json.loads(raw)
-                    if not isinstance(items, list):
-                        raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
-                        results[chunk["key"]] = {"status": "parse_failed", "batch_id": batch_id}
+                # Process items, skipping already-written ones on resume
+                processable_items = items[:max_items]
+                for item_idx, item in enumerate(processable_items):
+                    if item_idx < items_already_written:
                         continue
-                except Exception:
-                    raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
-                    results[chunk["key"]] = {"status": "parse_failed", "batch_id": batch_id}
-                    continue
 
-                # Persist LLM result so interrupted retries can resume
-                raw_vault.save_batch(batch_id, included_row_ids, json.dumps(items))
+                    content = str(item.get("content", "")).strip()
+                    if not content or len(content) < 10:
+                        raw_vault.update_batch_progress(batch_id, item_idx + 1)
+                        continue
+                    raw_importance = float(item.get("importance", 0.5))
+                    if raw_importance < 0.5:
+                        raw_vault.update_batch_progress(batch_id, item_idx + 1)
+                        continue
 
-            # Valid [] = "nothing worth keeping" → done (not failed)
-            if not items:
+                    about = item.get("about", "user")
+                    if about not in valid_about:
+                        about = "user"
+                    if about == "user" and not content.startswith("[用户]"):
+                        content = f"[用户] {content}"
+                    elif about == "interaction" and not content.startswith("[互动]"):
+                        content = f"[互动] {content}"
+                    elif about == "ai" and not content.startswith("[AI]"):
+                        content = f"[AI] {content}"
+
+                    valid_prov = {"user_statement", "user_correction", "user_quote",
+                                  "ai_summary", "ai_speculation", "roleplay_meme"}
+                    provenance = item.get("provenance", "")
+                    if provenance not in valid_prov:
+                        provenance = ""
+                    if provenance == "roleplay_meme":
+                        raw_importance = min(raw_importance, 0.55)
+
+                    subj_name = item.get("subject_name", "")
+                    spkr_name = item.get("speaker_name", "")
+                    subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
+                    source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
+
+                    item_source = f"extract:{batch_id}:item{item_idx}:{platform}:{chat_type}"
+
+                    # Idempotency: skip if proposal with this source already exists
+                    if raw_vault.proposal_exists_by_source(item_source):
+                        logger.info(f"[Recovery] Skipping duplicate item {item_idx} (proposal exists)")
+                        raw_vault.update_batch_progress(batch_id, item_idx + 1)
+                        continue
+
+                    verdict = _guardrail_check_and_audit(
+                        item=item, subj_name=subj_name, subject_id=subject_id,
+                        spkr_name=spkr_name, content=content, provenance=provenance,
+                        source_ctx=source_ctx,
+                        source_platform=item_source,
+                        proposer_ai_id=ai_id,
+                    )
+                    if verdict is not None and verdict.blocked:
+                        raw_vault.update_batch_progress(batch_id, item_idx + 1)
+                        continue
+
+                    if provenance == "user_correction":
+                        result = await memory_ops.apply_user_correction(
+                            corrected_value=content,
+                            old_value=str(item.get("corrects_old_value", "")).strip(),
+                            source_ai=ai_id,
+                            room=item.get("room", "living_room"),
+                            source_context=source_ctx,
+                            layer="private" if is_private_memory else "shared",
+                            owner_ai=ai_id if is_private_memory else "",
+                        )
+                        memories.append(result)
+                        raw_vault.update_batch_progress(batch_id, item_idx + 1)
+                        continue
+
+                    result = await memory_ops.remember(
+                        content=content,
+                        layer="private" if is_private_memory else "shared",
+                        room=item.get("room", "living_room"),
+                        owner_ai=ai_id if is_private_memory else "",
+                        importance=max(0.4, min(1.0, raw_importance)),
+                        event_date=item.get("event_date", ""),
+                        source_ai=ai_id,
+                        source_platform=item_source,
+                        source_context=source_ctx,
+                        auto_analyze=False,
+                        quick=True,
+                        provenance_type=provenance,
+                        claim_type=item.get("claim_type", ""),
+                        speech_mode=item.get("speech_mode", ""),
+                        subject_id=subject_id,
+                        source_actor_id=source_actor_id,
+                        info_type=item.get("info_type", ""),
+                        subject_name=subj_name,
+                        speaker_name=spkr_name,
+                    )
+                    memories.append(result)
+                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
+
+                    if item.get("resolved") == False:
+                        mem_id = result.get("id")
+                        if mem_id:
+                            await memory_ops.resolve_memory(mem_id, resolved=False)
+
                 raw_vault.mark_rows(
                     included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
                     expected_status=[raw_vault.EXTRACT_PROCESSING],
                     expected_batch=batch_id,
                 )
-                raw_vault.update_batch_progress(batch_id, 0, "done")
-                results[chunk["key"]] = {"status": "no_content", "batch_id": batch_id}
-                continue
+                raw_vault.update_batch_progress(batch_id, len(processable_items), "done")
+                chunk_memories.extend(memories)
 
-            max_items = {"private": 5, "private_group": 6, "public_group": 2}.get(chat_type, 8)
-            memories = []
-            valid_about = {"user", "interaction", "ai"}
-            source_ctx = conversation_text[:1500]
-            is_private_memory = chat_type == "private"
-
-            # Process items, skipping already-written ones on resume
-            processable_items = items[:max_items]
-            for item_idx, item in enumerate(processable_items):
-                if item_idx < items_already_written:
-                    continue
-
-                content = str(item.get("content", "")).strip()
-                if not content or len(content) < 10:
-                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
-                    continue
-                raw_importance = float(item.get("importance", 0.5))
-                if raw_importance < 0.5:
-                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
-                    continue
-
-                about = item.get("about", "user")
-                if about not in valid_about:
-                    about = "user"
-                if about == "user" and not content.startswith("[用户]"):
-                    content = f"[用户] {content}"
-                elif about == "interaction" and not content.startswith("[互动]"):
-                    content = f"[互动] {content}"
-                elif about == "ai" and not content.startswith("[AI]"):
-                    content = f"[AI] {content}"
-
-                valid_prov = {"user_statement", "user_correction", "user_quote",
-                              "ai_summary", "ai_speculation", "roleplay_meme"}
-                provenance = item.get("provenance", "")
-                if provenance not in valid_prov:
-                    provenance = ""
-                if provenance == "roleplay_meme":
-                    raw_importance = min(raw_importance, 0.55)
-
-                subj_name = item.get("subject_name", "")
-                spkr_name = item.get("speaker_name", "")
-                subject_id = database.resolve_alias(subj_name) or "" if subj_name else ""
-                source_actor_id = database.resolve_alias(spkr_name) or "" if spkr_name else ""
-
-                item_source = f"extract:{batch_id}:item{item_idx}:{platform}:{chat_type}"
-
-                # Idempotency: skip if proposal with this source already exists
-                if raw_vault.proposal_exists_by_source(item_source):
-                    logger.info(f"[Recovery] Skipping duplicate item {item_idx} (proposal exists)")
-                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
-                    continue
-
-                verdict = _guardrail_check_and_audit(
-                    item=item, subj_name=subj_name, subject_id=subject_id,
-                    spkr_name=spkr_name, content=content, provenance=provenance,
-                    source_ctx=source_ctx,
-                    source_platform=item_source,
-                    proposer_ai_id=ai_id,
-                )
-                if verdict is not None and verdict.blocked:
-                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
-                    continue
-
-                if provenance == "user_correction":
-                    result = await memory_ops.apply_user_correction(
-                        corrected_value=content,
-                        old_value=str(item.get("corrects_old_value", "")).strip(),
-                        source_ai=ai_id,
-                        room=item.get("room", "living_room"),
-                        source_context=source_ctx,
-                        layer="private" if is_private_memory else "shared",
-                        owner_ai=ai_id if is_private_memory else "",
-                    )
-                    memories.append(result)
-                    raw_vault.update_batch_progress(batch_id, item_idx + 1)
-                    continue
-
-                result = await memory_ops.remember(
-                    content=content,
-                    layer="private" if is_private_memory else "shared",
-                    room=item.get("room", "living_room"),
-                    owner_ai=ai_id if is_private_memory else "",
-                    importance=max(0.4, min(1.0, raw_importance)),
-                    event_date=item.get("event_date", ""),
-                    source_ai=ai_id,
-                    source_platform=item_source,
-                    source_context=source_ctx,
-                    auto_analyze=False,
-                    quick=True,
-                    provenance_type=provenance,
-                    claim_type=item.get("claim_type", ""),
-                    speech_mode=item.get("speech_mode", ""),
-                    subject_id=subject_id,
-                    source_actor_id=source_actor_id,
-                    info_type=item.get("info_type", ""),
-                    subject_name=subj_name,
-                    speaker_name=spkr_name,
-                )
-                memories.append(result)
-                raw_vault.update_batch_progress(batch_id, item_idx + 1)
-
-                if item.get("resolved") == False:
-                    mem_id = result.get("id")
-                    if mem_id:
-                        await memory_ops.resolve_memory(mem_id, resolved=False)
-
-            raw_vault.mark_rows(
-                included_row_ids, raw_vault.EXTRACT_DONE, batch_id,
-                expected_status=[raw_vault.EXTRACT_PROCESSING],
-                expected_batch=batch_id,
-            )
-            raw_vault.update_batch_progress(batch_id, len(processable_items), "done")
-
-            if memories:
-                logger.info(f"[Recovery] Extracted {len(memories)} memories from {chunk['key']} (batch={batch_id})")
-            else:
-                logger.info(f"[Recovery] No memories from {chunk['key']} (batch={batch_id})")
+                if memories:
+                    logger.info(f"[Recovery] Extracted {len(memories)} memories from {chunk['key']} (batch={batch_id})")
+                else:
+                    logger.info(f"[Recovery] No memories from {chunk['key']} (batch={batch_id})")
 
             results[chunk["key"]] = {
                 "status": "extracted",
-                "batch_id": batch_id,
-                "memory_count": len(memories),
+                "memory_count": len(chunk_memories),
             }
 
         return {"status": "recovered", "chunks": len(results), "details": results}
