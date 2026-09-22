@@ -436,22 +436,22 @@ class TestBackfillRawEmbeddings:
 
 
 class TestMCPToolRegistration:
-    def test_recent_raw_context_in_quickref(self):
+    def test_semantic_search_method_in_search_tool(self):
         src = open("mcp_server.py", encoding="utf-8").read()
-        assert "recent_raw_context" in src
-        assert "语义搜最近" in src
+        assert "semantic" in src
+        assert "semantic_search" in src
 
     def test_tool_count_updated(self):
         src = open("mcp_server.py", encoding="utf-8").read()
-        assert "39 个工具" in src
+        assert "12 个工具" in src
 
-    def test_search_guidance_in_docstring(self):
+    def test_semantic_search_in_search_tool(self):
         src = open("mcp_server.py", encoding="utf-8").read()
-        idx = src.find("async def recent_raw_context")
-        assert idx != -1
+        idx = src.find("async def search(")
+        assert idx != -1, "consolidated search tool not found"
         docstring = src[idx:idx + 1500]
-        assert "recall" in docstring
-        assert "search_raw" in docstring
+        assert "semantic" in docstring
+        assert "keyword" in docstring
 
 
 class TestStoreEmbedding:

@@ -526,11 +526,11 @@ class TestMCPContract:
         src = Path(__file__).parent.parent / "mcp_server.py"
         tree = ast.parse(src.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "search_raw":
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "search":
                 param_names = [a.arg for a in node.args.args]
-                assert "ai_id" not in param_names, "MCP search_raw must not expose ai_id"
+                assert "ai_id" not in param_names, "MCP search must not expose ai_id"
                 return
-        pytest.fail("search_raw function not found in mcp_server.py")
+        pytest.fail("search function not found in mcp_server.py")
 
     def test_mcp_search_raw_passes_empty_ai_id(self):
         """Verify the wrapper always calls raw_vault.search with ai_id=''."""

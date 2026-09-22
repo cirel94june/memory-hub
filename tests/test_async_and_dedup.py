@@ -259,29 +259,26 @@ class TestAsyncRememberHelpers:
         assert resp["status"] == "pending"
 
     def test_mcp_wrapper_has_idempotency_and_integrity_guards(self):
-        """Source-inspection guard: the MCP wrapper must contain the
-        idempotency query, the sqlite3.IntegrityError catch, and a
-        GC-safe background dispatch. Works offline (no mcp)."""
+        """Source-inspection guard: the remember pipeline (_async_remember_single
+        helper) must contain the idempotency query, the sqlite3.IntegrityError
+        catch, and a GC-safe background dispatch. Works offline (no mcp)."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        idx = src.find("async def remember(")
-        assert idx != -1, "remember MCP tool not found"
-        # Body needs to cover: docstring + idempotency lookup + INSERT loop
-        # with IntegrityError catch + id-collision return + background dispatch.
+        assert "async def remember(" in src, "remember MCP tool not found"
+        assert "async def _async_remember_single(" in src, \
+            "_async_remember_single helper not found"
+        idx = src.find("async def _async_remember_single(")
         body = src[idx:idx + 10000]
         assert "get_memory_by_client_request_id" in body, \
-            "MCP wrapper missing idempotency lookup"
+            "remember pipeline missing idempotency lookup"
         assert "sqlite3.IntegrityError" in body, \
-            "MCP wrapper missing IntegrityError catch — race would leak error"
-        # P0-1: must use the GC-safe helper, not raw asyncio.create_task
+            "remember pipeline missing IntegrityError catch"
         assert "_spawn_background_task" in body, \
-            "MCP wrapper missing GC-safe background dispatch — task may be " \
-            "garbage-collected mid-flight"
+            "remember pipeline missing GC-safe background dispatch"
         assert "asyncio.create_task" not in body, \
-            "MCP wrapper uses raw asyncio.create_task — Task ref may be " \
-            "GC'd; use _spawn_background_task"
+            "remember pipeline uses raw asyncio.create_task"
         assert "_finalize_pending_memory" in body, \
-            "MCP wrapper missing finalize dispatch"
+            "remember pipeline missing finalize dispatch"
 
     def test_no_double_row_after_normal_create(self, db_env):
         """P0-2 regression: skeleton_id must be REUSED by the pipeline when
@@ -400,19 +397,15 @@ class TestAsyncRememberHelpers:
         assert "hint" in resp
 
     def test_mcp_wrapper_returns_error_dict_on_id_collision(self):
-        """必修 2: after 3 skeleton_id retries, MCP wrapper must return a
-        structured error dict, NOT re-raise IntegrityError (violates the
-        'never bubble' contract)."""
+        """必修 2: after 3 skeleton_id retries, the remember pipeline must
+        return a structured error dict, NOT re-raise IntegrityError."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        idx = src.find("async def remember(")
+        idx = src.find("async def _async_remember_single(")
+        assert idx != -1, "_async_remember_single helper not found"
         body = src[idx:idx + 10000]
         assert '"error": "id_collision_max_retry"' in body, \
-            "MCP wrapper missing id_collision_max_retry error path"
-        # The MCP wrapper's INSERT loop must not have a raw `raise` on the
-        # id-collision branch. The only `raise` allowed is inside the
-        # IntegrityError handler (the CRQ-lookup fallback) that we now
-        # replaced with the structured error return.
+            "remember pipeline missing id_collision_max_retry error path"
         insert_loop_start = body.find("for attempt in range")
         insert_loop_end = body.find("if not inserted:")
         assert insert_loop_start != -1 and insert_loop_end != -1, \
@@ -548,14 +541,15 @@ class TestAsyncRememberHelpers:
         a crq_content_conflict error, not silently return the first row's id."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        idx = src.find("async def remember(")
+        idx = src.find("async def _async_remember_single(")
+        assert idx != -1, "_async_remember_single helper not found"
         body = src[idx:idx + 10000]
         assert "_request_fingerprint" in body, \
-            "MCP wrapper missing request fingerprint compute"
+            "remember pipeline missing request fingerprint compute"
         assert '"error": "crq_content_conflict"' in body, \
-            "MCP wrapper missing crq_content_conflict error path"
+            "remember pipeline missing crq_content_conflict error path"
         assert "request_fingerprint" in body, \
-            "MCP wrapper missing fingerprint persistence/comparison"
+            "remember pipeline missing fingerprint persistence/comparison"
 
     def test_m1_effective_crq_namespaces_by_source_ai(self):
         """M1: effective_crq must include source_ai to prevent cross-AI collision."""
@@ -1560,31 +1554,33 @@ class TestSafeRememberAsync:
             "finalize wrapper must inject _safe_remember_impl"
 
     def test_safe_remember_mcp_wrapper_structure(self):
-        """Source-inspection: safe_remember MCP tool must have the same
-        async guards as remember: idempotency lookup, skeleton INSERT with
-        IntegrityError catch, GC-safe background dispatch, and
-        source_platform='mcp:safe'."""
+        """Source-inspection: safe_remember is now a redirect alias to
+        remember, which delegates to _async_remember_single. Verify the
+        redirect exists and the pipeline has all guards."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
         idx = src.find("async def safe_remember(")
-        assert idx != -1, "safe_remember MCP tool not found"
-        body = src[idx:idx + 10000]
-        assert "get_memory_by_client_request_id" in body, \
-            "safe_remember missing idempotency lookup"
-        assert "sqlite3.IntegrityError" in body, \
-            "safe_remember missing IntegrityError catch"
-        assert "_spawn_background_task" in body, \
-            "safe_remember missing GC-safe background dispatch"
-        assert "_finalize_pending_memory" in body, \
-            "safe_remember missing finalize dispatch"
-        assert '"mcp:safe"' in body, \
-            "safe_remember skeleton must have source_platform='mcp:safe'"
-        assert '"status": "queued"' in body, \
-            "safe_remember must return queued status immediately"
-        assert '"safe_write": True' in body, \
-            "safe_remember must set safe_write flag in response"
-        assert "request_fingerprint" in body, \
-            "safe_remember missing request fingerprint for idempotency"
+        assert idx != -1, "safe_remember redirect alias not found"
+        alias_body = src[idx:idx + 500]
+        assert "await remember(" in alias_body, \
+            "safe_remember must redirect to remember()"
+        idx2 = src.find("async def _async_remember_single(")
+        assert idx2 != -1, "_async_remember_single helper not found"
+        pipeline = src[idx2:idx2 + 10000]
+        assert "get_memory_by_client_request_id" in pipeline, \
+            "remember pipeline missing idempotency lookup"
+        assert "sqlite3.IntegrityError" in pipeline, \
+            "remember pipeline missing IntegrityError catch"
+        assert "_spawn_background_task" in pipeline, \
+            "remember pipeline missing GC-safe background dispatch"
+        assert "_finalize_pending_memory" in pipeline, \
+            "remember pipeline missing finalize dispatch"
+        assert '"mcp:safe"' in pipeline, \
+            "remember pipeline must use source_platform='mcp:safe'"
+        assert '"status": "queued"' in pipeline, \
+            "remember pipeline must return queued status"
+        assert "request_fingerprint" in pipeline, \
+            "remember pipeline missing request fingerprint"
 
     def test_safe_remember_idempotent_duplicate(self, db_env):
         """Same client_request_id returns idempotent=True without creating
@@ -1626,24 +1622,24 @@ class TestSafeRememberAsync:
         assert resp["memory_id"] == "safe_skel_poll"
 
     def test_safe_remember_crq_namespaced_by_source_ai(self):
-        """safe_remember's effective_crq must be namespaced by source_ai,
-        so 'gpt::foo' and 'claude::foo' are distinct."""
+        """The remember pipeline's effective_crq must be namespaced by
+        source_ai, so 'gpt::foo' and 'claude::foo' are distinct."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        idx = src.find("async def safe_remember(")
+        idx = src.find("async def _async_remember_single(")
         body = src[idx:idx + 3000]
         assert 'f"{source_ai}::{client_request_id}"' in body, \
-            "safe_remember must namespace crq by source_ai"
+            "remember pipeline must namespace crq by source_ai"
 
     def test_safe_remember_speaker_name_passed_to_finalize(self):
-        """safe_remember must pass speaker_name through to
+        """The remember pipeline must pass speaker_name through to
         _finalize_pending_memory so guardrail checks can use it."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        idx = src.find("async def safe_remember(")
+        idx = src.find("async def _async_remember_single(")
         body = src[idx:idx + 10000]
         assert "speaker_name=speaker_name" in body, \
-            "safe_remember must pass speaker_name to finalize"
+            "remember pipeline must pass speaker_name to finalize"
 
 
 class TestSafeRememberBehavioral:

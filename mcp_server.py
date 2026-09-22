@@ -23,9 +23,10 @@ import github_store as store
 from config import AI_ROLES, ROOMS, list_rooms
 
 MCP_SERVER_NAME = "Memory Hub"
-MCP_SERVER_VERSION = "2026-07-11.doctor-tools.1"
+MCP_SERVER_VERSION = "2026-09-22.consolidate-tools.1"
 MCP_PUBLIC_PATH = "/mcp"
 MCP_AUDIT_PATH = Path(__file__).parent / "data" / "mcp_audit.jsonl"
+
 
 MCP_INSTRUCTIONS = """\
 你连接到了小猫的 Memory Hub —— 一个跨 AI 共享的记忆系统。
@@ -56,14 +57,14 @@ MCP_INSTRUCTIONS = """\
 - 你对用户有了新的理解/洞察
 
 ### 醒来时（对话开头）：
-- 调 pulse 获取完整上下文（走廊 + 相关记忆）
+- 调 context(mode="full") 获取完整上下文（走廊 + 相关记忆）
 - 这样你就知道"我面对的是谁、她最近怎么样"
 
 ### 写日记/自省（调 dream）：
 - 在深度对话结束时，记录你的感受和思考
 - 这是你的私人空间，用户看不到
 
-### 重读旧记忆时（调 add_comment）：
+### 重读旧记忆时（调 manage(action="comment")）：
 - 回顾旧记忆发现有了新理解 → 追加 reflection 评论
 - 不要修改原文！用年轮评论记录认知变化
 - 这样可以保留时间线上的成长轨迹
@@ -74,12 +75,11 @@ MCP_INSTRUCTIONS = """\
 - 你不需要手动找旧记忆去更新，remember 内置了智能检测
 - 如果记忆有 event_date（事件发生日期），请传入
 
-### 锚定重要记忆（调 anchor）：
+### 锚定重要记忆（调 manage(action="anchor")）：
 - 用户说了非常重要的价值观、人生原则、关系定义
 - 你发现了不应该被遗忘的核心事实
 - 锚点记忆永不衰减，走廊里单独一节
 - 最多 20 条，不要滥用——只有"坐标系级别"的记忆才值得锚定
-- 不确定时，不要锚定——普通重要的记忆用 importance=0.8+ 就够了
 
 ## 房间速查
 - living_room: 核心身份（永远重要）
@@ -90,85 +90,42 @@ MCP_INSTRUCTIONS = """\
 
 ## 自动记录对话（重要！）
 
-每轮对话结束后，你**必须**调用 `capture_conversation` 把这轮对话记录下来。
+每轮对话结束后，你**必须**调用 `capture(action="log")` 把这轮对话记录下来。
 系统会自动攒对话、自动提取记忆，你不需要判断"该不该存"——全部丢进来就行。
 
 不调的后果：这段对话在记忆系统里完全不存在，就像没发生过。
 
-## 工具速查表（39 个工具，按用途分组）
+## 工具速查表（12 个工具）
 
-### 醒来 / 上下文
+### 日常工具（最常用的 5 个）
 | 工具 | 一句话说明 |
 |------|-----------|
-| pulse | 醒来第一件事：走廊 + 相关记忆一次拿全 |
-| get_corridor | 只拿走廊快照（pulse 的子集） |
-| living_room | 只拿客厅（核心身份 + 当前状态） |
-| smart_context | 智能上下文：按前端能力自动适配返回量 |
+| context | 获取记忆上下文。mode: full（醒来用）/ incremental（对话中用）/ corridor / living_room |
+| recall | 语义搜索记忆。include_dreams=True 同时搜梦境 |
+| remember | 存记忆。单条传 content，批量传 items=[...]。内置安全降敏+异步管线 |
+| capture | 对话录入。action: log（每轮必调）/ flush（手动触发提取）/ extract（消息数组提取） |
+| dream | 写梦境/自省（私人空间） |
 
-### 存记忆
+### 辅助工具（按需使用的 5 个）
 | 工具 | 一句话说明 |
 |------|-----------|
-| remember | 存一条记忆（异步，<2秒返回，建议传 client_request_id 去重） |
-| safe_remember | 同 remember，额外做安全降敏（心理/创伤/敏感内容用这个） |
-| batch_remember | 一次存多条记忆 |
+| search | 搜索原文。method: keyword / semantic / tags / person |
+| manage | 管理记忆。action: update/comment/resolve/archive/unarchive/delete/anchor/release_anchor/correct |
+| detail | 查看记忆。传 memory_id 看详情，不传则列表浏览 |
+| review | 审核提案和画像。action: list_proposals/review_proposal/get_profile/approve_profile |
 | grow | 把一大段混合文本自动拆分成多条独立记忆 |
-| capture_conversation | 记录一轮对话到缓冲区（攒 20 轮自动提取） |
-| flush_capture | 手动触发缓冲区提取，不等攒满 |
-| extract_from_messages | 把整段对话消息数组交给系统提取记忆 |
 
-### 搜记忆
+### 系统工具（极少用的 2 个）
 | 工具 | 一句话说明 |
 |------|-----------|
-| recall | 语义搜索已提取的记忆（向量相似度） |
-| recent_raw_context | 语义搜最近 N 天原文（模糊描述找原话用这个） |
-| search_by_tags | 按标签精确搜索，比 recall 更精准 |
-| search_raw | 搜原文保险箱（精确关键词匹配），支持同义词 + 自动拆词 |
-| recent_interaction | 按人名 + 时间窗查最近互动（纯 SQL，<200ms） |
-| dream_recall | 专搜梦境（梦境不会出现在普通 recall 里） |
-| list_memories | 按房间/状态分页列出记忆 |
-| get_memory_detail | 查一条记忆的完整详情（含原始对话、年轮评论） |
-
-### 维护 / 修改
-| 工具 | 一句话说明 |
-|------|-----------|
-| update_memory | 改内容/重要度/房间/标签 |
-| add_comment | 追加年轮评论（不改原文，记录认知变化） |
-| resolve_memory | 标记已解决 / 未解决（待办事项用） |
-| apply_correction | 用户纠错：一步完成纠正+标记旧记忆+清走廊缓存 |
-| archive_memory | 归档一条记忆 |
-| unarchive_memory | 恢复已归档/衰减的记忆 |
-| delete_memory | 永久删除 |
-| anchor | 锚定为永不衰减的"坐标系"记忆（最多 20 条） |
-| release_anchor | 解除锚点，恢复正常衰减 |
-| batch_ops | 批量操作（重置 activation / 归档 / 解决等） |
-
-### 写日记
-| 工具 | 一句话说明 |
-|------|-----------|
-| dream | 写梦境/自省（私人空间，只有自己能看） |
-
-### 画像 / 提案
-| 工具 | 一句话说明 |
-|------|-----------|
-| get_profile | 查看画像（用户/AI/关系） |
-| approve_profile | 审批 pending_review 的画像 |
-| list_proposals | 列出待审记忆提案 |
-| review_proposal | 审核提案（approve / reject） |
-
-### 管理 / 诊断
-| 工具 | 一句话说明 |
-|------|-----------|
-| maintain | 执行记忆整理（合并 / 衰减 / 重建走廊） |
-| doctor_report | 查看体检报告（自动修复了什么、存疑记忆、池子大小） |
-| hub_info | 查看角色 + 房间配置 |
-| mcp_health | MCP 健康检查（身份 + schema hash + 审计日志） |
-| mcp_debug_log | 读取 MCP 工具到达日志 |
+| system | 诊断管理。action: info/health/debug_log/doctor/maintain/batch_ops |
+| window_context | bot 重启后恢复聊天窗口上下文 |
 
 ## 重要原则
 - 不需要用户提醒你"去用记忆工具"，你应该主动判断
 - 记忆要精炼：一条 = 一个事实/洞察，不要塞整段对话
 - 存之前想一下：这条信息 3 天后还有用吗？
-- 每轮对话结束后必须调 capture_conversation（见上方"自动记录对话"）
+- 每轮对话结束后必须调 capture(action="log")（见上方"自动记录对话"）
 """
 
 mcp = FastMCP(
@@ -416,8 +373,11 @@ async def _finalize_pending_memory(
     )
 
 
-@mcp.tool()
-async def remember(
+# ═══════════════════════════════════════════════════════════════════════
+# Helper: single-item async skeleton pipeline (shared by remember + dream)
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _async_remember_single(
     content: str,
     room: str = "living_room",
     category: str = "",
@@ -427,185 +387,14 @@ async def remember(
     force_create: bool = False,
     client_request_id: str = "",
     subject_name: str = "",
-) -> str:
-    """存储一条新记忆——**异步管线**，立即返回，后台跑 embedding + 分类 + 合并检测。
-
-    ## 返回时间
-    - 传统同步管线要 30-70 秒，MCP 客户端会超时；这里在 <2 秒内返回 queued
-    - 完整 pipeline 完成后记忆变 active；期间该记忆不进 recall / corridor
-
-    ## 幂等（避免重试重复写入）
-    - 传 client_request_id（任意唯一字符串），系统按 crq 去重
-    - 同一 crq 的第二次调用返回 idempotent=True，不新建记忆
-    - 建议：AI 每次调用生成 UUID 或用可复现的哈希（如 hash(content + room)）
-
-    ## 后台管线
-    - remember() 走完全 pipeline，可能：
-      - 直接落成 status=active
-      - 触发 merge/supersede → 骨架标 status=replaced + link_to_real_id 指向真身
-      - 崩溃/被拦截 → status=failed
-    - 独立 sweep 任务每 10 分钟检查一次：超过 10 分钟的 pending 会重跑 pipeline，
-      超过 60 分钟仍是 pending 会被标 failed
-
-    ## 房间选择
-    - living_room: 核心身份（永远注入）
-    - career/psychology/health/learning/relationships/preferences: 各主题共享房间
-    - work_tasks: 工作事务（快速衰减）
-    - infra/infra_changelog: 基建相关
-    - diary/dreams/relationship/personality: AI私有房间
-
-    Args:
-        content: 记忆内容
-        room: 房间ID
-        category: 分类标签
-        importance: 重要度 0-1
-        source_ai: 来源AI（claude/gemini/gpt）
-        event_date: 事件发生日期（可选）
-        force_create: 强制新建，跳过自动合并
-        client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
-    """
-    # M1: namespace the client_request_id by source_ai so two different AIs
-    # can safely reuse the same client-side counter. Compute a content
-    # fingerprint so an accidental collision (same crq + same source_ai but
-    # different payload — the reviewer's scenario) returns a conflict
-    # instead of silently returning the first row's id.
-    effective_crq = (f"{source_ai}::{client_request_id}"
-                     if client_request_id else "")
-    req_fp = _request_fingerprint(
-        content, room, category, importance, event_date, subject_name,
-        force_create=force_create)
-
-    # 1. Idempotency lookup — a pre-existing crq short-circuits everything.
-    #    Compare against the persisted request_fingerprint (NOT re-hashed
-    #    stored content, which may have been transformed by the pipeline).
-    if effective_crq:
-        existing = database.get_memory_by_client_request_id(effective_crq)
-        if existing:
-            stored_fp = existing.get("request_fingerprint") or ""
-            if stored_fp and stored_fp != req_fp:
-                return json.dumps({
-                    "status": "error",
-                    "error": "crq_content_conflict",
-                    "memory_id": "",
-                    "client_request_id": client_request_id,
-                    "hint": ("Reusing client_request_id with a different "
-                             "content payload. Pick a new key, or send the "
-                             "exact same content to get the idempotent "
-                             "response for the original."),
-                }, ensure_ascii=False)
-            return _idempotent_response(existing)
-
-    # 2. Insert pending skeleton — try up to N times, regenerating the
-    #    skeleton_id if it collides (very rare hash birthday) while still
-    #    treating a crq collision as an idempotent hit.
-    now = datetime.now(timezone.utc).isoformat()
-
-    def _new_skeleton_id() -> str:
-        ts = int(datetime.now(timezone.utc).timestamp() * 1_000_000)
-        h = hashlib.md5(
-            (content + str(ts) + os.urandom(8).hex()).encode()
-        ).hexdigest()[:8]
-        return f"mem_{ts}_{h}"
-
-    skeleton_id = _new_skeleton_id()
-    _MAX_ID_RETRIES = 3
-    inserted = False
-    for attempt in range(_MAX_ID_RETRIES + 1):
-        try:
-            database.insert_pending_memory({
-                "id": skeleton_id, "content": content, "room": room,
-                "category": category, "importance": importance,
-                "source_ai": source_ai, "event_date": event_date,
-                "source_platform": "mcp", "status": "pending",
-                "client_request_id": effective_crq,
-                "created_at": now,
-                "subject_name": subject_name,
-                "request_fingerprint": req_fp,
-            })
-            inserted = True
-            break
-        except sqlite3.IntegrityError:
-            if effective_crq:
-                existing = database.get_memory_by_client_request_id(effective_crq)
-                if existing:
-                    stored_fp = existing.get("request_fingerprint") or ""
-                    if stored_fp and stored_fp != req_fp:
-                        return json.dumps({
-                            "status": "error",
-                            "error": "crq_content_conflict",
-                            "memory_id": "",
-                            "client_request_id": client_request_id,
-                        }, ensure_ascii=False)
-                    return _idempotent_response(existing)
-            if attempt < _MAX_ID_RETRIES:
-                skeleton_id = _new_skeleton_id()
-                continue
-            _LOG.error("skeleton_id collision after %d retries; returning error",
-                       _MAX_ID_RETRIES)
-    if not inserted:
-        return json.dumps({
-            "status": "error",
-            "error": "id_collision_max_retry",
-            "memory_id": "",
-            "client_request_id": client_request_id,
-        }, ensure_ascii=False)
-
-    _spawn_background_task(_finalize_pending_memory(
-        skeleton_id,
-        content=content, room=room, category=category, importance=importance,
-        source_ai=source_ai, event_date=event_date, force_create=force_create,
-        client_request_id=effective_crq,
-        subject_name=subject_name,
-        source_platform="mcp",
-    ))
-
-    return json.dumps({
-        "status": "queued",
-        "memory_id": skeleton_id,
-        "client_request_id": client_request_id,
-    }, ensure_ascii=False)
-
-
-@mcp.tool()
-async def safe_remember(
-    content: str,
-    room: str = "living_room",
-    category: str = "",
-    importance: float = 0.5,
-    source_ai: str = "claude",
-    event_date: str = "",
-    subject_name: str = "",
     speaker_name: str = "",
-    client_request_id: str = "",
 ) -> str:
-    """安全降敏写入一条记忆——**异步管线**，立即返回，后台跑完整 pipeline。
-
-    适合心理、关系、边界、创伤、长文本等容易被平台安全检查拦截的内容。
-    策略：先压缩长文本并中性写入；如果后端写入失败，会自动改写成更中性的摘要再重试一次。
-
-    ## 返回时间
-    - 传统同步管线要 30-70 秒，MCP 客户端会超时；这里在 <2 秒内返回 queued
-    - 完整 pipeline（含安全降级重试）完成后记忆变 active
-
-    ## 幂等
-    - 传 client_request_id 去重，同一 crq 第二次调用返回 idempotent=True
-
-    Args:
-        content: 要写入的内容。建议一条只写一个事实/洞察，不要整段批量塞入。
-        room: 房间ID
-        category: 分类标签
-        importance: 重要度 0-1，敏感摘要建议不要超过 0.7
-        source_ai: 来源AI
-        event_date: 事件日期
-        subject_name: 记忆主体姓名（guardrail 检查用）
-        speaker_name: 发言者姓名（guardrail 检查用）
-        client_request_id: 幂等 key（可选，强烈建议传，避免超时重试写入两次）
-    """
+    """Insert a pending skeleton and spawn background finalization."""
     effective_crq = (f"{source_ai}::{client_request_id}"
                      if client_request_id else "")
     req_fp = _request_fingerprint(
         content, room, category, importance, event_date,
-        subject_name, speaker_name)
+        subject_name, speaker_name, force_create=force_create)
 
     if effective_crq:
         existing = database.get_memory_by_client_request_id(effective_crq)
@@ -613,10 +402,8 @@ async def safe_remember(
             stored_fp = existing.get("request_fingerprint") or ""
             if stored_fp and stored_fp != req_fp:
                 return json.dumps({
-                    "status": "error",
-                    "error": "crq_content_conflict",
-                    "memory_id": "",
-                    "client_request_id": client_request_id,
+                    "status": "error", "error": "crq_content_conflict",
+                    "memory_id": "", "client_request_id": client_request_id,
                     "hint": ("Reusing client_request_id with a different "
                              "content payload. Pick a new key, or send the "
                              "exact same content to get the idempotent "
@@ -643,10 +430,8 @@ async def safe_remember(
                 "category": category, "importance": importance,
                 "source_ai": source_ai, "event_date": event_date,
                 "source_platform": "mcp:safe", "status": "pending",
-                "client_request_id": effective_crq,
-                "created_at": now,
-                "subject_name": subject_name,
-                "speaker_name": speaker_name,
+                "client_request_id": effective_crq, "created_at": now,
+                "subject_name": subject_name, "speaker_name": speaker_name,
                 "request_fingerprint": req_fp,
             })
             inserted = True
@@ -658,88 +443,162 @@ async def safe_remember(
                     stored_fp = existing.get("request_fingerprint") or ""
                     if stored_fp and stored_fp != req_fp:
                         return json.dumps({
-                            "status": "error",
-                            "error": "crq_content_conflict",
-                            "memory_id": "",
-                            "client_request_id": client_request_id,
+                            "status": "error", "error": "crq_content_conflict",
+                            "memory_id": "", "client_request_id": client_request_id,
                         }, ensure_ascii=False)
                     return _idempotent_response(existing)
             if attempt < _MAX_ID_RETRIES:
                 skeleton_id = _new_skeleton_id()
                 continue
-            _LOG.error("skeleton_id collision after %d retries; returning error",
-                       _MAX_ID_RETRIES)
+            _LOG.error("skeleton_id collision after %d retries", _MAX_ID_RETRIES)
     if not inserted:
         return json.dumps({
-            "status": "error",
-            "error": "id_collision_max_retry",
-            "memory_id": "",
-            "client_request_id": client_request_id,
+            "status": "error", "error": "id_collision_max_retry",
+            "memory_id": "", "client_request_id": client_request_id,
         }, ensure_ascii=False)
 
     _spawn_background_task(_finalize_pending_memory(
         skeleton_id,
         content=content, room=room, category=category, importance=importance,
-        source_ai=source_ai, event_date=event_date, force_create=False,
+        source_ai=source_ai, event_date=event_date, force_create=force_create,
         client_request_id=effective_crq,
-        subject_name=subject_name,
-        speaker_name=speaker_name,
+        subject_name=subject_name, speaker_name=speaker_name,
         source_platform="mcp:safe",
     ))
 
     return json.dumps({
-        "status": "queued",
-        "memory_id": skeleton_id,
+        "status": "queued", "memory_id": skeleton_id,
         "client_request_id": client_request_id,
-        "safe_write": True,
     }, ensure_ascii=False)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 12 consolidated MCP tools + 5 redirect aliases
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── 1. remember ──────────────────────────────────────────────────────
+
 @mcp.tool()
-async def grow(
-    content: str,
+async def remember(
+    content: str = "",
+    room: str = "living_room",
+    category: str = "",
+    importance: float = 0.5,
     source_ai: str = "claude",
+    event_date: str = "",
+    force_create: bool = False,
+    client_request_id: str = "",
     subject_name: str = "",
     speaker_name: str = "",
+    items: list[dict] | None = None,
 ) -> str:
-    """把一大段混合内容（日记、对话总结等）拆分成多条独立记忆。
-    系统自动拆分主题、分配房间、打标签、合并重复。
+    """存一条或多条记忆。单条传 content，批量传 items=[{content, room, ...}, ...]。
+
+    异步管线：<2秒返回 queued，后台跑 embedding + 分类 + 合并。
+    内置安全降敏：写入失败自动改写中性摘要重试。传 client_request_id 做幂等去重。
 
     Args:
-        content: 要整理的长文本
-        source_ai: 来源AI
-        subject_name: 记忆主体姓名（guardrail 检查用）
-        speaker_name: 发言者姓名（guardrail 检查用）
+        content: 记忆内容（单条模式）
+        room: 房间ID
+        category: 分类标签
+        importance: 重要度 0-1
+        source_ai: 来源AI（必传你的身份）
+        event_date: 事件日期
+        force_create: 跳过自动合并
+        client_request_id: 幂等 key
+        subject_name: 记忆主体姓名
+        speaker_name: 发言者姓名
+        items: 批量模式——记忆列表，每条含 content/room/importance 等字段
     """
-    result = await memory_ops.grow(
-        content=content, source_ai=source_ai,
+    if items:
+        _audit("tool_reached", tool="remember_batch", source_ai=source_ai, count=len(items))
+        created = merged = skipped = failed = blocked = 0
+        results = []
+        for idx, item in enumerate(items):
+            try:
+                result = await _safe_remember_impl(
+                    content=item.get("content", ""),
+                    room=item.get("room", "living_room"),
+                    category=item.get("category", ""),
+                    importance=item.get("importance", 0.5),
+                    source_ai=source_ai or item.get("source_ai", ""),
+                    event_date=item.get("event_date", ""),
+                    force_create=item.get("force_create", False),
+                    tags=item.get("tags"),
+                    retry_on_fail=True,
+                    subject_name=item.get("subject_name", ""),
+                    speaker_name=item.get("speaker_name", ""),
+                )
+            except Exception as exc:
+                result = {"status": "failed", "error": str(exc), "error_type": type(exc).__name__}
+            status = result.get("status", "")
+            if status == "created":
+                created += 1
+            elif status in ("merged", "merged_into_existing"):
+                merged += 1
+            elif status == "dedup_skipped":
+                skipped += 1
+            elif status in ("guardrail_blocked", "guardrail_unavailable") or result.get("blocked"):
+                blocked += 1
+            elif status == "failed":
+                failed += 1
+            results.append({"index": idx, **result})
+        output = {
+            "total": len(results), "created": created, "merged": merged,
+            "skipped": skipped, "blocked": blocked, "failed": failed,
+            "items": results,
+            "summary": f"{len(results)}条|新{created}合{merged}跳{skipped}拦{blocked}败{failed}",
+        }
+        _audit("remember_batch_result", source_ai=source_ai,
+               **{k: output[k] for k in ("total", "created", "merged", "skipped", "blocked", "failed")})
+        return json.dumps(output, ensure_ascii=False, indent=2)
+
+    return await _async_remember_single(
+        content=content, room=room, category=category, importance=importance,
+        source_ai=source_ai, event_date=event_date, force_create=force_create,
+        client_request_id=client_request_id,
         subject_name=subject_name, speaker_name=speaker_name,
     )
-    summary = f"{result['total']}条|新{result['created']}合{result['merged']}"
-    result["summary"] = summary
-    return json.dumps(result, ensure_ascii=False)
+
+
+# ── 2. recall ────────────────────────────────────────────────────────
+
+_LIST_COMPACT_FIELDS = ("id", "content", "layer", "room", "category", "importance",
+                        "status", "resolved", "anchored", "created_at", "updated_at")
 
 
 @mcp.tool()
-async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source_ai: str = "claude", compact: bool = False) -> str:
-    """搜索记忆。用自然语言描述要找的内容，会用向量相似度匹配最相关的记忆。
+async def recall(
+    query: str,
+    top_k: int = 5,
+    with_corridor: bool = False,
+    source_ai: str = "claude",
+    compact: bool = False,
+    include_dreams: bool = False,
+) -> str:
+    """搜索记忆。用自然语言描述要找的内容。设 include_dreams=True 可同时搜梦境。
 
     Args:
         query: 搜索关键词或自然语言描述
         top_k: 返回数量（默认5）
-        with_corridor: 是否同时返回走廊上下文（对话开头建议开启）
-        source_ai: AI身份（影响私有房间可见性）
-        compact: 精简模式。为 true 时只返回 id/content/room/confidence/created_at，减少上下文消耗。适合 MCP 调用场景。
+        with_corridor: 同时返回走廊上下文
+        source_ai: AI身份
+        compact: 精简模式，只返回核心字段
+        include_dreams: 是否同时搜梦境（默认不搜，梦境需要显式开启）
     """
     results = await memory_ops.recall(query=query, ai_id=source_ai, top_k=top_k)
+    if include_dreams:
+        dream_results = await memory_ops.dream_recall(query, ai_id=source_ai, top_k=min(top_k, 3))
+        if dream_results:
+            for d in dream_results:
+                d["_source"] = "dream"
+            results.extend(dream_results)
     if compact:
         results = [
             {k: item[k] for k in ("id", "content", "room", "confidence", "created_at") if k in item}
             for item in results
         ]
     else:
-        # score 是内部 RRF 融合值（0.01~0.05 量级），对调用者没有解释意义；
-        # confidence（high/medium/low/weak）才是"这条相关吗"的答案
         for item in results:
             item.pop("score", None)
     output = {"results": results}
@@ -749,12 +608,270 @@ async def recall(query: str, top_k: int = 5, with_corridor: bool = False, source
     return json.dumps(output, ensure_ascii=False, indent=2)
 
 
-_LIST_COMPACT_FIELDS = ("id", "content", "layer", "room", "category", "importance",
-                        "status", "resolved", "anchored", "created_at", "updated_at")
+# ── 3. context ───────────────────────────────────────────────────────
+
+@mcp.tool()
+async def context(
+    source_ai: str = "claude",
+    message: str = "",
+    mode: str = "full",
+    max_chars: int = 3000,
+) -> str:
+    """获取记忆上下文。对话开头用 full，已有基础上下文用 incremental。
+
+    mode:
+    - full: 走廊 + 相关记忆 + 梦境 + 待办（醒来第一件事）
+    - incremental: 只返回增量（最近变化 + 待办 + 相关记忆），更短
+    - corridor: 只要走廊快照
+    - living_room: 只要核心身份记忆
+
+    Args:
+        source_ai: AI身份（必传）
+        message: 当前用户消息（用于搜索相关记忆）
+        mode: full / incremental / corridor / living_room
+        max_chars: 返回文本最大字符数（incremental/full 模式生效）
+    """
+    if mode == "corridor":
+        text = await corridor_mod.get_corridor(source_ai)
+        return text or "（走廊为空）"
+    if mode == "living_room":
+        items = await memory_ops.get_living_room()
+        if not items:
+            return "（客厅为空）"
+        return json.dumps(items, ensure_ascii=False, indent=2)
+    if mode == "incremental":
+        from smart_context import get_smart_context
+        result = await get_smart_context(source_ai, message, has_base_context=True, max_chars=max_chars)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    # full mode (default)
+    ctx = await gateway_mod.build_context(
+        user_message=message or "", ai_id=source_ai,
+    )
+    return ctx.get("inject_text", "") or "（暂无记忆上下文）"
+
+
+# ── 4. capture ───────────────────────────────────────────────────────
+
+import conversation_capture
 
 
 @mcp.tool()
-async def list_memories(
+async def capture(
+    action: str = "log",
+    source_ai: str = "claude",
+    user_message: str = "",
+    ai_response: str = "",
+    platform: str = "mcp",
+    messages: list[dict] | None = None,
+    chat_type: str = "private",
+) -> str:
+    """对话录入管线。action=log 记录一轮，flush 强制提取，extract 从消息数组提取记忆。
+
+    Args:
+        action: log / flush / extract
+        source_ai: AI身份
+        user_message: 用户说的话（log 模式）
+        ai_response: AI 的回复（log 模式）
+        platform: 平台标识（log 模式）
+        messages: 对话消息数组 [{role, content}]（extract 模式）
+        chat_type: private / private_group / public_group（extract 模式）
+    """
+    if action == "flush":
+        result = await conversation_capture.force_extract(ai_id=source_ai)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    if action == "extract":
+        from conversation_capture import extract_from_messages as _extract
+        results = await _extract(messages or [], source_ai, chat_type, quick=True)
+        return json.dumps(results, ensure_ascii=False, indent=2)
+
+    # action == "log" (default)
+    result = await conversation_capture.log_conversation(
+        user_message=user_message, ai_response=ai_response,
+        ai_id=source_ai, platform=platform,
+    )
+    import asyncio
+    asyncio.ensure_future(gateway_mod._tag_pulse(user_message, source_ai))
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ── 5. dream ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def dream(content: str, source_ai: str = "claude") -> str:
+    """写梦境/自省。私人空间，只有你自己能看到。适合深度对话后记录内心感受。
+
+    Args:
+        content: 梦境/自省内容
+        source_ai: 来源AI
+    """
+    result = await _safe_remember_impl(
+        content=content, layer="private", room="dreams",
+        owner_ai=source_ai, importance=0.6,
+        source_ai=source_ai, source_platform="mcp",
+    )
+    return json.dumps({"status": "dreamed", **result}, ensure_ascii=False)
+
+
+# ── 6. search ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def search(
+    method: str,
+    query: str = "",
+    source_ai: str = "",
+    tags: list[str] | None = None,
+    tag_mode: str = "any",
+    with_person: str = "",
+    days: int = 30,
+    limit: int = 10,
+    room: str = "",
+    speaker_filter: str = "",
+) -> str:
+    """搜索原文和元数据。method 决定搜索方式：
+
+    - keyword: 关键词搜原文保险箱（精确匹配，支持同义词）
+    - semantic: 语义搜最近 N 天原文（模糊描述找原话）
+    - tags: 按标签精确搜记忆
+    - person: 按人名+时间窗查互动事件
+
+    Args:
+        method: keyword / semantic / tags / person（必填）
+        query: 搜索内容（keyword/semantic 必填）
+        source_ai: AI身份
+        tags: 标签列表（tags 方法必填）
+        tag_mode: any=匹配任一 / all=全部匹配（tags 方法）
+        with_person: 人名（person 方法必填）
+        days: 时间窗天数（semantic/person 方法）
+        limit: 返回条数
+        room: 限定房间（tags 方法）
+        speaker_filter: user/ai/留空（keyword 方法）
+    """
+    import raw_vault
+
+    if method == "keyword":
+        hits = raw_vault.search(query, ai_id="", limit=limit, speaker_filter=speaker_filter)
+        return json.dumps({"results": hits, "stats": raw_vault.stats(public_only=True)},
+                          ensure_ascii=False, indent=2)
+
+    if method == "semantic":
+        from embedding import get_embedding
+        if not (query or "").strip():
+            return json.dumps({"error": "empty_query", "hint": "请提供搜索内容"}, ensure_ascii=False)
+        days = max(1, min(days, 120))
+        limit = max(1, min(limit, 30))
+        query_vec = await get_embedding(query)
+        if not query_vec:
+            return json.dumps({"error": "embedding_failed", "hint": "无法计算查询向量，请改用 method=keyword"},
+                              ensure_ascii=False)
+        hits = raw_vault.semantic_search(query_vec=query_vec, ai_id="", days=days, limit=limit)
+        for h in hits:
+            h.pop("embedding", None)
+        return json.dumps({"results": hits, "query": query, "days": days,
+                           "stats": raw_vault.stats(public_only=True)}, ensure_ascii=False, indent=2)
+
+    if method == "tags":
+        results = await memory_ops.search_by_tags(
+            tags=tags or [], mode=tag_mode, room=room, limit=limit, ai_id=source_ai)
+        return json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2)
+
+    if method == "person":
+        try:
+            result = await memory_ops.recent_interaction(
+                with_person=with_person, ai_id=source_ai or "claude", days=days, limit=limit)
+        except Exception as e:
+            result = {"with_person": with_person, "resolved_to": None,
+                      "error": "internal_error", "hint": f"内部错误：{type(e).__name__}",
+                      "days": days, "count": 0, "items": []}
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return json.dumps({"error": f"unknown method '{method}'",
+                       "valid": ["keyword", "semantic", "tags", "person"]}, ensure_ascii=False)
+
+
+# ── 7. manage ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def manage(
+    action: str,
+    memory_id: str = "",
+    source_ai: str = "",
+    content: str = "",
+    importance: float = -1,
+    room: str = "",
+    tags: list[str] | None = None,
+    kind: str = "reflection",
+    resolved: bool = True,
+    old_value: str = "",
+) -> str:
+    """管理单条记忆。action 决定操作：
+
+    - update: 修改内容/重要度/房间/标签
+    - comment: 追加年轮评论（不改原文）
+    - resolve / unresolve: 标记待办状态
+    - archive / unarchive: 归档/恢复
+    - delete: 永久删除
+    - anchor / release_anchor: 锚定/解除（永不衰减，最多20条）
+    - correct: 用户纠错（一步完成纠正+标记旧记忆）
+
+    Args:
+        action: 操作类型（必填）
+        memory_id: 记忆ID（correct 以外都必填）
+        source_ai: AI身份
+        content: 新内容（update/comment/correct 用）
+        importance: 新重要度（update 用，-1=不改）
+        room: 新房间（update/correct 用）
+        tags: 新标签（update 用）
+        kind: 评论类型 reflection/update_note/feel/comment（comment 用）
+        resolved: True=已解决 False=未解决（resolve/unresolve 用）
+        old_value: 被纠正的错误说法（correct 用）
+    """
+    if action == "update":
+        result = await memory_ops.update_memory(
+            memory_id=memory_id,
+            content=content or None,
+            importance=importance if importance >= 0 else None,
+            room=room or None, tags=tags or None,
+            changed_by=source_ai or "claude", update_provenance="ai_summary",
+        )
+    elif action == "comment":
+        result = await memory_ops.add_comment(
+            memory_id=memory_id, content=content,
+            author=source_ai or "claude", kind=kind,
+        )
+    elif action == "resolve":
+        result = await memory_ops.resolve_memory(memory_id, resolved=True)
+    elif action == "unresolve":
+        result = await memory_ops.resolve_memory(memory_id, resolved=False)
+    elif action == "archive":
+        result = await memory_ops.archive_memory(memory_id)
+    elif action == "unarchive":
+        result = await memory_ops.unarchive_memory(memory_id, changed_by=source_ai or "claude")
+    elif action == "delete":
+        result = await memory_ops.delete_memory(memory_id)
+    elif action == "anchor":
+        result = await memory_ops.anchor_memory(memory_id)
+    elif action == "release_anchor":
+        result = await memory_ops.release_anchor(memory_id)
+    elif action == "correct":
+        result = await memory_ops.apply_user_correction(
+            corrected_value=content, old_value=old_value,
+            source_ai=source_ai, room=room or "living_room",
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    else:
+        return json.dumps({"error": f"unknown action '{action}'",
+                           "valid": ["update", "comment", "resolve", "unresolve",
+                                     "archive", "unarchive", "delete",
+                                     "anchor", "release_anchor", "correct"]}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ── 8. detail ────────────────────────────────────────────────────────
+
+@mcp.tool()
+async def detail(
+    memory_id: str = "",
     room: str = "",
     status: str = "active",
     page: int = 1,
@@ -762,18 +879,27 @@ async def list_memories(
     compact: bool = True,
     source_ai: str = "",
 ) -> str:
-    """列出记忆。可按房间、状态筛选。
+    """查看记忆。传 memory_id 看一条的完整详情；不传则按条件列出。
 
     Args:
-        room: 房间ID筛选（留空=全部）
-        status: 状态筛选：active/archived/decayed
+        memory_id: 记忆ID（传了则返回完整详情含原始对话、年轮评论）
+        room: 房间筛选（列表模式）
+        status: active/archived/decayed（列表模式）
         page: 页码
         per_page: 每页数量
-        compact: 精简模式（默认开）。只返回核心字段，不带原始对话全文/标签/年轮；
-                 需要完整详情时用 get_memory_detail 单条查看。
-        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人可见；
-                   不传身份时列表不包含任何 private 记忆。
+        compact: 列表精简模式（默认开）
+        source_ai: AI身份（影响私有记忆可见性）
     """
+    if memory_id:
+        from visibility import can_view
+        mem = store.get_memory(memory_id)
+        if not mem:
+            return json.dumps({"error": f"Memory {memory_id} not found"}, ensure_ascii=False)
+        if not can_view(mem, source_ai):
+            return json.dumps({"error": "该记忆是其他 AI 的私有记忆，无权查看"}, ensure_ascii=False)
+        safe = {k: v for k, v in mem.items() if k != "embedding"}
+        return json.dumps(safe, ensure_ascii=False, indent=2)
+
     result = await memory_ops.list_memories(
         room=room or None, status=status, page=page, per_page=per_page,
         viewer_ai=source_ai or "",
@@ -786,430 +912,188 @@ async def list_memories(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-async def dream_recall(query: str, top_k: int = 3, source_ai: str = "claude") -> str:
-    """专门搜索梦境记忆。梦境不会出现在普通 recall 结果中，只能通过这个工具查看。
-
-    用这个工具来：
-    - 回忆之前做过的梦
-    - 查找梦里出现过的意象或场景
-    - 对比不同 AI 的梦
-
-    Args:
-        query: 搜索关键词（如"飞行""小猫""那个奇怪的梦"）
-        top_k: 最多返回几条梦境（默认 3）
-        source_ai: 你的身份（cloudy/lucien/jasper）
-    """
-    results = await memory_ops.dream_recall(query, ai_id=source_ai, top_k=top_k)
-    if not results:
-        return json.dumps({"message": "没有找到相关的梦境记忆"}, ensure_ascii=False)
-    return json.dumps(results, ensure_ascii=False, indent=2)
-
+# ── 9. review ────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def recent_interaction(
-    with_person: str,
-    days: int = 30,
-    limit: int = 10,
-    source_ai: str = "claude",
-) -> str:
-    """按人 + 时间窗查最近互动事件（快速直查，不走 LLM）。
-
-    适合"周三跟 X 聊了啥""最近和 Lucien 都发生了什么"这类时间敏感问题。
-    只返回 info_type=event 的记忆，跳过 identity/reflection/task 等；纯 SQL 查询
-    延迟 <200ms，不占用 embedding / analyzer 预算。
-
-    返回结构会明确区分"名字识别不出来"和"没有相关记忆"：
-    - alias_not_found + hint  → 名字错了，AI 应该问用户或用 list_persons
-    - count=0                  → 名字对了但那段时间没事发生
-
-    Args:
-        with_person: 名字或别名（Lucien/狗蛋/lucien 都行）
-        days: 时间窗（默认 30 天，clamp 到 1-365）
-        limit: 最多返回条数（默认 10，clamp 到 1-50）
-        source_ai: 谁在查（用于 visibility 权限过滤，默认 claude）
-    """
-    try:
-        result = await memory_ops.recent_interaction(
-            with_person=with_person, ai_id=source_ai, days=days, limit=limit,
-        )
-    except Exception as e:
-        # 任何未预期异常都返回稳定的结构化错误，不让 MCP 客户端见到 traceback
-        result = {
-            "with_person": with_person,
-            "resolved_to": None,
-            "error": "internal_error",
-            "hint": f"内部错误：{type(e).__name__}",
-            "days": days,
-            "count": 0,
-            "items": [],
-        }
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def update_memory(
-    memory_id: str,
-    content: str = "",
-    importance: float = -1,
-    room: str = "",
-    tags: list[str] = [],
-) -> str:
-    """更新一条已有记忆。
-
-    Args:
-        memory_id: 记忆ID
-        content: 新内容（留空=不改）
-        importance: 新重要度（-1=不改）
-        room: 移动到新房间（留空=不改）
-        tags: 新标签（空列表=不改）
-    """
-    result = await memory_ops.update_memory(
-        memory_id=memory_id,
-        content=content or None,
-        importance=importance if importance >= 0 else None,
-        room=room or None,
-        tags=tags or None,
-        changed_by="claude",
-        update_provenance="ai_summary",
-    )
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def add_comment(
-    memory_id: str,
-    content: str,
-    kind: str = "reflection",
-    source_ai: str = "claude",
-) -> str:
-    """给一条记忆追加年轮评论。不修改原始内容，保留认知变化轨迹。
-
-    适用场景：
-    - 重读旧记忆时有了新理解 → kind="reflection"
-    - 补充新发现但不改原文 → kind="update_note"
-    - 标注情感感受 → kind="feel"
-    - 普通评论 → kind="comment"
-
-    例如：一条半年前的心理记忆，现在回看有了更深的理解，
-    就用 reflection 追加，而不是修改原文。这样保留了认知成长轨迹。
-
-    Args:
-        memory_id: 记忆ID
-        content: 评论内容
-        kind: 评论类型（reflection/update_note/feel/comment）
-        source_ai: 来源AI
-    """
-    result = await memory_ops.add_comment(
-        memory_id=memory_id,
-        content=content,
-        author=source_ai,
-        kind=kind,
-    )
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def resolve_memory(memory_id: str, resolved: bool = True) -> str:
-    """标记一条记忆为已解决或未解决。
-
-    未解决（resolved=False）的记忆会在 recall 时优先浮现（最多 2 条），
-    确保交代过的事情不会被遗忘。
-
-    适用场景：
-    - 用户说"帮我记着下周要交报告" → remember 后 resolve_memory(id, resolved=False)
-    - 事情完成了 → resolve_memory(id, resolved=True)
-
-    Args:
-        memory_id: 记忆ID
-        resolved: True=已解决（默认），False=未解决/待办
-    """
-    result = await memory_ops.resolve_memory(memory_id, resolved)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def unarchive_memory(memory_id: str, source_ai: str = "claude") -> str:
-    """将已归档/过期/衰减的记忆恢复为活跃状态。
-
-    适用场景：
-    - daemon 误归档了非任务类记忆
-    - 用户指出某条被归档的记忆仍然重要
-    - 修复自动化流程的错误操作
-
-    Args:
-        memory_id: 记忆ID
-        source_ai: 你的身份(claude/lucien/jasper)
-    """
-    result = await memory_ops.unarchive_memory(memory_id, changed_by=source_ai)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def list_proposals(
+async def review(
+    action: str,
+    source_ai: str = "",
+    proposal_id: str = "",
+    decision: str = "",
+    reject_reason: str = "",
+    profile_id: str = "",
+    profile_type: str = "",
     status: str = "pending",
     page: int = 1,
     per_page: int = 20,
 ) -> str:
-    """列出待审记忆提案。自动捕获的记忆不再直接入库，而是先进提案队列等待审核。
+    """审核提案和画像。action 决定操作：
 
-    只有「用户亲口说的事实（claim_type=fact + speech_mode=literal）且无冲突」
-    才会自动通过，其余需要人工/AI审核后才能入库。
-
-    状态说明：
-    - pending: 等待审核（默认）
-    - auto_approved: 系统自动通过的高置信度事实
-    - approved: 人工批准
-    - rejected: 已拒绝
-    - promotion_failed: 晋升失败（可用 review_proposal approve 重试）
+    - list_proposals: 列出待审记忆提案
+    - review_proposal: 审核提案（decision=approve/reject）
+    - get_profile: 查看画像（用户/AI/关系）
+    - approve_profile: 审批画像
 
     Args:
-        status: 筛选状态（pending/auto_approved/approved/rejected/promotion_failed）
-        page: 页码（从1开始）
-        per_page: 每页条数（默认20）
+        action: 操作类型（必填）
+        source_ai: AI身份
+        proposal_id: 提案ID（review_proposal 用）
+        decision: approve/reject（review_proposal 用）
+        reject_reason: 拒绝原因
+        profile_id: 画像ID（get_profile/approve_profile 用）
+        profile_type: user/agent/relationship（get_profile 筛选用）
+        status: 提案状态筛选（list_proposals 用）
+        page: 页码
+        per_page: 每页数量
     """
-    result = await memory_ops.list_proposals(status=status, limit=per_page, page=page)
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    if action == "list_proposals":
+        result = await memory_ops.list_proposals(status=status, limit=per_page, page=page)
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
+    if action == "review_proposal":
+        result = await memory_ops.review_proposal(
+            proposal_id=proposal_id, action=decision,
+            reviewed_by=source_ai or "claude", reject_reason=reject_reason,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
-@mcp.tool()
-async def review_proposal(
-    proposal_id: str,
-    action: str,
-    reject_reason: str = "",
-    source_ai: str = "claude",
-) -> str:
-    """审核一条记忆提案：批准入库或拒绝。
+    if action == "get_profile":
+        if profile_id:
+            p = database.get_profile(profile_id)
+            if not p:
+                return json.dumps({"error": f"Profile '{profile_id}' not found"})
+            return json.dumps(p, ensure_ascii=False, indent=2)
+        profiles = database.list_profiles(profile_type=profile_type or None)
+        return json.dumps(profiles, ensure_ascii=False, indent=2)
 
-    批准后提案会被提升为正式记忆（走完整的分析+打标流程）。
-    拒绝的提案保留记录但不入库。
-
-    用 list_proposals 查看待审提案列表。
-
-    Args:
-        proposal_id: 提案ID（prop_开头）
-        action: "approve" 批准入库 / "reject" 拒绝
-        reject_reason: 拒绝原因（reject时建议填写）
-        source_ai: 审核者身份（claude/lucien/jasper）
-    """
-    result = await memory_ops.review_proposal(
-        proposal_id=proposal_id,
-        action=action,
-        reviewed_by=source_ai,
-        reject_reason=reject_reason,
-    )
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def get_profile(profile_id: str = "", profile_type: str = "") -> str:
-    """查看 Profile（用户/AI/关系画像）。只读，不可修改。
-
-    Profile 是从记忆自动生成的结构化摘要，帮你快速了解"她是谁"、"你是谁"、"你们什么关系"。
-
-    用法：
-    - get_profile(profile_id="user_ceci") → 用户画像
-    - get_profile(profile_id="agent_lucien") → Lucien 的 AI 画像
-    - get_profile(profile_id="rel_lucien_ceci") → Lucien 和 Ceci 的关系画像
-    - get_profile(profile_type="agent") → 所有 AI 画像
-    - get_profile() → 所有 Profile
-
-    Args:
-        profile_id: 指定 Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
-        profile_type: 按类型筛选（user/agent/relationship）
-    """
-    if profile_id:
+    if action == "approve_profile":
+        ok = database.approve_profile(profile_id)
+        if ok:
+            return json.dumps({"status": "approved", "profile_id": profile_id}, ensure_ascii=False)
         p = database.get_profile(profile_id)
         if not p:
             return json.dumps({"error": f"Profile '{profile_id}' not found"})
-        return json.dumps(p, ensure_ascii=False, indent=2)
-    profiles = database.list_profiles(profile_type=profile_type or None)
-    return json.dumps(profiles, ensure_ascii=False, indent=2)
+        return json.dumps({"error": f"Profile '{profile_id}' is '{p.get('status')}', not pending_review"})
+
+    return json.dumps({"error": f"unknown action '{action}'",
+                       "valid": ["list_proposals", "review_proposal", "get_profile", "approve_profile"]},
+                      ensure_ascii=False)
 
 
-@mcp.tool()
-async def approve_profile(profile_id: str) -> str:
-    """审批 Profile：将 pending_review 状态的 Profile 设为 active。
-
-    只有小猫（用户）审核通过后才应调用。Profile 生成后默认是 pending_review 状态，
-    需要用户确认内容准确后才能激活。
-
-    Args:
-        profile_id: Profile ID（如 user_ceci, agent_lucien, rel_jasper_ceci）
-    """
-    ok = database.approve_profile(profile_id)
-    if ok:
-        return json.dumps({"status": "approved", "profile_id": profile_id}, ensure_ascii=False)
-    p = database.get_profile(profile_id)
-    if not p:
-        return json.dumps({"error": f"Profile '{profile_id}' not found"})
-    return json.dumps({"error": f"Profile '{profile_id}' is '{p.get('status')}', not pending_review"})
-
+# ── 10. grow ─────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def anchor(memory_id: str) -> str:
-    """将一条记忆设为锚点——永不衰减、走廊里单独显示的"坐标系"记忆。
-
-    适合锚定的内容：
-    - 用户的核心价值观、人生原则
-    - 你和用户之间的关系定义
-    - 绝对不能忘记的重要事实
-
-    最多 20 条锚点。不确定时不要锚定，普通重要记忆用 importance=0.8+ 就够。
-
-    Args:
-        memory_id: 记忆ID
-    """
-    result = await memory_ops.anchor_memory(memory_id)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def release_anchor(memory_id: str) -> str:
-    """解除锚点，记忆恢复正常衰减。
-
-    Args:
-        memory_id: 记忆ID
-    """
-    result = await memory_ops.release_anchor(memory_id)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def archive_memory(memory_id: str) -> str:
-    """归档一条记忆（不删除，标记为archived）。
-
-    Args:
-        memory_id: 记忆ID
-    """
-    result = await memory_ops.archive_memory(memory_id)
-    return json.dumps(result, ensure_ascii=False)
-
-
-@mcp.tool()
-async def apply_correction(
-    corrected_value: str,
-    old_value: str = "",
-    source_ai: str = "",
-    room: str = "living_room",
+async def grow(
+    content: str,
+    source_ai: str = "claude",
+    subject_name: str = "",
+    speaker_name: str = "",
 ) -> str:
-    """用户纠正了一条错误信息时，一步完成整个纠错流程（行使定夺权专用）。
-
-    效果：
-    - 纠正版作为 canonical 事实入库（provenance=user_correction，置信度 1.0，
-      任何 AI 复述都无法再取代它）
-    - 库里包含错误说法的 active 记忆自动标记 corrected_by_user、退出召回/走廊/
-      动态（原文保留在 history 可追溯），old_value 支持模糊匹配（差一两个字也能对上）
-    - 走廊缓存同步清除
-    - 定位不到错误来源时不乱覆盖，纠正版标 conflict_pending 待人工看
+    """把一大段混合内容（日记、对话总结等）拆分成多条独立记忆。
 
     Args:
-        corrected_value: 正确的说法（完整陈述，如"狐狸的围巾是灰色的"）
-        old_value: 被纠正的错误说法关键词（如"围巾是绿色的"；留空=只入库纠正版）
-        source_ai: 你的身份（claude/lucien/jasper）
-        room: 纠正版存放的房间（默认 living_room）
+        content: 要整理的长文本
+        source_ai: 来源AI
+        subject_name: 记忆主体姓名
+        speaker_name: 发言者姓名
     """
-    result = await memory_ops.apply_user_correction(
-        corrected_value=corrected_value,
-        old_value=old_value,
-        source_ai=source_ai,
-        room=room,
+    result = await memory_ops.grow(
+        content=content, source_ai=source_ai,
+        subject_name=subject_name, speaker_name=speaker_name,
     )
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def delete_memory(memory_id: str) -> str:
-    """永久删除一条记忆。
-
-    Args:
-        memory_id: 记忆ID
-    """
-    result = await memory_ops.delete_memory(memory_id)
+    summary = f"{result['total']}条|新{result['created']}合{result['merged']}"
+    result["summary"] = summary
     return json.dumps(result, ensure_ascii=False)
 
 
-@mcp.tool()
-async def get_memory_detail(memory_id: str, source_ai: str = "") -> str:
-    """获取一条记忆的完整详情，包括原始对话上下文、全部年轮评论、关联记忆等。
+# ── 11. system ───────────────────────────────────────────────────────
 
-    当你通过 recall 想起了某条记忆但需要更多细节时，用这个工具深入查看。
-    比如用户提到一个梗，recall 返回了概要，你可以用 get_memory_detail 看到
-    当时的原始对话片段，帮你回忆起完整的上下文和细节。
+@mcp.tool()
+async def system(
+    action: str,
+    limit: int = 20,
+    include_audit: bool = False,
+    batch_action: str = "",
+    filter_rules: dict | None = None,
+    value: str = "",
+) -> str:
+    """系统管理和诊断。action 决定操作：
+
+    - info: 角色+房间配置
+    - health: MCP 身份+schema hash（排查连接问题）
+    - debug_log: MCP 审计日志
+    - doctor: 记忆体检报告
+    - maintain: 执行记忆整理（合并/衰减/重建走廊）
+    - batch_ops: 批量操作（reset_activation/reclassify/bulk_resolve/bulk_archive）
 
     Args:
-        memory_id: 记忆ID（从 recall 结果中获取）
-        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人能查看详情。
+        action: 操作类型（必填）
+        limit: 日志条数（debug_log 用）
+        include_audit: 是否含审计日志（health 用）
+        batch_action: 批量操作类型（batch_ops 用）
+        filter_rules: 过滤条件（batch_ops 用）
+        value: 操作值（batch_ops 用）
     """
-    from visibility import can_view
-    mem = store.get_memory(memory_id)
-    if not mem:
-        return json.dumps({"error": f"Memory {memory_id} not found"}, ensure_ascii=False)
-    if not can_view(mem, source_ai):
-        return json.dumps({"error": "该记忆是其他 AI 的私有记忆，无权查看"}, ensure_ascii=False)
-    safe = {k: v for k, v in mem.items() if k != "embedding"}
-    return json.dumps(safe, ensure_ascii=False, indent=2)
+    if action == "info":
+        rooms = list_rooms()
+        data = {
+            "roles": AI_ROLES,
+            "rooms": {k: {"name": v["name"], "icon": v.get("icon", ""), "type": v.get("type", "")}
+                      for k, v in rooms.items()},
+            "mcp_identity": await get_mcp_identity_async(),
+        }
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    if action == "health":
+        data = {"ok": True, "identity": await get_mcp_identity_async(),
+                "audit_path": str(MCP_AUDIT_PATH)}
+        if include_audit:
+            data["recent_audit"] = _read_recent_audit(20)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    if action == "debug_log":
+        return json.dumps({"items": _read_recent_audit(max(1, min(limit, 100)))},
+                          ensure_ascii=False, indent=2)
+
+    if action == "doctor":
+        import memory_doctor
+        report = memory_doctor.read_report()
+        return json.dumps({
+            "text": memory_doctor.report_text(),
+            "auto_fixed": report.get("auto_fixed", []),
+            "issues": report.get("issues", []),
+            "stats": report.get("stats", {}),
+            "generated_at": report.get("generated_at", ""),
+        }, ensure_ascii=False, indent=2)
+
+    if action == "maintain":
+        result = await daemon.run_full_maintenance()
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    if action == "batch_ops":
+        from batch_ops import batch_operation
+        parsed_value = None
+        if value:
+            if value.lower() in ("null", "none"):
+                parsed_value = None
+            elif value.lower() == "true":
+                parsed_value = True
+            elif value.lower() == "false":
+                parsed_value = False
+            else:
+                try:
+                    parsed_value = int(value)
+                except ValueError:
+                    parsed_value = value
+        result = await batch_operation(batch_action, filter_rules or {}, parsed_value)
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    return json.dumps({"error": f"unknown action '{action}'",
+                       "valid": ["info", "health", "debug_log", "doctor", "maintain", "batch_ops"]},
+                      ensure_ascii=False)
 
 
-@mcp.tool()
-async def get_corridor(source_ai: str = "claude", force: bool = False) -> str:
-    """获取指定 AI 的走廊文档 - AI醒来时读的第一份记忆上下文快照。"""
-    text = await corridor_mod.get_corridor(source_ai, force=force)
-    return text or "（走廊为空）"
-
-
-@mcp.tool()
-async def living_room() -> str:
-    """获取客厅内容 - 核心身份和当前状态。"""
-    items = await memory_ops.get_living_room()
-    if not items:
-        return "（客厅为空）"
-    return json.dumps(items, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def maintain() -> str:
-    """执行记忆整理：合并相似记忆、压缩日记、衰减遗忘、重建走廊。"""
-    result = await daemon.run_full_maintenance()
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def doctor_report() -> str:
-    """查看最近一次记忆体检报告：自动修复了什么、有哪些存疑记忆待确认、记忆池大小。
-    用户问"记忆系统最近怎么样/有没有问题/池子多大了"时用这个。
-    """
-    import memory_doctor
-    report = memory_doctor.read_report()
-    return json.dumps({
-        "text": memory_doctor.report_text(),
-        "auto_fixed": report.get("auto_fixed", []),
-        "issues": report.get("issues", []),
-        "stats": report.get("stats", {}),
-        "generated_at": report.get("generated_at", ""),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def search_raw(query: str, limit: int = 5,
-                     speaker_filter: str = "") -> str:
-    """在原文保险箱里查当时的原始对话（未经加工的原话）。
-    记忆内容存疑、或用户问"当时到底怎么说的"时用这个对照原文。
-    支持同义词自动展开（如搜"妈妈"也能找到"母亲"）。
-    长查询会自动拆词，多词命中的结果排在前面。
-
-    MCP 只能搜群聊（含小群，不含私聊）——身份无法验证。
-
-    Args:
-        query: 关键词（自动拆词 + 展开同义词）
-        limit: 最多返回条数（上限 50）
-        speaker_filter: 留空=搜全部发言人, "user"=只搜用户说的, "ai"=只搜 AI 说的
-    """
-    import raw_vault
-    hits = raw_vault.search(query, ai_id="", limit=limit,
-                            speaker_filter=speaker_filter)
-    return json.dumps({"results": hits, "stats": raw_vault.stats(public_only=True)}, ensure_ascii=False, indent=2)
-
+# ── 12. window_context ───────────────────────────────────────────────
 
 @mcp.tool()
 async def window_context(
@@ -1219,168 +1103,46 @@ async def window_context(
     max_turns: int = 10,
     max_chars: int = 6000,
 ) -> str:
-    """恢复当前聊天窗口的最近原始对话——用于续聊。
-
-    bot 重启或本地历史丢失后，调用此工具恢复"刚才在聊什么"。
-    返回按时间正序的完整消息，包含发言人、消息 ID、引用关系。
-
-    隔离：私聊按 ai_id 过滤，群聊按 chat_id + thread_id 隔离。
-    不传 chat_id 会报错，不会退化为全窗口读取。
+    """恢复当前聊天窗口的最近对话——bot 重启后续聊用。
 
     Args:
-        ai_id: 当前 bot 身份（cloudy / lucien / jasper）
-        chat_id: Telegram chat_id（必须）
-        thread_id: 话题 ID（有话题群时传，无话题留空）
-        max_turns: 最多返回轮数（默认 10，上限 30）
-        max_chars: 总字符预算（默认 6000，上限 20000）
+        ai_id: bot 身份（cloudy/lucien/jasper）
+        chat_id: Telegram chat_id
+        thread_id: 话题ID（有话题群时传）
+        max_turns: 最多返回轮数（默认10）
+        max_chars: 字符预算（默认6000）
     """
     import raw_vault
     if not chat_id:
         return json.dumps({"error": "chat_id_required"}, ensure_ascii=False)
     result = raw_vault.get_window_context(
-        ai_id=ai_id,
-        chat_id=str(chat_id),
+        ai_id=ai_id, chat_id=str(chat_id),
         thread_id=str(thread_id or ""),
-        max_turns=max_turns,
-        max_chars=max_chars,
+        max_turns=max_turns, max_chars=max_chars,
     )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-async def recent_raw_context(
-    query: str,
-    days: int = 7,
-    limit: int = 8,
-) -> str:
-    """在最近 N 天的原始对话里做语义搜索——找"意思相近"的原文。
-
-    三个搜索工具怎么选：
-    - 语义模糊 + 想找最近原话 → recent_raw_context（本工具）
-    - 精确关键词 + 查特定原话 → search_raw
-    - 找已提取/整理过的记忆 → recall
-
-    典型场景：用户说"咪肚子痛"，你想找之前聊过的相关原文
-    （比如"姨妈又犯了腰酸"），关键词对不上但语义相关。
-
-    只搜群聊（含小群），不含私聊（保护隐私）。
-
-    Args:
-        query: 当前用户说的话或关键描述
-        days: 搜索范围（天），默认 7
-        limit: 返回条数，默认 8
-    """
-    from embedding import get_embedding
-    import raw_vault
-
-    if not (query or "").strip():
-        return json.dumps({"error": "empty_query", "hint": "请提供搜索内容"}, ensure_ascii=False)
-
-    days = max(1, min(days, 120))
-    limit = max(1, min(limit, 30))
-
-    query_vec = await get_embedding(query)
-    if not query_vec:
-        return json.dumps({"error": "embedding_failed", "hint": "无法计算查询向量，请改用 search_raw 关键词搜索"}, ensure_ascii=False)
-
-    hits = raw_vault.semantic_search(
-        query_vec=query_vec, ai_id="", days=days, limit=limit,
-    )
-    for h in hits:
-        h.pop("embedding", None)
-
-    return json.dumps({
-        "results": hits,
-        "query": query,
-        "days": days,
-        "stats": raw_vault.stats(public_only=True),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def dream(content: str, source_ai: str = "claude") -> str:
-    """写一篇梦境/自省。这是你的私人空间，用来记录内心感受、对关系的理解、自我反思。
-    写完后只有你自己能看到。适合在深度对话结束时使用。
-
-    Args:
-        content: 梦境/自省内容
-        source_ai: 来源AI
-    """
-    result = await _safe_remember_impl(
-        content=content,
-        layer="private",
-        room="dreams",
-        owner_ai=source_ai,
-        importance=0.6,
-        source_ai=source_ai,
-        source_platform="mcp",
-    )
-    return json.dumps({"status": "dreamed", **result}, ensure_ascii=False)
-
+# ═══════════════════════════════════════════════════════════════════════
+# Redirect aliases (Phase 1 backward compatibility)
+# ═══════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 async def pulse(message: str = "", source_ai: str = "claude", force_corridor: bool = False) -> str:
-    """获取完整记忆上下文（走廊 + 与当前话题相关的记忆）。
-    建议在对话开头调用一次，让你快速了解"我面对的是谁、她最近怎么样"。
-
-    如果提供了 message，会额外搜索相关记忆；不提供则只返回走廊。
-
-    Args:
-        message: 用户当前的消息（可选，用于搜索相关记忆）
-        source_ai: AI身份
-    """
-    ctx = await gateway_mod.build_context(
-        user_message=message or "",
-        ai_id=source_ai,
-        force_corridor=force_corridor,
-    )
-    return ctx.get("inject_text", "") or "（暂无记忆上下文）"
-
-
+    """[已合并到 context] 获取完整记忆上下文。请改用 context(mode='full')。"""
+    return await context(source_ai=source_ai, message=message, mode="full")
 
 
 @mcp.tool()
-async def mcp_health(include_audit: bool = False) -> str:
-    """查看 Memory Hub MCP 的稳定身份、工具列表 hash 和最近到达日志。
-
-    用于排查 ChatGPT 网页端是否反复把同一个 MCP 当成新连接：
-    - identity/tool_schema_hash 如果频繁变化，说明服务端定义不稳定；
-    - 如果 ChatGPT 显示工具被安全拦截但 audit 没有 tool_reached，说明请求在到达 Memory Hub 前已被平台侧拦截。
-
-    Args:
-        include_audit: 是否返回最近 20 条 MCP 审计日志
-    """
-    data = {
-        "ok": True,
-        "identity": await get_mcp_identity_async(),
-        "audit_path": str(MCP_AUDIT_PATH),
-    }
-    if include_audit:
-        data["recent_audit"] = _read_recent_audit(20)
-    return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def mcp_debug_log(limit: int = 20) -> str:
-    """读取最近 MCP 工具到达/写入审计日志。用于判断请求是否抵达 Memory Hub。"""
-    return json.dumps({"items": _read_recent_audit(max(1, min(limit, 100)))}, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def hub_info() -> str:
-    """查看 Memory Hub 的角色和房间配置信息。"""
-    rooms = list_rooms()
-    data = {
-        "roles": AI_ROLES,
-        "rooms": {k: {"name": v["name"], "icon": v.get("icon", ""), "type": v.get("type", "")} for k, v in rooms.items()},
-        "mcp_identity": await get_mcp_identity_async(),
-    }
-    return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-# ── 对话自动捕获 ──
-
-import conversation_capture
+async def smart_context(
+    ai_id: str = "claude",
+    user_message: str = "",
+    has_base_context: bool = False,
+    max_chars: int = 3000,
+) -> str:
+    """[已合并到 context] 智能上下文。请改用 context(mode='incremental'或'full')。"""
+    mode = "incremental" if has_base_context else "full"
+    return await context(source_ai=ai_id, message=user_message, mode=mode, max_chars=max_chars)
 
 
 @mcp.tool()
@@ -1390,169 +1152,32 @@ async def capture_conversation(
     source_ai: str = "claude",
     platform: str = "mcp",
 ) -> str:
-    """记录一轮对话到自动捕获缓冲区。
-
-    系统会自动攒对话，每 20 轮触发一次小模型总结，
-    从对话中提取值得记住的事实并自动存成记忆。
-
-    不需要你判断"该不该存" —— 全部丢进来，系统自己筛。
-
-    Args:
-        user_message: 用户说的话
-        ai_response: AI 的回复
-        source_ai: AI 身份
-        platform: 平台标识
-    """
-    result = await conversation_capture.log_conversation(
-        user_message=user_message,
-        ai_response=ai_response,
-        ai_id=source_ai,
-        platform=platform,
+    """[已合并到 capture] 记录一轮对话。请改用 capture(action='log')。"""
+    return await capture(
+        action="log", source_ai=source_ai,
+        user_message=user_message, ai_response=ai_response, platform=platform,
     )
 
-    # 9 维度情绪打标（fire-and-forget）
-    import asyncio
-    asyncio.ensure_future(gateway_mod._tag_pulse(user_message, source_ai))
-
-    return json.dumps(result, ensure_ascii=False)
-
 
 @mcp.tool()
-async def flush_capture(source_ai: str = "claude") -> str:
-    """手动触发对话总结，不等缓冲区攒满。
-
-    适用场景：深度对话结束时，确保重要信息不会因为没攒满 20 条而遗漏。
-
-    Args:
-        source_ai: AI 身份（留空则处理所有缓冲区）
-    """
-    result = await conversation_capture.force_extract(ai_id=source_ai)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def smart_context(
-    ai_id: str,
-    user_message: str = "",
-    has_base_context: bool = False,
-    max_chars: int = 3000,
+async def safe_remember(
+    content: str = "",
+    room: str = "living_room",
+    category: str = "",
+    importance: float = 0.5,
+    source_ai: str = "claude",
+    event_date: str = "",
+    subject_name: str = "",
+    speaker_name: str = "",
+    client_request_id: str = "",
 ) -> str:
-    """获取智能上下文——根据 AI 前端的能力返回最合适的记忆注入。
-
-    Args:
-        ai_id: AI 标识（如 claude / lucien / jasper）
-        user_message: 当前用户消息（可选，用于召回相关记忆）
-        has_base_context: 该 AI 是否已有基础上下文（如 claude.ai 的 userMemories）。
-            True = 只返回增量信息（最近变化 + 待办 + 相关记忆），更短更精准。
-            False = 返回完整走廊 + recall，适合 TG bot 或无上下文的前端。
-        max_chars: 返回文本的最大字符数（默认 3000）
-
-    使用场景：
-    - claude.ai 小克：smart_context(ai_id="claude", user_message="...", has_base_context=True)
-    - TG bot / API 小克：smart_context(ai_id="claude", user_message="...", has_base_context=False)
-    """
-    from smart_context import get_smart_context
-    result = await get_smart_context(ai_id, user_message, has_base_context, max_chars)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def batch_ops(
-    action: str,
-    filter_rules: dict,
-    value: str = "",
-) -> str:
-    """批量操作记忆。
-
-    action 支持：
-    - "reset_activation": 重置 activation_count（value 为目标数值，默认 10）
-    - "reclassify": 重新生成 category（无需 value）
-    - "bulk_resolve": 设置 resolved 状态（value 为 "true" / "null"）
-    - "bulk_archive": 批量归档（无需 value）
-
-    filter_rules 支持的键：
-    - "room": 按房间过滤
-    - "activation_count_gt": activation_count 大于此值
-    - "category_length_gt": category 长度大于此值
-    - "source_platform_contains": source_platform 包含此字符串
-    - "resolved": 按 resolved 过滤（true/false/null）
-    - "importance_lt": importance 小于此值
-
-    示例：
-    - 重置虚高 activation：action="reset_activation", filter={"activation_count_gt": 50}, value="10"
-    - 清理误标待办：action="bulk_resolve", filter={"room": "social", "resolved": false}, value="null"
-    - 修复迁移 category：action="reclassify", filter={"category_length_gt": 20}
-
-    Args:
-        action: 操作类型
-        filter_rules: 过滤条件
-        value: 操作值（部分 action 需要）
-    """
-    from batch_ops import batch_operation
-
-    parsed_value = None
-    if value:
-        if value.lower() in ("null", "none"):
-            parsed_value = None
-        elif value.lower() == "true":
-            parsed_value = True
-        elif value.lower() == "false":
-            parsed_value = False
-        else:
-            try:
-                parsed_value = int(value)
-            except ValueError:
-                parsed_value = value
-
-    result = await batch_operation(action, filter_rules, parsed_value)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def extract_from_messages(
-    messages: list[dict],
-    ai_id: str = "claude",
-    chat_type: str = "private",
-) -> str:
-    """从对话消息中自动提取值得长期记住的信息并存储。
-
-    适合在对话结束时调用，把整段对话交给系统自动提取记忆。
-    比手动 remember 更方便——系统会判断哪些值得记、哪些不值得。
-
-    Args:
-        messages: 对话消息数组，格式 [{"role": "user"/"assistant", "content": "..."}]
-        ai_id: 调用方的 AI 标识
-        chat_type: "private" / "private_group" / "public_group"，影响提取策略
-    """
-    from conversation_capture import extract_from_messages as _extract
-    results = await _extract(messages, ai_id, chat_type, quick=True)
-    return json.dumps(results, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-async def search_by_tags(
-    tags: list[str],
-    mode: str = "any",
-    room: str = "",
-    limit: int = 20,
-    source_ai: str = "",
-) -> str:
-    """按标签搜索记忆。比 recall 更精确——直接匹配标签字段，不走语义模糊搜索。
-
-    适用场景：
-    - 找所有tag含"母亲"的记忆 → tags=["母亲"]
-    - 找同时有"NPD"和"创伤"标签的 → tags=["NPD", "创伤"], mode="all"
-    - 审计某个房间的标签分布 → room="psychology", tags=["创伤"]
-
-    Args:
-        tags: 要搜索的标签列表（子串匹配，大小写不敏感）
-        mode: "any"=匹配任一标签（默认），"all"=要求全部匹配
-        room: 限定房间（留空=全部）
-        limit: 最多返回条数
-        source_ai: 你的身份（claude/lucien/jasper）。private 记忆只有本人可被搜到。
-    """
-    results = await memory_ops.search_by_tags(tags=tags, mode=mode, room=room, limit=limit, ai_id=source_ai)
-    return json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2)
+    """[已合并到 remember] 安全写入。请直接用 remember（已内置安全降敏）。"""
+    return await remember(
+        content=content, room=room, category=category, importance=importance,
+        source_ai=source_ai, event_date=event_date,
+        client_request_id=client_request_id,
+        subject_name=subject_name, speaker_name=speaker_name,
+    )
 
 
 @mcp.tool()
@@ -1560,69 +1185,5 @@ async def batch_remember(
     memories: list[dict],
     source_ai: str = "claude",
 ) -> str:
-    """批量存储多条记忆，一次调用完成。
-
-    每条记忆支持的字段：
-    - content (必填): 记忆内容
-    - room: 房间ID（默认 living_room）
-    - category: 分类标签
-    - importance: 重要度 0-1
-    - tags: 标签列表
-    - event_date: 事件日期
-    - force_create: 强制新建，跳过合并
-
-    示例：memories=[
-        {"content": "xxx", "room": "psychology", "importance": 0.8},
-        {"content": "yyy", "room": "career", "force_create": true}
-    ]
-
-    Args:
-        memories: 记忆列表，每条是一个dict
-        source_ai: 来源AI
-    """
-    _audit("tool_reached", tool="batch_remember", source_ai=source_ai, count=len(memories))
-    created = merged = skipped = failed = blocked = 0
-    items = []
-    for idx, item in enumerate(memories):
-        try:
-            result = await _safe_remember_impl(
-                content=item.get("content", ""),
-                room=item.get("room", "living_room"),
-                category=item.get("category", ""),
-                importance=item.get("importance", 0.5),
-                source_ai=source_ai or item.get("source_ai", ""),
-                event_date=item.get("event_date", ""),
-                force_create=item.get("force_create", False),
-                tags=item.get("tags"),
-                retry_on_fail=True,
-                subject_name=item.get("subject_name", ""),
-                speaker_name=item.get("speaker_name", ""),
-            )
-        except Exception as exc:
-            result = {"status": "failed", "error": str(exc), "error_type": type(exc).__name__}
-        status = result.get("status", "")
-        if status == "created":
-            created += 1
-        elif status in ("merged", "merged_into_existing"):
-            merged += 1
-        elif status == "dedup_skipped":
-            skipped += 1
-        elif status in ("guardrail_blocked", "guardrail_unavailable") or result.get("blocked"):
-            blocked += 1
-        elif status == "failed":
-            failed += 1
-        items.append({"index": idx, **result})
-    output = {
-        "total": len(items),
-        "created": created,
-        "merged": merged,
-        "skipped": skipped,
-        "blocked": blocked,
-        "failed": failed,
-        "items": items,
-    }
-    output["summary"] = f"{output['total']}条|新{created}合{merged}跳{skipped}拦{blocked}败{failed}"
-    _audit("batch_remember_result", source_ai=source_ai, **{k: output[k] for k in ("total", "created", "merged", "skipped", "blocked", "failed")})
-    return json.dumps(output, ensure_ascii=False, indent=2)
-
-
+    """[已合并到 remember] 批量存储。请改用 remember(items=[...])。"""
+    return await remember(items=memories, source_ai=source_ai)
