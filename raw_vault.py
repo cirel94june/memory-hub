@@ -67,10 +67,19 @@ def _init_db():
         for col in ("thread_id", "message_id", "sender_id", "sender_type", "reply_to_id"):
             if col not in existing:
                 conn.execute(f"ALTER TABLE raw_events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        if "extract_status" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_status INTEGER NOT NULL DEFAULT 0")
+        if "extract_batch" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_batch TEXT NOT NULL DEFAULT ''")
+        if "extract_retries" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN extract_retries INTEGER NOT NULL DEFAULT 0")
+        if "last_attempt_at" not in existing:
+            conn.execute("ALTER TABLE raw_events ADD COLUMN last_attempt_at TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_events(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_ai ON raw_events(ai_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_window ON raw_events(chat_id, thread_id, created_at DESC)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_dedup ON raw_events(ai_id, chat_id, message_id) WHERE message_id != ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_extract ON raw_events(extract_status, created_at DESC)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS raw_vec_id_map (
@@ -84,6 +93,24 @@ def _init_db():
                 applied_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS extract_batches (
+                batch_id TEXT PRIMARY KEY,
+                row_ids TEXT NOT NULL DEFAULT '[]',
+                llm_result TEXT,
+                items_written INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing'
+            )
+        """)
+
+        # Migration: mark old rows as legacy (-1) so recovery only processes recent ones
+        applied = {r[0] for r in conn.execute("SELECT name FROM _migrations").fetchall()}
+        if "extract_status_backfill" not in applied:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
+            conn.execute("UPDATE raw_events SET extract_status = -1 WHERE extract_status = 0 AND created_at < ?", (cutoff,))
+            conn.execute("INSERT OR IGNORE INTO _migrations (name, applied_at) VALUES ('extract_status_backfill', ?)",
+                         (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
         conn.execute("COMMIT")
 
         try:
@@ -197,13 +224,14 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
              turn_id: str = "", *,
              thread_id: str = "", message_id: str = "",
              sender_id: str = "", sender_type: str = "",
-             reply_to_id: str = ""):
+             reply_to_id: str = "") -> int | None:
     """记录一轮原始对话。任何失败都不往外抛——保险箱故障不能影响聊天。
 
     去重：当 ai_id + chat_id + message_id 三元组重复时跳过插入（message_id 非空时）。
+    返回 event_id（成功）或 None（失败/去重跳过）。
     """
     if not (user_message or "").strip() and not (ai_response or "").strip():
-        return
+        return None
     try:
         conn = _connect()
         try:
@@ -222,7 +250,7 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
             )
         except sqlite3.IntegrityError:
             conn.close()
-            return
+            return None
         event_id = cur.lastrowid
         conn.commit()
         conn.close()
@@ -236,8 +264,10 @@ def log_turn(user_message: str, ai_response: str, ai_id: str = "",
                 task.add_done_callback(_bg_tasks.discard)
             except RuntimeError:
                 pass
+        return event_id
     except Exception as e:
         log.warning(f"raw_vault log failed: {e}")
+        return None
 
 
 _LIKE_ESCAPE_TABLE = str.maketrans({"%": "\\%", "_": "\\_", "\\": "\\\\"})
@@ -907,3 +937,272 @@ def renormalize_all_embeddings(batch: int = 500) -> dict:
         "status": "done", "renormalized": updated,
         "skipped": skipped, "failed": 0, "total": total,
     }
+
+
+# ════════════════════════════════════════════
+#  Extraction status tracking
+# ════════════════════════════════════════════
+# extract_status: -1=legacy(skip), 0=pending, 1=processing, 2=done, 3=failed
+EXTRACT_PENDING = 0
+EXTRACT_PROCESSING = 1
+EXTRACT_DONE = 2
+EXTRACT_FAILED = 3
+EXTRACT_LEGACY = -1
+
+
+_MAX_EXTRACT_RETRIES = 3
+_RETRY_BACKOFF_SECONDS = 1800  # 30 minutes
+
+
+_CLAIM_STALE_SECONDS = 300  # 5 minutes: status=1 rows older than this are considered abandoned
+
+def get_unprocessed_chunks(max_chunks: int = 3, chunk_size: int = 30) -> list[dict]:
+    """Find unprocessed raw_events grouped by ai_id+chat_id+thread_id.
+
+    Returns up to max_chunks groups, each with row IDs, chat metadata,
+    and formatted conversation text. Includes:
+    - status 0 (pending)
+    - status 1 (processing) only if last_attempt_at is stale (>5 min, abandoned claim)
+    - status 3 (failed) with retries < 3 and 30min backoff from last_attempt_at
+    Private chats are isolated per ai_id.
+    """
+    now = datetime.now(timezone.utc)
+    retry_cutoff = (now - timedelta(seconds=_RETRY_BACKOFF_SECONDS)).isoformat(timespec="seconds")
+    claim_cutoff = (now - timedelta(seconds=_CLAIM_STALE_SECONDS)).isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, ai_id, platform, chat_id, chat_type, user_text, ai_text, "
+            "created_at, thread_id, sender_id, sender_type, extract_status, "
+            "extract_batch "
+            "FROM raw_events "
+            "WHERE extract_status = 0 "
+            "   OR (extract_status = 1 AND last_attempt_at < ?) "
+            "   OR (extract_status = 3 AND extract_retries < ? AND last_attempt_at < ?) "
+            "ORDER BY created_at ASC "
+            "LIMIT ?",
+            (claim_cutoff, _MAX_EXTRACT_RETRIES, retry_cutoff, max_chunks * chunk_size * 2),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        key = f"{row[1]}:{row[3]}:{row[8]}"  # ai_id:chat_id:thread_id
+        if key not in groups:
+            groups[key] = []
+        groups[key].append({
+            "id": row[0], "ai_id": row[1], "platform": row[2],
+            "chat_id": row[3], "chat_type": row[4],
+            "user_text": row[5], "ai_text": row[6],
+            "created_at": row[7], "thread_id": row[8],
+            "sender_id": row[9], "sender_type": row[10],
+            "extract_status": row[11],
+            "extract_batch": row[12],
+        })
+
+    chunks = []
+    for key, events in list(groups.items())[:max_chunks]:
+        events_to_process = events[:chunk_size]
+        remaining = events[chunk_size:]
+        ai_id = events_to_process[0]["ai_id"] or "claude"
+        # Collect batch_ids from interrupted (status=1) rows for idempotency check
+        interrupted_batches = list({
+            e["extract_batch"] for e in events_to_process
+            if e["extract_status"] == 1 and e["extract_batch"]
+        })
+        chunks.append({
+            "key": key,
+            "chat_id": events_to_process[0]["chat_id"],
+            "thread_id": events_to_process[0]["thread_id"],
+            "chat_type": events_to_process[0]["chat_type"],
+            "ai_id": ai_id,
+            "platform": events_to_process[0]["platform"],
+            "row_ids": [e["id"] for e in events_to_process],
+            "events": events_to_process,
+            "remaining_count": len(remaining),
+            "interrupted_batches": interrupted_batches,
+        })
+    return chunks
+
+
+def mark_rows(
+    row_ids: list[int], status: int, batch_id: str = "",
+    expected_status: list[int] | None = None,
+    expected_batch: str | None = None,
+    stale_before: str | None = None,
+) -> list[int]:
+    """Set extract_status on specific rows. Returns list of row IDs actually updated.
+
+    expected_status: if provided, only update rows currently in one of these states.
+    expected_batch: if provided, only update rows whose extract_batch matches.
+    stale_before: if provided, PROCESSING rows are only claimed when
+        last_attempt_at < this ISO timestamp (i.e. they're stale/abandoned).
+        PENDING and FAILED rows are claimed unconditionally.
+    Together these make claims and done-marking atomic and owner-verified.
+    Increments extract_retries when marking as failed (status=3).
+    Updates last_attempt_at when marking as processing (1) or failed (3).
+    """
+    if not row_ids:
+        return []
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" for _ in row_ids)
+        status_filter = ""
+        filter_params: list = []
+        if expected_status is not None:
+            if stale_before is not None and EXTRACT_PROCESSING in expected_status:
+                non_proc = [s for s in expected_status if s != EXTRACT_PROCESSING]
+                if non_proc:
+                    np_ph = ",".join("?" for _ in non_proc)
+                    status_filter = (
+                        f" AND (extract_status IN ({np_ph})"
+                        f" OR (extract_status = {EXTRACT_PROCESSING} AND last_attempt_at < ?))"
+                    )
+                    filter_params = list(non_proc) + [stale_before]
+                else:
+                    status_filter = f" AND extract_status = {EXTRACT_PROCESSING} AND last_attempt_at < ?"
+                    filter_params = [stale_before]
+            else:
+                s_placeholders = ",".join("?" for _ in expected_status)
+                status_filter = f" AND extract_status IN ({s_placeholders})"
+                filter_params = list(expected_status)
+        if expected_batch is not None:
+            status_filter += " AND extract_batch = ?"
+            filter_params.append(expected_batch)
+
+        where = f"id IN ({placeholders}){status_filter}"
+
+        if status == EXTRACT_FAILED:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
+                f"extract_retries = extract_retries + 1, last_attempt_at = ? "
+                f"WHERE {where}",
+                [status, batch_id or "", now] + row_ids + filter_params,
+            )
+        elif status == EXTRACT_PROCESSING:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ?, extract_batch = ?, "
+                f"last_attempt_at = ? "
+                f"WHERE {where}",
+                [status, batch_id or "", now] + row_ids + filter_params,
+            )
+        elif batch_id:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ?, extract_batch = ? "
+                f"WHERE {where}",
+                [status, batch_id] + row_ids + filter_params,
+            )
+        else:
+            conn.execute(
+                f"UPDATE raw_events SET extract_status = ? "
+                f"WHERE {where}",
+                [status] + row_ids + filter_params,
+            )
+        if batch_id:
+            updated = conn.execute(
+                f"SELECT id FROM raw_events WHERE id IN ({placeholders}) "
+                f"AND extract_status = ? AND extract_batch = ?",
+                row_ids + [status, batch_id],
+            ).fetchall()
+        else:
+            updated = conn.execute(
+                f"SELECT id FROM raw_events WHERE id IN ({placeholders}) "
+                f"AND extract_status = ?",
+                row_ids + [status],
+            ).fetchall()
+        conn.commit()
+        return [r[0] for r in updated]
+    finally:
+        conn.close()
+
+
+def save_batch(batch_id: str, row_ids: list[int], llm_result: str | None = None):
+    """Create or update an extract_batch record to persist LLM result.
+    Does NOT overwrite existing llm_result with None (preserves saved state on re-claim).
+    """
+    import json as _json
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = _connect()
+    try:
+        if llm_result is not None:
+            conn.execute(
+                "INSERT INTO extract_batches (batch_id, row_ids, llm_result, created_at, status) "
+                "VALUES (?, ?, ?, ?, 'processing') "
+                "ON CONFLICT(batch_id) DO UPDATE SET llm_result = excluded.llm_result, "
+                "row_ids = excluded.row_ids",
+                (batch_id, _json.dumps(row_ids), llm_result, now),
+            )
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO extract_batches (batch_id, row_ids, created_at, status) "
+                "VALUES (?, ?, ?, 'processing')",
+                (batch_id, _json.dumps(row_ids), now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_batch(batch_id: str) -> dict | None:
+    """Load a saved batch record. Returns None if not found."""
+    import json as _json
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT batch_id, row_ids, llm_result, items_written, status "
+            "FROM extract_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "batch_id": row[0],
+        "row_ids": _json.loads(row[1]),
+        "llm_result": row[2],
+        "items_written": row[3],
+        "status": row[4],
+    }
+
+
+def update_batch_progress(batch_id: str, items_written: int, status: str = "processing"):
+    """Update items_written and status on a batch record."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE extract_batches SET items_written = ?, status = ? WHERE batch_id = ?",
+            (items_written, status, batch_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def proposal_exists_by_source(source_platform: str) -> bool:
+    """Check if a proposal with this exact source_platform already exists."""
+    try:
+        import database
+        conn = database._get_read_conn()
+        row = conn.execute(
+            "SELECT 1 FROM proposals WHERE source_platform = ? LIMIT 1",
+            (source_platform,),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def count_by_status() -> dict[str, int]:
+    """Return counts of rows per extract_status for diagnostics."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT extract_status, COUNT(*) FROM raw_events GROUP BY extract_status"
+        ).fetchall()
+    finally:
+        conn.close()
+    labels = {-1: "legacy", 0: "pending", 1: "processing", 2: "done", 3: "failed"}
+    return {labels.get(s, f"unknown_{s}"): c for s, c in rows}
