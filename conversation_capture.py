@@ -901,6 +901,8 @@ async def recover_unprocessed() -> dict:
             ).isoformat(timespec="seconds")
 
             chunk_memories = []
+            chunk_failed = 0
+            chunk_claimed = 0
             for job in recovery_jobs:
                 batch_id = job["batch_id"]
                 saved = job["saved"]
@@ -915,6 +917,7 @@ async def recover_unprocessed() -> dict:
                 )
                 if not claimed_ids:
                     continue
+                chunk_claimed += 1
 
                 items = None
                 items_already_written = 0
@@ -1006,11 +1009,13 @@ async def recover_unprocessed() -> dict:
                     except Exception as e:
                         logger.warning(f"[Recovery] LLM call failed for {chunk['key']}: {e}")
                         raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        chunk_failed += 1
                         continue
 
                     if not raw:
                         logger.warning(f"[Recovery] LLM returned empty for {chunk['key']}, marking failed")
                         raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        chunk_failed += 1
                         continue
 
                     try:
@@ -1020,9 +1025,11 @@ async def recover_unprocessed() -> dict:
                         items = json.loads(raw)
                         if not isinstance(items, list):
                             raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                            chunk_failed += 1
                             continue
                     except Exception:
                         raw_vault.mark_rows(included_row_ids, raw_vault.EXTRACT_FAILED, batch_id)
+                        chunk_failed += 1
                         continue
 
                     # Persist LLM result so interrupted retries can resume
@@ -1157,8 +1164,16 @@ async def recover_unprocessed() -> dict:
                 else:
                     logger.info(f"[Recovery] No memories from {chunk['key']} (batch={batch_id})")
 
+            if chunk_claimed == 0:
+                chunk_status = "no_rows_claimed"
+            elif chunk_failed == chunk_claimed:
+                chunk_status = "failed"
+            elif chunk_failed > 0:
+                chunk_status = "partial"
+            else:
+                chunk_status = "extracted"
             results[chunk["key"]] = {
-                "status": "extracted",
+                "status": chunk_status,
                 "memory_count": len(chunk_memories),
             }
 

@@ -1627,3 +1627,75 @@ def test_two_interrupted_batches_resume_independently():
         b_sources = [s for s in remembered_sources if batch_b in s]
         assert len(a_sources) == 1, "batch A should produce 1 memory"
         assert len(b_sources) == 1, "batch B should produce 1 memory"
+
+
+# ── 41. Recovery status reflects failures (P2 fix) ──
+
+def test_recovery_status_reports_failed_when_llm_fails():
+    """When LLM fails for all recovery jobs, status must be 'failed', not 'extracted'."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "pending msg for recovery",
+             "extract_status": 0, "created_at": "2026-09-20T12:00:00+00:00"},
+        ])
+
+        async def mock_llm(prompt):
+            raise RuntimeError("LLM unavailable")
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        detail = list(result["details"].values())[0]
+        assert detail["status"] == "failed", \
+            f"all jobs failed → status must be 'failed', got '{detail['status']}'"
+        assert detail["memory_count"] == 0
+
+
+def test_recovery_status_reports_no_rows_claimed():
+    """When chunk has rows but none can be claimed (all fresh PROCESSING),
+    status must be 'no_rows_claimed'."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        stale_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(timespec="seconds")
+        fresh_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "stale pending row to make chunk appear",
+             "extract_status": 0, "created_at": "2026-09-20T12:00:00+00:00"},
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "fresh processing row",
+             "extract_status": 1, "created_at": "2026-09-20T12:01:00+00:00"},
+        ])
+        # Make the PROCESSING row fresh so it can't be claimed
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE raw_events SET last_attempt_at = ? WHERE extract_status = 1", (fresh_ts,))
+        conn.commit()
+        # Get row ids
+        rows = conn.execute("SELECT id, extract_status FROM raw_events ORDER BY id").fetchall()
+        pending_id = rows[0][0]
+        conn.close()
+
+        # Mock mark_rows to reject ALL claims (simulating another worker grabbed them)
+        original_mark = raw_vault.mark_rows.__wrapped__ if hasattr(raw_vault.mark_rows, '__wrapped__') else raw_vault.mark_rows
+
+        def reject_all_claims(row_ids, status, batch_id="", **kw):
+            if status == raw_vault.EXTRACT_PROCESSING:
+                return []
+            return original_mark(row_ids, status, batch_id, **kw)
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("raw_vault.mark_rows", side_effect=reject_all_claims), \
+             mock.patch("conversation_capture._call_llm", side_effect=RuntimeError("should not be called")), \
+             mock.patch("database.resolve_alias", return_value=""):
+            result = asyncio.run(recover_unprocessed())
+
+        assert result["status"] == "recovered"
+        detail = list(result["details"].values())[0]
+        assert detail["status"] == "no_rows_claimed", \
+            f"no rows claimed → status must be 'no_rows_claimed', got '{detail['status']}'"
