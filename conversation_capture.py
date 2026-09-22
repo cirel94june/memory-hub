@@ -471,6 +471,35 @@ async def _extract_and_remember(buffer_key: str) -> list[dict]:
             logger.info(f"No rows claimed for {buffer_key} (already processed by recovery)")
             return []
         included_row_ids = claimed_ids
+
+        # Partial claim: filter entries/lines to only claimed rows
+        if len(claimed_ids) < len(all_row_ids):
+            claimed_set = set(claimed_ids)
+            old_entries = included_entries
+            included_entries = [
+                e for e in old_entries
+                if not e.get("raw_event_id") or e["raw_event_id"] in claimed_set
+            ]
+            unclaimed_entries = [
+                e for e in old_entries
+                if e.get("raw_event_id") and e["raw_event_id"] not in claimed_set
+            ]
+            if unclaimed_entries:
+                _conversation_buffers[buffer_key] = unclaimed_entries + _conversation_buffers.get(buffer_key, [])
+            # Rebuild text from claimed entries only
+            lines = []
+            for entry in included_entries:
+                user_short = entry['user'][:200]
+                ai_short = entry['ai'][:200] if entry['ai'] else ""
+                ts = entry['timestamp'][:16]
+                entry_ai = entry.get('ai_id', 'AI')
+                if is_group:
+                    line = f"[{ts}] {user_short}\n  → {entry_ai}: {ai_short}" if ai_short else f"[{ts}] {user_short}"
+                else:
+                    line = f"[{ts}] ceci: {user_short} | {entry_ai}: {ai_short}" if ai_short else f"[{ts}] ceci: {user_short}"
+                lines.append(line)
+            conversation_text = "\n".join(lines)
+
         raw_vault.save_batch(batch_id, included_row_ids)
 
     today = local_today()
@@ -847,11 +876,16 @@ async def recover_unprocessed() -> dict:
             if not batch_id:
                 batch_id = f"recovery-{uuid.uuid4().hex[:12]}"
 
-            # Conditional claim: only take rows in PENDING or stale PROCESSING
+            # Conditional claim: PENDING/FAILED unconditionally, PROCESSING only if stale
+            from datetime import timedelta
+            stale_cutoff = (
+                datetime.now(timezone.utc) - timedelta(seconds=raw_vault._CLAIM_STALE_SECONDS)
+            ).isoformat(timespec="seconds")
             claimed_ids = raw_vault.mark_rows(
                 row_ids, raw_vault.EXTRACT_PROCESSING, batch_id,
                 expected_status=[raw_vault.EXTRACT_PENDING, raw_vault.EXTRACT_PROCESSING,
                                  raw_vault.EXTRACT_FAILED],
+                stale_before=stale_cutoff,
             )
             if not claimed_ids:
                 results[chunk["key"]] = {"status": "no_rows_claimed", "batch_id": batch_id}

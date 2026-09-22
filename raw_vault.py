@@ -1026,11 +1026,15 @@ def mark_rows(
     row_ids: list[int], status: int, batch_id: str = "",
     expected_status: list[int] | None = None,
     expected_batch: str | None = None,
+    stale_before: str | None = None,
 ) -> list[int]:
     """Set extract_status on specific rows. Returns list of row IDs actually updated.
 
     expected_status: if provided, only update rows currently in one of these states.
     expected_batch: if provided, only update rows whose extract_batch matches.
+    stale_before: if provided, PROCESSING rows are only claimed when
+        last_attempt_at < this ISO timestamp (i.e. they're stale/abandoned).
+        PENDING and FAILED rows are claimed unconditionally.
     Together these make claims and done-marking atomic and owner-verified.
     Increments extract_retries when marking as failed (status=3).
     Updates last_attempt_at when marking as processing (1) or failed (3).
@@ -1044,9 +1048,22 @@ def mark_rows(
         status_filter = ""
         filter_params: list = []
         if expected_status is not None:
-            s_placeholders = ",".join("?" for _ in expected_status)
-            status_filter = f" AND extract_status IN ({s_placeholders})"
-            filter_params = list(expected_status)
+            if stale_before is not None and EXTRACT_PROCESSING in expected_status:
+                non_proc = [s for s in expected_status if s != EXTRACT_PROCESSING]
+                if non_proc:
+                    np_ph = ",".join("?" for _ in non_proc)
+                    status_filter = (
+                        f" AND (extract_status IN ({np_ph})"
+                        f" OR (extract_status = {EXTRACT_PROCESSING} AND last_attempt_at < ?))"
+                    )
+                    filter_params = list(non_proc) + [stale_before]
+                else:
+                    status_filter = f" AND extract_status = {EXTRACT_PROCESSING} AND last_attempt_at < ?"
+                    filter_params = [stale_before]
+            else:
+                s_placeholders = ",".join("?" for _ in expected_status)
+                status_filter = f" AND extract_status IN ({s_placeholders})"
+                filter_params = list(expected_status)
         if expected_batch is not None:
             status_filter += " AND extract_batch = ?"
             filter_params.append(expected_batch)

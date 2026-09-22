@@ -1368,3 +1368,102 @@ def test_cross_path_idempotency():
         # Recovery must NOT create a duplicate — same batch_id means same source key
         assert len(recovery_remembered) == 0, \
             "recovery must skip items already written by normal path (same idempotency key)"
+
+
+# ── 31. Partial claim filters conversation text to only claimed rows ──
+
+def test_partial_claim_filters_conversation_text():
+    """If 2 rows in buffer but only 1 is PENDING (other already DONE),
+    the already-done row must NOT appear in the LLM prompt."""
+    import raw_vault
+    from conversation_capture import _extract_and_remember, _conversation_buffers, _buffer_chat_types
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "already done msg",
+             "extract_status": 2, "created_at": "2026-09-20T12:00:00+00:00"},
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "pending msg for extraction",
+             "extract_status": 0, "created_at": "2026-09-20T12:01:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        conn.close()
+
+        buf_key = "cloudy:100"
+        _conversation_buffers[buf_key] = [
+            {"user": "already done msg", "ai": "ok", "timestamp": "2026-09-20T12:00:00+00:00",
+             "ai_id": "cloudy", "platform": "telegram", "raw_event_id": all_ids[0]},
+            {"user": "pending msg for extraction", "ai": "noted", "timestamp": "2026-09-20T12:01:00+00:00",
+             "ai_id": "cloudy", "platform": "telegram", "raw_event_id": all_ids[1]},
+        ]
+        _buffer_chat_types[buf_key] = "private"
+        llm_prompts = []
+
+        async def mock_llm(prompt):
+            llm_prompts.append(prompt)
+            return '[]'
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("database.resolve_alias", return_value=""):
+            asyncio.run(_extract_and_remember(buf_key))
+
+        assert len(llm_prompts) == 1
+        prompt_text = llm_prompts[0]
+        assert "already done msg" not in prompt_text, \
+            "already-done row must NOT appear in LLM prompt"
+        assert "pending msg" in prompt_text, \
+            "pending row must appear in LLM prompt"
+
+
+# ── 32. Recovery cannot steal freshly-claimed PROCESSING rows ──
+
+def test_recovery_cannot_steal_fresh_processing():
+    """Recovery must NOT claim rows that were just claimed by normal extraction
+    (last_attempt_at is recent, within stale timeout)."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "being extracted now",
+             "extract_status": 1, "created_at": "2026-09-20T12:00:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        row_id = conn.execute("SELECT id FROM raw_events").fetchone()[0]
+        # Set last_attempt_at to just now (fresh claim by normal extraction)
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE raw_events SET last_attempt_at = ?, extract_batch = 'normal-abc123'",
+            (recent,),
+        )
+        conn.commit()
+        conn.close()
+
+        llm_called = []
+
+        async def mock_llm(prompt):
+            llm_called.append(prompt)
+            return '[]'
+
+        # get_unprocessed_chunks won't even return this row (stale check in query),
+        # but even if we force it through, mark_rows must reject it.
+        # Test at mark_rows level directly:
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)):
+            stale_cutoff = (
+                datetime.now(timezone.utc) - timedelta(seconds=raw_vault._CLAIM_STALE_SECONDS)
+            ).isoformat(timespec="seconds")
+            claimed = raw_vault.mark_rows(
+                [row_id], raw_vault.EXTRACT_PROCESSING, "recovery-xyz",
+                expected_status=[raw_vault.EXTRACT_PENDING, raw_vault.EXTRACT_PROCESSING,
+                                 raw_vault.EXTRACT_FAILED],
+                stale_before=stale_cutoff,
+            )
+
+        assert len(claimed) == 0, "fresh PROCESSING row must NOT be stolen by recovery"
+
+        # Verify original batch ownership is preserved
+        conn = sqlite3.connect(db)
+        batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
+        conn.close()
+        assert batch == "normal-abc123", "batch ownership must not change"
