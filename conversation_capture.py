@@ -921,12 +921,14 @@ async def recover_unprocessed() -> dict:
                     items = None
 
             if items is None:
-                # No saved result — build conversation text from chunk events
+                # No saved result — build conversation text from claimed events only
+                claimed_set = set(row_ids)
+                claimed_events = [e for e in chunk["events"] if e["id"] in claimed_set]
                 lines = []
                 included_row_ids = []
                 char_budget = 5500
                 is_group = chat_type in ("private_group", "public_group")
-                for event in chunk["events"]:
+                for event in claimed_events:
                     user_short = (event["user_text"] or "")[:200]
                     ai_short = (event["ai_text"] or "")[:200]
                     ts = (event["created_at"] or "")[:16]

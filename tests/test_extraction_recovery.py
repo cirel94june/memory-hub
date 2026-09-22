@@ -1467,3 +1467,63 @@ def test_recovery_cannot_steal_fresh_processing():
         batch = conn.execute("SELECT extract_batch FROM raw_events").fetchone()[0]
         conn.close()
         assert batch == "normal-abc123", "batch ownership must not change"
+
+
+# ── 33. Recovery partial claim filters events to claimed rows only ──
+
+def test_recovery_partial_claim_filters_events():
+    """If recovery claims only 1 of 2 rows (other is freshly PROCESSING),
+    the unclaimed row's text must NOT appear in the LLM prompt or batch record."""
+    import raw_vault
+    from conversation_capture import recover_unprocessed
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _make_db(tmp)
+        # Row 1: freshly claimed by normal extraction (PROCESSING, recent)
+        # Row 2: pending
+        _seed(db, [
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "normal claimed this",
+             "extract_status": 1, "created_at": "2026-09-20T12:00:00+00:00"},
+            {"ai_id": "cloudy", "chat_id": "100", "user_text": "recovery should get this",
+             "extract_status": 0, "created_at": "2026-09-20T12:01:00+00:00"},
+        ])
+        conn = sqlite3.connect(db)
+        all_ids = [r[0] for r in conn.execute("SELECT id FROM raw_events ORDER BY id").fetchall()]
+        # Make row 1 freshly claimed (not stale)
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE raw_events SET last_attempt_at = ?, extract_batch = 'normal-xxx' WHERE id = ?",
+            (recent, all_ids[0]),
+        )
+        conn.commit()
+        conn.close()
+
+        llm_prompts = []
+
+        async def mock_llm(prompt):
+            llm_prompts.append(prompt)
+            return '[]'
+
+        async def mock_remember(**kw):
+            return {"id": "mem-1"}
+
+        with mock.patch.object(raw_vault, "DB_PATH", Path(db)), \
+             mock.patch("conversation_capture._call_llm", side_effect=mock_llm), \
+             mock.patch("memory_ops.remember", side_effect=mock_remember), \
+             mock.patch("database.resolve_alias", return_value=""):
+            asyncio.run(recover_unprocessed())
+
+        assert len(llm_prompts) == 1
+        prompt_text = llm_prompts[0]
+        assert "normal claimed this" not in prompt_text, \
+            "freshly-claimed row must NOT appear in recovery LLM prompt"
+        assert "recovery should get this" in prompt_text, \
+            "pending row must appear in recovery LLM prompt"
+
+        # Batch record must only contain the claimed row
+        conn = sqlite3.connect(db)
+        batch_row = conn.execute("SELECT row_ids FROM extract_batches").fetchone()
+        conn.close()
+        if batch_row:
+            batch_row_ids = json.loads(batch_row[0])
+            assert all_ids[0] not in batch_row_ids, \
+                "unclaimed row must not be in batch record"
