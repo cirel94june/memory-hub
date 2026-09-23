@@ -476,7 +476,7 @@ async def _async_remember_single(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 12 consolidated MCP tools + 5 redirect aliases
+# 12 consolidated MCP tools + 6 redirect aliases
 # ═══════════════════════════════════════════════════════════════════════
 
 # ── 1. remember ──────────────────────────────────────────────────────
@@ -1265,3 +1265,18 @@ async def batch_remember(
 ) -> str:
     """[已合并到 remember] 批量存储。请改用 remember(items=[...])。"""
     return await remember(items=memories, source_ai=source_ai)
+
+
+@mcp.tool()
+async def update_memory(
+    memory_id: str,
+    content: str = "",
+    importance: float = -1,
+    room: str = "",
+    tags: list[str] | None = None,
+) -> str:
+    """[已合并到 manage] 更新记忆。请改用 manage(action='update')。"""
+    return await manage(
+        action="update", memory_id=memory_id,
+        content=content, importance=importance, room=room, tags=tags,
+    )
