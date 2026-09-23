@@ -149,35 +149,52 @@ def _exact_match_score(query: str, mem: dict) -> float:
     return matched / len(words)
 
 
-def _rrf_merge(*rank_lists, k: int = 60) -> list[dict]:
+def _rrf_merge(vec_results, kw_results, like_results, exact_results,
+               *, k: int = 60) -> list[dict]:
     """Reciprocal Rank Fusion：多路排序结果融合
 
     每路给每个 ID 打分 1/(k+rank)，最后按总分排序。
     k=60 是标准 RRF 参数。
 
-    保留各路原始 score 的最大值（best_route_score）和命中路数
-    （matched_routes），供下游 relevance gate 使用。
+    Tracks evidence families for downstream relevance gate:
+    - semantic: vector search (independent signal)
+    - lexical: FTS + CJK LIKE + exact (same word-match family, counted once)
+    Also preserves pure embed_score (cosine similarity without time/importance)
+    via the _embed_score field set by the vector search path.
     """
-    scores = {}  # id -> {"rrf": float, "data": dict, "matched_routes": int, "best_route_score": float}
-    for rank_list in rank_lists:
+    all_lists = [
+        ("semantic", vec_results),
+        ("lexical", kw_results),
+        ("lexical", like_results),
+        ("lexical", exact_results),
+    ]
+    scores = {}  # id -> {rrf, data, families: set, best_route_score}
+    for family, rank_list in all_lists:
         for rank, item in enumerate(rank_list):
             mid = item["id"]
             rrf_score = 1.0 / (k + rank + 1)
             route_score = item.get("score", 0)
             if mid not in scores:
-                scores[mid] = {"rrf": 0.0, "data": item, "matched_routes": 0, "best_route_score": 0.0}
+                scores[mid] = {
+                    "rrf": 0.0, "data": item,
+                    "families": set(), "best_route_score": 0.0,
+                }
             scores[mid]["rrf"] += rrf_score
-            scores[mid]["matched_routes"] += 1
+            scores[mid]["families"].add(family)
             if route_score > scores[mid]["best_route_score"]:
                 scores[mid]["best_route_score"] = route_score
 
     merged = sorted(scores.values(), key=lambda x: x["rrf"], reverse=True)
     results = []
     for item in merged:
+        embed = item["data"].get("_embed_score", 0.0)
         row = item["data"] | {
             "score": round(item["rrf"], 6),
-            "matched_routes": item["matched_routes"],
+            "matched_families": len(item["families"]),
+            "has_semantic": "semantic" in item["families"],
+            "has_lexical": "lexical" in item["families"],
             "best_route_score": round(item["best_route_score"], 4),
+            "embed_score": round(embed, 4),
         }
         results.append(row)
     return results
@@ -644,28 +661,40 @@ from resolve_patterns import (
 _RECENCY_BOOST_COEF = 0.25
 _RECENCY_DECAY_DAYS = 7
 
-# Relevance gate: an item must meet at least ONE of these to be "relevant".
-# - best_route_score >= 0.35 (strong single-route match)
-# - matched_routes >= 2 (confirmed by multiple search paths)
-# Items below the gate don't receive recency boost and are trimmed
-# when enough above-gate results exist.
-_RELEVANCE_BEST_SCORE_MIN = 0.35
-_RELEVANCE_MIN_ROUTES = 2
+# Relevance gate uses evidence families, not raw route count.
+# - semantic family: vector search (independent signal)
+# - lexical family: FTS + CJK LIKE + exact (same word-match, counted once)
+# An item is "relevant" if it has:
+#   strong semantic match (pure cosine >= 0.35), OR
+#   both semantic + lexical families confirm it, OR
+#   strong exact/keyword score (best_route_score >= 0.6)
+_RELEVANCE_EMBED_MIN = 0.35
+_RELEVANCE_STRONG_LEXICAL_MIN = 0.6
 # importance tie-break: very light, only for relevant items
 _IMPORTANCE_TIEBREAK_COEF = 0.05
 
 
 def _is_relevant(item: dict) -> bool:
-    """Check if item passes the relevance gate."""
-    return (item.get("best_route_score", 0) >= _RELEVANCE_BEST_SCORE_MIN
-            or item.get("matched_routes", 0) >= _RELEVANCE_MIN_ROUTES)
+    """Check if item passes the relevance gate via evidence families."""
+    embed = item.get("embed_score", 0)
+    if embed >= _RELEVANCE_EMBED_MIN:
+        return True
+    has_semantic = item.get("has_semantic", False)
+    has_lexical = item.get("has_lexical", False)
+    if has_semantic and has_lexical:
+        return True
+    if item.get("best_route_score", 0) >= _RELEVANCE_STRONG_LEXICAL_MIN:
+        return True
+    return False
 
 
 def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
-    """Split items into relevant/weak; only apply recency boost to relevant ones.
+    """Split items into relevant/weak tiers.
 
-    If enough relevant items exist (>= top_k), weak items are dropped entirely.
-    Otherwise weak items fill remaining slots without recency boost.
+    Relevant items are sorted by score and always come first.
+    Weak items fill remaining slots (up to top_k) but never displace
+    relevant items. By default weak items are NOT returned when enough
+    relevant results exist.
     """
     relevant = []
     weak = []
@@ -680,9 +709,11 @@ def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
         imp = item.get("importance", 0.5)
         item["score"] = round(item["score"] * (1 + _IMPORTANCE_TIEBREAK_COEF * imp), 6)
 
-    if len(relevant) >= top_k:
-        return relevant
-    return relevant + weak
+    relevant.sort(key=lambda x: x.get("score", 0), reverse=True)
+    weak.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    remaining = max(0, top_k - len(relevant))
+    return relevant + weak[:remaining]
 
 
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
@@ -1824,7 +1855,6 @@ async def recall(
     query: str,
     ai_id: str = "",
     top_k: int = 8,
-    threshold: float = 0.008,
     include_rooms: list[str] = None,
     exclude_isolated: bool = True,
     query_domain: list[str] = None,
@@ -1946,6 +1976,7 @@ async def recall(
                 importance_score = _safe_float(mem.get("importance"), 0.5)
                 final = (embed_score * 0.6 + emotion_score * 0.15 +
                          time_score * 0.1 + importance_score * 0.15)
+                mem["_embed_score"] = embed_score
                 vec_scored.append((mem, final))
             vec_scored.sort(key=lambda x: x[1], reverse=True)
             vec_results = [_build_result(m, s) for m, s in vec_scored[:50]]
@@ -2009,7 +2040,7 @@ async def recall(
         exact_results = [_build_result(m, s) for m, s in exact_scored[:50]]
 
         # RRF 融合
-        merged = _rrf_merge(vec_results, kw_results, like_results, exact_results)
+        merged = _rrf_merge(vec_results, kw_results, like_results, exact_results, k=60)
 
         # Fail-closed: final provenance filter after RRF (defense in depth)
         # Unknown items (get_fn returns None) are EXCLUDED — fail-closed.
@@ -2022,67 +2053,69 @@ async def recall(
                     filtered.append(item)
             merged = filtered
 
-        # Block 2: relevance gate → recency boost (only for relevant items)
+        # Block 2: relevance gate → tier-separated processing
+        # _apply_relevance_gate returns [relevant..., weak...] with relevant first.
         merged = _apply_relevance_gate(merged, top_k)
-        relevant_ids = {item["id"] for item in merged if _is_relevant(item)}
-        # recency boost only for items that passed the relevance gate
-        relevant_items = [item for item in merged if item["id"] in relevant_ids]
-        weak_items = [item for item in merged if item["id"] not in relevant_ids]
-        _apply_recency_boost(relevant_items)
-        merged = relevant_items + weak_items
-        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
-
-        # Block 3: activation_count P95 顶端惩罚（≥20 条结果才触发）
-        _apply_activation_penalty(merged)
-        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
-
-        # 残缺正文降权（content_incomplete 由完整性审计标记）
+        # Tag each item's tier for downstream preservation
         for item in merged:
-            mem = get_fn(item["id"])
-            if mem and _has_tag(mem, "content_incomplete"):
-                item["score"] = round(item.get("score", 0) * 0.6, 6)
+            item["_relevant"] = _is_relevant(item)
 
-        # owner=self 的 private 记忆加权：查询者自己的梦/日记等高匹配私有内容
-        # 不能被 shared 高频梗（RRF 多路都命中）压到后排
-        if ai_ids:
-            _self_material_markers = ("我梦", "梦见", "梦到", "我的梦", "昨晚的梦",
-                                      "我的日记", "我写的", "我记得我")
-            query_wants_self = any(k in query for k in _self_material_markers)
-            for item in merged:
+        # Recency boost: ONLY for relevant items
+        relevant_items = [item for item in merged if item["_relevant"]]
+        weak_items = [item for item in merged if not item["_relevant"]]
+        _apply_recency_boost(relevant_items)
+
+        # Block 3: activation_count P95 顶端惩罚（only within relevant tier）
+        _apply_activation_penalty(relevant_items)
+        relevant_items.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # Apply secondary boosts within each tier separately
+        for tier in (relevant_items, weak_items):
+            # 残缺正文降权
+            for item in tier:
                 mem = get_fn(item["id"])
-                if not mem or (mem.get("layer") or "shared") != "private":
-                    continue
-                owner = mem.get("owner_ai") or mem.get("source_ai") or ""
-                from config import AI_ALIASES as _al
-                if owner in ai_ids or _al.get(owner, owner) in ai_ids:
-                    boost = 1.3
-                    if query_wants_self and mem.get("room") in ("dreams", "diary"):
-                        boost = 2.0
-                    item["score"] = round(item.get("score", 0) * boost, 6)
-            merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+                if mem and _has_tag(mem, "content_incomplete"):
+                    item["score"] = round(item.get("score", 0) * 0.6, 6)
 
-        # subject_id 加权：查询提到某人时，关于该人的记忆 boost
-        try:
-            all_aliases = database.get_all_aliases(scope="any")
-            query_person_ids = set()
-            ql = query.lower()
-            for alias_name, pid in all_aliases.items():
-                if len(alias_name) >= 2 and alias_name.lower() in ql:
-                    query_person_ids.add(pid)
-            if query_person_ids:
-                for item in merged:
+            # owner=self private 记忆加权
+            if ai_ids:
+                _self_material_markers = ("我梦", "梦见", "梦到", "我的梦", "昨晚的梦",
+                                          "我的日记", "我写的", "我记得我")
+                query_wants_self = any(k in query for k in _self_material_markers)
+                for item in tier:
                     mem = get_fn(item["id"])
-                    if mem and mem.get("subject_id") in query_person_ids:
-                        item["score"] = round(item.get("score", 0) * 1.25, 6)
-                merged.sort(key=lambda x: x.get("score", 0), reverse=True)
-        except Exception:
-            pass
+                    if not mem or (mem.get("layer") or "shared") != "private":
+                        continue
+                    owner = mem.get("owner_ai") or mem.get("source_ai") or ""
+                    from config import AI_ALIASES as _al
+                    if owner in ai_ids or _al.get(owner, owner) in ai_ids:
+                        boost = 1.3
+                        if query_wants_self and mem.get("room") in ("dreams", "diary"):
+                            boost = 2.0
+                        item["score"] = round(item.get("score", 0) * boost, 6)
 
-        # Enforce threshold: drop items below minimum score
-        if threshold > 0:
-            merged = [item for item in merged if item.get("score", 0) >= threshold]
+            # subject_id 加权
+            try:
+                all_aliases = database.get_all_aliases(scope="any")
+                query_person_ids = set()
+                ql = query.lower()
+                for alias_name, pid in all_aliases.items():
+                    if len(alias_name) >= 2 and alias_name.lower() in ql:
+                        query_person_ids.add(pid)
+                if query_person_ids:
+                    for item in tier:
+                        mem = get_fn(item["id"])
+                        if mem and mem.get("subject_id") in query_person_ids:
+                            item["score"] = round(item.get("score", 0) * 1.25, 6)
+            except Exception:
+                pass
 
-        # Unresolved 优先浮现
+            tier.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        # Merge tiers: relevant ALWAYS before weak (tier boundary is sacred)
+        merged = relevant_items + weak_items
+
+        # Unresolved 优先浮现 (within their own tier)
         unresolved_items = []
         normal_items = []
         for item in merged:
@@ -2108,8 +2141,13 @@ async def recall(
     # ── 结果后处理：confidence 标签 + 清理内部字段 ──
     for r in results:
         r.pop("_unresolved", None)
-        r.pop("matched_routes", None)
+        r.pop("_relevant", None)
+        r.pop("_embed_score", None)
+        r.pop("matched_families", None)
+        r.pop("has_semantic", None)
+        r.pop("has_lexical", None)
         r.pop("best_route_score", None)
+        r.pop("embed_score", None)
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
 

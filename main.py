@@ -1880,7 +1880,7 @@ async def api_breath_debug(
     bm25_list = [{"id": mid, "score": d["bm25"]} for mid, d in sorted(bm25_details.items(), key=lambda x: x[1]["bm25"], reverse=True)]
     exact_list = [{"id": mid, "score": d["exact"]} for mid, d in sorted(exact_details.items(), key=lambda x: x[1]["exact"], reverse=True)]
 
-    rrf_merged = _rrf_merge(vec_list, bm25_list, exact_list)
+    rrf_merged = _rrf_merge(vec_list, bm25_list, [], exact_list)
 
     results = []
     for i, item in enumerate(rrf_merged[:15]):

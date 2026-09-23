@@ -21,6 +21,7 @@ import math
 import struct
 import hashlib
 import asyncio
+import inspect
 import sqlite3
 from datetime import datetime, timezone, timedelta
 from unittest.mock import patch
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import database
+import memory_ops
 from config import EMBEDDING_DIM
 
 
@@ -849,26 +851,48 @@ class TestSharedWriteLock:
 
 
 # ════════════════════════════════════════════
-#  Block 7: relevance gate + threshold
+#  Block 7: relevance gate (evidence families)
 # ════════════════════════════════════════════
 
 class TestRelevanceGate:
-    """Test _is_relevant, _apply_relevance_gate, and threshold enforcement."""
+    """Test _is_relevant, _apply_relevance_gate with evidence families."""
 
-    def test_strong_single_route_is_relevant(self):
+    def test_strong_embed_is_relevant(self):
+        """Strong pure cosine similarity → relevant regardless of families."""
         from memory_ops import _is_relevant
-        item = {"best_route_score": 0.5, "matched_routes": 1}
+        item = {"embed_score": 0.5, "has_semantic": True, "has_lexical": False}
         assert _is_relevant(item) is True
 
-    def test_multi_route_weak_score_is_relevant(self):
+    def test_both_families_weak_scores_is_relevant(self):
+        """Semantic + lexical families both present → relevant even if individual scores weak."""
         from memory_ops import _is_relevant
-        item = {"best_route_score": 0.1, "matched_routes": 2}
+        item = {"embed_score": 0.1, "has_semantic": True, "has_lexical": True,
+                "best_route_score": 0.2}
         assert _is_relevant(item) is True
 
-    def test_single_route_weak_score_not_relevant(self):
+    def test_lexical_only_weak_not_relevant(self):
+        """Only lexical matches (FTS+LIKE), no semantic → NOT relevant unless very strong."""
         from memory_ops import _is_relevant
-        item = {"best_route_score": 0.1, "matched_routes": 1}
+        item = {"embed_score": 0.0, "has_semantic": False, "has_lexical": True,
+                "best_route_score": 0.3}
         assert _is_relevant(item) is False
+
+    def test_strong_lexical_is_relevant(self):
+        """Very strong lexical score (≥0.6) → relevant even without semantic."""
+        from memory_ops import _is_relevant
+        item = {"embed_score": 0.0, "has_semantic": False, "has_lexical": True,
+                "best_route_score": 0.7}
+        assert _is_relevant(item) is True
+
+    def test_fts_plus_like_not_two_families(self):
+        """FTS and LIKE are the same lexical family — both together is still 1 family."""
+        from memory_ops import _rrf_merge
+        kw = [{"id": "a", "score": 0.3}]
+        like = [{"id": "a", "score": 0.2}]
+        merged = _rrf_merge([], kw, like, [])
+        assert merged[0]["has_lexical"] is True
+        assert merged[0]["has_semantic"] is False
+        assert merged[0]["matched_families"] == 1
 
     def test_missing_fields_not_relevant(self):
         from memory_ops import _is_relevant
@@ -876,97 +900,106 @@ class TestRelevanceGate:
 
     def test_gate_drops_weak_when_enough_relevant(self):
         from memory_ops import _apply_relevance_gate
-        relevant = [{"id": f"r{i}", "score": 0.05, "best_route_score": 0.5,
-                      "matched_routes": 2, "importance": 0.5} for i in range(5)]
-        weak = [{"id": f"w{i}", "score": 0.04, "best_route_score": 0.1,
-                 "matched_routes": 1, "importance": 0.5} for i in range(5)]
+        relevant = [{"id": f"r{i}", "score": 0.05, "embed_score": 0.5,
+                      "has_semantic": True, "has_lexical": True,
+                      "best_route_score": 0.5, "importance": 0.5} for i in range(5)]
+        weak = [{"id": f"w{i}", "score": 0.04, "embed_score": 0.1,
+                 "has_semantic": False, "has_lexical": True,
+                 "best_route_score": 0.1, "importance": 0.5} for i in range(5)]
         result = _apply_relevance_gate(relevant + weak, top_k=5)
         assert len(result) == 5
         assert all(item["id"].startswith("r") for item in result)
 
-    def test_gate_keeps_weak_as_filler(self):
+    def test_weak_never_displaces_relevant(self):
+        """Even with higher RRF score, weak items must come AFTER relevant items."""
+        from memory_ops import _apply_relevance_gate, _is_relevant
+        relevant = {"id": "rel", "score": 0.010, "embed_score": 0.5,
+                    "has_semantic": True, "has_lexical": False,
+                    "best_route_score": 0.5, "importance": 0.5}
+        weak = {"id": "wk", "score": 0.016, "embed_score": 0.0,
+                "has_semantic": False, "has_lexical": True,
+                "best_route_score": 0.1, "importance": 0.5}
+        assert _is_relevant(relevant)
+        assert not _is_relevant(weak)
+        result = _apply_relevance_gate([weak, relevant], top_k=5)
+        assert result[0]["id"] == "rel", "relevant must always precede weak"
+
+    def test_gate_limits_weak_filler(self):
+        """Weak items fill remaining slots only up to top_k."""
         from memory_ops import _apply_relevance_gate
-        relevant = [{"id": "r0", "score": 0.05, "best_route_score": 0.5,
-                      "matched_routes": 2, "importance": 0.5}]
-        weak = [{"id": f"w{i}", "score": 0.04, "best_route_score": 0.1,
-                 "matched_routes": 1, "importance": 0.5} for i in range(4)]
-        result = _apply_relevance_gate(relevant + weak, top_k=5)
-        assert len(result) == 5
+        relevant = [{"id": "r0", "score": 0.05, "embed_score": 0.5,
+                      "has_semantic": True, "has_lexical": True,
+                      "best_route_score": 0.5, "importance": 0.5}]
+        weak = [{"id": f"w{i}", "score": 0.04, "embed_score": 0.0,
+                 "has_semantic": False, "has_lexical": True,
+                 "best_route_score": 0.1, "importance": 0.5} for i in range(10)]
+        result = _apply_relevance_gate(relevant + weak, top_k=3)
+        assert len(result) == 3
         assert result[0]["id"] == "r0"
 
     def test_importance_tiebreak_light(self):
         """importance=1.0 should give at most ~1.05x boost, not 1.1x."""
         from memory_ops import _apply_relevance_gate, _IMPORTANCE_TIEBREAK_COEF
-        items = [{"id": "a", "score": 0.05, "best_route_score": 0.5,
-                  "matched_routes": 2, "importance": 1.0}]
+        items = [{"id": "a", "score": 0.05, "embed_score": 0.5,
+                  "has_semantic": True, "has_lexical": True,
+                  "best_route_score": 0.5, "importance": 1.0}]
         _apply_relevance_gate(items, top_k=5)
         assert items[0]["score"] == pytest.approx(0.05 * (1 + _IMPORTANCE_TIEBREAK_COEF * 1.0), abs=0.001)
         assert _IMPORTANCE_TIEBREAK_COEF <= 0.05
 
-    def test_recency_not_applied_to_weak_items(self):
-        """Weak items must NOT receive recency boost after relevance gate."""
-        from memory_ops import _apply_recency_boost, _is_relevant
-        now = datetime(2026, 9, 23, tzinfo=timezone.utc)
-        weak_item = {
-            "score": 0.01,
-            "best_route_score": 0.1,
-            "matched_routes": 1,
-            "created_at": now.isoformat(),
-        }
-        assert not _is_relevant(weak_item)
-        original_score = weak_item["score"]
-        # recency boost should only be called on relevant items;
-        # verify weak item score doesn't change when not boosted
-        assert weak_item["score"] == original_score
-
-    def test_threshold_filters_low_scores(self):
-        """threshold parameter must actually filter results."""
-        items = [
-            {"id": "good", "score": 0.05},
-            {"id": "bad", "score": 0.005},
-        ]
-        filtered = [item for item in items if item["score"] >= 0.008]
-        assert len(filtered) == 1
-        assert filtered[0]["id"] == "good"
-
-    def test_threshold_default_is_calibrated_to_rrf(self):
-        """Default threshold must be in RRF score range, not cosine range."""
-        src = open(os.path.join(os.path.dirname(__file__), "..", "memory_ops.py"),
-                   encoding="utf-8").read()
-        import re
-        # Match specifically in the recall() function signature
-        m = re.search(r'async def recall\([^)]*threshold:\s*float\s*=\s*([\d.]+)', src, re.DOTALL)
-        assert m, "threshold parameter in recall() not found"
-        default = float(m.group(1))
-        assert default < 0.05, f"threshold default {default} is too high for RRF scores"
+    def test_threshold_removed_from_recall(self):
+        """threshold parameter must not exist in recall() — gate is the real filter."""
+        import inspect
+        sig = inspect.signature(memory_ops.recall)
+        assert "threshold" not in sig.parameters, \
+            "threshold should be removed; relevance gate replaces it"
 
 
-class TestRRFPreservesRouteInfo:
-    """_rrf_merge must preserve best_route_score and matched_routes."""
+class TestRRFEvidenceFamilies:
+    """_rrf_merge must track evidence families and pure embed_score."""
 
-    def test_single_route(self):
+    def test_vec_only_has_semantic(self):
         from memory_ops import _rrf_merge
-        items = [{"id": "a", "score": 0.8}]
-        merged = _rrf_merge(items)
-        assert merged[0]["matched_routes"] == 1
-        assert merged[0]["best_route_score"] == 0.8
+        vec = [{"id": "a", "score": 0.8, "_embed_score": 0.75}]
+        merged = _rrf_merge(vec, [], [], [])
+        assert merged[0]["has_semantic"] is True
+        assert merged[0]["has_lexical"] is False
+        assert merged[0]["matched_families"] == 1
+        assert merged[0]["embed_score"] == 0.75
 
-    def test_multi_route_best_score(self):
+    def test_kw_only_has_lexical(self):
         from memory_ops import _rrf_merge
-        vec = [{"id": "a", "score": 0.9}]
+        kw = [{"id": "a", "score": 0.5}]
+        merged = _rrf_merge([], kw, [], [])
+        assert merged[0]["has_lexical"] is True
+        assert merged[0]["has_semantic"] is False
+        assert merged[0]["embed_score"] == 0.0
+
+    def test_vec_plus_kw_both_families(self):
+        from memory_ops import _rrf_merge
+        vec = [{"id": "a", "score": 0.9, "_embed_score": 0.85}]
         kw = [{"id": "a", "score": 0.3}]
-        merged = _rrf_merge(vec, kw)
-        assert merged[0]["matched_routes"] == 2
-        assert merged[0]["best_route_score"] == 0.9
+        merged = _rrf_merge(vec, kw, [], [])
+        assert merged[0]["has_semantic"] is True
+        assert merged[0]["has_lexical"] is True
+        assert merged[0]["matched_families"] == 2
+        assert merged[0]["embed_score"] == 0.85
 
-    def test_four_routes(self):
+    def test_all_four_routes_still_two_families(self):
+        """FTS, LIKE, exact are all lexical — four routes but only 2 families max."""
         from memory_ops import _rrf_merge
-        lists = [
-            [{"id": "a", "score": 0.7}],
-            [{"id": "a", "score": 0.5}],
-            [{"id": "a", "score": 0.3}],
-            [{"id": "a", "score": 0.1}],
-        ]
-        merged = _rrf_merge(*lists)
-        assert merged[0]["matched_routes"] == 4
+        vec = [{"id": "a", "score": 0.7, "_embed_score": 0.6}]
+        kw = [{"id": "a", "score": 0.5}]
+        like = [{"id": "a", "score": 0.3}]
+        exact = [{"id": "a", "score": 0.1}]
+        merged = _rrf_merge(vec, kw, like, exact)
+        assert merged[0]["matched_families"] == 2
         assert merged[0]["best_route_score"] == 0.7
+
+    def test_embed_score_is_pure_cosine(self):
+        """embed_score must be the pure cosine, not the blended vec score."""
+        from memory_ops import _rrf_merge
+        vec = [{"id": "a", "score": 0.9, "_embed_score": 0.4}]
+        merged = _rrf_merge(vec, [], [], [])
+        assert merged[0]["embed_score"] == 0.4
+        assert merged[0]["best_route_score"] == 0.9
