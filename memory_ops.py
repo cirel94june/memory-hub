@@ -154,18 +154,33 @@ def _rrf_merge(*rank_lists, k: int = 60) -> list[dict]:
 
     每路给每个 ID 打分 1/(k+rank)，最后按总分排序。
     k=60 是标准 RRF 参数。
+
+    保留各路原始 score 的最大值（best_route_score）和命中路数
+    （matched_routes），供下游 relevance gate 使用。
     """
-    scores = {}  # id -> {"score": float, "data": dict}
+    scores = {}  # id -> {"rrf": float, "data": dict, "matched_routes": int, "best_route_score": float}
     for rank_list in rank_lists:
         for rank, item in enumerate(rank_list):
             mid = item["id"]
             rrf_score = 1.0 / (k + rank + 1)
+            route_score = item.get("score", 0)
             if mid not in scores:
-                scores[mid] = {"score": 0.0, "data": item}
-            scores[mid]["score"] += rrf_score
+                scores[mid] = {"rrf": 0.0, "data": item, "matched_routes": 0, "best_route_score": 0.0}
+            scores[mid]["rrf"] += rrf_score
+            scores[mid]["matched_routes"] += 1
+            if route_score > scores[mid]["best_route_score"]:
+                scores[mid]["best_route_score"] = route_score
 
-    merged = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
-    return [item["data"] | {"score": round(item["score"], 6)} for item in merged]
+    merged = sorted(scores.values(), key=lambda x: x["rrf"], reverse=True)
+    results = []
+    for item in merged:
+        row = item["data"] | {
+            "score": round(item["rrf"], 6),
+            "matched_routes": item["matched_routes"],
+            "best_route_score": round(item["best_route_score"], 4),
+        }
+        results.append(row)
+    return results
 
 
 # ── 记忆出处（provenance）体系 ──
@@ -628,6 +643,46 @@ from resolve_patterns import (
 # Adjust here and update test_recency_* thresholds if tuning further.
 _RECENCY_BOOST_COEF = 0.25
 _RECENCY_DECAY_DAYS = 7
+
+# Relevance gate: an item must meet at least ONE of these to be "relevant".
+# - best_route_score >= 0.35 (strong single-route match)
+# - matched_routes >= 2 (confirmed by multiple search paths)
+# Items below the gate don't receive recency boost and are trimmed
+# when enough above-gate results exist.
+_RELEVANCE_BEST_SCORE_MIN = 0.35
+_RELEVANCE_MIN_ROUTES = 2
+# importance tie-break: very light, only for relevant items
+_IMPORTANCE_TIEBREAK_COEF = 0.05
+
+
+def _is_relevant(item: dict) -> bool:
+    """Check if item passes the relevance gate."""
+    return (item.get("best_route_score", 0) >= _RELEVANCE_BEST_SCORE_MIN
+            or item.get("matched_routes", 0) >= _RELEVANCE_MIN_ROUTES)
+
+
+def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
+    """Split items into relevant/weak; only apply recency boost to relevant ones.
+
+    If enough relevant items exist (>= top_k), weak items are dropped entirely.
+    Otherwise weak items fill remaining slots without recency boost.
+    """
+    relevant = []
+    weak = []
+    for item in items:
+        if _is_relevant(item):
+            relevant.append(item)
+        else:
+            weak.append(item)
+
+    # importance tie-break: light boost for relevant items only
+    for item in relevant:
+        imp = item.get("importance", 0.5)
+        item["score"] = round(item["score"] * (1 + _IMPORTANCE_TIEBREAK_COEF * imp), 6)
+
+    if len(relevant) >= top_k:
+        return relevant
+    return relevant + weak
 
 
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
@@ -1769,7 +1824,7 @@ async def recall(
     query: str,
     ai_id: str = "",
     top_k: int = 8,
-    threshold: float = 0.25,
+    threshold: float = 0.008,
     include_rooms: list[str] = None,
     exclude_isolated: bool = True,
     query_domain: list[str] = None,
@@ -1967,8 +2022,14 @@ async def recall(
                     filtered.append(item)
             merged = filtered
 
-        # Block 2: 新鲜度 boost — RRF 合并后统一加权
-        _apply_recency_boost(merged)
+        # Block 2: relevance gate → recency boost (only for relevant items)
+        merged = _apply_relevance_gate(merged, top_k)
+        relevant_ids = {item["id"] for item in merged if _is_relevant(item)}
+        # recency boost only for items that passed the relevance gate
+        relevant_items = [item for item in merged if item["id"] in relevant_ids]
+        weak_items = [item for item in merged if item["id"] not in relevant_ids]
+        _apply_recency_boost(relevant_items)
+        merged = relevant_items + weak_items
         merged.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         # Block 3: activation_count P95 顶端惩罚（≥20 条结果才触发）
@@ -1996,7 +2057,6 @@ async def recall(
                 if owner in ai_ids or _al.get(owner, owner) in ai_ids:
                     boost = 1.3
                     if query_wants_self and mem.get("room") in ("dreams", "diary"):
-                        # 用户明确在问"我梦见/我的日记"：本人私有材料强力优先
                         boost = 2.0
                     item["score"] = round(item.get("score", 0) * boost, 6)
             merged.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -2017,6 +2077,10 @@ async def recall(
                 merged.sort(key=lambda x: x.get("score", 0), reverse=True)
         except Exception:
             pass
+
+        # Enforce threshold: drop items below minimum score
+        if threshold > 0:
+            merged = [item for item in merged if item.get("score", 0) >= threshold]
 
         # Unresolved 优先浮现
         unresolved_items = []
@@ -2041,9 +2105,11 @@ async def recall(
     if results:
         _touch_recalled_memories([r["id"] for r in results])
 
-    # ── 结果后处理：confidence 标签 ──
+    # ── 结果后处理：confidence 标签 + 清理内部字段 ──
     for r in results:
         r.pop("_unresolved", None)
+        r.pop("matched_routes", None)
+        r.pop("best_route_score", None)
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
 

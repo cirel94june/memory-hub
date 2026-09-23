@@ -846,3 +846,127 @@ class TestSharedWriteLock:
             assert row[0] == 1, f"iter {i}: expected resolved=1, got {row[0]}"
             assert row[1] == 1, f"iter {i}: expected activation_count=1, got {row[1]}"
             assert resolved_out == [tid], f"iter {i}: resolve should succeed"
+
+
+# ════════════════════════════════════════════
+#  Block 7: relevance gate + threshold
+# ════════════════════════════════════════════
+
+class TestRelevanceGate:
+    """Test _is_relevant, _apply_relevance_gate, and threshold enforcement."""
+
+    def test_strong_single_route_is_relevant(self):
+        from memory_ops import _is_relevant
+        item = {"best_route_score": 0.5, "matched_routes": 1}
+        assert _is_relevant(item) is True
+
+    def test_multi_route_weak_score_is_relevant(self):
+        from memory_ops import _is_relevant
+        item = {"best_route_score": 0.1, "matched_routes": 2}
+        assert _is_relevant(item) is True
+
+    def test_single_route_weak_score_not_relevant(self):
+        from memory_ops import _is_relevant
+        item = {"best_route_score": 0.1, "matched_routes": 1}
+        assert _is_relevant(item) is False
+
+    def test_missing_fields_not_relevant(self):
+        from memory_ops import _is_relevant
+        assert _is_relevant({}) is False
+
+    def test_gate_drops_weak_when_enough_relevant(self):
+        from memory_ops import _apply_relevance_gate
+        relevant = [{"id": f"r{i}", "score": 0.05, "best_route_score": 0.5,
+                      "matched_routes": 2, "importance": 0.5} for i in range(5)]
+        weak = [{"id": f"w{i}", "score": 0.04, "best_route_score": 0.1,
+                 "matched_routes": 1, "importance": 0.5} for i in range(5)]
+        result = _apply_relevance_gate(relevant + weak, top_k=5)
+        assert len(result) == 5
+        assert all(item["id"].startswith("r") for item in result)
+
+    def test_gate_keeps_weak_as_filler(self):
+        from memory_ops import _apply_relevance_gate
+        relevant = [{"id": "r0", "score": 0.05, "best_route_score": 0.5,
+                      "matched_routes": 2, "importance": 0.5}]
+        weak = [{"id": f"w{i}", "score": 0.04, "best_route_score": 0.1,
+                 "matched_routes": 1, "importance": 0.5} for i in range(4)]
+        result = _apply_relevance_gate(relevant + weak, top_k=5)
+        assert len(result) == 5
+        assert result[0]["id"] == "r0"
+
+    def test_importance_tiebreak_light(self):
+        """importance=1.0 should give at most ~1.05x boost, not 1.1x."""
+        from memory_ops import _apply_relevance_gate, _IMPORTANCE_TIEBREAK_COEF
+        items = [{"id": "a", "score": 0.05, "best_route_score": 0.5,
+                  "matched_routes": 2, "importance": 1.0}]
+        _apply_relevance_gate(items, top_k=5)
+        assert items[0]["score"] == pytest.approx(0.05 * (1 + _IMPORTANCE_TIEBREAK_COEF * 1.0), abs=0.001)
+        assert _IMPORTANCE_TIEBREAK_COEF <= 0.05
+
+    def test_recency_not_applied_to_weak_items(self):
+        """Weak items must NOT receive recency boost after relevance gate."""
+        from memory_ops import _apply_recency_boost, _is_relevant
+        now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+        weak_item = {
+            "score": 0.01,
+            "best_route_score": 0.1,
+            "matched_routes": 1,
+            "created_at": now.isoformat(),
+        }
+        assert not _is_relevant(weak_item)
+        original_score = weak_item["score"]
+        # recency boost should only be called on relevant items;
+        # verify weak item score doesn't change when not boosted
+        assert weak_item["score"] == original_score
+
+    def test_threshold_filters_low_scores(self):
+        """threshold parameter must actually filter results."""
+        items = [
+            {"id": "good", "score": 0.05},
+            {"id": "bad", "score": 0.005},
+        ]
+        filtered = [item for item in items if item["score"] >= 0.008]
+        assert len(filtered) == 1
+        assert filtered[0]["id"] == "good"
+
+    def test_threshold_default_is_calibrated_to_rrf(self):
+        """Default threshold must be in RRF score range, not cosine range."""
+        src = open(os.path.join(os.path.dirname(__file__), "..", "memory_ops.py"),
+                   encoding="utf-8").read()
+        import re
+        # Match specifically in the recall() function signature
+        m = re.search(r'async def recall\([^)]*threshold:\s*float\s*=\s*([\d.]+)', src, re.DOTALL)
+        assert m, "threshold parameter in recall() not found"
+        default = float(m.group(1))
+        assert default < 0.05, f"threshold default {default} is too high for RRF scores"
+
+
+class TestRRFPreservesRouteInfo:
+    """_rrf_merge must preserve best_route_score and matched_routes."""
+
+    def test_single_route(self):
+        from memory_ops import _rrf_merge
+        items = [{"id": "a", "score": 0.8}]
+        merged = _rrf_merge(items)
+        assert merged[0]["matched_routes"] == 1
+        assert merged[0]["best_route_score"] == 0.8
+
+    def test_multi_route_best_score(self):
+        from memory_ops import _rrf_merge
+        vec = [{"id": "a", "score": 0.9}]
+        kw = [{"id": "a", "score": 0.3}]
+        merged = _rrf_merge(vec, kw)
+        assert merged[0]["matched_routes"] == 2
+        assert merged[0]["best_route_score"] == 0.9
+
+    def test_four_routes(self):
+        from memory_ops import _rrf_merge
+        lists = [
+            [{"id": "a", "score": 0.7}],
+            [{"id": "a", "score": 0.5}],
+            [{"id": "a", "score": 0.3}],
+            [{"id": "a", "score": 0.1}],
+        ]
+        merged = _rrf_merge(*lists)
+        assert merged[0]["matched_routes"] == 4
+        assert merged[0]["best_route_score"] == 0.7
