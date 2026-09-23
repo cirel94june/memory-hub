@@ -974,6 +974,16 @@ class TestRelevanceGate:
         assert _IMPORTANCE_WEIGHT_MAX >= 0.2
         assert _IMPORTANCE_WEIGHT_MAX <= 0.5
 
+    def test_exact_match_uses_raw_query_not_expanded(self):
+        """_exact_match_score should use the raw query, not alias-expanded version."""
+        from memory_ops import _exact_match_score
+        mem = {"content": "小猫没有脚气", "category": "", "tags": "[]", "domain": "[]"}
+        raw_score = _exact_match_score("小猫没有脚气", mem)
+        expanded_score = _exact_match_score("小猫没有脚气 Ceci 猫猫 香蕉猫", mem)
+        assert raw_score == 1.0, "raw query should be perfect exact match"
+        assert expanded_score < raw_score, \
+            "alias-expanded query should score lower than raw query for exact match"
+
     def test_threshold_removed_from_recall(self):
         """threshold parameter must not exist in recall() — gate is the real filter."""
         import inspect
