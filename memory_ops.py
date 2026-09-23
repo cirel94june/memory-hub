@@ -670,8 +670,10 @@ _RECENCY_DECAY_DAYS = 7
 #   strong exact/keyword score (best_route_score >= 0.6)
 _RELEVANCE_EMBED_MIN = 0.35
 _RELEVANCE_STRONG_LEXICAL_MIN = 0.6
-# importance tie-break: very light, only for relevant items
-_IMPORTANCE_TIEBREAK_COEF = 0.05
+# Importance weight: applied to ALL items (relevant + weak) so high-importance
+# memories can outrank low-importance ones even across tiers.
+# importance=0.95 → 1.285x, importance=0.5 → 1.15x, importance=0.3 → 1.09x
+_IMPORTANCE_WEIGHT = 0.3
 
 
 def _is_relevant(item: dict) -> bool:
@@ -689,12 +691,12 @@ def _is_relevant(item: dict) -> bool:
 
 
 def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
-    """Split items into relevant/weak tiers.
+    """Select items via relevance gate and apply importance weighting.
 
-    Relevant items are sorted by score and always come first.
-    Weak items fill remaining slots (up to top_k) but never displace
-    relevant items. By default weak items are NOT returned when enough
-    relevant results exist.
+    Importance boost applies to ALL items so that high-importance weak
+    items can compete with low-importance relevant items after recency
+    boost is applied downstream.  Truncation still prefers relevant
+    items: all relevant are kept, weak fill remaining slots up to top_k.
     """
     relevant = []
     weak = []
@@ -704,16 +706,20 @@ def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
         else:
             weak.append(item)
 
-    # importance tie-break: light boost for relevant items only
-    for item in relevant:
+    # importance boost: applied to ALL items (relevant + weak)
+    for item in items:
         imp = item.get("importance", 0.5)
-        item["score"] = round(item["score"] * (1 + _IMPORTANCE_TIEBREAK_COEF * imp), 6)
+        item["score"] = round(item["score"] * (1 + _IMPORTANCE_WEIGHT * imp), 6)
 
+    # Truncation: prefer relevant items for selection
     relevant.sort(key=lambda x: x.get("score", 0), reverse=True)
     weak.sort(key=lambda x: x.get("score", 0), reverse=True)
-
     remaining = max(0, top_k - len(relevant))
-    return relevant + weak[:remaining]
+    selected = relevant + weak[:remaining]
+
+    # Final order: global sort by importance-weighted score
+    selected.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return selected
 
 
 def _apply_recency_boost(items: list[dict], now_utc: datetime = None) -> None:
@@ -2112,8 +2118,10 @@ async def recall(
 
             tier.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-        # Merge tiers: relevant ALWAYS before weak (tier boundary is sacred)
+        # Merge tiers and sort globally: importance-weighted scores let
+        # high-importance weak items rank above low-importance relevant ones.
         merged = relevant_items + weak_items
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
 
         # Unresolved 优先浮现 (within their own tier)
         unresolved_items = []
