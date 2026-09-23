@@ -184,7 +184,7 @@ def test_corrected_memory_excluded_from_smart_context(fake_store, monkeypatch):
         "id": "ok1", "content": "ceci纠正：狗蛋穿的是真丝裤衩",
         "layer": "shared", "room": "social", "owner_ai": "",
         "source_ai": "jasper", "status": "active",
-        "provenance_type": "user_correction", "importance": 0.85,
+        "provenance_type": "user_correction", "importance": 0.9,
         "tags": "[]", "comments": [], "superseded_by": "",
         "resolved": None, "updated_at": now, "created_at": now,
     }
@@ -195,6 +195,41 @@ def test_corrected_memory_excluded_from_smart_context(fake_store, monkeypatch):
         ai_id="lucien", has_base_context=True, max_chars=4000))
     assert "真丝羽毛" not in result["text"]
     assert "真丝裤衩" in result["text"]
+
+
+def test_correction_inherits_importance_from_target(fake_store):
+    """Correction importance = target memory importance, not hardcoded 0.85."""
+    mems = fake_store
+    wrong = {
+        "id": "wrong_imp", "content": "小猫有脚气",
+        "layer": "shared", "room": "living_room", "owner_ai": "",
+        "source_ai": "lucien", "status": "active",
+        "provenance_type": "ai_summary", "importance": 0.4,
+        "tags": "[]", "comments": [], "superseded_by": "",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    mems["wrong_imp"] = wrong
+
+    result = asyncio.run(memory_ops.apply_user_correction(
+        corrected_value="小猫没有脚气",
+        old_value="小猫有脚气",
+        source_ai="lucien",
+    ))
+    canonical = mems[result["canonical_id"]]
+    assert canonical["importance"] == 0.4, \
+        f"correction should inherit target importance 0.4, got {canonical['importance']}"
+
+
+def test_correction_default_importance_without_target(fake_store):
+    """When no target is found, correction uses moderate default, not 0.85."""
+    result = asyncio.run(memory_ops.apply_user_correction(
+        corrected_value="某个没有对应错误记忆的纠正",
+        old_value="",
+    ))
+    canonical = fake_store[result["canonical_id"]]
+    assert canonical["importance"] <= 0.5, \
+        f"correction default importance should be moderate, got {canonical['importance']}"
 
 
 # ── 正文完整性 ──
