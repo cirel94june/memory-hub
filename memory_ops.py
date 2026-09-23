@@ -1896,13 +1896,14 @@ async def recall(
     """
     ai_ids = _identity_ids(ai_id)
 
-    query = _expand_query_aliases(query)
+    raw_query = query.strip()
+    expanded_query = _expand_query_aliases(raw_query)
 
-    query_vec = await get_embedding(query)
+    query_vec = await get_embedding(raw_query)
 
     if not query_domain and not skip_analyze:
         try:
-            q_analysis = await analyzer.analyze(query)
+            q_analysis = await analyzer.analyze(raw_query)
             query_domain = q_analysis.get("domain", [])
             if query_valence < 0:
                 query_valence = q_analysis.get("valence", 0.5)
@@ -2003,7 +2004,7 @@ async def recall(
 
         # 路径 2：FTS5
         fts_fn = database.ro_fts_search if use_ro else database.fts_search
-        raw_fts = fts_fn(query, top_k=50, status="active",
+        raw_fts = fts_fn(expanded_query, top_k=50, status="active",
                          exclude_provenance=db_kwargs.get("exclude_provenance"),
                          exclude_resolved=db_kwargs.get("exclude_resolved", False),
                          exclude_superseded=db_kwargs.get("exclude_superseded", False),
@@ -2024,7 +2025,7 @@ async def recall(
         like_results = []
         try:
             like_fn = database.ro_cjk_like_search if use_ro else database.cjk_like_search
-            like_raw = like_fn(query, top_k=50, status="active",
+            like_raw = like_fn(expanded_query, top_k=50, status="active",
                                exclude_provenance=db_kwargs.get("exclude_provenance"),
                                exclude_resolved=db_kwargs.get("exclude_resolved", False),
                                exclude_superseded=db_kwargs.get("exclude_superseded", False),
@@ -2051,9 +2052,25 @@ async def recall(
                     mem = get_fn(mid)
                     if mem:
                         exact_candidates.append(mem)
+        # Direct substring search with raw_query to prevent candidate starvation
+        if raw_query and len(raw_query) >= 4:
+            try:
+                raw_like_fn = database.ro_cjk_like_search if use_ro else database.cjk_like_search
+                raw_like_hits = raw_like_fn(raw_query, top_k=10, status="active",
+                                            exclude_provenance=db_kwargs.get("exclude_provenance"),
+                                            exclude_resolved=db_kwargs.get("exclude_resolved", False),
+                                            exclude_superseded=db_kwargs.get("exclude_superseded", False),
+                                            include_rooms=db_kwargs.get("include_rooms"),
+                                            exclude_rooms=db_kwargs.get("exclude_rooms"))
+                for mem in raw_like_hits:
+                    if mem["id"] not in seen_ids and _passes_private_filter(mem):
+                        seen_ids.add(mem["id"])
+                        exact_candidates.append(mem)
+            except Exception:
+                pass
         exact_scored = []
         for mem in exact_candidates:
-            exact = _exact_match_score(query, mem)
+            exact = _exact_match_score(raw_query, mem)
             if exact > 0.3:
                 exact_scored.append((mem, exact))
         exact_scored.sort(key=lambda x: x[1], reverse=True)
@@ -2101,7 +2118,7 @@ async def recall(
             if ai_ids:
                 _self_material_markers = ("我梦", "梦见", "梦到", "我的梦", "昨晚的梦",
                                           "我的日记", "我写的", "我记得我")
-                query_wants_self = any(k in query for k in _self_material_markers)
+                query_wants_self = any(k in raw_query for k in _self_material_markers)
                 for item in tier:
                     mem = get_fn(item["id"])
                     if not mem or (mem.get("layer") or "shared") != "private":
@@ -2118,7 +2135,7 @@ async def recall(
             try:
                 all_aliases = database.get_all_aliases(scope="any")
                 query_person_ids = set()
-                ql = query.lower()
+                ql = raw_query.lower()
                 for alias_name, pid in all_aliases.items():
                     if len(alias_name) >= 2 and alias_name.lower() in ql:
                         query_person_ids.add(pid)
