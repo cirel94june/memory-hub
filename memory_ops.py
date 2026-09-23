@@ -2149,10 +2149,18 @@ async def recall(
 
             tier.sort(key=lambda x: x.get("score", 0), reverse=True)
 
-        # Merge tiers and sort globally: importance-weighted scores let
-        # high-importance weak items rank above low-importance relevant ones.
+        # Full-phrase match: when the raw query appears verbatim in content,
+        # that item sorts above partial/multi-route accumulations.
+        if len(raw_query) >= 4:
+            rq_lower = raw_query.lower()
+            for item in relevant_items + weak_items:
+                item["_full_phrase"] = rq_lower in item.get("content", "").lower()
+        else:
+            for item in relevant_items + weak_items:
+                item["_full_phrase"] = False
+
         merged = relevant_items + weak_items
-        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        merged.sort(key=lambda x: (x.get("_full_phrase", False), x.get("score", 0)), reverse=True)
 
         # Unresolved 优先浮现 (within their own tier)
         unresolved_items = []
@@ -2187,6 +2195,7 @@ async def recall(
         r.pop("has_lexical", None)
         r.pop("best_route_score", None)
         r.pop("embed_score", None)
+        r.pop("_full_phrase", None)
         s = r.get("score", 0)
         r["confidence"] = "high" if s >= 0.035 else "medium" if s >= 0.02 else "low" if s >= 0.01 else "weak"
 

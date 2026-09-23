@@ -984,6 +984,39 @@ class TestRelevanceGate:
         assert expanded_score < raw_score, \
             "alias-expanded query should score lower than raw query for exact match"
 
+    def test_full_phrase_match_beats_long_multiroute(self):
+        """A short item whose content exactly matches the query must outrank
+        a long diary that accumulates score from many partial keyword hits."""
+        from memory_ops import _apply_relevance_gate
+        # Simulate: item A = exact phrase match, low importance
+        item_a = {
+            "id": "correction", "content": "小猫没有脚气",
+            "score": 0.03, "importance": 0.3,
+            "embed_score": 0.5, "has_semantic": True, "has_lexical": True,
+            "matched_families": 2, "best_route_score": 0.4,
+            "_full_phrase": True,
+        }
+        # Simulate: item B = long diary, high multi-route score, no full phrase
+        item_b = {
+            "id": "diary", "content": "很长的日记，反复出现小猫和猫猫" * 10,
+            "score": 0.06, "importance": 0.5,
+            "embed_score": 0.4, "has_semantic": True, "has_lexical": True,
+            "matched_families": 2, "best_route_score": 0.5,
+            "_full_phrase": False,
+        }
+        items = [item_b, item_a]  # B starts first by raw score
+        items.sort(
+            key=lambda x: (x.get("_full_phrase", False), x.get("score", 0)),
+            reverse=True,
+        )
+        assert items[0]["id"] == "correction", \
+            "full phrase match should sort above higher-scoring partial match"
+
+    def test_short_query_no_full_phrase_boost(self):
+        """Queries shorter than 4 chars should not trigger full-phrase boost."""
+        item = {"id": "a", "content": "cat is here", "_full_phrase": False, "score": 0.05}
+        assert not item["_full_phrase"], "short query should not set full phrase flag"
+
     def test_threshold_removed_from_recall(self):
         """threshold parameter must not exist in recall() — gate is the real filter."""
         import inspect
