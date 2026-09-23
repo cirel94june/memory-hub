@@ -320,10 +320,11 @@ Memory Hub 的 MCP 入口现在会在启动时打印稳定身份信息：server 
 
 记忆写入新增 safe_remember，普通 remember 和 batch_remember 也会走安全包装：长文本会先压缩；后端写入失败时只重试一次中性摘要；失败原文会写入 data/mcp_audit.jsonl 供排查，但不会无限原样重试。batch_remember 会逐条写入并返回每条 status，区分 created / merged / skipped / blocked / failed。若 ChatGPT 显示 工具调用被安全检查屏蔽但审计日志没有 tool_reached，说明请求没有到达 Memory Hub，是平台侧提前拦截。
 
-### 2026-07-07 MCP 工具列表缓存排查
-已确认 FastMCP 真实注册表会导出 28 个工具，包含 safe_remember、mcp_health、mcp_debug_log。/api/mcp/health 和 hub_info 现在都使用 FastMCP 自己的 list_tools 生成 tool_count 与 tool_schema_hash，不再只扫描 Python 函数名。
+### 2026-09-22 MCP 工具精简 40→20
+40 个 MCP 工具合并为 15 个核心工具 + 5 个过渡别名（共 20 个）。AI 客户端重连后应看到 20 个工具。旧别名（pulse、smart_context、capture_conversation、safe_remember、batch_remember）仍可调用，会自动重定向到新工具。
 
-如果 ChatGPT 侧仍只看到 25 个工具，但 batch_remember 已经是新版逐条写入，说明后端代码已更新，ChatGPT 端仍在使用旧 schema。处理方式是断开 Memory Hub MCP 连接后重新连接；重连后可先调用 hub_info，查看 mcp_identity.tool_count 是否为 28，以及 tools 里是否包含 safe_remember、mcp_health、mcp_debug_log。
+### 2026-07-07 MCP 工具列表缓存排查
+（历史记录）当时注册表为 28 个工具。2026-09-22 已精简为 20 个（15 核心 + 5 别名）。如果客户端工具数不对，断开重连 MCP 即可。
 
 MCP HTTP 层会把 /mcp JSON-RPC 请求写入 data/mcp_audit.jsonl；tools/list 会额外记录 response_tool_count。若重连后没有 tools/list 记录，说明客户端复用了旧连接/旧授权；若记录显示 service_tool_count=28 且 response_tool_count=28，但 ChatGPT UI 仍是 25，则可判定为 ChatGPT 端缓存旧 schema。
 

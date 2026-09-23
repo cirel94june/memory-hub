@@ -958,21 +958,21 @@ class TestRecentInteractionRobustness:
                 f"probe {probe!r} failed to resolve"
 
     def test_mcp_wrapper_has_internal_error_guard(self):
-        """MCP wrapper source must include try/except that returns
+        """The search tool's person branch must include try/except that returns
         error='internal_error' — guards against future refactor stripping it.
         Works offline (no `mcp` module required)."""
         with open("mcp_server.py", encoding="utf-8") as f:
             src = f.read()
-        # Extract the recent_interaction tool body from source
-        marker = "async def recent_interaction("
+        marker = "async def search("
         idx = src.find(marker)
-        assert idx != -1, "recent_interaction MCP tool not found in mcp_server.py"
-        # Grab ~2000 chars after the marker (covers a typical tool body)
-        body = src[idx:idx + 2000]
+        assert idx != -1, "search MCP tool not found in mcp_server.py"
+        body = src[idx:idx + 5000]
+        assert "recent_interaction" in body, \
+            "search tool must call memory_ops.recent_interaction for person method"
         assert "try:" in body and "except Exception" in body, \
-            "MCP wrapper missing try/except — internal error would leak traceback"
+            "search tool missing try/except — internal error would leak traceback"
         assert '"error": "internal_error"' in body, \
-            "MCP wrapper must return error='internal_error' on unexpected exceptions"
+            "search tool must return error='internal_error' on unexpected exceptions"
 
 
 # ── Corridor activation_count P95 penalty ─────────────────────────────
