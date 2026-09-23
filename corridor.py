@@ -12,7 +12,7 @@
 import json
 import math
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import AI_ROLES, AI_ALIASES as _ALIASES
 import github_store as store
@@ -277,29 +277,33 @@ async def build_corridor(ai_id: str) -> str:
     shared_relationships = _pick_recency_weighted(
         shared_rel_candidates, quota=8, now_utc=now_utc)
 
-    # 3. 该 AI 最近的日记/周记（保持 created_at DESC 3 条，本来就是纯时间序）
+    # 3. 该 AI 最近的日记/周记（14 天内，最多 3 条）
+    diary_cutoff = (now_utc - timedelta(days=14)).isoformat()
     diary = sorted(
         [m for m in visible_mems.values()
          if m.get("room") == "diary" and m.get("owner_ai") == ai_id
-         and m.get("status") == "active"],
+         and m.get("status") == "active"
+         and m.get("created_at", "") >= diary_cutoff],
         key=lambda x: x.get("created_at", ""),
         reverse=True,
     )[:3]
 
-    # 3.5. 该 AI 最近的梦（room=dreams，排除消化条目，最多 1 条）
+    # 3.5. 该 AI 最近的梦（14 天内，最多 1 条）
     dreams = sorted(
         [m for m in visible_mems.values()
          if m.get("room") == "dreams" and m.get("owner_ai") == ai_id
-         and m.get("status") == "active" and m.get("category") != "digest"],
+         and m.get("status") == "active" and m.get("category") != "digest"
+         and m.get("created_at", "") >= diary_cutoff],
         key=lambda x: x.get("created_at", ""),
         reverse=True,
     )[:1]
 
-    # 3.6. 最近一次消化摘要（room=dreams, category=digest）
+    # 3.6. 最近一次消化摘要（14 天内）
     digests = sorted(
         [m for m in visible_mems.values()
          if m.get("room") == "dreams" and m.get("owner_ai") == ai_id
-         and m.get("status") == "active" and m.get("category") == "digest"],
+         and m.get("status") == "active" and m.get("category") == "digest"
+         and m.get("created_at", "") >= diary_cutoff],
         key=lambda x: x.get("created_at", ""),
         reverse=True,
     )[:1]
