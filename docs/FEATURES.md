@@ -311,7 +311,7 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 → 重建走�
 ### MCP 工具列表真实注册表诊断（2026-07-07）
 - /api/mcp/health、mcp_health 与 hub_info 现在使用 FastMCP list_tools 的真实注册表生成 tool_count 和 tool_schema_hash。
 - hub_info 会返回 mcp_identity，因此即使 ChatGPT 端暂时看不到新加的 mcp_health / mcp_debug_log，也能通过旧工具确认服务端实际工具列表。
-- 2026-09-22 已精简为 17 个工具（12 核心 + 5 过渡别名）；若客户端工具数不对，断开并重新连接 MCP。
+- 2026-09-22 已精简为 20 个工具（15 核心 + 5 过渡别名）；若客户端工具数不对，断开并重新连接 MCP。
 
 ### 梦境展示与轻量 Dream Context（2026-07-07）
 - dream.py 新增 get_recent_dreams_for_ai，用 canonical id + aliases 读取某个 AI 最近的私有梦境。
