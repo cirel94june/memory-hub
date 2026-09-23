@@ -913,11 +913,14 @@ class TestRelevanceGate:
         assert all(f"r{i}" in result_ids for i in range(5))
 
     def test_important_weak_can_outrank_trivial_relevant(self):
-        """High-importance weak item can rank above low-importance relevant item."""
+        """High-importance weak item (embed=0, full weight) can outrank
+        low-importance relevant item (high embed, dampened weight)."""
         from memory_ops import _apply_relevance_gate, _is_relevant
+        # relevant item has high embed → importance weight dampened
         relevant = {"id": "rel", "score": 0.016, "embed_score": 0.5,
                     "has_semantic": True, "has_lexical": False,
                     "best_route_score": 0.5, "importance": 0.3}
+        # weak item has embed=0 → full importance weight
         weak = {"id": "wk", "score": 0.016, "embed_score": 0.0,
                 "has_semantic": False, "has_lexical": True,
                 "best_route_score": 0.1, "importance": 0.95}
@@ -926,6 +929,23 @@ class TestRelevanceGate:
         result = _apply_relevance_gate([relevant, weak], top_k=5)
         assert result[0]["id"] == "wk", \
             "high-importance weak item should outrank low-importance relevant item"
+
+    def test_specific_query_relevance_dominates(self):
+        """For items with similar embed_score, importance is dampened equally,
+        so RRF base score (query relevance) determines ranking."""
+        from memory_ops import _apply_relevance_gate, _is_relevant
+        # Both items have similar high embed → importance is dampened
+        specific = {"id": "work", "score": 0.020, "embed_score": 0.6,
+                    "has_semantic": True, "has_lexical": True,
+                    "best_route_score": 0.6, "importance": 0.5}
+        identity = {"id": "identity", "score": 0.015, "embed_score": 0.55,
+                    "has_semantic": True, "has_lexical": False,
+                    "best_route_score": 0.4, "importance": 0.95}
+        assert _is_relevant(specific)
+        assert _is_relevant(identity)
+        result = _apply_relevance_gate([identity, specific], top_k=5)
+        assert result[0]["id"] == "work", \
+            "higher-relevance item must beat higher-importance item when embed is strong"
 
     def test_gate_limits_weak_filler(self):
         """Weak items fill remaining slots only up to top_k."""
@@ -940,16 +960,19 @@ class TestRelevanceGate:
         assert len(result) == 3
         assert result[0]["id"] == "r0"
 
-    def test_importance_weight_meaningful(self):
-        """importance=1.0 should give a meaningful boost (up to 1.3x) to all items."""
-        from memory_ops import _apply_relevance_gate, _IMPORTANCE_WEIGHT
-        items = [{"id": "a", "score": 0.05, "embed_score": 0.5,
-                  "has_semantic": True, "has_lexical": True,
-                  "best_route_score": 0.5, "importance": 1.0}]
-        _apply_relevance_gate(items, top_k=5)
-        assert items[0]["score"] == pytest.approx(0.05 * (1 + _IMPORTANCE_WEIGHT * 1.0), abs=0.001)
-        assert _IMPORTANCE_WEIGHT >= 0.2, "importance must be a meaningful factor"
-        assert _IMPORTANCE_WEIGHT <= 0.5, "importance must not dominate over relevance"
+    def test_importance_weight_embed_aware(self):
+        """Importance weight is dampened by embed_score: high embed → low weight."""
+        from memory_ops import _importance_factor, _IMPORTANCE_WEIGHT_MAX
+        # embed=0 → full weight
+        low_embed = {"embed_score": 0.0, "importance": 1.0}
+        assert _importance_factor(low_embed) == pytest.approx(
+            1 + _IMPORTANCE_WEIGHT_MAX * 1.0, abs=0.001)
+        # embed=0.8 → only 20% of max weight
+        high_embed = {"embed_score": 0.8, "importance": 1.0}
+        assert _importance_factor(high_embed) == pytest.approx(
+            1 + _IMPORTANCE_WEIGHT_MAX * 0.2 * 1.0, abs=0.001)
+        assert _IMPORTANCE_WEIGHT_MAX >= 0.2
+        assert _IMPORTANCE_WEIGHT_MAX <= 0.5
 
     def test_threshold_removed_from_recall(self):
         """threshold parameter must not exist in recall() — gate is the real filter."""

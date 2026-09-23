@@ -670,10 +670,12 @@ _RECENCY_DECAY_DAYS = 7
 #   strong exact/keyword score (best_route_score >= 0.6)
 _RELEVANCE_EMBED_MIN = 0.35
 _RELEVANCE_STRONG_LEXICAL_MIN = 0.6
-# Importance weight: applied to ALL items (relevant + weak) so high-importance
-# memories can outrank low-importance ones even across tiers.
-# importance=0.95 → 1.285x, importance=0.5 → 1.15x, importance=0.3 → 1.09x
-_IMPORTANCE_WEIGHT = 0.3
+# Importance weight: embed-score-aware.  The stronger the vector match,
+# the less importance influences the score — query relevance dominates
+# for specific queries, importance differentiates among broadly matched items.
+# Formula: weight = MAX * (1 - embed_score)
+#   embed=0.0 → full weight (0.3), embed=0.5 → half (0.15), embed=0.8 → low (0.06)
+_IMPORTANCE_WEIGHT_MAX = 0.3
 
 
 def _is_relevant(item: dict) -> bool:
@@ -690,13 +692,26 @@ def _is_relevant(item: dict) -> bool:
     return False
 
 
+def _importance_factor(item: dict) -> float:
+    """Compute importance multiplier, dampened by embed_score.
+
+    High embed_score means the item is already strongly query-relevant,
+    so importance should barely affect its rank.  Low embed_score (or 0
+    for lexical-only matches) means importance has more influence.
+    """
+    embed = item.get("embed_score", 0)
+    imp = item.get("importance", 0.5)
+    weight = _IMPORTANCE_WEIGHT_MAX * (1 - embed)
+    return 1 + weight * imp
+
+
 def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
     """Select items via relevance gate and apply importance weighting.
 
-    Importance boost applies to ALL items so that high-importance weak
-    items can compete with low-importance relevant items after recency
-    boost is applied downstream.  Truncation still prefers relevant
-    items: all relevant are kept, weak fill remaining slots up to top_k.
+    Importance boost is embed-aware: strong vector matches keep their
+    query-relevance ordering, while broadly matched items are
+    differentiated by importance.  Truncation prefers relevant items;
+    final ordering is global so important weak items can intermix.
     """
     relevant = []
     weak = []
@@ -706,10 +721,9 @@ def _apply_relevance_gate(items: list[dict], top_k: int) -> list[dict]:
         else:
             weak.append(item)
 
-    # importance boost: applied to ALL items (relevant + weak)
+    # importance boost: embed-aware, applied to ALL items
     for item in items:
-        imp = item.get("importance", 0.5)
-        item["score"] = round(item["score"] * (1 + _IMPORTANCE_WEIGHT * imp), 6)
+        item["score"] = round(item["score"] * _importance_factor(item), 6)
 
     # Truncation: prefer relevant items for selection
     relevant.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -2990,12 +3004,48 @@ async def apply_user_correction(
     3. 清走廊缓存，避免旧版本残留
     找不到错误来源时不乱猜：纠正版打上 conflict_pending 标记待人工看。
     """
+    # Determine importance: inherit from corrected memory if found,
+    # otherwise use moderate default (0.45). fact_confidence=1.0 means
+    # the correction is TRUE; importance is how much it matters to
+    # future conversations — "小猫没有脚气" is true but not important.
+    correction_importance = 0.45
+
+    def _bigrams(s: str) -> set:
+        s = "".join(ch for ch in s if ch.isalnum())
+        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else {s} if s else set()
+
+    def _matches_old_value(content: str, old: str) -> bool:
+        if old in content:
+            return True
+        og = _bigrams(old)
+        if len(og) < 3:
+            return False
+        cg = _bigrams(content)
+        return len(og & cg) / len(og) >= 0.7
+
+    # Scan for targets first to inherit importance
+    old_value = (old_value or "").strip()
+    target_mems = []
+    if old_value:
+        for mem in list(store.get_all_memories().values()):
+            if mem.get("status") != "active":
+                continue
+            if not _matches_old_value(mem.get("content") or "", old_value):
+                continue
+            if (mem.get("provenance_type") or "") == "user_correction":
+                continue
+            target_mems.append(mem)
+        if target_mems:
+            correction_importance = max(
+                m.get("importance", 0.5) for m in target_mems
+            )
+
     result = await remember(
         content=corrected_value,
         layer=layer,
         room=room,
         owner_ai=owner_ai,
-        importance=0.85,
+        importance=correction_importance,
         source_ai=source_ai,
         source_platform="user_correction",
         source_context=source_context,
@@ -3006,33 +3056,10 @@ async def apply_user_correction(
     )
     new_id = result.get("id", "")
 
-    def _bigrams(s: str) -> set:
-        s = "".join(ch for ch in s if ch.isalnum())
-        return {s[i:i + 2] for i in range(len(s) - 1)} if len(s) > 1 else {s} if s else set()
-
-    def _matches_old_value(content: str, old: str) -> bool:
-        if old in content:
-            return True
-        # 模糊兜底：提取模型转述 old_value 时可能差一两个字
-        # （实测："狐狸围巾是绿色的" vs 库里的"狐狸的围巾是绿色的"）。
-        # 用字符二元组重合度衡量，≥0.7 视为同一说法。
-        og = _bigrams(old)
-        if len(og) < 3:
-            return False  # 太短的 old_value 不做模糊匹配，避免误伤
-        cg = _bigrams(content)
-        return len(og & cg) / len(og) >= 0.7
-
     corrected_ids = []
-    old_value = (old_value or "").strip()
-    if old_value and new_id:
+    if target_mems and new_id:
         now = _now()
-        for mem in list(store.get_all_memories().values()):
-            if mem.get("id") == new_id or mem.get("status") != "active":
-                continue
-            if not _matches_old_value(mem.get("content") or "", old_value):
-                continue
-            if (mem.get("provenance_type") or "") == "user_correction":
-                continue  # 已有的用户纠正不被自动失效
+        for mem in target_mems:
             mem["status"] = "corrected_by_user"
             mem["superseded_by"] = new_id
             mem["updated_at"] = now
