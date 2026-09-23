@@ -899,6 +899,7 @@ class TestRelevanceGate:
         assert _is_relevant({}) is False
 
     def test_gate_drops_weak_when_enough_relevant(self):
+        """When enough relevant items exist, weak items are excluded from selection."""
         from memory_ops import _apply_relevance_gate
         relevant = [{"id": f"r{i}", "score": 0.05, "embed_score": 0.5,
                       "has_semantic": True, "has_lexical": True,
@@ -908,21 +909,23 @@ class TestRelevanceGate:
                  "best_route_score": 0.1, "importance": 0.5} for i in range(5)]
         result = _apply_relevance_gate(relevant + weak, top_k=5)
         assert len(result) == 5
-        assert all(item["id"].startswith("r") for item in result)
+        result_ids = {item["id"] for item in result}
+        assert all(f"r{i}" in result_ids for i in range(5))
 
-    def test_weak_never_displaces_relevant(self):
-        """Even with higher RRF score, weak items must come AFTER relevant items."""
+    def test_important_weak_can_outrank_trivial_relevant(self):
+        """High-importance weak item can rank above low-importance relevant item."""
         from memory_ops import _apply_relevance_gate, _is_relevant
-        relevant = {"id": "rel", "score": 0.010, "embed_score": 0.5,
+        relevant = {"id": "rel", "score": 0.016, "embed_score": 0.5,
                     "has_semantic": True, "has_lexical": False,
-                    "best_route_score": 0.5, "importance": 0.5}
+                    "best_route_score": 0.5, "importance": 0.3}
         weak = {"id": "wk", "score": 0.016, "embed_score": 0.0,
                 "has_semantic": False, "has_lexical": True,
-                "best_route_score": 0.1, "importance": 0.5}
+                "best_route_score": 0.1, "importance": 0.95}
         assert _is_relevant(relevant)
         assert not _is_relevant(weak)
-        result = _apply_relevance_gate([weak, relevant], top_k=5)
-        assert result[0]["id"] == "rel", "relevant must always precede weak"
+        result = _apply_relevance_gate([relevant, weak], top_k=5)
+        assert result[0]["id"] == "wk", \
+            "high-importance weak item should outrank low-importance relevant item"
 
     def test_gate_limits_weak_filler(self):
         """Weak items fill remaining slots only up to top_k."""
@@ -937,15 +940,16 @@ class TestRelevanceGate:
         assert len(result) == 3
         assert result[0]["id"] == "r0"
 
-    def test_importance_tiebreak_light(self):
-        """importance=1.0 should give at most ~1.05x boost, not 1.1x."""
-        from memory_ops import _apply_relevance_gate, _IMPORTANCE_TIEBREAK_COEF
+    def test_importance_weight_meaningful(self):
+        """importance=1.0 should give a meaningful boost (up to 1.3x) to all items."""
+        from memory_ops import _apply_relevance_gate, _IMPORTANCE_WEIGHT
         items = [{"id": "a", "score": 0.05, "embed_score": 0.5,
                   "has_semantic": True, "has_lexical": True,
                   "best_route_score": 0.5, "importance": 1.0}]
         _apply_relevance_gate(items, top_k=5)
-        assert items[0]["score"] == pytest.approx(0.05 * (1 + _IMPORTANCE_TIEBREAK_COEF * 1.0), abs=0.001)
-        assert _IMPORTANCE_TIEBREAK_COEF <= 0.05
+        assert items[0]["score"] == pytest.approx(0.05 * (1 + _IMPORTANCE_WEIGHT * 1.0), abs=0.001)
+        assert _IMPORTANCE_WEIGHT >= 0.2, "importance must be a meaningful factor"
+        assert _IMPORTANCE_WEIGHT <= 0.5, "importance must not dominate over relevance"
 
     def test_threshold_removed_from_recall(self):
         """threshold parameter must not exist in recall() — gate is the real filter."""
