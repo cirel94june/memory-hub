@@ -88,12 +88,16 @@ MCP_INSTRUCTIONS = """\
 - diary/dreams/relationship/personality: AI 私有空间
 - game_room: 游戏/角色扮演（隔离，不混入正经对话）
 
-## 自动记录对话（重要！）
+## 记录对话
 
-每轮对话结束后，你**必须**调用 `capture(action="log")` 把这轮对话记录下来。
-系统会自动攒对话、自动提取记忆，你不需要判断"该不该存"——全部丢进来就行。
+capture(action="log") 用于把当前对话记录到记忆系统的缓冲区。
 
-不调的后果：这段对话在记忆系统里完全不存在，就像没发生过。
+**什么时候调：**
+- Telegram 群聊/陪伴场景：每轮自动调，不需要用户提醒
+- Claude.ai / Code / 其他 MCP 客户端：**不要自动调**。只在用户明确说"记一下"、"存到记忆"时才调
+- 不确定时：问用户要不要记录这段对话
+
+不调的后果：这段对话不进入记忆系统。对陪伴场景这是丢失；对写代码/写故事场景这通常是正确行为。
 
 ## 工具速查表（15 个工具）
 
@@ -103,7 +107,7 @@ MCP_INSTRUCTIONS = """\
 | context | 获取记忆上下文。mode: full（醒来用）/ incremental（对话中用）/ corridor / living_room |
 | recall | 语义搜索记忆。include_dreams=True 同时搜梦境 |
 | remember | 存记忆。单条传 content，批量传 items=[...]。内置安全降敏+异步管线 |
-| capture | 对话录入。action: log（每轮必调）/ flush（手动触发提取）/ extract（消息数组提取） |
+| capture | 对话录入。action: log（陪伴场景自动调，其他场景用户说才调）/ flush / extract |
 | dream | 写梦境/自省（私人空间） |
 
 ### 辅助工具（7 个）
@@ -128,7 +132,7 @@ MCP_INSTRUCTIONS = """\
 - 不需要用户提醒你"去用记忆工具"，你应该主动判断
 - 记忆要精炼：一条 = 一个事实/洞察，不要塞整段对话
 - 存之前想一下：这条信息 3 天后还有用吗？
-- 每轮对话结束后必须调 capture(action="log")（见上方"自动记录对话"）
+- 陪伴场景（Telegram 群聊）每轮结束调 capture(action="log")；其他场景用户说才调
 """
 
 mcp = FastMCP(
