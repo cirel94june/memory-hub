@@ -443,7 +443,7 @@ class TestMCPToolRegistration:
 
     def test_tool_count_updated(self):
         src = open("mcp_server.py", encoding="utf-8").read()
-        assert "12 个工具" in src
+        assert "15 个工具" in src
 
     def test_semantic_search_in_search_tool(self):
         src = open("mcp_server.py", encoding="utf-8").read()

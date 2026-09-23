@@ -257,7 +257,7 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 → 重建走�
 ### 走廊新鲜度与客厅画像刷新（2026-07-06）
 
 - `corridor.get_corridor()` 支持 `force=True`，缓存窗口缩短为 5 分钟；观测/调试时可以强制重建，避免看到一小时前的旧走廊。
-- MCP `get_corridor(source_ai=...)` 不再写死 Claude，Lucien/Jasper/小克各自能读自己的走廊；`pulse(..., force_corridor=True)` 可强制刷新。
+- MCP 走廊读取按 AI 身份区分，Lucien/Jasper/小克各自读自己的走廊；`pulse(..., force_corridor=True)` 或 `context(mode="corridor")` 可刷新。
 - `/api/gateway/context` 返回 `requested_ai_id`、`ai_id`、`chat_id`、`chat_type`、`corridor_forced`，用于审计“AI 醒来实际读的是谁的记忆”。
 - 编辑记忆后会异步重建全部走廊，避免过期/被修改的客厅画像继续残留。
 - 新增 `POST /api/memory/living-room/refresh`：默认 `dry_run=true` 只生成画像更新建议；`dry_run=false` 才会把用户基本情况、重要人物画像、稳定状态变化写入 `living_room` 或 `relationships` 并重建走廊。`daemon` 每 12 小时维护时也会自动跑一次 `dry_run=false`，前台按钮用于临时补跑和人工确认。
@@ -311,7 +311,7 @@ Daemon 每 12h：合并/压缩/蒸馏/过时检测/衰减/归档 → 重建走�
 ### MCP 工具列表真实注册表诊断（2026-07-07）
 - /api/mcp/health、mcp_health 与 hub_info 现在使用 FastMCP list_tools 的真实注册表生成 tool_count 和 tool_schema_hash。
 - hub_info 会返回 mcp_identity，因此即使 ChatGPT 端暂时看不到新加的 mcp_health / mcp_debug_log，也能通过旧工具确认服务端实际工具列表。
-- 当前真实注册表应为 28 个工具，包含 safe_remember、mcp_health、mcp_debug_log；若 ChatGPT 只显示 25 个，优先按客户端旧 schema 缓存处理，断开并重新连接 MCP。
+- 2026-09-22 已精简为 17 个工具（12 核心 + 5 过渡别名）；若客户端工具数不对，断开并重新连接 MCP。
 
 ### 梦境展示与轻量 Dream Context（2026-07-07）
 - dream.py 新增 get_recent_dreams_for_ai，用 canonical id + aliases 读取某个 AI 最近的私有梦境。

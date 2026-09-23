@@ -95,7 +95,7 @@ MCP_INSTRUCTIONS = """\
 
 不调的后果：这段对话在记忆系统里完全不存在，就像没发生过。
 
-## 工具速查表（12 个工具）
+## 工具速查表（15 个工具）
 
 ### 日常工具（最常用的 5 个）
 | 工具 | 一句话说明 |
@@ -106,19 +106,22 @@ MCP_INSTRUCTIONS = """\
 | capture | 对话录入。action: log（每轮必调）/ flush（手动触发提取）/ extract（消息数组提取） |
 | dream | 写梦境/自省（私人空间） |
 
-### 辅助工具（按需使用的 5 个）
+### 辅助工具（7 个）
 | 工具 | 一句话说明 |
 |------|-----------|
 | search | 搜索原文。method: keyword / semantic / tags / person |
-| manage | 管理记忆。action: update/comment/resolve/archive/unarchive/delete/anchor/release_anchor/correct |
+| manage | 管理记忆。action: update/comment/resolve/unresolve/archive/unarchive/anchor/release_anchor |
+| correct | 用户纠错：一步完成纠正+标记旧记忆（不需要 memory_id） |
+| delete_memory | 永久删除一条记忆（不可恢复） |
 | detail | 查看记忆。传 memory_id 看详情，不传则列表浏览 |
 | review | 审核提案和画像。action: list_proposals/review_proposal/get_profile/approve_profile |
 | grow | 把一大段混合文本自动拆分成多条独立记忆 |
 
-### 系统工具（极少用的 2 个）
+### 系统工具（3 个）
 | 工具 | 一句话说明 |
 |------|-----------|
-| system | 诊断管理。action: info/health/debug_log/doctor/maintain/batch_ops |
+| system | 只读诊断。action: info/health/debug_log/doctor |
+| maintenance | 记忆维护（会改数据）。action: maintain/batch_ops |
 | window_context | bot 重启后恢复聊天窗口上下文 |
 
 ## 重要原则
@@ -510,7 +513,11 @@ async def remember(
         speaker_name: 发言者姓名
         items: 批量模式——记忆列表，每条含 content/room/importance 等字段
     """
-    if items:
+    if items is not None:
+        if not items:
+            return json.dumps({"total": 0, "created": 0, "merged": 0,
+                               "skipped": 0, "blocked": 0, "failed": 0,
+                               "items": [], "summary": "0条|空批次"}, ensure_ascii=False)
         _audit("tool_reached", tool="remember_batch", source_ai=source_ai, count=len(items))
         created = merged = skipped = failed = blocked = 0
         results = []
@@ -552,6 +559,10 @@ async def remember(
         _audit("remember_batch_result", source_ai=source_ai,
                **{k: output[k] for k in ("total", "created", "merged", "skipped", "blocked", "failed")})
         return json.dumps(output, ensure_ascii=False, indent=2)
+
+    if not content.strip():
+        return json.dumps({"status": "error", "error": "empty_content",
+                           "hint": "content 不能为空"}, ensure_ascii=False)
 
     return await _async_remember_single(
         content=content, room=room, category=category, importance=importance,
@@ -631,6 +642,10 @@ async def context(
         mode: full / incremental / corridor / living_room
         max_chars: 返回文本最大字符数（incremental/full 模式生效）
     """
+    _VALID_MODES = ("full", "incremental", "corridor", "living_room")
+    if mode not in _VALID_MODES:
+        return json.dumps({"error": f"unknown mode '{mode}'",
+                           "valid": list(_VALID_MODES)}, ensure_ascii=False)
     if mode == "corridor":
         text = await corridor_mod.get_corridor(source_ai)
         return text or "（走廊为空）"
@@ -643,11 +658,14 @@ async def context(
         from smart_context import get_smart_context
         result = await get_smart_context(source_ai, message, has_base_context=True, max_chars=max_chars)
         return json.dumps(result, ensure_ascii=False, indent=2)
-    # full mode (default)
+    # full mode
     ctx = await gateway_mod.build_context(
         user_message=message or "", ai_id=source_ai,
     )
-    return ctx.get("inject_text", "") or "（暂无记忆上下文）"
+    text = ctx.get("inject_text", "") or "（暂无记忆上下文）"
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
+    return text
 
 
 # ── 4. capture ───────────────────────────────────────────────────────
@@ -676,6 +694,11 @@ async def capture(
         messages: 对话消息数组 [{role, content}]（extract 模式）
         chat_type: private / private_group / public_group（extract 模式）
     """
+    _VALID_ACTIONS = ("log", "flush", "extract")
+    if action not in _VALID_ACTIONS:
+        return json.dumps({"error": f"unknown action '{action}'",
+                           "valid": list(_VALID_ACTIONS)}, ensure_ascii=False)
+
     if action == "flush":
         result = await conversation_capture.force_extract(ai_id=source_ai)
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -685,7 +708,7 @@ async def capture(
         results = await _extract(messages or [], source_ai, chat_type, quick=True)
         return json.dumps(results, ensure_ascii=False, indent=2)
 
-    # action == "log" (default)
+    # action == "log"
     result = await conversation_capture.log_conversation(
         user_message=user_message, ai_response=ai_response,
         ai_id=source_ai, platform=platform,
@@ -802,7 +825,6 @@ async def manage(
     tags: list[str] | None = None,
     kind: str = "reflection",
     resolved: bool = True,
-    old_value: str = "",
 ) -> str:
     """管理单条记忆。action 决定操作：
 
@@ -810,22 +832,28 @@ async def manage(
     - comment: 追加年轮评论（不改原文）
     - resolve / unresolve: 标记待办状态
     - archive / unarchive: 归档/恢复
-    - delete: 永久删除
     - anchor / release_anchor: 锚定/解除（永不衰减，最多20条）
-    - correct: 用户纠错（一步完成纠正+标记旧记忆）
+
+    高危操作请用独立工具：delete_memory（永久删除）、correct（用户纠错）。
 
     Args:
         action: 操作类型（必填）
-        memory_id: 记忆ID（correct 以外都必填）
+        memory_id: 记忆ID（必填）
         source_ai: AI身份
-        content: 新内容（update/comment/correct 用）
+        content: 新内容（update/comment 用）
         importance: 新重要度（update 用，-1=不改）
-        room: 新房间（update/correct 用）
+        room: 新房间（update 用）
         tags: 新标签（update 用）
         kind: 评论类型 reflection/update_note/feel/comment（comment 用）
         resolved: True=已解决 False=未解决（resolve/unresolve 用）
-        old_value: 被纠正的错误说法（correct 用）
     """
+    _VALID_ACTIONS = ("update", "comment", "resolve", "unresolve",
+                      "archive", "unarchive", "anchor", "release_anchor")
+    if action not in _VALID_ACTIONS:
+        return json.dumps({"error": f"unknown action '{action}'",
+                           "valid": list(_VALID_ACTIONS),
+                           "hint": "永久删除请用 delete_memory，用户纠错请用 correct"},
+                          ensure_ascii=False)
     if action == "update":
         result = await memory_ops.update_memory(
             memory_id=memory_id,
@@ -847,23 +875,49 @@ async def manage(
         result = await memory_ops.archive_memory(memory_id)
     elif action == "unarchive":
         result = await memory_ops.unarchive_memory(memory_id, changed_by=source_ai or "claude")
-    elif action == "delete":
-        result = await memory_ops.delete_memory(memory_id)
     elif action == "anchor":
         result = await memory_ops.anchor_memory(memory_id)
     elif action == "release_anchor":
         result = await memory_ops.release_anchor(memory_id)
-    elif action == "correct":
-        result = await memory_ops.apply_user_correction(
-            corrected_value=content, old_value=old_value,
-            source_ai=source_ai, room=room or "living_room",
-        )
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    else:
-        return json.dumps({"error": f"unknown action '{action}'",
-                           "valid": ["update", "comment", "resolve", "unresolve",
-                                     "archive", "unarchive", "delete",
-                                     "anchor", "release_anchor", "correct"]}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ── 7b. correct ──────────────────────────────────────────────────────
+
+@mcp.tool()
+async def correct(
+    content: str,
+    old_value: str = "",
+    source_ai: str = "",
+    room: str = "living_room",
+) -> str:
+    """用户纠错：一步完成纠正+标记旧记忆+清走廊缓存。不需要 memory_id。
+
+    Args:
+        content: 正确的说法
+        old_value: 被纠正的错误说法
+        source_ai: AI身份
+        room: 房间（默认 living_room）
+    """
+    result = await memory_ops.apply_user_correction(
+        corrected_value=content, old_value=old_value,
+        source_ai=source_ai, room=room,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ── 7c. delete_memory ───────────────────────────────────────────────
+
+@mcp.tool()
+async def delete_memory(
+    memory_id: str,
+) -> str:
+    """永久删除一条记忆。不可恢复，请确认后再调用。
+
+    Args:
+        memory_id: 记忆ID（必填）
+    """
+    result = await memory_ops.delete_memory(memory_id)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1013,27 +1067,28 @@ async def system(
     action: str,
     limit: int = 20,
     include_audit: bool = False,
-    batch_action: str = "",
-    filter_rules: dict | None = None,
-    value: str = "",
 ) -> str:
-    """系统管理和诊断。action 决定操作：
+    """系统诊断（只读）。action 决定操作：
 
     - info: 角色+房间配置
     - health: MCP 身份+schema hash（排查连接问题）
     - debug_log: MCP 审计日志
     - doctor: 记忆体检报告
-    - maintain: 执行记忆整理（合并/衰减/重建走廊）
-    - batch_ops: 批量操作（reset_activation/reclassify/bulk_resolve/bulk_archive）
+
+    写入操作请用 maintenance 工具。
 
     Args:
-        action: 操作类型（必填）
+        action: info / health / debug_log / doctor（必填）
         limit: 日志条数（debug_log 用）
         include_audit: 是否含审计日志（health 用）
-        batch_action: 批量操作类型（batch_ops 用）
-        filter_rules: 过滤条件（batch_ops 用）
-        value: 操作值（batch_ops 用）
     """
+    _VALID_ACTIONS = ("info", "health", "debug_log", "doctor")
+    if action not in _VALID_ACTIONS:
+        return json.dumps({"error": f"unknown action '{action}'",
+                           "valid": list(_VALID_ACTIONS),
+                           "hint": "维护/批量操作请用 maintenance 工具"},
+                          ensure_ascii=False)
+
     if action == "info":
         rooms = list_rooms()
         data = {
@@ -1055,17 +1110,38 @@ async def system(
         return json.dumps({"items": _read_recent_audit(max(1, min(limit, 100)))},
                           ensure_ascii=False, indent=2)
 
-    if action == "doctor":
-        import memory_doctor
-        report = memory_doctor.read_report()
-        return json.dumps({
-            "text": memory_doctor.report_text(),
-            "auto_fixed": report.get("auto_fixed", []),
-            "issues": report.get("issues", []),
-            "stats": report.get("stats", {}),
-            "generated_at": report.get("generated_at", ""),
-        }, ensure_ascii=False, indent=2)
+    # action == "doctor"
+    import memory_doctor
+    report = memory_doctor.read_report()
+    return json.dumps({
+        "text": memory_doctor.report_text(),
+        "auto_fixed": report.get("auto_fixed", []),
+        "issues": report.get("issues", []),
+        "stats": report.get("stats", {}),
+        "generated_at": report.get("generated_at", ""),
+    }, ensure_ascii=False, indent=2)
 
+
+# ── 11b. maintenance ────────────────────────────────────────────────
+
+@mcp.tool()
+async def maintenance(
+    action: str,
+    batch_action: str = "",
+    filter_rules: dict | None = None,
+    value: str = "",
+) -> str:
+    """记忆维护（会修改数据）。action 决定操作：
+
+    - maintain: 执行记忆整理（合并/衰减/重建走廊）
+    - batch_ops: 批量操作（reset_activation/reclassify/bulk_resolve/bulk_archive）
+
+    Args:
+        action: maintain / batch_ops（必填）
+        batch_action: 批量操作类型（batch_ops 用）
+        filter_rules: 过滤条件（batch_ops 用）
+        value: 操作值（batch_ops 用）
+    """
     if action == "maintain":
         result = await daemon.run_full_maintenance()
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -1089,8 +1165,7 @@ async def system(
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     return json.dumps({"error": f"unknown action '{action}'",
-                       "valid": ["info", "health", "debug_log", "doctor", "maintain", "batch_ops"]},
-                      ensure_ascii=False)
+                       "valid": ["maintain", "batch_ops"]}, ensure_ascii=False)
 
 
 # ── 12. window_context ───────────────────────────────────────────────
@@ -1130,6 +1205,8 @@ async def window_context(
 @mcp.tool()
 async def pulse(message: str = "", source_ai: str = "claude", force_corridor: bool = False) -> str:
     """[已合并到 context] 获取完整记忆上下文。请改用 context(mode='full')。"""
+    if force_corridor:
+        await corridor_mod.get_corridor(source_ai, force=True)
     return await context(source_ai=source_ai, message=message, mode="full")
 
 
@@ -1141,8 +1218,9 @@ async def smart_context(
     max_chars: int = 3000,
 ) -> str:
     """[已合并到 context] 智能上下文。请改用 context(mode='incremental'或'full')。"""
-    mode = "incremental" if has_base_context else "full"
-    return await context(source_ai=ai_id, message=user_message, mode=mode, max_chars=max_chars)
+    from smart_context import get_smart_context as _get_sc
+    result = await _get_sc(ai_id, user_message, has_base_context=has_base_context, max_chars=max_chars)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
