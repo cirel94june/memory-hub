@@ -303,19 +303,17 @@ async def build_context(
             return []
         import database
 
+        from memory_ops import is_open_todo, sort_todos
+
         def _query():
+            now = datetime.now(timezone.utc)
             mems = database.ro_iter_memories(status="active")
-            unresolved = []
-            for mem in mems:
-                if mem.get("resolved") is not False:
-                    continue
-                if mem.get("layer") == "private" and mem.get("owner_ai") != ai_id:
-                    continue
-                if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
-                    continue
-                unresolved.append(mem)
-            unresolved.sort(key=lambda m: (float(m.get("importance", 0) or 0), m.get("updated_at") or m.get("created_at") or ""), reverse=True)
-            return unresolved[:3]
+            unresolved = [
+                mem for mem in mems
+                if is_open_todo(mem, now)
+                and not (mem.get("layer") == "private" and mem.get("owner_ai") != ai_id)
+            ]
+            return sort_todos(unresolved)[:3]
 
         return await asyncio.to_thread(_query)
 
@@ -354,6 +352,9 @@ async def build_context(
         lines = [f"· {d.get('ai_id', 'AI')}: {d['summary']}" for d in group_digests]
         parts.append("【这个群里其他AI最近在聊】\n" + "\n".join(lines))
 
+    if unresolved and corridor_result:
+        unresolved = [m for m in unresolved
+                      if (m.get("content") or "")[:60] not in corridor_result]
     if unresolved:
         lines = [f"· {m.get('content','')[:180]}" for m in unresolved]
         parts.append("【当前待办/未完成】\n这些事项如果和本轮对话相关，请主动推进、提醒或询问是否已完成。\n" + "\n".join(lines))
@@ -732,6 +733,8 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
 
 规则：
 - 只写有记忆依据的内容，不要脑补。
+- 不要下诊断或定性结论（如"NPD""典型症状""创伤反应""植入的程序"）。用户自己用过的词可以引用并注明"用户说"，否则只描述事实和用户原话。
+- 不要替 AI 揣测情感或动机。
 - 如果只知道名字但不知道细节，可以写成“用户经常提到X，但系统目前缺少更具体画像”，importance 不要太高。
 - 如果同一事实已在当前客厅或关系画像里表达清楚，不要重复。
 - 每条 <=140 字，写成可直接进入记忆库的中文事实。
@@ -811,7 +814,7 @@ async def refresh_living_room_profile(dry_run: bool = True, source_ai: str = "sy
             log.warning(f"  Living room dedup check failed: {e}")
 
         result = await remember(
-            content=item["content"],
+            content=f"[AI解读] {item['content']}",
             layer="shared",
             room=item["room"],
             category=item["category"],

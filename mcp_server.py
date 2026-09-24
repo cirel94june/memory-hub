@@ -23,7 +23,7 @@ import github_store as store
 from config import AI_ROLES, ROOMS, list_rooms
 
 MCP_SERVER_NAME = "Memory Hub"
-MCP_SERVER_VERSION = "2026-09-22.consolidate-tools.1"
+MCP_SERVER_VERSION = "2026-09-24.trial-fixes.1"
 MCP_PUBLIC_PATH = "/mcp"
 MCP_AUDIT_PATH = Path(__file__).parent / "data" / "mcp_audit.jsonl"
 
@@ -60,10 +60,9 @@ MCP_INSTRUCTIONS = """\
 - 不要修改原文！用年轮评论记录认知变化
 - 这样可以保留时间线上的成长轨迹
 
-### 信息更新时（remember 会自动处理）：
-- 用户说了新事实（如换工作、搬家）→ 直接 remember 新内容
-- 系统会自动检测旧记忆并标记为"已过时"
-- 你不需要手动找旧记忆去更新，remember 内置了智能检测
+### 信息更新时：
+- 情况自然变化（换工作、搬家）→ remember 新内容，系统会尝试把旧记忆标记为过时
+- **用户明确改口**（"不是X，是Y""别再叫我X""你记错了"）→ 用 `correct`，不要只 remember 新说法，否则旧说法会继续被当真
 - 如果记忆有 event_date（事件发生日期），请传入
 
 ### 锚定重要记忆（调 manage(action="anchor")）：
@@ -74,10 +73,18 @@ MCP_INSTRUCTIONS = """\
 
 ## 房间速查
 - living_room: 核心身份（永远重要）
-- career/psychology/health/learning/relationships/preferences: 各主题
+- career/psychology/health/learning/preferences: 各主题
+- relationships（带 s）: 人物档案——小猫身边的人、各个 AI 分别是谁
+- relationship（不带 s）: 你和小猫之间的关系（AI 私有）
+- social: 群聊互动
 - work_tasks: 工作事务（会自动衰减）
-- diary/dreams/relationship/personality: AI 私有空间
+- infra / infra_changelog: 系统基建状态和变更记录
+- diary/dreams/personality: AI 私有空间
 - game_room: 游戏/角色扮演（隔离，不混入正经对话）
+
+## 前缀含义
+- [用户] 关于小猫的事实 · [互动] 小猫和 AI 之间发生的事 · [AI] 关于 AI 自己
+- [AI解读] 后台模型综合整理的解读，**不是小猫原话**，引用时要说明是推测
 
 ## 记录对话
 
@@ -632,7 +639,7 @@ async def context(
         source_ai: AI身份。默认 claude=小克；Lucien/Jasper 必须显式传入
         message: 当前用户消息（用于搜索相关记忆）
         mode: full / incremental / corridor / living_room
-        max_chars: 返回文本最大字符数（incremental/full 模式生效）
+        max_chars: 返回文本最大字符数（incremental 生效；full 至少 8000）
     """
     _VALID_MODES = ("full", "incremental", "corridor", "living_room")
     if mode not in _VALID_MODES:
@@ -655,9 +662,8 @@ async def context(
         user_message=message or "", ai_id=source_ai,
     )
     text = ctx.get("inject_text", "") or "（暂无记忆上下文）"
-    if max_chars and len(text) > max_chars:
-        text = text[:max_chars]
-    return text
+    from smart_context import trim_full_context
+    return trim_full_context(text, max_chars)
 
 
 # ── 4. capture ───────────────────────────────────────────────────────
@@ -734,7 +740,7 @@ async def dream(content: str, source_ai: str = "claude") -> str:
 async def search(
     method: str,
     query: str = "",
-    source_ai: str = "",
+    source_ai: str = "claude",
     tags: list[str] | None = None,
     tag_mode: str = "any",
     with_person: str = "",
@@ -810,7 +816,7 @@ async def search(
 async def manage(
     action: str,
     memory_id: str = "",
-    source_ai: str = "",
+    source_ai: str = "claude",
     content: str = "",
     importance: float = -1,
     room: str = "",
@@ -880,7 +886,7 @@ async def manage(
 async def correct(
     content: str,
     old_value: str = "",
-    source_ai: str = "",
+    source_ai: str = "claude",
     room: str = "living_room",
 ) -> str:
     """用户纠错：一步完成纠正+标记旧记忆+清走廊缓存。不需要 memory_id。
@@ -923,7 +929,7 @@ async def detail(
     page: int = 1,
     per_page: int = 20,
     compact: bool = True,
-    source_ai: str = "",
+    source_ai: str = "claude",
 ) -> str:
     """查看记忆。传 memory_id 看一条的完整详情；不传则按条件列出。
 
@@ -963,7 +969,7 @@ async def detail(
 @mcp.tool()
 async def review(
     action: str,
-    source_ai: str = "",
+    source_ai: str = "claude",
     proposal_id: str = "",
     decision: str = "",
     reject_reason: str = "",

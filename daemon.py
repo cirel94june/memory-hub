@@ -830,15 +830,44 @@ async def _backfill_analysis():
     return backfilled
 
 
+AI_INTERPRETATION_PREFIX = "[AI解读]"
+
+
+def _is_ai_interpretation(mem: dict) -> bool:
+    # [用户] means "about the user"; readers take it as "the user said so",
+    # so AI-synthesized profile text must not carry it.
+    return (mem.get("source_platform") == "living_room_refresh"
+            or mem.get("provenance_type") == "ai_speculation")
+
+
 async def _auto_fix_about_prefix():
-    """自动给缺少 [用户]/[互动]/[AI] 前缀的记忆补上前缀"""
+    """自动给缺少前缀的记忆补上前缀；AI 解读类条目纠正误贴的 [用户]"""
     all_mems = store.get_all_memories()
-    prefixes = ("[用户]", "[互动]", "[AI]")
+    prefixes = ("[用户]", "[互动]", "[AI]", AI_INTERPRETATION_PREFIX)
     fixed = 0
     for mem in all_mems.values():
         if mem.get("status") != "active":
             continue
         content = mem.get("content", "")
+        if _is_ai_interpretation(mem):
+            if content.startswith(AI_INTERPRETATION_PREFIX):
+                continue
+            if content.startswith("[用户]"):
+                content = content[len("[用户]"):].lstrip()
+                comments = mem.get("comments", [])
+                if not isinstance(comments, list):
+                    comments = []
+                comments.append({
+                    "date": datetime.now(timezone.utc).isoformat(),
+                    "author": "system",
+                    "kind": "provenance_note",
+                    "content": "前缀由 [用户] 更正为 [AI解读]：这条是后台模型综合整理的解读，不是用户原话。正文未改动。",
+                })
+                mem["comments"] = comments
+            mem["content"] = f"{AI_INTERPRETATION_PREFIX} {content}"
+            store.set_memory(mem)
+            fixed += 1
+            continue
         if any(content.startswith(p) for p in prefixes):
             continue
         # 简单规则判断（不调 LLM，省钱）
