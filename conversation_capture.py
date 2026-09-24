@@ -218,7 +218,7 @@ EXTRACT_OUTPUT_FORMAT = """
     "speaker_name": "谁说的（人名）",
     "info_type": "identity（身份/很少变）/state（当前状态/会过期）/event（已发生的事）/task（待办）/reflection（AI感受）/relationship（关系相关）",
     "corrects_old_value": "仅user_correction时填",
-    "resolved": null（默认）或 false（仅"要做某事/待办/提醒我"时用）
+    "resolved": null（默认）或 false（仅用于还没做、之后需要跟进或提醒的事，info_type 必须是 task 或将来的 event；已经发生/做完的事、状态、事实、纠正一律 null）
   }
 ]
 

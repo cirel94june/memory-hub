@@ -2569,7 +2569,7 @@ async def delete_memory(memory_id: str) -> dict:
 
 def _normalize_for_dedup(content: str) -> str:
     text = (content or "").strip().lower()
-    for prefix in ("[用户]", "[互动]", "[AI]", "[鐢ㄦ埛]", "[浜掑姩]"):
+    for prefix in ("[用户]", "[互动]", "[AI解读]", "[AI]", "[鐢ㄦ埛]", "[浜掑姩]"):
         if text.startswith(prefix.lower()):
             text = text[len(prefix):].strip()
     return "".join(ch for ch in text if ch.isalnum())
@@ -3010,6 +3010,41 @@ async def audit_content_integrity(mark: bool = True) -> dict:
 
 def _has_tag(mem: dict, tag: str) -> bool:
     return tag in _parse_json_field(mem.get("tags", "[]"))
+
+
+# ── 待办判定（走廊 / incremental / full 三处共用）──
+
+TODO_EVENT_WINDOW_DAYS = 14
+
+
+def _parse_ts(ts: str):
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def is_open_todo(mem: dict, now: datetime) -> bool:
+    """待办 = 需要跟进、还没完成的 task，或 14 天内的 event（将来的约定）。"""
+    if mem.get("resolved") is not False or mem.get("status") != "active":
+        return False
+    if mem.get("provenance_type") == "user_correction":
+        return False
+    if mem.get("room") == "social" and "auto_capture" in (mem.get("source_platform") or ""):
+        return False
+    info_type = mem.get("info_type") or "fact"
+    if info_type == "task":
+        return True
+    if info_type == "event":
+        created = _parse_ts(mem.get("created_at") or "")
+        return created is not None and (now - created).days <= TODO_EVENT_WINDOW_DAYS
+    return False
+
+
+def sort_todos(mems: list[dict]) -> list[dict]:
+    return sorted(mems, key=lambda m: m.get("updated_at") or m.get("created_at") or "",
+                  reverse=True)
 
 
 # ── 用户纠正处理 ──

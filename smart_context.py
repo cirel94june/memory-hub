@@ -50,6 +50,16 @@ def _trim_at_boundary(text: str, budget: int, marker: str = "\n...(已截断)") 
     return cut.rstrip() + marker
 
 
+# The wake-up corridor alone often exceeds 3000 chars; a smaller budget cut off
+# todos and dreams at the end.
+FULL_CONTEXT_MIN_CHARS = 8000
+
+
+def trim_full_context(text: str, max_chars: int) -> str:
+    budget = max(max_chars or 0, FULL_CONTEXT_MIN_CHARS)
+    return _trim_at_boundary(text, budget, "\n...(上下文已截断，需要更多请用 recall 搜索)")
+
+
 def _fit_sections(sections: list[str], max_chars: int) -> str:
     """按顺序装入 sections，装不下的整段丢弃（保序，先来的优先级高）。
     避免旧行为：拼完再一刀切，把排在末尾的重要内容砍成半句。"""
@@ -127,14 +137,10 @@ async def get_smart_context(
             recall_section = "【相关记忆】\n" + "\n".join(lines)
 
     # 2. 未解决的待办（可见性过滤）
-    unresolved = [
+    unresolved = memory_ops.sort_todos([
         m for m in all_mems.values()
-        if m.get("resolved") == False
-        and m.get("status") == "active"
-        and can_view(m, ai_id)
-        and not (m.get("room") == "social"
-                 and "auto_capture" in (m.get("source_platform") or ""))
-    ]
+        if memory_ops.is_open_todo(m, now) and can_view(m, ai_id)
+    ])
     todo_section = ""
     if unresolved:
         lines = [f"· {m['content'][:150]}" for m in unresolved[:3]]
@@ -177,12 +183,14 @@ async def get_smart_context(
     # 4. 其他 AI 的最近动态（跨端感知）——只允许 shared 层，
     #    别人的 private（梦/日记）绝不能出现在这里
     from config import AI_ROLES
+    shown_ids = recalled_ids | {m["id"] for m in recent} | {m["id"] for m in unresolved[:3]}
     cross_ai = sorted(
         [m for m in all_mems.values()
          if m.get("status") == "active"
          and (m.get("layer") or "shared") == "shared"
          and m.get("source_ai") and m.get("source_ai") != ai_id
          and m.get("updated_at", "") > cutoff_48h.isoformat()
+         and m["id"] not in shown_ids
          and not memory_ops._has_tag(m, "content_incomplete")],
         key=lambda x: x.get("updated_at", ""),
         reverse=True,

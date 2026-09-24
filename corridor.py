@@ -454,6 +454,9 @@ async def build_corridor(ai_id: str) -> str:
     if recent_chat_lines:
         sections.append("【最近的对话】\n" + "\n".join(f"· {line}" for line in recent_chat_lines))
 
+    # 待办在下方第 8 节计算，插回这里：靠前放，截断时不会先丢
+    todo_insert_at = len(sections)
+
     if living:
         deduped_living = _dedup_texts(living, max_items=8)
         sections.append("【关于主人】\n" + "\n".join(f"· {x}" for x in deduped_living))
@@ -512,16 +515,13 @@ async def build_corridor(ai_id: str) -> str:
 
     # 8. Unresolved 记忆（待办事项提醒）
     # 只展示 task/event 类型；排除已被其他段展示的；按新旧排序。
-    _TODO_TYPES = {"task", "event"}
+    from memory_ops import is_open_todo, sort_todos
     _TODO_STALE_DAYS = 14
-    unresolved_mems = [
+    unresolved_mems = sort_todos([
         m for m in visible_mems.values()
-        if m.get("resolved") == False
-        and m.get("status") == "active"
-        and m.get("info_type", "fact") in _TODO_TYPES
+        if is_open_todo(m, now_utc)
         and _norm(m.get("content", "")) not in seen_norms
-    ]
-    unresolved_mems.sort(key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
+    ])
     if unresolved_mems:
         lines = []
         for m in unresolved_mems[:3]:
@@ -529,7 +529,7 @@ async def build_corridor(ai_id: str) -> str:
             stale = f" [{int(age)}天前]" if age > _TODO_STALE_DAYS else ""
             lines.append(f"· {m['content'][:200]}{stale}")
             seen_norms.add(_norm(m.get("content", "")))
-        sections.append("【待办/未完成】\n如果这些事项和当前对话相关，请主动提醒、推进，或询问是否已经完成。\n" + "\n".join(lines))
+        sections.insert(todo_insert_at, "【待办/未完成】\n如果这些事项和当前对话相关，请主动提醒、推进，或询问是否已经完成。\n" + "\n".join(lines))
 
     corridor_text = "\n\n".join(sections)
 
