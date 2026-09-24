@@ -629,7 +629,7 @@ async def context(
     - living_room: 只要核心身份记忆
 
     Args:
-        source_ai: AI身份（必传）
+        source_ai: AI身份。默认 claude=小克；Lucien/Jasper 必须显式传入
         message: 当前用户消息（用于搜索相关记忆）
         mode: full / incremental / corridor / living_room
         max_chars: 返回文本最大字符数（incremental/full 模式生效）
